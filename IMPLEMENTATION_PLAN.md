@@ -333,13 +333,13 @@ polymarket-as-rust/
 - **PASS/FAIL Criteria:** PASS iff all exact vectors match to `1e-6`, `P99` compute `< 25 us`, all 5 adversarial cases pass without panic/`NaN`/crossed quotes, and Phase 0–1 tests stay green.
 
 #### Phase 2 GATE CHECKLIST
-- [ ] `rtk cargo fmt --all -- --check` exits 0
-- [ ] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] `rtk cargo test --workspace` exits 0
-- [ ] Live/replay `poly-as trace` outputs complete 6-station trace + `P99 < 25 us` + valid JSONL
-- [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
-- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
-- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-2-complete` tag pushed
+- [x] `rtk cargo fmt --all -- --check` exits 0
+- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `rtk cargo test --workspace` exits 0
+- [x] Live/replay `poly-as trace` outputs complete 6-station trace + `P99 < 25 us` + valid JSONL
+- [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [x] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-2-complete` tag pushed
 
 ---
 
