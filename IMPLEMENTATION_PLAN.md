@@ -17,6 +17,7 @@
 5. **Zero-Allocation Hot Path:** Intern 77-digit token IDs to `#[repr(u8)] enum Outcome { Up = 0, Down = 1 }` at ingress. Parse price/size decimal slices directly into integer micro-units without allocating `String`/`Vec` inside `rtrb` slots.
 6. **Official Docs Grounding:** Verified against `C:\Users\Tiger\Agents\Projects\AI Trading\Library\`, read-only legacy docs `C:\Users\Tiger\Agents\Projects\AI Trading\dangerously-skip-permissions-bot\docs\avellaneda-stoikov\`, live Polymarket official docs (`polymarket-docs` MCP, Nov 2026), and Context7 (`rtrb`, `tokio-tungstenite`, `hdrhistogram`, `alloy`).
 7. **Windows 11 Platform Discipline:** Commands use Windows PowerShell (`pwsh`) syntax; use `rtk cargo ...` / `rtk git ...` in agent tool calls. Mitigate Windows 15.625ms timer granularity and `w32time` clock drift explicitly in `core-types`.
+8. **Git Workflow & Delivery Discipline:** Follow [AGENTS.md](AGENTS.md) for all Phase 2–5 work: branch from synced `main` (`feat/phase-<N>-<slug>`), make atomic conventional commits per verified slice (separating prior-phase polish from new phase features), push to `origin`, open a PR with the Verification Scorecard, wait for green CI, merge cleanly (`--merge --delete-branch`), fast-forward local `main`, and push annotated tag `phase-<N>-complete`. Never commit feature work directly to `main`.
 
 ---
 
@@ -338,6 +339,7 @@ polymarket-as-rust/
 - [ ] Live/replay `poly-as trace` outputs complete 6-station trace + `P99 < 25 us` + valid JSONL
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-2-complete` tag pushed
 
 ---
 
@@ -408,6 +410,7 @@ polymarket-as-rust/
 - [ ] Live 60s `poly-as paper` + deterministic replay run verified with JSONL audit
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-3-complete` tag pushed
 
 ---
 
@@ -498,6 +501,7 @@ polymarket-as-rust/
 - [ ] `poly-as lifecycle --source sim-epoch --fast-forward` and `--inject-fault` tests verified
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-4-complete` tag pushed
 
 ---
 
@@ -594,13 +598,14 @@ polymarket-as-rust/
 - [ ] `poly-as exec --mode dry-run --duration 60s` verified (`tau_3 < 80 us`, 0 leaked secrets, valid JSONL)
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-5-complete` tag pushed
 
 ---
 
 ## 4. Strict Gating Rule (Non-Negotiable Execution Law)
 
 > **STRICT SEQUENTIAL PHASE GATE:**
-> Work may advance from **Phase $N$** to **Phase $N+1$** **ONLY** when ALL FIVE conditions are satisfied with fresh terminal evidence:
+> Work may advance from **Phase $N$** to **Phase $N+1$** **ONLY** when ALL SIX conditions are satisfied with fresh terminal evidence:
 > 1. **[N.1 DO]** All crates, modules, structs, and CLI subcommands for Phase $N$ are implemented cleanly with zero placeholders.
 > 2. **[N.2 VERIFY]** The live terminal calculation trace (`cargo run ...`), all exact numeric unit-test vectors (`cargo test ...`), and structured JSONL log validation have been executed fresh and confirmed passing.
 > 3. **[N.3 VERIFY-AGAIN]** All adversarial edge-case re-runs and full workspace regression tests (`cargo test --workspace`) have been executed fresh and confirmed passing.
@@ -615,6 +620,7 @@ polymarket-as-rust/
 >      - Code Safety & Hygiene (`10 pts`)
 >    - **Pass/Fail Override Rule:** `95–100` = `PASS` (Production-Ready); `85–94` = `PASS WITH NOTES` (functional, minor non-blocking headroom/tuning notes); `< 85` or ANY failed hard gate (failing test, panic, leaked secret, or `CRITICAL`/`HIGH` reviewer finding) = **`FAIL` (Blocked)** regardless of numeric score.
 >    - **Plain-English Verdict:** 2–3 short sentences directly answering whether the output matches what a working, completed Phase $N$ should produce.
+> 6. **GIT DELIVERY GATE:** All work lives on a dedicated branch with atomic conventional commits (`AGENTS.md`), zero leaked secrets or ignored artifacts, pushed to `origin`, opened as a PR with the Verification Scorecard and green GitHub Actions CI, merged to `main` (`--merge --delete-branch`), local `main` fast-forwarded cleanly, and annotated tag `phase-<N>-complete` pushed.
 >
 > **STOP RULE:** If ANY check fails, **STOP immediately**, fix the root cause in Phase $N$, and re-run **BOTH** `[N.2 VERIFY]` and `[N.3 VERIFY-AGAIN]` from scratch before advancing. **NEVER skip, batch, or overlap phases.**
 
@@ -638,3 +644,4 @@ The greenfield Rust project is **DONE** when:
 5. **Execution Client:** Direct Native Rust (`reqwest` + `alloy` + `hmac`).
 6. **Cross-Model Review (`doubt-driven-development`):** Skipped by operator; proceeding with single-model adversarial findings only.
 7. **Operator Verification Scorecard:** Starting from Phase 2 onward, every phase verification report MUST include a Human-Readable Verification Scorecard (plain-English metric translation, target vs. measured values, transparent 0–100 rubric score, and PASS/FAIL verdict) alongside the raw terminal output.
+8. **Git Workflow & Repository Conventions:** Repository lives at `AI-Degen-69/polymarket-as-rust` (private). Starting from Phase 2 onward, all changes follow `AGENTS.md` (short-lived feature branches, atomic conventional commits, PR + green CI before merging to `main`, and `phase-<N>-complete` tags).
