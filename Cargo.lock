@@ -800,7 +800,6 @@ dependencies = [
  "core-types",
  "serde",
  "serde_json",
- "thiserror",
 ]
 
 [[package]]

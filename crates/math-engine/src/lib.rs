@@ -15,6 +15,8 @@
 
 use core_types::MathError;
 
+/// Unified zero-allocation Stations 1–6 math pipeline orchestrator and telemetry trace.
+pub mod pipeline;
 /// Station 1: Savitzky-Golay 5-point microstructure noise filter.
 pub mod station1_sg;
 /// Station 2: Rolling 60-second ZOH TWAP, variance decay, and cross-venue Binance lead-lag.
@@ -24,6 +26,9 @@ pub mod station3_kappa;
 /// Stations 4–6: Optimal spread `s*`, reservation price `r_i`, dual bids, and 3-way Post-Only guard.
 pub mod station4_6_pricer;
 
+pub use pipeline::{
+    MathPipeline, MathPipelineConfig, PipelineFlags, PipelineInput, PipelineTrace, StationTimings,
+};
 pub use station1_sg::{CAUSAL_WEIGHTS, SYMMETRIC_WEIGHTS, SavitzkyGolayFilter, SgOutput};
 pub use station2_twap::{
     LeadLagSignal, RollingTwapAndVariance, SpotSample, Station2Config, Station2Output, norm_cdf,
