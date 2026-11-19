@@ -1,3 +1,5 @@
+//! Unified terminal CLI binary `poly-as` for Polymarket 5-minute BTC market making.
+
 #![forbid(unsafe_code)]
 #![cfg_attr(
     test,
@@ -12,13 +14,41 @@
 mod doctor;
 mod feeds_cmd;
 mod feeds_report;
+mod trace_cmd;
+mod trace_report;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+use core_types::{KappaMode, SgMode, VarianceMode};
 
 use feeds_cmd::FeedsArgs;
+use trace_cmd::{TraceArgs, TraceSourceMode};
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliTraceSource {
+    Live,
+    Replay,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSgMode {
+    Causal,
+    Symmetric,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliKappaMode {
+    Normalized,
+    LogSlope,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliVarianceMode {
+    BinaryCara,
+    LibraryStrict,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -57,11 +87,37 @@ enum Commands {
         #[arg(long, default_value = "logs/phase1-feeds.jsonl")]
         jsonl: PathBuf,
     },
+    /// Phase 2 math engine tracer: stream live or replayed ticks through Stations 1–6.
+    Trace {
+        /// Feed source (`live` WebSockets or `replay` JSONL log).
+        #[arg(long, value_enum, default_value_t = CliTraceSource::Live)]
+        source: CliTraceSource,
+        /// Input JSONL path used when `--source replay` (defaults to `logs/phase1-feeds.jsonl`).
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Station 1 Savitzky-Golay filter mode (`causal` default or `symmetric`).
+        #[arg(long, value_enum, default_value_t = CliSgMode::Causal)]
+        sg_mode: CliSgMode,
+        /// Station 3 liquidity decay estimator (`normalized` default or `log-slope`).
+        #[arg(long, value_enum, default_value_t = CliKappaMode::Normalized)]
+        kappa_mode: CliKappaMode,
+        /// Station 2/5 remaining variance mode (`binary-cara` default or `library-strict`).
+        #[arg(long, value_enum, default_value_t = CliVarianceMode::BinaryCara)]
+        variance_mode: CliVarianceMode,
+        /// Number of post-warmup 100ms evaluation ticks to print and record (`>= 1`).
+        #[arg(long, default_value_t = 25)]
+        ticks: usize,
+        /// Simulated net UP-DOWN share inventory `q` (integer shares).
+        #[arg(long, default_value_t = 0)]
+        inventory: i64,
+        /// Output path for structured JSONL telemetry log.
+        #[arg(long, default_value = "logs/phase2-trace.jsonl")]
+        jsonl: PathBuf,
+    },
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let result = match cli.command {
+fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    match cli.command {
         Commands::Doctor { jsonl } => doctor::run(&jsonl),
         Commands::Feeds {
             discover,
@@ -76,9 +132,42 @@ fn main() -> ExitCode {
             replay_out,
             jsonl,
         }),
-    };
+        Commands::Trace {
+            source,
+            input,
+            sg_mode,
+            kappa_mode,
+            variance_mode,
+            ticks,
+            inventory,
+            jsonl,
+        } => trace_cmd::run(TraceArgs {
+            source: match source {
+                CliTraceSource::Live => TraceSourceMode::Live,
+                CliTraceSource::Replay => TraceSourceMode::Replay,
+            },
+            input,
+            sg_mode: match sg_mode {
+                CliSgMode::Causal => SgMode::Causal,
+                CliSgMode::Symmetric => SgMode::Symmetric,
+            },
+            kappa_mode: match kappa_mode {
+                CliKappaMode::Normalized => KappaMode::TradeNormalizedDepth,
+                CliKappaMode::LogSlope => KappaMode::LibraryLogSlope,
+            },
+            variance_mode: match variance_mode {
+                CliVarianceMode::BinaryCara => VarianceMode::BinaryCara,
+                CliVarianceMode::LibraryStrict => VarianceMode::LibraryStrict,
+            },
+            ticks,
+            inventory,
+            jsonl,
+        }),
+    }
+}
 
-    match result {
+fn main() -> ExitCode {
+    match dispatch_cli(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("ERROR: {err}");
@@ -103,7 +192,7 @@ mod tests {
             Commands::Doctor { jsonl } => {
                 assert_eq!(jsonl, PathBuf::from("logs/phase0-doctor.jsonl"));
             }
-            Commands::Feeds { .. } => panic!("expected Doctor"),
+            Commands::Feeds { .. } | Commands::Trace { .. } => panic!("expected Doctor"),
         }
 
         let custom_cli =
@@ -112,7 +201,7 @@ mod tests {
             Commands::Doctor { jsonl } => {
                 assert_eq!(jsonl, PathBuf::from("out/custom.jsonl"));
             }
-            Commands::Feeds { .. } => panic!("expected Doctor"),
+            Commands::Feeds { .. } | Commands::Trace { .. } => panic!("expected Doctor"),
         }
     }
 
@@ -142,7 +231,7 @@ mod tests {
                 assert!(replay_out.is_none());
                 assert_eq!(jsonl, PathBuf::from("logs/phase1-feeds.jsonl"));
             }
-            Commands::Doctor { .. } => panic!("expected Feeds"),
+            Commands::Doctor { .. } | Commands::Trace { .. } => panic!("expected Feeds"),
         }
 
         let replay =
@@ -154,7 +243,80 @@ mod tests {
                 assert!(!discover);
                 assert_eq!(replay, Some(PathBuf::from("logs/rec.jsonl")));
             }
-            Commands::Doctor { .. } => panic!("expected Feeds"),
+            Commands::Doctor { .. } | Commands::Trace { .. } => panic!("expected Feeds"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_trace_live_and_replay_ab_flags() {
+        let live = Cli::try_parse_from([
+            "poly-as",
+            "trace",
+            "--source",
+            "live",
+            "--sg-mode",
+            "causal",
+            "--ticks",
+            "20",
+            "--jsonl",
+            "logs/phase2-trace.jsonl",
+        ])
+        .unwrap();
+        match live.command {
+            Commands::Trace {
+                source,
+                ticks,
+                inventory,
+                input,
+                ..
+            } => {
+                assert!(matches!(source, CliTraceSource::Live));
+                assert_eq!(ticks, 20);
+                assert_eq!(inventory, 0);
+                assert!(input.is_none());
+            }
+            Commands::Doctor { .. } | Commands::Feeds { .. } => panic!("expected Trace"),
+        }
+
+        let ab = Cli::try_parse_from([
+            "poly-as",
+            "trace",
+            "--source",
+            "replay",
+            "--input",
+            "logs/phase1-feeds.jsonl",
+            "--sg-mode",
+            "symmetric",
+            "--kappa-mode",
+            "log-slope",
+            "--variance-mode",
+            "library-strict",
+            "--ticks",
+            "25",
+            "--inventory",
+            "20",
+            "--jsonl",
+            "logs/phase2-trace-ab.jsonl",
+        ])
+        .unwrap();
+        match ab.command {
+            Commands::Trace {
+                source,
+                sg_mode,
+                kappa_mode,
+                variance_mode,
+                ticks,
+                inventory,
+                ..
+            } => {
+                assert!(matches!(source, CliTraceSource::Replay));
+                assert!(matches!(sg_mode, CliSgMode::Symmetric));
+                assert!(matches!(kappa_mode, CliKappaMode::LogSlope));
+                assert!(matches!(variance_mode, CliVarianceMode::LibraryStrict));
+                assert_eq!(ticks, 25);
+                assert_eq!(inventory, 20);
+            }
+            Commands::Doctor { .. } | Commands::Feeds { .. } => panic!("expected Trace"),
         }
     }
 }

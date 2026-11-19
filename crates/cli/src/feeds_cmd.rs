@@ -30,7 +30,7 @@ pub(crate) struct FeedsArgs {
     pub(crate) jsonl: PathBuf,
 }
 
-struct ActorHandles {
+pub(crate) struct ActorHandles {
     clob_cmd: mpsc::Sender<ClobWsCommand>,
     binance_cmd: mpsc::Sender<BinanceWsCommand>,
     polybolt_cmd: mpsc::Sender<PolyBoltWsCommand>,
@@ -169,7 +169,7 @@ fn init_capture_data(polybolt_enabled: bool) -> CaptureReportData {
     CaptureReportData::new(pb_state)
 }
 
-fn spawn_actors(
+pub(crate) fn spawn_actors(
     cfg: &EngineConfig,
     desc: &MarketDescriptor,
     discovery: &GammaDiscoveryClient,
@@ -236,7 +236,7 @@ async fn capture_until_deadline(
     Ok(())
 }
 
-async fn shutdown_actors(
+pub(crate) async fn shutdown_actors(
     handles: ActorHandles,
     polybolt_enabled: bool,
 ) -> ((FeedStats, FeedStats, FeedStats), Option<String>) {
