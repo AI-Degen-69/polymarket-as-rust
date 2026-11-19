@@ -128,13 +128,18 @@ impl PolyBoltSeqTracker {
 
     fn observe_seq(&mut self, channel: &str, seq: Option<u64>, dropped: u32) -> Option<String> {
         let mut warning = None;
-        if let Some(s) = seq
-            && let Some(prev) = self.last_seq.insert(channel.to_string(), s)
-            && s > prev.saturating_add(1)
-        {
-            warning = Some(format!(
-                "PolyBolt seq gap on `{channel}`: prev={prev} got={s}"
-            ));
+        if let Some(s) = seq {
+            if let Some(prev_slot) = self.last_seq.get_mut(channel) {
+                let prev = *prev_slot;
+                *prev_slot = s;
+                if s > prev.saturating_add(1) {
+                    warning = Some(format!(
+                        "PolyBolt seq gap on `{channel}`: prev={prev} got={s}"
+                    ));
+                }
+            } else {
+                self.last_seq.insert(channel.to_string(), s);
+            }
         }
         if dropped > 0 && warning.is_none() {
             warning = Some(format!(
@@ -493,8 +498,8 @@ impl PolyBoltTwapWsActor {
         close_ws_bounded(writer).await;
         self.warn(detail.clone(), health_tx)?;
         self.emit_disconnect(health_tx, detail.clone()).await?;
-        let permanent =
-            matches!(code, Some("auth_invalid" | "chainlink_key_required")) || status == Some(4010);
+        let permanent = matches!(code, Some("auth_invalid" | "chainlink_key_required"))
+            || matches!(status, Some(4001 | 4008 | 4010));
         if permanent {
             Ok(Some(SessionExit::FatalError(detail)))
         } else {
@@ -661,6 +666,12 @@ fn build_oracle_event(
     warning: Option<String>,
     seq_tracker: &mut PolyBoltSeqTracker,
 ) -> Result<PolyBoltParsed, FeedError> {
+    if val_e8 == 0 {
+        return Err(FeedError::WebSocket {
+            feed: "polybolt",
+            detail: format!("non-positive oracle price `0` on channel `{channel}`"),
+        });
+    }
     match channel {
         "price.crypto" => {
             seq_tracker.last_spot_e8 = val_e8;

@@ -878,4 +878,68 @@ mod tests {
         assert!(!up.is_crossed());
         assert_eq!(up.best_bid().unwrap().price, MicroUsdc(520_000));
     }
+
+    #[tokio::test]
+    async fn adversarial_polybolt_zero_price_and_error_status_4001() {
+        let mut seq = PolyBoltSeqTracker::default();
+        let zero_spot = r#"{"channel":"price.crypto","seq":1,"ts":1000,"payload":{"value":"0"}}"#;
+        assert!(matches!(
+            parse_polybolt_ws_text(zero_spot, 10, &mut seq),
+            Err(FeedError::WebSocket {
+                feed: "polybolt",
+                ..
+            })
+        ));
+        let zero_twap =
+            r#"{"channel":"price.crypto.twap","seq":1,"ts":1000,"payload":{"value":0}}"#;
+        assert!(matches!(
+            parse_polybolt_ws_text(zero_twap, 20, &mut seq),
+            Err(FeedError::WebSocket {
+                feed: "polybolt",
+                ..
+            })
+        ));
+
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+        let srv = tokio::spawn(async move {
+            let (sock, _) = ws_listener.accept().await.unwrap();
+            let mut ws = accept_async(sock).await.unwrap();
+            let _ = ws.next().await; // auth
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"op":"error","status":4001,"code":"auth_failed"}"#.into(),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let cfg = PolyBoltWsConfig {
+            enabled: true,
+            ws_url: format!("ws://{ws_addr}"),
+            api_key: Some(SecretString::from("k")),
+            api_secret: Some(SecretString::from("s")),
+            api_passphrase: Some(SecretString::from("p")),
+            chainlink_api_key: Some(SecretString::from("clk")),
+            connect_timeout: Duration::from_secs(2),
+            stale_timeout: Duration::from_secs(5),
+            reconnect_backoff: Duration::from_millis(20),
+            drain_jitter_max: Duration::from_millis(10),
+        };
+        let (prod, _cons) = RingBuffer::new(8);
+        let (htx, _hrx) = mpsc::channel(8);
+        let (_ctx, crx) = mpsc::channel(4);
+        let res = PolyBoltTwapWsActor::new(cfg)
+            .unwrap()
+            .run(prod, htx, crx)
+            .await;
+        srv.abort();
+        assert!(matches!(
+            res,
+            Err(FeedError::WebSocket {
+                feed: "polybolt",
+                ..
+            })
+        ));
+    }
 }
