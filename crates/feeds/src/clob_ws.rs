@@ -16,9 +16,9 @@ use crate::error::FeedError;
 use crate::events::{FeedHealthEvent, FeedId, FeedStats, PolyMarketEvent};
 use crate::parse::{de_opt_string_or_u64, parse_decimal_micro_flexible, parse_order_side};
 use crate::ws_common::{
-    ConnectStep, HealthThrottle, check_stale_watchdog, connect_ws_bounded, emit_disconnect,
-    emit_health_transition, empty_stats, finalize_stats, now_pair, push_ring_event,
-    record_parse_warning,
+    ConnectStep, HealthThrottle, check_stale_watchdog, close_ws_bounded, connect_ws_bounded,
+    emit_disconnect, emit_health_transition, empty_stats, finalize_stats, now_pair,
+    push_ring_event, record_parse_warning,
 };
 
 /// Default Polymarket CLOB market WebSocket endpoint.
@@ -426,7 +426,7 @@ impl ClobMarketWsActor {
     ) -> Result<Option<SessionExit>, FeedError> {
         match cmd {
             None | Some(ClobWsCommand::Shutdown) => {
-                let _ = io.writer.send(Message::Close(None)).await;
+                close_ws_bounded(io.writer).await;
                 Ok(Some(SessionExit::Shutdown))
             }
             Some(ClobWsCommand::Rollover {
@@ -469,7 +469,7 @@ impl ClobMarketWsActor {
         if let Some(sent_at) = io.awaiting_pong
             && sent_at.elapsed() >= self.config.pong_timeout
         {
-            let _ = io.writer.send(Message::Close(None)).await;
+            close_ws_bounded(io.writer).await;
             let reason = format!("PONG timeout after {}ms", sent_at.elapsed().as_millis());
             self.emit_disconnect(io.health_tx, reason).await?;
             return Ok(Some(SessionExit::Reconnect));

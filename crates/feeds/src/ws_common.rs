@@ -161,11 +161,7 @@ where
         },
     )
     .await;
-    let _ = tokio::time::timeout(
-        Duration::from_millis(250),
-        writer.send(Message::Close(None)),
-    )
-    .await;
+    close_ws_bounded(writer).await;
     emit_disconnect(
         feed,
         clock,
@@ -283,4 +279,65 @@ pub(crate) fn finalize_stats(mut stats: FeedStats, tracker: &LatencyTracker) -> 
     let summary = tracker.summary();
     stats.latency = (summary.count > 0).then_some(summary);
     stats
+}
+
+/// Sends a best-effort WebSocket Close frame bounded by a 250ms timeout so stalled TCP sockets cannot block exit.
+pub(crate) async fn close_ws_bounded<S>(writer: &mut S)
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let _ = tokio::time::timeout(
+        Duration::from_millis(250),
+        writer.send(Message::Close(None)),
+    )
+    .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use super::*;
+
+    struct StalledSink;
+
+    impl Sink<Message> for StalledSink {
+        type Error = tokio_tungstenite::tungstenite::Error;
+
+        fn poll_ready(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn start_send(self: Pin<&mut Self>, _item: Message) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn poll_flush(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Result<(), Self::Error>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn close_ws_bounded_returns_within_1s_on_stalled_sink() {
+        let mut sink = StalledSink;
+        let start = Instant::now();
+        close_ws_bounded(&mut sink).await;
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(1), "elapsed={elapsed:?}");
+        assert!(elapsed >= Duration::from_millis(200), "elapsed={elapsed:?}");
+    }
 }

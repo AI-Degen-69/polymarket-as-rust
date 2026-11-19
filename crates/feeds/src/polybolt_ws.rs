@@ -18,9 +18,9 @@ use crate::parse::{
     de_opt_decimal_as_string, de_opt_string_or_u64, de_string_or_u64, parse_decimal_e8_truncating,
 };
 use crate::ws_common::{
-    ConnectStep, HealthThrottle, check_stale_watchdog, connect_ws_bounded, emit_disconnect,
-    emit_health_transition, empty_stats, finalize_stats, now_pair, push_ring_event,
-    record_parse_warning, sleep_until_cancel,
+    ConnectStep, HealthThrottle, check_stale_watchdog, close_ws_bounded, connect_ws_bounded,
+    emit_disconnect, emit_health_transition, empty_stats, finalize_stats, now_pair,
+    push_ring_event, record_parse_warning, sleep_until_cancel,
 };
 
 /// Default Polymarket PolyBolt authenticated reference-price WebSocket URL.
@@ -320,7 +320,7 @@ impl PolyBoltTwapWsActor {
             let step = tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
                     None | Some(PolyBoltWsCommand::Shutdown) => {
-                        let _ = writer.send(Message::Close(None)).await;
+                        close_ws_bounded(writer).await;
                         Some(SessionExit::Shutdown)
                     }
                 },
@@ -490,7 +490,7 @@ impl PolyBoltTwapWsActor {
         writer: &mut WsWriter,
         health_tx: &mpsc::Sender<FeedHealthEvent>,
     ) -> Result<Option<SessionExit>, FeedError> {
-        let _ = writer.send(Message::Close(None)).await;
+        close_ws_bounded(writer).await;
         self.warn(detail.clone(), health_tx)?;
         self.emit_disconnect(health_tx, detail.clone()).await?;
         let permanent =
