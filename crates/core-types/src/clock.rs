@@ -5,7 +5,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use crate::error::ClockError;
 
 /// Monotonic QPC-backed clock for wire-to-wire latency profiling and elapsed checks.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct MonotonicClock {
     origin: Instant,
 }

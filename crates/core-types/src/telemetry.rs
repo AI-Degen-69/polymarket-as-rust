@@ -4,12 +4,12 @@ use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use hdrhistogram::Histogram;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::TelemetryError;
 
 /// Percentiles snapshot extracted from `LatencyTracker` (values in nanoseconds).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LatencySummary {
     /// Total recorded samples.
     pub count: u64,

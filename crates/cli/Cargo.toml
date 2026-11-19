@@ -15,7 +15,8 @@ workspace = true
 [dependencies]
 clap.workspace = true
 core-types = { path = "../core-types" }
+feeds = { path = "../feeds" }
+rtrb.workspace = true
 serde.workspace = true
-
-[dev-dependencies]
 serde_json.workspace = true
+tokio.workspace = true

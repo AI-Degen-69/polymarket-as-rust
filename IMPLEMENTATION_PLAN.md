@@ -249,11 +249,11 @@ polymarket-as-rust/
 - **PASS/FAIL Criteria:** PASS iff live discovery succeeds on real Polymarket Gamma/CLOB APIs, live Binance + Polymarket ticks stream for 20s with `0` panics and `0` dropped pings, parse latency `P99 < 100 us`, and all adversarial + regression tests pass.
 
 #### Phase 1 GATE CHECKLIST
-- [ ] `rtk cargo fmt --all -- --check` exits 0
-- [ ] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] `rtk cargo test --workspace` exits 0
-- [ ] Live `poly-as feeds --discover --duration 20s` captures real Binance + Polymarket ticks & writes valid JSONL
-- [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [x] `rtk cargo fmt --all -- --check` exits 0
+- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `rtk cargo test --workspace` exits 0
+- [x] Live `poly-as feeds --discover --duration 20s` captures real Binance + Polymarket ticks & writes valid JSONL
+- [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 
 ---
 

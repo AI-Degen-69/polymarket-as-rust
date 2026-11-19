@@ -32,13 +32,24 @@ pub struct LiveCredentials {
 }
 
 impl LiveCredentials {
+    /// Returns `true` when CLOB L2 API credentials (`key`, `secret`, `passphrase`) are populated.
+    #[must_use]
+    pub fn has_clob_api_key_set(&self) -> bool {
+        self.clob_api_key.is_some()
+            && self.clob_api_secret.is_some()
+            && self.clob_api_passphrase.is_some()
+    }
+
+    /// Returns `true` when all CLOB L2 and Chainlink Data Streams credentials for PolyBolt are populated.
+    #[must_use]
+    pub fn has_polybolt_credentials(&self) -> bool {
+        self.has_clob_api_key_set() && self.chainlink_api_key.is_some()
+    }
+
     /// Returns `true` when all required CLOB L1/L2 trading secrets are populated.
     #[must_use]
     pub fn has_clob_credentials(&self) -> bool {
-        self.signer_secret_key.is_some()
-            && self.clob_api_key.is_some()
-            && self.clob_api_secret.is_some()
-            && self.clob_api_passphrase.is_some()
+        self.signer_secret_key.is_some() && self.has_clob_api_key_set()
     }
 }
 
@@ -460,9 +471,9 @@ fn validate_modes_and_credentials(cfg: &EngineConfig) -> Result<(), ConfigError>
             "paper and dry-run modes require dry_run=true to keep order gates armed",
         ));
     }
-    if cfg.polybolt_enabled && cfg.credentials.chainlink_api_key.is_none() {
+    if cfg.polybolt_enabled && !cfg.credentials.has_polybolt_credentials() {
         return Err(invariant(
-            "polybolt_enabled=true requires CHAINLINK_API_KEY to be configured",
+            "polybolt_enabled=true requires CLOB_API_KEY, CLOB_API_SECRET, CLOB_API_PASSPHRASE, and CHAINLINK_API_KEY",
         ));
     }
     if cfg.execution_mode == ExecutionMode::CanaryLive {

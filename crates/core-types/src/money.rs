@@ -407,8 +407,24 @@ fn classify_decimal_byte(
     Ok(Some(byte - b'0'))
 }
 
-/// Zero-allocation ASCII parser converting decimal strings (`"0.52"`, `"10"`) to `10^-6` micro-units.
-pub fn parse_decimal_micro(bytes: &[u8]) -> Result<u64, ParseDecimalError> {
+/// Controls how `parse_decimal_scaled` handles digits beyond `max_frac_digits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecimalFracPolicy {
+    /// Reject any fractional digits beyond `max_frac_digits`.
+    Strict,
+    /// Accept extra fractional digits only when every extra digit is `'0'`.
+    AllowTrailingZeros,
+    /// Ignore extra fractional digits beyond `max_frac_digits` (still validates ASCII digits).
+    TruncateExtra,
+}
+
+/// Zero-allocation ASCII parser converting non-negative decimal strings to `scale`-multiplied integers.
+pub fn parse_decimal_scaled(
+    bytes: &[u8],
+    max_frac_digits: usize,
+    scale: u64,
+    policy: DecimalFracPolicy,
+) -> Result<u64, ParseDecimalError> {
     if bytes.is_empty() {
         return Err(ParseDecimalError::Empty);
     }
@@ -426,26 +442,49 @@ pub fn parse_decimal_micro(bytes: &[u8]) -> Result<u64, ParseDecimalError> {
                 .checked_mul(10)
                 .and_then(|v| v.checked_add(u64::from(digit)))
                 .ok_or(ParseDecimalError::Overflow)?;
-        } else {
+        } else if frac_digits < max_frac_digits {
             frac_digits += 1;
-            if frac_digits > 6 {
-                return Err(ParseDecimalError::TooManyFractionalDigits { count: frac_digits });
-            }
-            frac = frac * 10 + u64::from(digit);
+            frac = frac
+                .checked_mul(10)
+                .and_then(|v| v.checked_add(u64::from(digit)))
+                .ok_or(ParseDecimalError::Overflow)?;
+        } else {
+            validate_extra_frac_digit(policy, digit, frac_digits)?;
         }
     }
 
     if seen_dot && frac_digits == 0 {
         return Err(ParseDecimalError::MalformedDecimalPoint);
     }
-    for _ in frac_digits..6 {
-        frac *= 10;
+    for _ in frac_digits..max_frac_digits {
+        frac = frac.checked_mul(10).ok_or(ParseDecimalError::Overflow)?;
     }
 
     whole
-        .checked_mul(MICRO_SCALE)
+        .checked_mul(scale)
         .and_then(|w| w.checked_add(frac))
         .ok_or(ParseDecimalError::Overflow)
+}
+
+fn validate_extra_frac_digit(
+    policy: DecimalFracPolicy,
+    digit: u8,
+    frac_digits: usize,
+) -> Result<(), ParseDecimalError> {
+    match policy {
+        DecimalFracPolicy::TruncateExtra => Ok(()),
+        DecimalFracPolicy::AllowTrailingZeros if digit == 0 => Ok(()),
+        DecimalFracPolicy::Strict | DecimalFracPolicy::AllowTrailingZeros => {
+            Err(ParseDecimalError::TooManyFractionalDigits {
+                count: frac_digits + 1,
+            })
+        }
+    }
+}
+
+/// Zero-allocation ASCII parser converting decimal strings (`"0.52"`, `"10"`) to `10^-6` micro-units.
+pub fn parse_decimal_micro(bytes: &[u8]) -> Result<u64, ParseDecimalError> {
+    parse_decimal_scaled(bytes, 6, MICRO_SCALE, DecimalFracPolicy::Strict)
 }
 
 /// Quantizes a raw floating-point dollar price downward to an exact multiple of `tick_micro`.

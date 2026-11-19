@@ -32,9 +32,10 @@ pub use market::{
     SgMode, VarianceMode, WalletMode,
 };
 pub use money::{
-    FeeSchedule, FinitePosF64, MICRO_SCALE, MicroUsdc, ONE_CENT_MICRO, ONE_DOLLAR_MICRO,
-    ONE_SHARE_MICRO, OrderSide, SIZE_STEP_MICRO, SharesMicro, SignedSharesMicro, TickPrecision,
-    WireAmounts, encode_buy_amounts, encode_sell_amounts, floor_to_tick, parse_decimal_micro,
+    DecimalFracPolicy, FeeSchedule, FinitePosF64, MICRO_SCALE, MicroUsdc, ONE_CENT_MICRO,
+    ONE_DOLLAR_MICRO, ONE_SHARE_MICRO, OrderSide, SIZE_STEP_MICRO, SharesMicro, SignedSharesMicro,
+    TickPrecision, WireAmounts, encode_buy_amounts, encode_sell_amounts, floor_to_tick,
+    parse_decimal_micro, parse_decimal_scaled,
 };
 pub use telemetry::{JsonlWriter, LatencySummary, LatencyTracker};
 
@@ -454,6 +455,14 @@ mod tests {
         let mut polybolt = HashMap::new();
         polybolt.insert("POLYBOLT_ENABLED", "true");
         assert!(EngineConfig::from_lookup(lookup_map(&polybolt)).is_err());
+
+        polybolt.insert("CHAINLINK_API_KEY", "SECRET_CHAINLINK_SENTINEL");
+        assert!(EngineConfig::from_lookup(lookup_map(&polybolt)).is_err());
+
+        polybolt.insert("CLOB_API_KEY", "SECRET_API_KEY_SENTINEL");
+        polybolt.insert("CLOB_API_SECRET", "SECRET_HMAC_SENTINEL");
+        polybolt.insert("CLOB_API_PASSPHRASE", "SECRET_PASS_SENTINEL");
+        assert!(EngineConfig::from_lookup(lookup_map(&polybolt)).is_ok());
 
         let mut zero_addr = HashMap::new();
         zero_addr.insert(
