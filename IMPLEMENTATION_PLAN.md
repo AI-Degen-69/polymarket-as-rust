@@ -404,12 +404,12 @@ polymarket-as-rust/
 - **PASS/FAIL Criteria:** PASS iff FIFO partial fills, cancel-race adverse fills, VWAP merges, and fee deductions match exact test vectors, live 60s paper session runs cleanly with valid JSONL, and all prior tests remain green.
 
 #### Phase 3 GATE CHECKLIST
-- [ ] `rtk cargo fmt --all -- --check` exits 0
-- [ ] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] `rtk cargo test --workspace` exits 0
-- [ ] Live 60s `poly-as paper` + deterministic replay run verified with JSONL audit
-- [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
-- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [x] `rtk cargo fmt --all -- --check` exits 0
+- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `rtk cargo test --workspace` exits 0
+- [x] Live 60s `poly-as paper` + deterministic replay run verified with JSONL audit
+- [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
 - [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-3-complete` tag pushed
 
 ---

@@ -17,6 +17,7 @@ clap.workspace = true
 core-types = { path = "../core-types" }
 feeds = { path = "../feeds" }
 math-engine = { path = "../math-engine" }
+paper-sim = { path = "../paper-sim" }
 rtrb.workspace = true
 serde.workspace = true
 serde_json.workspace = true

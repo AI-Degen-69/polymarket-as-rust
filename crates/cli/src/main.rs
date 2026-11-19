@@ -14,6 +14,8 @@
 mod doctor;
 mod feeds_cmd;
 mod feeds_report;
+mod paper_cmd;
+mod paper_report;
 mod trace_cmd;
 mod trace_report;
 
@@ -114,6 +116,31 @@ enum Commands {
         #[arg(long, default_value = "logs/phase2-trace.jsonl")]
         jsonl: PathBuf,
     },
+    /// Phase 3 paper simulator: run FIFO queue-aware paper trading against live WebSockets or replayed JSONL logs.
+    #[command(alias = "sim")]
+    Paper {
+        /// Feed source (`live` WebSockets or `replay` JSONL log).
+        #[arg(long, value_enum, default_value_t = CliTraceSource::Live)]
+        source: CliTraceSource,
+        /// Input JSONL path used when `--source replay` (defaults to `logs/phase1-feeds.jsonl`).
+        #[arg(long)]
+        input: Option<PathBuf>,
+        /// Simulation duration (`60s`, `300s`, `5m`).
+        #[arg(long, default_value = "60s")]
+        duration: String,
+        /// Maximum dollar position capital in USD (`$50` default).
+        #[arg(long, default_value_t = 50)]
+        v_max: u64,
+        /// Base order size in whole shares (`20` default).
+        #[arg(long, default_value_t = 20)]
+        base_size: u64,
+        /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
+        #[arg(long, default_value_t = 40)]
+        latency_ms: u64,
+        /// Output path for structured JSONL telemetry log.
+        #[arg(long, default_value = "logs/phase3-paper.jsonl")]
+        jsonl: PathBuf,
+    },
 }
 
 fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -163,6 +190,26 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             inventory,
             jsonl,
         }),
+        Commands::Paper {
+            source,
+            input,
+            duration,
+            v_max,
+            base_size,
+            latency_ms,
+            jsonl,
+        } => paper_cmd::run(paper_cmd::PaperArgs {
+            source: match source {
+                CliTraceSource::Live => TraceSourceMode::Live,
+                CliTraceSource::Replay => TraceSourceMode::Replay,
+            },
+            input,
+            duration,
+            v_max,
+            base_size,
+            latency_ms,
+            jsonl,
+        }),
     }
 }
 
@@ -192,7 +239,7 @@ mod tests {
             Commands::Doctor { jsonl } => {
                 assert_eq!(jsonl, PathBuf::from("logs/phase0-doctor.jsonl"));
             }
-            Commands::Feeds { .. } | Commands::Trace { .. } => panic!("expected Doctor"),
+            _ => panic!("expected Doctor"),
         }
 
         let custom_cli =
@@ -201,7 +248,7 @@ mod tests {
             Commands::Doctor { jsonl } => {
                 assert_eq!(jsonl, PathBuf::from("out/custom.jsonl"));
             }
-            Commands::Feeds { .. } | Commands::Trace { .. } => panic!("expected Doctor"),
+            _ => panic!("expected Doctor"),
         }
     }
 
@@ -231,7 +278,7 @@ mod tests {
                 assert!(replay_out.is_none());
                 assert_eq!(jsonl, PathBuf::from("logs/phase1-feeds.jsonl"));
             }
-            Commands::Doctor { .. } | Commands::Trace { .. } => panic!("expected Feeds"),
+            _ => panic!("expected Feeds"),
         }
 
         let replay =
@@ -243,7 +290,7 @@ mod tests {
                 assert!(!discover);
                 assert_eq!(replay, Some(PathBuf::from("logs/rec.jsonl")));
             }
-            Commands::Doctor { .. } | Commands::Trace { .. } => panic!("expected Feeds"),
+            _ => panic!("expected Feeds"),
         }
     }
 
@@ -275,7 +322,7 @@ mod tests {
                 assert_eq!(inventory, 0);
                 assert!(input.is_none());
             }
-            Commands::Doctor { .. } | Commands::Feeds { .. } => panic!("expected Trace"),
+            _ => panic!("expected Trace"),
         }
 
         let ab = Cli::try_parse_from([
@@ -316,7 +363,74 @@ mod tests {
                 assert_eq!(ticks, 25);
                 assert_eq!(inventory, 20);
             }
-            Commands::Doctor { .. } | Commands::Feeds { .. } => panic!("expected Trace"),
+            _ => panic!("expected Trace"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_paper_and_sim_alias_flags() {
+        let paper = Cli::try_parse_from([
+            "poly-as",
+            "paper",
+            "--source",
+            "live",
+            "--duration",
+            "60s",
+            "--v-max",
+            "100",
+            "--base-size",
+            "25",
+            "--latency-ms",
+            "50",
+            "--jsonl",
+            "logs/phase3-paper.jsonl",
+        ])
+        .unwrap();
+        match paper.command {
+            Commands::Paper {
+                source,
+                duration,
+                v_max,
+                base_size,
+                latency_ms,
+                jsonl,
+                ..
+            } => {
+                assert!(matches!(source, CliTraceSource::Live));
+                assert_eq!(duration, "60s");
+                assert_eq!(v_max, 100);
+                assert_eq!(base_size, 25);
+                assert_eq!(latency_ms, 50);
+                assert_eq!(jsonl, PathBuf::from("logs/phase3-paper.jsonl"));
+            }
+            _ => panic!("expected Paper"),
+        }
+
+        let sim = Cli::try_parse_from([
+            "poly-as",
+            "sim",
+            "--source",
+            "replay",
+            "--input",
+            "logs/custom.jsonl",
+        ])
+        .unwrap();
+        match sim.command {
+            Commands::Paper {
+                source,
+                input,
+                v_max,
+                base_size,
+                latency_ms,
+                ..
+            } => {
+                assert!(matches!(source, CliTraceSource::Replay));
+                assert_eq!(input, Some(PathBuf::from("logs/custom.jsonl")));
+                assert_eq!(v_max, 50);
+                assert_eq!(base_size, 20);
+                assert_eq!(latency_ms, 40);
+            }
+            _ => panic!("expected Paper"),
         }
     }
 }
