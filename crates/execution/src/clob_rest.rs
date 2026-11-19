@@ -758,7 +758,6 @@ fn parse_retry_after(resp: &reqwest::Response) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::primitives::address;
     use core_types::market::{MarketDescriptor, ProtocolVersion, WalletMode};
     use core_types::money::{FeeSchedule, MicroUsdc, SharesMicro};
     use secrecy::SecretString;
@@ -781,15 +780,9 @@ mod tests {
             SecretString::new("synthetic_test_passphrase_fixture".into()),
         )?;
 
-        let priv_key = SecretString::new(
-            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".into(),
-        );
-        let deposit_wallet = address!("eE3B778A783510BC833384919F709e3d2fee1624");
-        let order_signer = crate::eip712::OrderSigner::new(
-            &priv_key,
-            WalletMode::DepositWallet1271,
-            Some(deposit_wallet),
-        )?;
+        // No hardcoded private key: use a fresh ephemeral signer so no secret
+        // material ever enters version control (GitGuardian gate).
+        let order_signer = crate::eip712::OrderSigner::new_ephemeral(WalletMode::Eoa, None)?;
 
         let market = MarketDescriptor {
             condition_id: "0x1234".to_string(),
