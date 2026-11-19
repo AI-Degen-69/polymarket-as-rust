@@ -204,6 +204,7 @@ dependencies = [
  "clap",
  "core-types",
  "feeds",
+ "math-engine",
  "rtrb",
  "serde",
  "serde_json",

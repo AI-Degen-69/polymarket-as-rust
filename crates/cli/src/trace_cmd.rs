@@ -524,7 +524,7 @@ async fn finish_live_trace(
 ) -> Result<(), Box<dyn Error>> {
     let ((_clob, _bin, _pb), shutdown_err) = shutdown_actors(handles, cfg.polybolt_enabled).await;
     let now_ms = MonotonicClock::unix_now_ms()?;
-    let _ = drain_live_rings(now_ms, rings, state, pipe);
+    let drain_err = drain_live_rings(now_ms, rings, state, pipe).err();
     let slug = state.desc.as_ref().map_or("unknown", |d| d.slug.as_str());
     write_and_print_summary(
         TraceSourceMode::Live.as_str(),
@@ -538,6 +538,9 @@ async fn finish_live_trace(
     loop_res?;
     if let Some(err) = shutdown_err {
         return Err(err.into());
+    }
+    if let Some(err) = drain_err {
+        return Err(err);
     }
     if state.stats.evaluated_ticks < args.ticks {
         return Err(format!(
@@ -601,9 +604,20 @@ fn apply_binance_to_state(
 ) -> Result<(), Box<dyn Error>> {
     let spot = match ev {
         BinanceSpotEvent::BookTicker { bid_e8, ask_e8, .. } => {
+            if bid_e8 == 0 || ask_e8 < bid_e8 {
+                return Err(format!(
+                    "invalid Binance BookTicker BBO: bid_e8={bid_e8} ask_e8={ask_e8}"
+                )
+                .into());
+            }
             (bid_e8 as f64 + ask_e8 as f64) / 200_000_000.0
         }
-        BinanceSpotEvent::AggTrade { price_e8, .. } => price_e8 as f64 / 100_000_000.0,
+        BinanceSpotEvent::AggTrade { price_e8, .. } => {
+            if price_e8 == 0 {
+                return Err("invalid Binance AggTrade zero price".into());
+            }
+            price_e8 as f64 / 100_000_000.0
+        }
     };
     state.observe_spot(spot);
     if let Some(desc) = &state.desc {
@@ -739,7 +753,9 @@ fn apply_delta_state(
         Outcome::Down => (&mut state.book_dn, &mut state.latest_dn),
     };
     m.apply_delta_allow_transient_cross(side, price, size, rx_mono_ns, exch_ts_ms)?;
-    if !m.is_crossed() {
+    if m.is_crossed() {
+        *slot = None;
+    } else {
         *slot = Some(m.top_n::<10>()?);
     }
     Ok(())
@@ -799,5 +815,60 @@ mod tests {
         let missing = temp_path("missing");
         assert!(resolve_replay_input(Some(&missing), &temp_path("out")).is_err());
         let _ = std::fs::remove_file(&replay_in);
+
+        // Malformed Binance rows fail closed and transient cross clears cached snapshot.
+        let mut st = TraceState::new();
+        let cfg = MathPipelineConfig::try_default().unwrap();
+        let mut pipe = MathPipeline::new(cfg, MonotonicClock::start()).unwrap();
+        let bad_bbo = BinanceSpotEvent::BookTicker {
+            bid_e8: 9_000_000_000_000,
+            ask_e8: 8_900_000_000_000,
+            bid_qty_e8: 1,
+            ask_qty_e8: 1,
+            update_id: 1,
+            rx_mono_ns: 10,
+        };
+        assert!(apply_binance_to_state(100, bad_bbo, &mut st, &mut pipe).is_err());
+        let zero_tr = BinanceSpotEvent::AggTrade {
+            price_e8: 0,
+            qty_e8: 1,
+            is_buyer_maker: false,
+            exch_ts_ms: 100,
+            rx_mono_ns: 10,
+        };
+        assert!(apply_binance_to_state(100, zero_tr, &mut st, &mut pipe).is_err());
+
+        apply_delta_state(
+            Outcome::Up,
+            core_types::OrderSide::Buy,
+            MicroUsdc(490_000),
+            core_types::SharesMicro(1_000_000),
+            10,
+            100,
+            &mut st,
+        )
+        .unwrap();
+        apply_delta_state(
+            Outcome::Up,
+            core_types::OrderSide::Sell,
+            MicroUsdc(510_000),
+            core_types::SharesMicro(1_000_000),
+            11,
+            101,
+            &mut st,
+        )
+        .unwrap();
+        assert!(st.latest_up.is_some());
+        apply_delta_state(
+            Outcome::Up,
+            core_types::OrderSide::Buy,
+            MicroUsdc(520_000),
+            core_types::SharesMicro(1_000_000),
+            12,
+            102,
+            &mut st,
+        )
+        .unwrap();
+        assert!(st.latest_up.is_none());
     }
 }
