@@ -2,7 +2,7 @@ use core_types::{
     FeeSchedule, FinitePosF64, MathError, MicroUsdc, MonotonicClock, ONE_DOLLAR_MICRO,
     SignedSharesMicro, TickPrecision, floor_to_tick,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::safe_clamp;
 
@@ -77,7 +77,7 @@ pub struct PostOnlyBounds {
 }
 
 /// Explicit reason why Stations 1–6 produced no active passive quote on this tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SuppressionReason {
     /// Station 1 Savitzky-Golay filter is still warming up (`< 5` samples).
     WarmingUp,
@@ -92,7 +92,7 @@ pub enum SuppressionReason {
 }
 
 /// Passive dual-bid output of Station 6.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuoteOutput {
     /// At least one valid Post-Only, tick-aligned passive bid leg is active.
     Active {

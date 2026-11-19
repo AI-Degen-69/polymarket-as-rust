@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/core-types", "crates/feeds", "crates/math-engine", "crates/paper-sim", "crates/cli"]
+members = [
+    "crates/core-types",
+    "crates/feeds",
+    "crates/math-engine",
+    "crates/paper-sim",
+    "crates/risk-lifecycle",
+    "crates/cli",
+]
 
 [workspace.package]
 edition = "2024"
@@ -20,6 +27,7 @@ unimplemented = "deny"
 indexing_slicing = "deny"
 
 [workspace.dependencies]
+arc-swap = "1.7"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 dotenvy = "0.15"
