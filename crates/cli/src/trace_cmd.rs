@@ -18,7 +18,9 @@ use rtrb::RingBuffer;
 use tokio::sync::mpsc;
 
 use crate::feeds_cmd::{ActorHandles, shutdown_actors, spawn_actors};
-use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent, canonical_target_path};
+use crate::feeds_report::{
+    RawJsonlEnvelope, ReplayFixedBook, ReplayPolyEvent, canonical_target_path,
+};
 use crate::trace_report::{
     TraceReportStats, print_trace_header, record_and_print_tick, write_and_print_summary,
 };
@@ -58,6 +60,8 @@ struct TraceState {
     spot_usd: Option<f64>,
     strike_usd: Option<f64>,
     strike_source: &'static str,
+    replay_time_anchor: Option<(u64, u64)>,
+    max_outer_mono: u64,
     next_eval_ms: Option<u64>,
     stats: TraceReportStats,
 }
@@ -73,6 +77,8 @@ impl TraceState {
             spot_usd: None,
             strike_usd: None,
             strike_source: "none",
+            replay_time_anchor: None,
+            max_outer_mono: 0,
             next_eval_ms: None,
             stats: TraceReportStats::default(),
         }
@@ -84,7 +90,7 @@ impl TraceState {
             self.strike_source = "market_metadata";
         } else {
             self.strike_usd = None;
-            self.strike_source = "inferred_first_spot";
+            self.strike_source = "pending_first_spot";
         }
         self.desc = Some(desc);
     }
@@ -174,6 +180,17 @@ fn run_replay(
             continue;
         }
         let env: RawJsonlEnvelope = serde_json::from_str(&line)?;
+        if env.mono_ns < state.max_outer_mono {
+            return Err(format!(
+                "non-monotonic replay mono_ns: {} < {}",
+                env.mono_ns, state.max_outer_mono
+            )
+            .into());
+        }
+        state.max_outer_mono = env.mono_ns;
+        let _ = state
+            .replay_time_anchor
+            .get_or_insert((env.ts_unix_ms, env.mono_ns));
         process_replay_env(
             env,
             &mut state,
@@ -232,6 +249,9 @@ fn process_replay_env(
         &MonotonicClock,
     ),
 ) -> Result<(), Box<dyn Error>> {
+    let anchor = state
+        .replay_time_anchor
+        .unwrap_or((env.ts_unix_ms, env.mono_ns));
     match env.event.as_str() {
         "market_discovered" => {
             let desc: MarketDescriptor = serde_json::from_value(env.payload)?;
@@ -240,7 +260,10 @@ fn process_replay_env(
         }
         "binance_tick" => {
             let ev: BinanceSpotEvent = serde_json::from_value(env.payload)?;
-            apply_binance_to_state(env.ts_unix_ms, ev, state, pipe)?;
+            let rx_ns = binance_rx_mono_ns(&ev);
+            let mono_for_ev = if rx_ns > 0 { rx_ns } else { env.mono_ns };
+            let ev_ts_ms = mono_ns_to_adjusted_ms(anchor, mono_for_ev);
+            apply_binance_to_state(ev_ts_ms, ev, state, pipe)?;
         }
         "poly_book" | "poly_price_change" | "poly_trade" | "poly_tick_size" | "poly_bba" => {
             let ev: ReplayPolyEvent = serde_json::from_value(env.payload)?;
@@ -250,7 +273,7 @@ fn process_replay_env(
         other => return Err(format!("unknown event `{other}` in replay input").into()),
     }
     maybe_eval_replay_tick(
-        env.ts_unix_ms,
+        mono_ns_to_adjusted_ms(anchor, env.mono_ns),
         state,
         pipe,
         cfg,
@@ -357,7 +380,12 @@ async fn run_live(
     let _timer_guard = HighResTimerGuard::acquire_1ms()?;
     feeds::install_tls_provider();
 
+    let mut pipe = MathPipeline::new(MathPipelineConfig::from_engine_config(cfg)?, clock)?;
+    let mut tracker = LatencyTracker::new()?;
+    let mut jsonl = JsonlWriter::create(&args.jsonl)?;
     let (discovery, offset_est, desc) = discover_live_market(cfg).await?;
+    let base_adj_ms = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
+    let base_mono_ns = clock.now_ns()?;
     let mut state = TraceState::new();
     state.set_market(desc.clone());
     print_trace_header(
@@ -370,12 +398,8 @@ async fn run_live(
     );
 
     let (handles, mut rings) = spawn_live_pipeline(cfg, &desc, &discovery, clock)?;
-    let mut pipe = MathPipeline::new(MathPipelineConfig::from_engine_config(cfg)?, clock)?;
-    let mut tracker = LatencyTracker::new()?;
-    let mut jsonl = JsonlWriter::create(&args.jsonl)?;
-
     let loop_res = drive_live_trace(
-        (args, cfg, inventory_q, &offset_est),
+        (args, cfg, inventory_q, (base_adj_ms, base_mono_ns)),
         &mut rings,
         &mut state,
         &mut pipe,
@@ -385,8 +409,7 @@ async fn run_live(
     finish_live_trace(
         handles,
         &mut rings,
-        cfg,
-        args,
+        (cfg, args, (base_adj_ms, base_mono_ns)),
         loop_res,
         (&mut state, &mut pipe, &tracker, jsonl, &clock),
     )
@@ -431,12 +454,34 @@ fn spawn_live_pipeline(
     Ok((handles, rings))
 }
 
+const fn binance_rx_mono_ns(ev: &BinanceSpotEvent) -> u64 {
+    match *ev {
+        BinanceSpotEvent::BookTicker { rx_mono_ns, .. }
+        | BinanceSpotEvent::AggTrade { rx_mono_ns, .. } => rx_mono_ns,
+    }
+}
+
+const fn mono_ns_to_adjusted_ms((base_adj_ms, base_mono_ns): (u64, u64), mono_ns: u64) -> u64 {
+    if mono_ns >= base_mono_ns {
+        base_adj_ms.saturating_add((mono_ns - base_mono_ns) / 1_000_000)
+    } else {
+        base_adj_ms.saturating_sub((base_mono_ns - mono_ns) / 1_000_000)
+    }
+}
+
+fn mono_adjusted_now_ms(
+    time_anchor: (u64, u64),
+    clock: &MonotonicClock,
+) -> Result<u64, Box<dyn Error>> {
+    Ok(mono_ns_to_adjusted_ms(time_anchor, clock.now_ns()?))
+}
+
 async fn drive_live_trace(
-    (args, cfg, inventory_q, offset_est): (
+    (args, cfg, inventory_q, time_anchor): (
         &TraceArgs,
         &EngineConfig,
         SignedSharesMicro,
-        &ClockOffsetEstimator,
+        (u64, u64),
     ),
     rings: &mut LiveRings,
     state: &mut TraceState,
@@ -457,12 +502,11 @@ async fn drive_live_trace(
             _ = &mut deadline => break,
             _ = &mut ctrl_c => return Err("interrupted by Ctrl-C".into()),
             _ = drain_tick.tick() => {
-                let adj = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
-                drain_live_rings(adj, rings, state, pipe)?;
+                drain_live_rings(time_anchor, rings, state, pipe)?;
             }
             _ = eval_tick.tick() => {
                 let done = step_live_eval(
-                    (args, cfg, inventory_q, offset_est),
+                    (args, cfg, inventory_q, time_anchor),
                     rings,
                     state,
                     pipe,
@@ -476,19 +520,19 @@ async fn drive_live_trace(
 }
 
 fn step_live_eval(
-    (args, cfg, inventory_q, offset_est): (
+    (args, cfg, inventory_q, time_anchor): (
         &TraceArgs,
         &EngineConfig,
         SignedSharesMicro,
-        &ClockOffsetEstimator,
+        (u64, u64),
     ),
     rings: &mut LiveRings,
     state: &mut TraceState,
     pipe: &mut MathPipeline,
     (tracker, jsonl, clock): (&mut LatencyTracker, &mut JsonlWriter, &MonotonicClock),
 ) -> Result<bool, Box<dyn Error>> {
-    let adj = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
-    drain_live_rings(adj, rings, state, pipe)?;
+    drain_live_rings(time_anchor, rings, state, pipe)?;
+    let adj = mono_adjusted_now_ms(time_anchor, clock)?;
     if let (Some(desc), Some(up), Some(dn), Some(_)) = (
         state.desc.clone(),
         state.latest_up,
@@ -511,8 +555,7 @@ fn step_live_eval(
 async fn finish_live_trace(
     handles: ActorHandles,
     rings: &mut LiveRings,
-    cfg: &EngineConfig,
-    args: &TraceArgs,
+    (cfg, args, time_anchor): (&EngineConfig, &TraceArgs, (u64, u64)),
     loop_res: Result<(), Box<dyn Error>>,
     (state, pipe, tracker, mut jsonl, clock): (
         &mut TraceState,
@@ -523,25 +566,24 @@ async fn finish_live_trace(
     ),
 ) -> Result<(), Box<dyn Error>> {
     let ((_clob, _bin, _pb), shutdown_err) = shutdown_actors(handles, cfg.polybolt_enabled).await;
-    let now_ms = MonotonicClock::unix_now_ms()?;
-    let drain_err = drain_live_rings(now_ms, rings, state, pipe).err();
+    let drain_res = drain_live_rings(time_anchor, rings, state, pipe);
     let slug = state.desc.as_ref().map_or("unknown", |d| d.slug.as_str());
-    write_and_print_summary(
+    let summary_res = write_and_print_summary(
         TraceSourceMode::Live.as_str(),
         slug,
         state.strike_source,
         &state.stats,
         tracker.summary(),
         (&mut jsonl, clock, &args.jsonl),
-    )?;
-    jsonl.close()?;
+    );
+    let close_res = jsonl.close();
+    summary_res?;
+    close_res?;
     loop_res?;
     if let Some(err) = shutdown_err {
         return Err(err.into());
     }
-    if let Some(err) = drain_err {
-        return Err(err);
-    }
+    drain_res?;
     if state.stats.evaluated_ticks < args.ticks {
         return Err(format!(
             "live trace timed out after {} post-warmup ticks (< requested {})",
@@ -553,7 +595,7 @@ async fn finish_live_trace(
 }
 
 fn drain_live_rings(
-    now_ms: u64,
+    time_anchor: (u64, u64),
     rings: &mut LiveRings,
     state: &mut TraceState,
     pipe: &mut MathPipeline,
@@ -562,7 +604,8 @@ fn drain_live_rings(
         apply_live_poly_to_state(ev, state, pipe)?;
     }
     while let Ok(ev) = rings.binance_cons.pop() {
-        apply_binance_to_state(now_ms, ev, state, pipe)?;
+        let ev_ts_ms = mono_ns_to_adjusted_ms(time_anchor, binance_rx_mono_ns(&ev));
+        apply_binance_to_state(ev_ts_ms, ev, state, pipe)?;
     }
     while let Ok(_ev) = rings.oracle_cons.pop() {}
     while let Ok(ev) = rings.health_rx.try_recv() {
@@ -637,26 +680,7 @@ fn apply_replay_poly_to_state(
             book,
             rx_mono_ns,
             exch_ts_ms,
-        } => {
-            if book.bids.len() > 10 || book.asks.len() > 10 {
-                return Err("replay BookSnapshot exceeds 10 levels".into());
-            }
-            let fixed = FixedBook::<10>::try_from_slices(
-                outcome,
-                &book.bids,
-                &book.asks,
-                book.last_update_ns,
-                book.exchange_ts_ms,
-            )?;
-            apply_book_snapshot_state(
-                outcome,
-                &book.bids,
-                &book.asks,
-                fixed,
-                (rx_mono_ns, exch_ts_ms),
-                state,
-            )?;
-        }
+        } => apply_replay_book_snapshot(outcome, book, rx_mono_ns, exch_ts_ms, state)?,
         ReplayPolyEvent::PriceChange {
             outcome,
             side,
@@ -673,6 +697,36 @@ fn apply_replay_poly_to_state(
         ReplayPolyEvent::BestBidAsk { .. } => {}
     }
     Ok(())
+}
+
+fn apply_replay_book_snapshot(
+    outcome: Outcome,
+    book: ReplayFixedBook,
+    rx_mono_ns: u64,
+    exch_ts_ms: u64,
+    state: &mut TraceState,
+) -> Result<(), Box<dyn Error>> {
+    if book.outcome != outcome {
+        return Err("replay BookSnapshot outcome mismatch".into());
+    }
+    if book.bids.len() > 10 || book.asks.len() > 10 {
+        return Err("replay BookSnapshot exceeds 10 levels".into());
+    }
+    let fixed = FixedBook::<10>::try_from_slices(
+        outcome,
+        &book.bids,
+        &book.asks,
+        book.last_update_ns,
+        book.exchange_ts_ms,
+    )?;
+    apply_book_snapshot_state(
+        outcome,
+        &book.bids,
+        &book.asks,
+        fixed,
+        (rx_mono_ns, exch_ts_ms),
+        state,
+    )
 }
 
 fn apply_live_poly_to_state(

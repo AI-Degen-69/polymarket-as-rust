@@ -26,7 +26,7 @@ struct MathTraceEnvelope<'a> {
     market_slug: &'a str,
     gamma: f64,
     fee_rate_e6: u64,
-    v_bar: f64,
+    v_bar: Option<f64>,
     up_bid_levels: u8,
     up_ask_levels: u8,
     #[serde(flatten)]
@@ -105,7 +105,7 @@ pub(crate) fn record_and_print_tick(
     }
 
     print_tick_trace(idx, source, (desc, cfg, up_book, dn_book), &trace);
-    let v_bar = trace.kappa.map_or(0.0, |k| k.v_bar);
+    let v_bar = trace.kappa.map(|k| k.v_bar);
     let env = MathTraceEnvelope {
         tick_index: idx,
         source,
