@@ -21,6 +21,8 @@ pub mod station1_sg;
 pub mod station2_twap;
 /// Station 3: UP-book liquidity decay (`kappa`) estimator with spoof-wall touch guard.
 pub mod station3_kappa;
+/// Stations 4–6: Optimal spread `s*`, reservation price `r_i`, dual bids, and 3-way Post-Only guard.
+pub mod station4_6_pricer;
 
 pub use station1_sg::{CAUSAL_WEIGHTS, SYMMETRIC_WEIGHTS, SavitzkyGolayFilter, SgOutput};
 pub use station2_twap::{
@@ -28,6 +30,10 @@ pub use station2_twap::{
     norm_pdf,
 };
 pub use station3_kappa::{KappaConfig, KappaEstimator, KappaOutput};
+pub use station4_6_pricer::{
+    DualBidPricer, PostOnlyBounds, PricerConfig, PricerInput, PricerTrace, QuoteOutput,
+    SuppressionReason,
+};
 
 /// Clamps `val` to `[lo, hi]` after verifying all inputs are finite and `lo <= hi`.
 ///
