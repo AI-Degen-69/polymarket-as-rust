@@ -15,6 +15,11 @@
 
 use core_types::MathError;
 
+/// Station 1: Savitzky-Golay 5-point microstructure noise filter.
+pub mod station1_sg;
+
+pub use station1_sg::{CAUSAL_WEIGHTS, SYMMETRIC_WEIGHTS, SavitzkyGolayFilter, SgOutput};
+
 /// Clamps `val` to `[lo, hi]` after verifying all inputs are finite and `lo <= hi`.
 ///
 /// Unlike `f64::clamp`, this never panics on `NaN`, infinity, or inverted bounds.
