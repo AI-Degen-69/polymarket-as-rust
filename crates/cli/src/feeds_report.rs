@@ -620,7 +620,7 @@ fn write_replay_report(
     Ok(())
 }
 
-fn canonical_target_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
+pub(crate) fn canonical_target_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     if path.exists() {
         return Ok(normalize_lexical(&std::fs::canonicalize(path)?));
     }
@@ -658,24 +658,24 @@ fn normalize_lexical(path: &Path) -> PathBuf {
 }
 
 #[derive(Deserialize)]
-struct RawJsonlEnvelope {
-    ts_unix_ms: u64,
-    mono_ns: u64,
-    event: String,
-    payload: serde_json::Value,
+pub(crate) struct RawJsonlEnvelope {
+    pub(crate) ts_unix_ms: u64,
+    pub(crate) mono_ns: u64,
+    pub(crate) event: String,
+    pub(crate) payload: serde_json::Value,
 }
 
 #[derive(Deserialize)]
-struct ReplayFixedBook {
-    outcome: Outcome,
-    bids: Vec<BookLevel>,
-    asks: Vec<BookLevel>,
-    last_update_ns: u64,
-    exchange_ts_ms: u64,
+pub(crate) struct ReplayFixedBook {
+    pub(crate) outcome: Outcome,
+    pub(crate) bids: Vec<BookLevel>,
+    pub(crate) asks: Vec<BookLevel>,
+    pub(crate) last_update_ns: u64,
+    pub(crate) exchange_ts_ms: u64,
 }
 
 #[derive(Deserialize)]
-enum ReplayPolyEvent {
+pub(crate) enum ReplayPolyEvent {
     BookSnapshot {
         outcome: Outcome,
         book: ReplayFixedBook,
