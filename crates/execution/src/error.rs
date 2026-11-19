@@ -50,6 +50,10 @@ pub enum ExecutionError {
     #[error("Channel error: {0}")]
     Channel(String),
 
+    /// Venue payload field failed to parse (e.g. malformed decimal amount).
+    #[error("Parse error: {0}")]
+    Parse(String),
+
     /// Configuration or environment error.
     #[error("Config error: {0}")]
     Config(String),

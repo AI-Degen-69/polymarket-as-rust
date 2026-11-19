@@ -8,6 +8,7 @@ pub mod clob_rest;
 pub mod eip712;
 pub mod error;
 pub mod heartbeat;
+pub mod user_ws;
 
 pub use auth::{L2Headers, L2HmacSigner, compute_l2_signature, strip_query_string};
 pub use clob_rest::{
@@ -25,4 +26,9 @@ pub use error::ExecutionError;
 pub use heartbeat::{
     DEFAULT_HEARTBEAT_INTERVAL, HeartbeatRequest, HeartbeatResponse, OrderHeartbeatActor,
     execute_shutdown_cancel,
+};
+pub use user_ws::{
+    ClobUserWsActor, DEFAULT_USER_WS_URL, FillReconciler, LegDelta, OrderRegistrySnapshot,
+    TradeStage, USER_WS_PING_INTERVAL, USER_WS_PONG_TIMEOUT, UserOrderEvent, UserWsCredentials,
+    subscription_frame,
 };

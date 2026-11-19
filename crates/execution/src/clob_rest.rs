@@ -203,12 +203,21 @@ pub struct TradeRecord {
     pub size: String,
     pub price: String,
     pub status: String,
-    #[serde(alias = "makerOrders", default)]
+    #[serde(alias = "makerOrders", default, deserialize_with = "null_as_empty_vec")]
     pub maker_orders: Vec<TradeMakerFill>,
     #[serde(alias = "traderSide", default)]
     pub trader_side: Option<String>,
     #[serde(alias = "transactionHash", default)]
     pub transaction_hash: Option<String>,
+}
+
+/// Deserializes `null` or a missing array as an empty `Vec` (the user WS sends `"maker_orders": null`).
+fn null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// High-performance keep-alive CLOB REST client.
