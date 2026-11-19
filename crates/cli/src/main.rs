@@ -14,6 +14,8 @@
 mod doctor;
 mod feeds_cmd;
 mod feeds_report;
+mod lifecycle_cmd;
+mod lifecycle_report;
 mod paper_cmd;
 mod paper_report;
 mod trace_cmd;
@@ -26,12 +28,28 @@ use clap::{Parser, Subcommand, ValueEnum};
 use core_types::{KappaMode, SgMode, VarianceMode};
 
 use feeds_cmd::FeedsArgs;
+use lifecycle_cmd::{CliFaultMode, LifecycleArgs, LifecycleSourceMode};
 use trace_cmd::{TraceArgs, TraceSourceMode};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliTraceSource {
     Live,
     Replay,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliLifecycleSource {
+    Live,
+    SimEpoch,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliFaultModeArg {
+    None,
+    Stale,
+    Tier4,
+    TickChange,
+    Disconnect,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -141,6 +159,30 @@ enum Commands {
         #[arg(long, default_value = "logs/phase3-paper.jsonl")]
         jsonl: PathBuf,
     },
+    /// Phase 4 risk & lifecycle actor pipeline: run deterministic 300s epoch or live feeds with 4-tier risk limits.
+    Lifecycle {
+        /// Source mode (`live` WebSockets or `sim-epoch` simulated 300s epoch).
+        #[arg(long, value_enum, default_value_t = CliLifecycleSource::SimEpoch)]
+        source: CliLifecycleSource,
+        /// Live run duration (`60s`, `90s`, `300s`).
+        #[arg(long, default_value = "90s")]
+        duration: String,
+        /// Fast-forward virtual clock in sim-epoch mode.
+        #[arg(long)]
+        fast_forward: bool,
+        /// Inject adversarial fault mode (`none`, `stale`, `tier4`, `tick-change`, `disconnect`).
+        #[arg(long, value_enum, default_value_t = CliFaultModeArg::None, alias = "fault")]
+        inject_fault: CliFaultModeArg,
+        /// Maximum dollar position capital in USD (`$50` default).
+        #[arg(long, default_value_t = 50)]
+        v_max: u64,
+        /// Base order size in whole shares (`20` default).
+        #[arg(long, default_value_t = 20)]
+        base_size: u64,
+        /// Output path for structured JSONL telemetry log.
+        #[arg(long, default_value = "logs/phase4-lifecycle.jsonl")]
+        jsonl: PathBuf,
+    },
 }
 
 fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -208,6 +250,32 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             v_max,
             base_size,
             latency_ms,
+            jsonl,
+        }),
+        Commands::Lifecycle {
+            source,
+            duration,
+            fast_forward,
+            inject_fault,
+            v_max,
+            base_size,
+            jsonl,
+        } => lifecycle_cmd::run(LifecycleArgs {
+            source: match source {
+                CliLifecycleSource::Live => LifecycleSourceMode::Live,
+                CliLifecycleSource::SimEpoch => LifecycleSourceMode::SimEpoch,
+            },
+            duration,
+            fast_forward,
+            fault: match inject_fault {
+                CliFaultModeArg::None => CliFaultMode::None,
+                CliFaultModeArg::Stale => CliFaultMode::Stale,
+                CliFaultModeArg::Tier4 => CliFaultMode::Tier4,
+                CliFaultModeArg::TickChange => CliFaultMode::TickChange,
+                CliFaultModeArg::Disconnect => CliFaultMode::Disconnect,
+            },
+            v_max,
+            base_size,
             jsonl,
         }),
     }

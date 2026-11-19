@@ -59,6 +59,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "arc-swap"
+version = "1.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84a22b5d51209f6de83d37a0b33d320acb8da88823e42a94c075140708f032a5"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "atomic-waker"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -206,6 +215,7 @@ dependencies = [
  "feeds",
  "math-engine",
  "paper-sim",
+ "risk-lifecycle",
  "rtrb",
  "serde",
  "serde_json",
@@ -1096,6 +1106,23 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "risk-lifecycle"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "chrono",
+ "core-types",
+ "hdrhistogram",
+ "math-engine",
+ "paper-sim",
+ "rtrb",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
