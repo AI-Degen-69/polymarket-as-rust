@@ -191,13 +191,18 @@ impl OrderHeartbeatActor {
         let is_running = self.is_running.clone();
 
         tokio::spawn(async move {
+            if *shutdown_rx.borrow() {
+                is_running.store(false, Ordering::SeqCst);
+                return Ok(self.current_heartbeat_id);
+            }
+
             let mut ticker = tokio::time::interval(self.interval);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
-                    _ = shutdown_rx.changed() => {
-                        if *shutdown_rx.borrow() {
+                    res = shutdown_rx.changed() => {
+                        if res.is_err() || *shutdown_rx.borrow() {
                             break;
                         }
                     }
@@ -258,7 +263,7 @@ mod tests {
             "0xeE3B778A783510BC833384919F709e3d2fee1624",
             "api-key-1234",
             &secret,
-            SecretString::new("pass-5678".into()),
+            SecretString::new("synthetic_test_passphrase_fixture".into()),
         )
     }
 

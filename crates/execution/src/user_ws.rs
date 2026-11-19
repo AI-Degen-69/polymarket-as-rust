@@ -512,6 +512,8 @@ impl ClobUserWsActor {
             self.publish();
             let started = Instant::now();
             if let Ok(SessionEnd::Shutdown) = self.session(&mut shutdown).await {
+                self.reconciler.set_reconciling(true);
+                self.publish();
                 return Ok(());
             }
             self.reconciler.set_reconciling(true);
@@ -523,7 +525,13 @@ impl ClobUserWsActor {
             }
             tokio::select! {
                 () = tokio::time::sleep(backoff) => {}
-                _ = shutdown.changed() => {}
+                res = shutdown.changed() => {
+                    if res.is_err() || *shutdown.borrow() {
+                        self.reconciler.set_reconciling(true);
+                        self.publish();
+                        return Ok(());
+                    }
+                }
             }
             backoff = backoff.saturating_mul(2).min(RECONNECT_BACKOFF_MAX);
         }
@@ -540,6 +548,16 @@ impl ClobUserWsActor {
         &mut self,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<SessionEnd, ExecutionError> {
+        let lower = self.url.to_ascii_lowercase();
+        if !lower.starts_with("wss://")
+            && !lower.starts_with("ws://127.0.0.1")
+            && !lower.starts_with("ws://localhost")
+        {
+            return Err(ExecutionError::WebSocket(
+                "Unencrypted ws:// endpoint rejected: user channel requires wss://".to_string(),
+            ));
+        }
+
         let (ws, _) = tokio_tungstenite::connect_async(self.url.as_str())
             .await
             .map_err(ws_err)?;

@@ -133,7 +133,6 @@ pub struct OrderPlacementResponse {
 /// Response returned from cancellation endpoints (`DELETE /order`, `/orders`, `/cancel-market-orders`, `/cancel-all`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelResponse {
-    #[serde(default)]
     pub canceled: Vec<String>,
     #[serde(default)]
     pub not_canceled: HashMap<String, String>,
@@ -169,7 +168,6 @@ pub struct OpenOrdersResponse {
     pub count: usize,
     #[serde(default)]
     pub next_cursor: String,
-    #[serde(default)]
     pub data: Vec<OpenOrderRecord>,
 }
 
@@ -334,7 +332,6 @@ impl ClobRestClient {
 
         let resp = req.send().await?;
         let status = resp.status();
-        let _ = self.record_error_status(status);
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after_ms = parse_retry_after(&resp);
@@ -352,6 +349,11 @@ impl ClobRestClient {
         }
 
         let text = resp.text().await?;
+        let crossed_book = text.contains("order crosses book");
+        if !(status == StatusCode::BAD_REQUEST && crossed_book) {
+            self.record_error_status(status)?;
+        }
+
         let parsed: OrderPlacementResponse =
             serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
@@ -359,7 +361,7 @@ impl ClobRestClient {
             })?;
 
         // Check for specific cross book condition
-        if !parsed.success && parsed.error_msg.contains("order crosses book") {
+        if !parsed.success && (crossed_book || parsed.error_msg.contains("order crosses book")) {
             return Err(ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
                 detail: "invalid post-only order: order crosses book".to_string(),
@@ -421,7 +423,6 @@ impl ClobRestClient {
 
         let resp = req.send().await?;
         let status = resp.status();
-        let _ = self.record_error_status(status);
 
         if status == StatusCode::TOO_MANY_REQUESTS {
             let retry_after_ms = parse_retry_after(&resp);
@@ -431,7 +432,20 @@ impl ClobRestClient {
             });
         }
 
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            return Err(ExecutionError::Rest {
+                status_code: Some(503),
+                detail: "Venue 503 service unavailable on batch (cancel-only / maintenance)"
+                    .to_string(),
+            });
+        }
+
         let text = resp.text().await?;
+        let crossed_book = text.contains("order crosses book");
+        if !(status == StatusCode::BAD_REQUEST && crossed_book) {
+            self.record_error_status(status)?;
+        }
+
         let responses: Vec<OrderPlacementResponse> =
             serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
@@ -473,6 +487,13 @@ impl ClobRestClient {
             });
         }
 
+        if !status.is_success() {
+            return Err(ExecutionError::Rest {
+                status_code: Some(status.as_u16()),
+                detail: format!("cancel order request failed: '{text}'"),
+            });
+        }
+
         let parsed: CancelResponse =
             serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
@@ -505,6 +526,13 @@ impl ClobRestClient {
         let _ = self.record_error_status(status);
 
         let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(ExecutionError::Rest {
+                status_code: Some(status.as_u16()),
+                detail: format!("cancel batch request failed: '{text}'"),
+            });
+        }
+
         let parsed: CancelResponse =
             serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
@@ -538,6 +566,13 @@ impl ClobRestClient {
         let _ = self.record_error_status(status);
 
         let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(ExecutionError::Rest {
+                status_code: Some(status.as_u16()),
+                detail: format!("cancel market request failed: '{text}'"),
+            });
+        }
+
         let parsed: CancelResponse =
             serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
@@ -562,6 +597,13 @@ impl ClobRestClient {
         let _ = self.record_error_status(status);
 
         let text = resp.text().await?;
+        if !status.is_success() {
+            return Err(ExecutionError::Rest {
+                status_code: Some(status.as_u16()),
+                detail: format!("cancel-all request failed: '{text}'"),
+            });
+        }
+
         let parsed: CancelResponse =
             serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
@@ -571,88 +613,135 @@ impl ClobRestClient {
         Ok(parsed)
     }
 
-    /// Retrieves open resting orders for the authenticated user (`GET /data/orders`).
+    /// Retrieves open resting orders for the authenticated user (`GET /data/orders`), paginating
+    /// until the end of the list.
     pub async fn get_open_orders(
         &self,
         market: Option<&str>,
         asset_id: Option<&str>,
     ) -> Result<Vec<OpenOrderRecord>, ExecutionError> {
-        let mut query_params = Vec::new();
-        if let Some(m) = market {
-            query_params.push(format!("market={m}"));
+        let mut all_orders = Vec::new();
+        let mut cursor = "MA==".to_string();
+
+        loop {
+            let mut query_params = vec![format!("next_cursor={cursor}")];
+            if let Some(m) = market {
+                query_params.push(format!("market={m}"));
+            }
+            if let Some(a) = asset_id {
+                query_params.push(format!("asset_id={a}"));
+            }
+
+            let query_str = format!("?{}", query_params.join("&"));
+            let request_path = format!("/data/orders{query_str}");
+            let headers = self.signer.sign_request_now("GET", &request_path, None)?;
+
+            let url = format!("{}{request_path}", self.base_url);
+            let req = self.http.get(&url);
+            let req = headers.apply_to_request(req);
+
+            let resp = req.send().await?;
+            let status = resp.status();
+            let _ = self.record_error_status(status);
+
+            let text = resp.text().await?;
+            if !status.is_success() {
+                return Err(ExecutionError::Rest {
+                    status_code: Some(status.as_u16()),
+                    detail: format!("open orders request failed: '{text}'"),
+                });
+            }
+
+            let parsed: OpenOrdersResponse =
+                serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
+                    status_code: Some(status.as_u16()),
+                    detail: format!("Failed to parse open orders '{text}': {err}"),
+                })?;
+
+            all_orders.extend(parsed.data);
+
+            if parsed.next_cursor.is_empty()
+                || parsed.next_cursor == "LTE="
+                || parsed.next_cursor == cursor
+            {
+                break;
+            }
+            cursor = parsed.next_cursor;
         }
-        if let Some(a) = asset_id {
-            query_params.push(format!("asset_id={a}"));
-        }
 
-        let query_str = if query_params.is_empty() {
-            String::new()
-        } else {
-            format!("?{}", query_params.join("&"))
-        };
-
-        let request_path = format!("/data/orders{query_str}");
-        let headers = self.signer.sign_request_now("GET", &request_path, None)?;
-
-        let url = format!("{}{request_path}", self.base_url);
-        let req = self.http.get(&url);
-        let req = headers.apply_to_request(req);
-
-        let resp = req.send().await?;
-        let status = resp.status();
-        let _ = self.record_error_status(status);
-
-        let text = resp.text().await?;
-        let parsed: OpenOrdersResponse =
-            serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
-                status_code: Some(status.as_u16()),
-                detail: format!("Failed to parse open orders '{text}': {err}"),
-            })?;
-
-        Ok(parsed.data)
+        Ok(all_orders)
     }
 
-    /// Retrieves filled/matched trades for the authenticated maker (`GET /data/trades`).
+    /// Retrieves filled/matched trades for the authenticated maker (`GET /data/trades`), paginating
+    /// until the end of the list.
     pub async fn get_trades(
         &self,
         maker_address: &str,
         market: Option<&str>,
     ) -> Result<Vec<TradeRecord>, ExecutionError> {
-        let mut query_params = vec![format!("maker_address={maker_address}")];
-        if let Some(m) = market {
-            query_params.push(format!("market={m}"));
-        }
-
-        let query_str = format!("?{}", query_params.join("&"));
-        let request_path = format!("/data/trades{query_str}");
-        let headers = self.signer.sign_request_now("GET", &request_path, None)?;
-
-        let url = format!("{}{request_path}", self.base_url);
-        let req = self.http.get(&url);
-        let req = headers.apply_to_request(req);
-
-        let resp = req.send().await?;
-        let status = resp.status();
-        let _ = self.record_error_status(status);
-
-        let text = resp.text().await?;
-        // API returns array of trade records or wrapped in data
-        if let Ok(records) = serde_json::from_str::<Vec<TradeRecord>>(&text) {
-            return Ok(records);
-        }
+        let mut all_trades = Vec::new();
+        let mut cursor = "MA==".to_string();
 
         #[derive(Deserialize)]
         struct TradesEnvelope {
+            #[serde(default)]
+            next_cursor: String,
             data: Vec<TradeRecord>,
         }
 
-        let envelope: TradesEnvelope =
-            serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
-                status_code: Some(status.as_u16()),
-                detail: format!("Failed to parse trades '{text}': {err}"),
-            })?;
+        loop {
+            let mut query_params = vec![
+                format!("maker_address={maker_address}"),
+                format!("next_cursor={cursor}"),
+            ];
+            if let Some(m) = market {
+                query_params.push(format!("market={m}"));
+            }
 
-        Ok(envelope.data)
+            let query_str = format!("?{}", query_params.join("&"));
+            let request_path = format!("/data/trades{query_str}");
+            let headers = self.signer.sign_request_now("GET", &request_path, None)?;
+
+            let url = format!("{}{request_path}", self.base_url);
+            let req = self.http.get(&url);
+            let req = headers.apply_to_request(req);
+
+            let resp = req.send().await?;
+            let status = resp.status();
+            let _ = self.record_error_status(status);
+
+            let text = resp.text().await?;
+            if !status.is_success() {
+                return Err(ExecutionError::Rest {
+                    status_code: Some(status.as_u16()),
+                    detail: format!("trades request failed: '{text}'"),
+                });
+            }
+
+            // API returns array of trade records or wrapped in data
+            if let Ok(records) = serde_json::from_str::<Vec<TradeRecord>>(&text) {
+                all_trades.extend(records);
+                break;
+            }
+
+            let envelope: TradesEnvelope =
+                serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
+                    status_code: Some(status.as_u16()),
+                    detail: format!("Failed to parse trades '{text}': {err}"),
+                })?;
+
+            all_trades.extend(envelope.data);
+
+            if envelope.next_cursor.is_empty()
+                || envelope.next_cursor == "LTE="
+                || envelope.next_cursor == cursor
+            {
+                break;
+            }
+            cursor = envelope.next_cursor;
+        }
+
+        Ok(all_trades)
     }
 }
 
@@ -689,7 +778,7 @@ mod tests {
             "0xeE3B778A783510BC833384919F709e3d2fee1624",
             "api-key-1234",
             &secret,
-            SecretString::new("pass-5678".into()),
+            SecretString::new("synthetic_test_passphrase_fixture".into()),
         )?;
 
         let priv_key = SecretString::new(

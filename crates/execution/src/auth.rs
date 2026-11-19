@@ -10,7 +10,7 @@ use crate::error::ExecutionError;
 type HmacSha256 = Hmac<Sha256>;
 
 /// L2 authenticated HTTP headers required by Polymarket CLOB endpoints.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct L2Headers {
     /// Ethereum address associated with the API key (`POLY_ADDRESS`).
     pub poly_address: String,
@@ -22,6 +22,18 @@ pub struct L2Headers {
     pub poly_timestamp: String,
     /// HMAC-SHA256 signature encoded as urlsafeBase64WithPadding (`POLY_SIGNATURE`).
     pub poly_signature: String,
+}
+
+impl std::fmt::Debug for L2Headers {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("L2Headers")
+            .field("poly_address", &self.poly_address)
+            .field("poly_api_key", &self.poly_api_key)
+            .field("poly_passphrase", &"[REDACTED]")
+            .field("poly_timestamp", &self.poly_timestamp)
+            .field("poly_signature", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl L2Headers {
@@ -217,7 +229,7 @@ mod tests {
             "0xeE3B778A783510BC833384919F709e3d2fee1624",
             "api-key-1234",
             &secret,
-            SecretString::new("pass-5678".into()),
+            SecretString::new("synthetic_test_passphrase_fixture".into()),
         )?;
 
         let ts = 1700000000;
@@ -228,7 +240,7 @@ mod tests {
             "0xeE3B778A783510BC833384919F709e3d2fee1624"
         );
         assert_eq!(headers.poly_api_key, "api-key-1234");
-        assert_eq!(headers.poly_passphrase, "pass-5678");
+        assert_eq!(headers.poly_passphrase, "synthetic_test_passphrase_fixture");
         assert_eq!(headers.poly_timestamp, "1700000000");
         assert!(!headers.poly_signature.is_empty());
 

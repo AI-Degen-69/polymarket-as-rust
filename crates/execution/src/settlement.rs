@@ -185,15 +185,9 @@ pub fn verify_wallet_type(
             "wallet verification: empty maker address".to_string(),
         ));
     }
-    let expected_sig = expected.as_u8();
-    if let Some(reported) = profile_sig_type
-        && reported != expected_sig
-    {
-        return Err(ExecutionError::Settlement(format!(
-            "wallet type mismatch: configured sig_type={expected_sig} but profile reports {reported}"
-        )));
-    }
     let is_contract = eth_code_len > 0;
+    let expected_sig = expected.as_u8();
+
     match expected {
         WalletMode::Eoa => {
             if is_contract {
@@ -201,11 +195,28 @@ pub fn verify_wallet_type(
                     "wallet verification: EOA mode but eth_getCode is non-empty".to_string(),
                 ));
             }
+            if let Some(reported) = profile_sig_type
+                && reported != expected_sig
+            {
+                return Err(ExecutionError::Settlement(format!(
+                    "wallet type mismatch: configured EOA sig_type=0 but profile reports {reported}"
+                )));
+            }
         }
         WalletMode::PolyProxy | WalletMode::GnosisSafe | WalletMode::DepositWallet1271 => {
             if !is_contract {
                 return Err(ExecutionError::Settlement(format!(
                     "wallet verification: {expected:?} expects contract code, got empty eth_getCode"
+                )));
+            }
+            let Some(reported) = profile_sig_type else {
+                return Err(ExecutionError::Settlement(format!(
+                    "wallet verification: profile sig_type required for contract wallet {expected:?}"
+                )));
+            };
+            if reported != expected_sig {
+                return Err(ExecutionError::Settlement(format!(
+                    "wallet type mismatch: configured sig_type={expected_sig} but profile reports {reported}"
                 )));
             }
         }
@@ -221,12 +232,33 @@ struct TxParamsResponse {
     nonce: String,
 }
 
-/// Relayer submit response (`submit` returns a tracking hash + state).
+/// Relayer submit response (`submit` returns a tracking ID + state).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct RelayerSubmitResponse {
-    #[serde(alias = "txHash", alias = "tx_hash", default)]
-    tx_hash: String,
+    #[serde(
+        alias = "transactionID",
+        alias = "transactionId",
+        alias = "id",
+        default
+    )]
+    transaction_id: String,
     #[serde(alias = "state", default)]
+    state: String,
+}
+
+/// Relayer transaction record from `GET /transaction?id=<transactionID>`.
+#[derive(Debug, Clone, Deserialize)]
+struct RelayerTxRecord {
+    #[serde(default, alias = "transactionID", alias = "transactionId")]
+    transaction_id: String,
+    #[serde(
+        default,
+        alias = "transactionHash",
+        alias = "txHash",
+        alias = "tx_hash"
+    )]
+    transaction_hash: Option<String>,
+    #[serde(default)]
     state: String,
 }
 
@@ -287,7 +319,7 @@ impl RelayerClient {
         Ok(parsed.nonce)
     }
 
-    /// Submits a merge via the gasless relayer and returns the tracking hash.
+    /// Submits a merge via the gasless relayer and returns the tracking transaction ID.
     pub async fn submit_merge(
         &self,
         wallet: &str,
@@ -296,8 +328,6 @@ impl RelayerClient {
     ) -> Result<String, ExecutionError> {
         let nonce = self.fetch_nonce(wallet).await?;
         let body = serde_json::json!({
-            "apiKey": self.api_key.expose_secret(),
-            "address": self.api_key_address,
             "wallet": wallet,
             "nonce": nonce,
             "calldataPreview": calldata_preview,
@@ -311,7 +341,14 @@ impl RelayerClient {
             },
         });
         let url = format!("{}/submit", self.base_url);
-        let resp = self.http.post(&url).json(&body).send().await?;
+        let resp = self
+            .http
+            .post(&url)
+            .header("RELAYER_API_KEY", self.api_key.expose_secret())
+            .header("RELAYER_API_KEY_ADDRESS", &self.api_key_address)
+            .json(&body)
+            .send()
+            .await?;
         let status = resp.status();
         let text = resp.text().await?;
         if !status.is_success() {
@@ -325,41 +362,58 @@ impl RelayerClient {
                 status_code: Some(status.as_u16()),
                 detail: format!("relayer submit parse '{text}': {err}"),
             })?;
-        if parsed.tx_hash.trim().is_empty() {
+        if parsed.transaction_id.trim().is_empty() {
             return Err(ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
-                detail: "relayer submit returned empty tx hash".to_string(),
+                detail: "relayer submit returned empty transaction ID".to_string(),
             });
         }
-        Ok(parsed.tx_hash)
+        Ok(parsed.transaction_id)
     }
 
-    /// Polls `GET /status/<tx_hash>` until `STATE_CONFIRMED` or timeout.
+    /// Polls `GET /transaction?id=<transaction_id>` until `STATE_CONFIRMED` or timeout.
+    /// Returns the onchain transaction hash if available.
     pub async fn poll_until_confirmed(
         &self,
-        tx_hash: &str,
+        transaction_id: &str,
         max_wait: Duration,
-    ) -> Result<(), ExecutionError> {
+    ) -> Result<String, ExecutionError> {
         let deadline = std::time::Instant::now() + max_wait;
         loop {
-            let url = format!("{}/status/{tx_hash}", self.base_url);
+            let url = format!("{}/transaction?id={transaction_id}", self.base_url);
             let resp = self.http.get(&url).send().await?;
             let status = resp.status();
             let text = resp.text().await?;
             if status.is_success() {
-                let upper = text.to_ascii_uppercase();
-                if upper.contains("STATE_CONFIRMED") || upper.contains("CONFIRMED") {
-                    return Ok(());
-                }
-                if upper.contains("FAILED") {
-                    return Err(ExecutionError::Settlement(format!(
-                        "relayer tx {tx_hash} FAILED: {text}"
-                    )));
+                let records = if let Ok(list) = serde_json::from_str::<Vec<RelayerTxRecord>>(&text)
+                {
+                    list
+                } else if let Ok(single) = serde_json::from_str::<RelayerTxRecord>(&text) {
+                    vec![single]
+                } else {
+                    Vec::new()
+                };
+
+                for rec in records {
+                    if !rec.transaction_id.is_empty() && rec.transaction_id != transaction_id {
+                        continue;
+                    }
+                    let st = rec.state.trim().to_ascii_uppercase();
+                    if st == "STATE_CONFIRMED" || st == "CONFIRMED" {
+                        return Ok(rec
+                            .transaction_hash
+                            .unwrap_or_else(|| transaction_id.to_string()));
+                    }
+                    if st == "STATE_FAILED" || st == "STATE_INVALID" || st == "FAILED" {
+                        return Err(ExecutionError::Settlement(format!(
+                            "relayer tx {transaction_id} terminal failure: {st} ({text})"
+                        )));
+                    }
                 }
             }
             if std::time::Instant::now() >= deadline {
                 return Err(ExecutionError::Settlement(format!(
-                    "relayer tx {tx_hash} not confirmed within {max_wait:?}"
+                    "relayer tx {transaction_id} not confirmed within {max_wait:?}"
                 )));
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
@@ -374,6 +428,10 @@ pub struct SettlementConfig {
     pub min_batch_micro: u64,
     /// Maximum relayer confirmation wait.
     pub max_poll: Duration,
+    /// When true, enables direct settlement fallback checking dynamic gas floor.
+    pub direct_mode: bool,
+    /// Dynamic gas floor in micro-shares: N_min = ceil(10 * TxCost_gas / s*).
+    pub min_batch_for_gas: u64,
 }
 
 impl Default for SettlementConfig {
@@ -381,6 +439,8 @@ impl Default for SettlementConfig {
         Self {
             min_batch_micro: DEFAULT_MIN_BATCH_MICRO,
             max_poll: Duration::from_secs(30),
+            direct_mode: false,
+            min_batch_for_gas: DEFAULT_MIN_BATCH_MICRO,
         }
     }
 }
@@ -402,6 +462,7 @@ pub struct SettlementWorker {
     market: MarketDescriptor,
     wallet: String,
     relayer: Option<RelayerClient>,
+    in_flight_micro: std::sync::atomic::AtomicU64,
 }
 
 impl SettlementWorker {
@@ -418,13 +479,37 @@ impl SettlementWorker {
             market,
             wallet,
             relayer,
+            in_flight_micro: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Current decision for `snapshot` (never settles `MATCHED`-only fills).
+    /// Subtracts any in-flight merge amounts that have not yet confirmed.
     #[must_use]
     pub fn decision(&self, snapshot: &OrderRegistrySnapshot) -> SettlementDecision {
-        decide_settlement(snapshot, self.config.min_batch_micro)
+        let in_flight = self
+            .in_flight_micro
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let pairable = snapshot.pairable_confirmed();
+        let available = pairable.saturating_sub(in_flight);
+        if available < self.config.min_batch_micro {
+            return SettlementDecision {
+                should_settle: false,
+                amount_micro: 0,
+                reason: if in_flight > 0 && pairable >= self.config.min_batch_micro {
+                    "in-flight-reservation"
+                } else if pairable == 0 {
+                    "no-pairs"
+                } else {
+                    "below-threshold"
+                },
+            };
+        }
+        SettlementDecision {
+            should_settle: true,
+            amount_micro: available,
+            reason: "confirmed-threshold-met",
+        }
     }
 
     /// Deterministic calldata preview for `amount_micro`.
@@ -446,24 +531,58 @@ impl SettlementWorker {
         if !decision.should_settle {
             return Ok(None);
         }
-        let target = merge_target_for_market(&self.market, decision.amount_micro);
+
+        if self.config.direct_mode && decision.amount_micro < self.config.min_batch_for_gas {
+            return Err(ExecutionError::Settlement(format!(
+                "Direct settlement batch {} < dynamic gas floor {}",
+                decision.amount_micro, self.config.min_batch_for_gas
+            )));
+        }
+
+        let amount = decision.amount_micro;
+        self.in_flight_micro
+            .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
+
+        let target = merge_target_for_market(&self.market, amount);
         let preview = build_merge_calldata(&target);
         let Some(relayer) = self.relayer.as_ref() else {
+            self.in_flight_micro
+                .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
             return Ok(Some(SettlementReceipt {
                 tx_hash: "dry-run-no-relayer".to_string(),
-                amount_micro: decision.amount_micro,
+                amount_micro: amount,
                 target: preview,
             }));
         };
-        let tx_hash = relayer
-            .submit_merge(&self.wallet, &target, &preview)
-            .await?;
-        relayer
-            .poll_until_confirmed(&tx_hash, self.config.max_poll)
-            .await?;
+
+        let tx_id = match relayer.submit_merge(&self.wallet, &target, &preview).await {
+            Ok(id) => id,
+            Err(e) => {
+                self.in_flight_micro
+                    .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
+                return Err(e);
+            }
+        };
+
+        let tx_hash = match relayer
+            .poll_until_confirmed(&tx_id, self.config.max_poll)
+            .await
+        {
+            Ok(hash) => {
+                self.in_flight_micro
+                    .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
+                hash
+            }
+            Err(e) => {
+                self.in_flight_micro
+                    .fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
+                return Err(e);
+            }
+        };
+
         Ok(Some(SettlementReceipt {
             tx_hash,
-            amount_micro: decision.amount_micro,
+            amount_micro: amount,
             target: preview,
         }))
     }
@@ -594,6 +713,15 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            verify_wallet_type(
+                WalletMode::DepositWallet1271,
+                "0xeE3B778A783510BC833384919F709e3d2fee1624",
+                128,
+                None
+            )
+            .is_err()
+        );
         assert!(verify_wallet_type(WalletMode::Eoa, "0xabc", 10, Some(0)).is_err());
         assert!(verify_wallet_type(WalletMode::Eoa, "0xabc", 0, Some(0)).is_ok());
         Ok(())
@@ -612,16 +740,20 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/submit"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "tx_hash": "0xrelay123",
-                "state": "PENDING"
+                "transactionID": "tx-relayer-123",
+                "state": "STATE_NEW"
             })))
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/status/0xrelay123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "state": "STATE_CONFIRMED"
-            })))
+            .and(path("/transaction"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!([
+                {
+                    "transactionID": "tx-relayer-123",
+                    "transactionHash": "0xrelay123",
+                    "state": "STATE_CONFIRMED"
+                }
+            ])))
             .mount(&server)
             .await;
 
@@ -640,6 +772,33 @@ mod tests {
         let receipt = worker.settle_once(&snap).await?.ok_or("expected receipt")?;
         assert_eq!(receipt.tx_hash, "0xrelay123");
         assert_eq!(receipt.amount_micro, 6_000_000);
+
+        // Verify in-flight reservation prevents double submission
+        let worker_res = SettlementWorker::new(
+            SettlementConfig::default(),
+            test_market(ProtocolVersion::PolyV2),
+            "0xwallet".to_string(),
+            None,
+        );
+        worker_res
+            .in_flight_micro
+            .store(6_000_000, std::sync::atomic::Ordering::SeqCst);
+        let d = worker_res.decision(&snap);
+        assert!(!d.should_settle);
+        assert_eq!(d.reason, "in-flight-reservation");
+
+        // Verify direct_mode gas floor check
+        let worker_direct = SettlementWorker::new(
+            SettlementConfig {
+                direct_mode: true,
+                min_batch_for_gas: 10_000_000,
+                ..SettlementConfig::default()
+            },
+            test_market(ProtocolVersion::PolyV2),
+            "0xwallet".to_string(),
+            None,
+        );
+        assert!(worker_direct.settle_once(&snap).await.is_err());
 
         let dry = SettlementWorker::new(
             SettlementConfig::default(),

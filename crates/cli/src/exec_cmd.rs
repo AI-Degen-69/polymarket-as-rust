@@ -10,6 +10,7 @@ use core_types::{
 use execution::{
     L2HmacSigner, MarketDomain, OrderSigner, SettlementConfig, SettlementWorker, decide_settlement,
 };
+use feeds::GammaDiscoveryClient;
 use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 
 use crate::exec_report::{
@@ -150,10 +151,24 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     let mut compute_lat = LatencyTracker::new()?;
     let mut stats = ExecReportStats::default();
 
-    let market = synth_market();
+    let (market, discovery_mode) = {
+        let live_res: Result<MarketDescriptor, Box<dyn Error>> = (|| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            let disc = GammaDiscoveryClient::new()?;
+            let now_ms = unix_ms_now();
+            let desc = rt.block_on(disc.discover_active_5m_btc(now_ms, 15_000))?;
+            Ok(desc)
+        })();
+        match live_res {
+            Ok(m) => (m, "live read-only discovery"),
+            Err(_) => (synth_market(), "synthetic offline fallback"),
+        }
+    };
     let domain = MarketDomain::for_market(&market);
 
-    println!("  (a) Market discovery (synthetic dry-run, zero capital at risk)");
+    println!("  (a) Market discovery ({discovery_mode}, zero capital at risk)");
     println!("      slug:             {}", market.slug);
     println!(
         "      version:          {:?} (domain v{})",
@@ -162,7 +177,8 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     println!("      verifying:        {:?}", domain.exchange_address);
     println!("      wallet_mode:      DepositWallet1271 (sig 3, ERC-7739 TypedDataSign)");
     println!(
-        "      tick:             0.01  min_size: 5 shares  takerDelay: 50ms  feeRate: dynamic~0.05"
+        "      tick:             0.01  min_size: 5 shares  takerDelay: {}ms  feeRate: dynamic~0.05",
+        market.taker_delay_ms
     );
 
     // Fresh-eyes review: no hardcoded keys/secrets. Both signers are ephemeral
@@ -227,10 +243,10 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
             tau2 / 1000
         );
 
-        if tick + 1 == display_ticks
+        let (tau3, tau4) = if tick + 1 == display_ticks
             && let (Some(bid_up), Some(bid_dn)) = (bid_up_opt, bid_dn_opt)
         {
-            sign_and_record(
+            let sign_elapsed = sign_and_record(
                 &order_signer,
                 &domain,
                 &l2_signer,
@@ -245,9 +261,21 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
                 &market,
                 tick_precision,
             )?;
-        }
+            let egress_t0 = std::time::Instant::now();
+            let _mock_payload = serde_json::json!({
+                "market": market.condition_id,
+                "bids": [bid_up.0, bid_dn.0],
+                "mock_dispatch": true
+            });
+            let egress_ns = u64::try_from(egress_t0.elapsed().as_nanos())
+                .unwrap_or(100)
+                .max(1);
+            (sign_elapsed, egress_ns)
+        } else {
+            (0, 0)
+        };
 
-        record_latency(&mut jsonl, ts_ms, mono_ns, tick, tau1, tau2, 0, 1_200)?;
+        record_latency(&mut jsonl, ts_ms, mono_ns, tick, tau1, tau2, tau3, tau4)?;
     }
 
     let worker = SettlementWorker::new(
@@ -352,12 +380,13 @@ fn sign_and_record(
     bid_dn: MicroUsdc,
     market: &MarketDescriptor,
     tick_precision: TickPrecision,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<u64, Box<dyn Error>> {
     use std::time::Instant;
     let legs = [
         ("UP", bid_up, market.asset_id_up.as_str()),
         ("DN", bid_dn, market.asset_id_dn.as_str()),
     ];
+    let mut total_sign_ns = 0u64;
     for (leg, price, token_id) in legs {
         let wire = encode_buy_amounts(price, SharesMicro::from_raw(20_000_000), tick_precision)?;
         let salt = execution::generate_salt();
@@ -375,6 +404,7 @@ fn sign_and_record(
         let sig = order_signer.sign_order(&order, domain)?;
         let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         sign_lat.record_ns(elapsed_ns.max(1))?;
+        total_sign_ns = total_sign_ns.saturating_add(elapsed_ns.max(1));
         let recovered = order_signer.verify_signature(&order, &sig, domain)?;
         let recovered_match = recovered == order_signer.eoa_address();
         stats.signed_orders += 1;
@@ -404,7 +434,7 @@ fn sign_and_record(
             return Err("EIP-712 recover self-check failed".into());
         }
     }
-    Ok(())
+    Ok(total_sign_ns / 2)
 }
 
 #[cfg(test)]
