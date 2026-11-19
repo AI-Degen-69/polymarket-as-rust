@@ -12,6 +12,8 @@
 )]
 
 mod doctor;
+mod exec_cmd;
+mod exec_report;
 mod feeds_cmd;
 mod feeds_report;
 mod lifecycle_cmd;
@@ -27,6 +29,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand, ValueEnum};
 use core_types::{KappaMode, SgMode, VarianceMode};
 
+use exec_cmd::{ExecArgs, ExecMode};
 use feeds_cmd::FeedsArgs;
 use lifecycle_cmd::{CliFaultMode, LifecycleArgs, LifecycleSourceMode};
 use trace_cmd::{TraceArgs, TraceSourceMode};
@@ -68,6 +71,14 @@ enum CliKappaMode {
 enum CliVarianceMode {
     BinaryCara,
     LibraryStrict,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliExecMode {
+    #[value(name = "dry-run")]
+    DryRun,
+    #[value(name = "canary-live")]
+    CanaryLive,
 }
 
 #[derive(Debug, Parser)]
@@ -183,6 +194,24 @@ enum Commands {
         #[arg(long, default_value = "logs/phase4-lifecycle.jsonl")]
         jsonl: PathBuf,
     },
+    /// Phase 5 execution tracer: EIP-712 signing, dry-run dispatch, and settlement preview.
+    Exec {
+        /// Execution safety mode (`dry-run` default or `canary-live`).
+        #[arg(long, value_enum, default_value_t = CliExecMode::DryRun)]
+        mode: CliExecMode,
+        /// Explicit live-capital acknowledgement required for `canary-live`.
+        #[arg(long, default_value_t = false)]
+        confirm_live_capital: bool,
+        /// Canary dollar cap in USD (`<= 25` enforced).
+        #[arg(long, default_value_t = 10)]
+        canary_max_usd: u64,
+        /// Dry-run trace duration (`60s` default).
+        #[arg(long, default_value = "60s")]
+        duration: String,
+        /// Output path for structured JSONL telemetry log.
+        #[arg(long, default_value = "logs/phase5-exec-dry.jsonl")]
+        jsonl: PathBuf,
+    },
 }
 
 fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
@@ -276,6 +305,22 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             v_max,
             base_size,
+            jsonl,
+        }),
+        Commands::Exec {
+            mode,
+            confirm_live_capital,
+            canary_max_usd,
+            duration,
+            jsonl,
+        } => exec_cmd::run(ExecArgs {
+            mode: match mode {
+                CliExecMode::DryRun => ExecMode::DryRun,
+                CliExecMode::CanaryLive => ExecMode::CanaryLive,
+            },
+            confirm_live_capital,
+            canary_max_usd,
+            duration,
             jsonl,
         }),
     }

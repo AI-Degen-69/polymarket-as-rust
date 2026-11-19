@@ -1,0 +1,33 @@
+[package]
+name = "execution"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy.workspace = true
+arc-swap.workspace = true
+base64.workspace = true
+chrono.workspace = true
+core-types = { path = "../core-types" }
+futures-util.workspace = true
+hdrhistogram.workspace = true
+hex.workspace = true
+hmac.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+risk-lifecycle = { path = "../risk-lifecycle" }
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
