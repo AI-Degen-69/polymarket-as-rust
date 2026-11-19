@@ -161,11 +161,8 @@ pub(crate) fn print_exec_summary(
         sign_summary.p99_ns / 1000
     );
     println!("  Settlement preview: {settlement_calldata}");
-    println!("  Secrets: 0 leaked (private key / L2 secret / passphrase / relayer key absent)");
-    jsonl_summary(stats, sign_summary);
+    println!("  Secrets: no full secrets written (signature prefixes only, ephemeral keys)");
 }
-
-fn jsonl_summary(_stats: &ExecReportStats, _sign: &LatencySummary) {}
 
 pub(crate) fn record_summary_jsonl(
     jsonl: &mut JsonlWriter,

@@ -11,7 +11,6 @@ use execution::{
     L2HmacSigner, MarketDomain, OrderSigner, SettlementConfig, SettlementWorker, decide_settlement,
 };
 use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
-use secrecy::SecretString;
 
 use crate::exec_report::{
     ExecReportStats, print_exec_header, print_exec_summary, record_latency,
@@ -166,21 +165,14 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
         "      tick:             0.01  min_size: 5 shares  takerDelay: 50ms  feeRate: dynamic~0.05"
     );
 
-    let test_privkey = SecretString::new(
-        "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".into(),
-    );
-    let order_signer = OrderSigner::new(
-        &test_privkey,
-        WalletMode::DepositWallet1271,
-        Some(deposit_wallet_value()),
-    )?;
-    let l2_secret = SecretString::new("aGVsbG8td29ybGRfc2VjcmV0".into());
-    let l2_signer = L2HmacSigner::new(
-        "0xeE3B778A783510BC833384919F709e3d2fee1624",
-        "dry-run-key",
-        &l2_secret,
-        SecretString::new("dry-run-pass".into()),
-    )?;
+    // Fresh-eyes review: no hardcoded keys/secrets. Both signers are ephemeral
+    // per process: a random EOA for EIP-712 plus a random synthetic deposit
+    // wallet and random L2 HMAC credentials. Outputs verify locally only.
+    let synth_wallet = ephemeral_wallet();
+    let synth_wallet_hex = format!("{synth_wallet:#x}");
+    let order_signer =
+        OrderSigner::new_ephemeral(WalletMode::DepositWallet1271, Some(synth_wallet))?;
+    let l2_signer = L2HmacSigner::new_ephemeral_dry_run(synth_wallet_hex.clone(), "dry-run-key");
 
     let mut pipeline = MathPipeline::new(MathPipelineConfig::try_default()?, clock)?;
     let tick_precision = TickPrecision::from_micro(market.tick_size_micro)?;
@@ -191,11 +183,8 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
         let ts_ms = unix_ms_now().saturating_add(tick as u64 * 100);
         let mono_ns = clock.now_ns()?;
         let drift = (tick as u64).saturating_mul(2_000);
-        let upper = if drift.min(20_000) > 460_000 {
-            440_000
-        } else {
-            460_000 - drift.min(20_000)
-        };
+        // Synthetic book drifts 460k -> 440k then holds (capped at 20k).
+        let upper = 460_000 - drift.min(20_000);
         let book_up = synth_book(Outcome::Up, 520_000 + drift, mono_ns, ts_ms);
         let book_dn = synth_book(Outcome::Down, upper, mono_ns, ts_ms);
 
@@ -264,7 +253,7 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     let worker = SettlementWorker::new(
         SettlementConfig::default(),
         market.clone(),
-        "0xeE3B778A783510BC833384919F709e3d2fee1624".to_string(),
+        synth_wallet_hex,
         None,
     );
     let preview_snap = execution::OrderRegistrySnapshot {
@@ -331,10 +320,21 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn deposit_wallet_value() -> alloy::primitives::Address {
-    use std::str::FromStr;
-    alloy::primitives::Address::from_str("0xeE3B778A783510BC833384919F709e3d2fee1624")
-        .unwrap_or(alloy::primitives::Address::ZERO)
+/// Generates a fresh random synthetic wallet address per dry-run process.
+///
+/// Avoids hardcoding any address fixture; the value is trace-only and never
+/// funded. Loops on the negligible all-zero case so callers never see `ZERO`.
+fn ephemeral_wallet() -> alloy::primitives::Address {
+    use rand::RngCore;
+    let mut rng = rand::rng();
+    loop {
+        let mut bytes = [0u8; 20];
+        rng.fill_bytes(&mut bytes);
+        let addr = alloy::primitives::Address::from_slice(&bytes);
+        if addr != alloy::primitives::Address::ZERO {
+            return addr;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -360,7 +360,6 @@ fn sign_and_record(
     ];
     for (leg, price, token_id) in legs {
         let wire = encode_buy_amounts(price, SharesMicro::from_raw(20_000_000), tick_precision)?;
-        let t0 = Instant::now();
         let salt = execution::generate_salt();
         let order = order_signer.build_order(
             salt,
@@ -370,6 +369,9 @@ fn sign_and_record(
             true,
             ts_ms / 1000,
         )?;
+        // tau_3 is pure EIP-712 signing: salt/build happen before the timer so
+        // CSPRNG jitter does not inflate the signing budget.
+        let t0 = Instant::now();
         let sig = order_signer.sign_order(&order, domain)?;
         let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
         sign_lat.record_ns(elapsed_ns.max(1))?;

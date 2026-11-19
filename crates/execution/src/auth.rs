@@ -100,6 +100,27 @@ pub struct L2HmacSigner {
 }
 
 impl L2HmacSigner {
+    /// Creates a dry-run signer with fresh random credentials (no hardcoded secrets).
+    ///
+    /// Generates 32 random secret bytes (URL-safe base64) and a random 16-byte
+    /// hex passphrase. The address/api-key labels are synthetic trace-only
+    /// values; signing output verifies locally but never touches the CLOB.
+    #[must_use]
+    pub fn new_ephemeral_dry_run(address: impl Into<String>, api_key: impl Into<String>) -> Self {
+        use rand::RngCore;
+        let mut rng = rand::rng();
+        let mut secret_raw = [0u8; 32];
+        rng.fill_bytes(&mut secret_raw);
+        let mut pass_raw = [0u8; 16];
+        rng.fill_bytes(&mut pass_raw);
+        Self {
+            address: address.into(),
+            api_key: api_key.into(),
+            secret_bytes: secret_raw.to_vec(),
+            passphrase: secrecy::SecretString::new(hex::encode(pass_raw).into()),
+        }
+    }
+
     /// Creates a new `L2HmacSigner`, validating and decoding the base64 secret.
     pub fn new(
         address: impl Into<String>,

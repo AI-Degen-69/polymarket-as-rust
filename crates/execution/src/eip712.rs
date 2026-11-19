@@ -158,21 +158,25 @@ pub struct OrderSigner {
 }
 
 impl OrderSigner {
-    /// Creates a new `OrderSigner`.
+    /// Creates a signer backed by a fresh ephemeral key (dry-run / tests only).
     ///
-    /// For `WalletMode::DepositWallet1271`, enforces `maker == signer == deposit_wallet`.
-    /// For `WalletMode::Eoa`, `maker == signer == eoa`.
-    /// For `WalletMode::PolyProxy` / `WalletMode::GnosisSafe`, `maker == proxy`, `signer == eoa`.
-    pub fn new(
-        private_key: &SecretString,
+    /// The key is generated via [`PrivateKeySigner::random`] and never leaves
+    /// memory; there is no hardcoded test vector to leak. Address derivation
+    /// follows the same `maker`/`signer` rules as [`Self::new`].
+    pub fn new_ephemeral(
         wallet_mode: WalletMode,
         proxy_or_deposit_wallet: Option<Address>,
     ) -> Result<Self, ExecutionError> {
-        let raw_hex = private_key.expose_secret().trim();
-        let key_str = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
-        let signer = PrivateKeySigner::from_str(key_str)
-            .map_err(|err| ExecutionError::Signing(format!("Invalid private key: {err}")))?;
+        let signer = PrivateKeySigner::random();
+        Self::from_signer(signer, wallet_mode, proxy_or_deposit_wallet)
+    }
 
+    /// Shared constructor once a [`PrivateKeySigner`] exists.
+    fn from_signer(
+        signer: PrivateKeySigner,
+        wallet_mode: WalletMode,
+        proxy_or_deposit_wallet: Option<Address>,
+    ) -> Result<Self, ExecutionError> {
         let eoa_address = signer.address();
 
         let (maker_address, signer_address) = match wallet_mode {
@@ -203,6 +207,24 @@ impl OrderSigner {
             signer_address,
             deposit_constants: DepositWalletConstants::new(),
         })
+    }
+
+    /// Creates a new `OrderSigner`.
+    ///
+    /// For `WalletMode::DepositWallet1271`, enforces `maker == signer == deposit_wallet`.
+    /// For `WalletMode::Eoa`, `maker == signer == eoa`.
+    /// For `WalletMode::PolyProxy` / `WalletMode::GnosisSafe`, `maker == proxy`, `signer == eoa`.
+    pub fn new(
+        private_key: &SecretString,
+        wallet_mode: WalletMode,
+        proxy_or_deposit_wallet: Option<Address>,
+    ) -> Result<Self, ExecutionError> {
+        let raw_hex = private_key.expose_secret().trim();
+        let key_str = raw_hex.strip_prefix("0x").unwrap_or(raw_hex);
+        let signer = PrivateKeySigner::from_str(key_str)
+            .map_err(|err| ExecutionError::Signing(format!("Invalid private key: {err}")))?;
+
+        Self::from_signer(signer, wallet_mode, proxy_or_deposit_wallet)
     }
 
     /// Returns the address of the underlying EOA key.
@@ -371,6 +393,18 @@ mod tests {
     use alloy::primitives::Signature;
     use core_types::money::{FeeSchedule, MicroUsdc, SharesMicro};
 
+    fn random_address() -> Address {
+        use rand::RngCore;
+        loop {
+            let mut bytes = [0u8; 20];
+            rand::rng().fill_bytes(&mut bytes);
+            let addr = Address::from_slice(&bytes);
+            if addr != Address::ZERO {
+                return addr;
+            }
+        }
+    }
+
     fn dummy_market(version: ProtocolVersion, neg_risk: bool) -> MarketDescriptor {
         MarketDescriptor {
             condition_id: "0x1234".to_string(),
@@ -418,12 +452,8 @@ mod tests {
 
     #[test]
     fn test_eip712_safe_signing_and_recovery() -> Result<(), Box<dyn std::error::Error>> {
-        let priv_key = SecretString::new(
-            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".into(),
-        );
-        let safe_proxy = address!("eE3B778A783510BC833384919F709e3d2fee1624");
-
-        let signer = OrderSigner::new(&priv_key, WalletMode::GnosisSafe, Some(safe_proxy))?;
+        let safe_proxy = random_address();
+        let signer = OrderSigner::new_ephemeral(WalletMode::GnosisSafe, Some(safe_proxy))?;
         assert_eq!(signer.wallet_mode(), WalletMode::GnosisSafe);
         assert_eq!(signer.maker_address(), safe_proxy);
         assert_eq!(signer.signer_address(), signer.eoa_address());
@@ -458,16 +488,9 @@ mod tests {
     #[test]
     fn test_eip712_deposit_wallet_wrapped_signature_layout()
     -> Result<(), Box<dyn std::error::Error>> {
-        let priv_key = SecretString::new(
-            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".into(),
-        );
-        let deposit_wallet = address!("eE3B778A783510BC833384919F709e3d2fee1624");
-
-        let signer = OrderSigner::new(
-            &priv_key,
-            WalletMode::DepositWallet1271,
-            Some(deposit_wallet),
-        )?;
+        let deposit_wallet = random_address();
+        let signer =
+            OrderSigner::new_ephemeral(WalletMode::DepositWallet1271, Some(deposit_wallet))?;
         assert_eq!(signer.wallet_mode(), WalletMode::DepositWallet1271);
         assert_eq!(signer.maker_address(), deposit_wallet);
         assert_eq!(signer.signer_address(), deposit_wallet);
@@ -523,16 +546,9 @@ mod tests {
 
     #[test]
     fn test_signing_latency_under_80_micros() -> Result<(), Box<dyn std::error::Error>> {
-        let priv_key = SecretString::new(
-            "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318".into(),
-        );
-        let deposit_wallet = address!("eE3B778A783510BC833384919F709e3d2fee1624");
-
-        let signer = OrderSigner::new(
-            &priv_key,
-            WalletMode::DepositWallet1271,
-            Some(deposit_wallet),
-        )?;
+        let deposit_wallet = random_address();
+        let signer =
+            OrderSigner::new_ephemeral(WalletMode::DepositWallet1271, Some(deposit_wallet))?;
         let market = dummy_market(ProtocolVersion::PolyV2, false);
         let domain = MarketDomain::for_market(&market);
 

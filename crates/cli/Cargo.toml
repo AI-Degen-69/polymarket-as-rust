@@ -20,6 +20,7 @@ execution = { path = "../execution" }
 feeds = { path = "../feeds" }
 math-engine = { path = "../math-engine" }
 paper-sim = { path = "../paper-sim" }
+rand.workspace = true
 risk-lifecycle = { path = "../risk-lifecycle" }
 rtrb.workspace = true
 secrecy.workspace = true
