@@ -337,6 +337,7 @@ polymarket-as-rust/
 - [ ] `rtk cargo test --workspace` exits 0
 - [ ] Live/replay `poly-as trace` outputs complete 6-station trace + `P99 < 25 us` + valid JSONL
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
 
 ---
 
@@ -406,6 +407,7 @@ polymarket-as-rust/
 - [ ] `rtk cargo test --workspace` exits 0
 - [ ] Live 60s `poly-as paper` + deterministic replay run verified with JSONL audit
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
 
 ---
 
@@ -495,6 +497,7 @@ polymarket-as-rust/
 - [ ] `rtk cargo test --workspace` exits 0
 - [ ] `poly-as lifecycle --source sim-epoch --fast-forward` and `--inject-fault` tests verified
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
 
 ---
 
@@ -590,17 +593,28 @@ polymarket-as-rust/
 - [ ] `rtk cargo build --release` exits 0
 - [ ] `poly-as exec --mode dry-run --duration 60s` verified (`tau_3 < 80 us`, 0 leaked secrets, valid JSONL)
 - [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
 
 ---
 
 ## 4. Strict Gating Rule (Non-Negotiable Execution Law)
 
 > **STRICT SEQUENTIAL PHASE GATE:**
-> Work may advance from **Phase $N$** to **Phase $N+1$** **ONLY** when ALL FOUR conditions are satisfied with fresh terminal evidence:
+> Work may advance from **Phase $N$** to **Phase $N+1$** **ONLY** when ALL FIVE conditions are satisfied with fresh terminal evidence:
 > 1. **[N.1 DO]** All crates, modules, structs, and CLI subcommands for Phase $N$ are implemented cleanly with zero placeholders.
 > 2. **[N.2 VERIFY]** The live terminal calculation trace (`cargo run ...`), all exact numeric unit-test vectors (`cargo test ...`), and structured JSONL log validation have been executed fresh and confirmed passing.
 > 3. **[N.3 VERIFY-AGAIN]** All adversarial edge-case re-runs and full workspace regression tests (`cargo test --workspace`) have been executed fresh and confirmed passing.
 > 4. **MANDATORY REVIEW SIGN-OFF:** Both `rust-reviewer` (`cargo fmt --check`, `cargo clippy -- -D warnings`, ownership/concurrency/safety audit) and `silent-failure-hunter` (swallowed errors, bad fallbacks, missing timeouts/rollbacks) report **0 CRITICAL and 0 HIGH findings**. Invoke `rust-build-resolver` immediately on any compilation/borrow-checker/Cargo error.
+> 5. **HUMAN-READABLE VERIFICATION SCORECARD:** Present a structured plain-English scorecard alongside raw terminal telemetry containing:
+>    - **Metric Translation Table:** Columns `Terminal Field | Measured Value | What It Measures (Plain English) | Target | Status` translating every key output metric from `[N.2 VERIFY]` and `[N.3 VERIFY-AGAIN]`.
+>    - **100-Point Rubric (5 weighted pillars):**
+>      - Data & Protocol Integrity (`25 pts`)
+>      - Math / Logic Correctness (`25 pts`)
+>      - Latency & Performance Budget (`20 pts`)
+>      - Adversarial & Edge-Case Resilience (`20 pts`)
+>      - Code Safety & Hygiene (`10 pts`)
+>    - **Pass/Fail Override Rule:** `95–100` = `PASS` (Production-Ready); `85–94` = `PASS WITH NOTES` (functional, minor non-blocking headroom/tuning notes); `< 85` or ANY failed hard gate (failing test, panic, leaked secret, or `CRITICAL`/`HIGH` reviewer finding) = **`FAIL` (Blocked)** regardless of numeric score.
+>    - **Plain-English Verdict:** 2–3 short sentences directly answering whether the output matches what a working, completed Phase $N$ should produce.
 >
 > **STOP RULE:** If ANY check fails, **STOP immediately**, fix the root cause in Phase $N$, and re-run **BOTH** `[N.2 VERIFY]` and `[N.3 VERIFY-AGAIN]` from scratch before advancing. **NEVER skip, batch, or overlap phases.**
 
@@ -623,3 +637,4 @@ The greenfield Rust project is **DONE** when:
 4. **Chainlink PolyBolt:** No Chainlink API key — default to Binance Spot WSS + local 60s rolling TWAP, with PolyBolt opt-in (`POLYBOLT_ENABLED=false`).
 5. **Execution Client:** Direct Native Rust (`reqwest` + `alloy` + `hmac`).
 6. **Cross-Model Review (`doubt-driven-development`):** Skipped by operator; proceeding with single-model adversarial findings only.
+7. **Operator Verification Scorecard:** Starting from Phase 2 onward, every phase verification report MUST include a Human-Readable Verification Scorecard (plain-English metric translation, target vs. measured values, transparent 0–100 rubric score, and PASS/FAIL verdict) alongside the raw terminal output.
