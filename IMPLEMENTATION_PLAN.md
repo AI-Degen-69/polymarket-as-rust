@@ -410,7 +410,7 @@ polymarket-as-rust/
 - [x] Live 60s `poly-as paper` + deterministic replay run verified with JSONL audit
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
-- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-3-complete` tag pushed
+- [x] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-3-complete` tag pushed
 
 ---
 
