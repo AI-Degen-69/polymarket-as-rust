@@ -19,12 +19,15 @@ use core_types::MathError;
 pub mod station1_sg;
 /// Station 2: Rolling 60-second ZOH TWAP, variance decay, and cross-venue Binance lead-lag.
 pub mod station2_twap;
+/// Station 3: UP-book liquidity decay (`kappa`) estimator with spoof-wall touch guard.
+pub mod station3_kappa;
 
 pub use station1_sg::{CAUSAL_WEIGHTS, SYMMETRIC_WEIGHTS, SavitzkyGolayFilter, SgOutput};
 pub use station2_twap::{
     LeadLagSignal, RollingTwapAndVariance, SpotSample, Station2Config, Station2Output, norm_cdf,
     norm_pdf,
 };
+pub use station3_kappa::{KappaConfig, KappaEstimator, KappaOutput};
 
 /// Clamps `val` to `[lo, hi]` after verifying all inputs are finite and `lo <= hi`.
 ///
