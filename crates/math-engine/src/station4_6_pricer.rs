@@ -199,12 +199,8 @@ impl DualBidPricer {
 
         let t4 = clock_ns(clock)?;
         let (s_star_raw, s_min, s_star) = compute_station4(self.config, input, tick_usd)?;
-        let s4_ns = clock_ns(clock)?.saturating_sub(t4);
-
         let t5 = clock_ns(clock)?;
         let (r_i_unclamped, r_i) = compute_station5(self.config.gamma.get(), input, tick_usd)?;
-        let s5_ns = clock_ns(clock)?.saturating_sub(t5);
-
         let t6 = clock_ns(clock)?;
         let mut trace = compute_station6(
             self.config,
@@ -212,10 +208,10 @@ impl DualBidPricer {
             (s_star_raw, s_min, s_star),
             (r_i_unclamped, r_i),
         )?;
-        let s6_ns = clock_ns(clock)?.saturating_sub(t6);
-        trace.s4_ns = s4_ns;
-        trace.s5_ns = s5_ns;
-        trace.s6_ns = s6_ns;
+        let t_end = clock_ns(clock)?;
+        trace.s4_ns = t5.saturating_sub(t4);
+        trace.s5_ns = t6.saturating_sub(t5);
+        trace.s6_ns = t_end.saturating_sub(t6);
         Ok(trace)
     }
 }

@@ -126,6 +126,8 @@ pub struct RollingTwapAndVariance {
     samples: [SpotSample; SPOT_RING_CAP],
     head: usize,
     len: usize,
+    stored_area: f64,
+    evictions_since_resync: u32,
     last_spot_usd: Option<f64>,
     last_spot_ts_ms: Option<u64>,
     sigma_binance: f64,
@@ -135,6 +137,11 @@ pub struct RollingTwapAndVariance {
     spot_dirty: bool,
     last_mid: Option<(u64, f64)>,
     sigma_ewma_sq: f64,
+    term_expiry_ms: u64,
+    term_last_ts_ms: u64,
+    term_area: f64,
+    term_total_ms: u64,
+    term_valid: bool,
 }
 
 impl RollingTwapAndVariance {
@@ -147,6 +154,8 @@ impl RollingTwapAndVariance {
             samples: [SpotSample::EMPTY; SPOT_RING_CAP],
             head: 0,
             len: 0,
+            stored_area: 0.0,
+            evictions_since_resync: 0,
             last_spot_usd: None,
             last_spot_ts_ms: None,
             sigma_binance: default_sigma,
@@ -156,6 +165,11 @@ impl RollingTwapAndVariance {
             spot_dirty: false,
             last_mid: None,
             sigma_ewma_sq: 0.0,
+            term_expiry_ms: 0,
+            term_last_ts_ms: 0,
+            term_area: 0.0,
+            term_total_ms: 0,
+            term_valid: false,
         })
     }
 
@@ -164,6 +178,8 @@ impl RollingTwapAndVariance {
         self.samples = [SpotSample::EMPTY; SPOT_RING_CAP];
         self.head = 0;
         self.len = 0;
+        self.stored_area = 0.0;
+        self.evictions_since_resync = 0;
         self.last_spot_usd = None;
         self.last_spot_ts_ms = None;
         self.sigma_binance = self.config.default_sigma_binance;
@@ -173,6 +189,11 @@ impl RollingTwapAndVariance {
         self.spot_dirty = false;
         self.last_mid = None;
         self.sigma_ewma_sq = 0.0;
+        self.term_expiry_ms = 0;
+        self.term_last_ts_ms = 0;
+        self.term_area = 0.0;
+        self.term_total_ms = 0;
+        self.term_valid = false;
     }
 
     /// Returns count of samples currently held in the circular buffer.
@@ -190,6 +211,9 @@ impl RollingTwapAndVariance {
     /// Inserts one BTC spot sample, maintaining monotonic ZOH ordering in `[SpotSample; 1024]`.
     pub fn push_spot(&mut self, ts_ms: u64, price_usd: f64) -> Result<(), MathError> {
         check_pos_finite(price_usd)?;
+        if self.term_valid && ts_ms <= self.term_last_ts_ms {
+            self.term_valid = false;
+        }
         if let Some(last) = self.last_sample() {
             if ts_ms < last.ts_ms {
                 return Ok(());
@@ -317,10 +341,9 @@ impl RollingTwapAndVariance {
         }
         let tau_secs = expiry_ms.saturating_sub(now_ms) as f64 / 1000.0;
         let (sigma_eff_sq, v_rem) = self.compute_variance(tau_secs, p_mid)?;
-        let twap_60s_usd =
-            self.twap_over_window(now_ms.saturating_sub(self.config.window_ms), now_ms);
+        let twap_60s_usd = self.twap_60s_fast(now_ms);
         let (terminal_window_active, terminal_lock_fraction, terminal_twap_usd) =
-            self.compute_terminal_tracker(now_ms, expiry_ms);
+            self.update_terminal_tracker(now_ms, expiry_ms);
         let lead_lag = self.resolve_lead_lag(strike_usd, tau_secs)?;
 
         Ok(Station2Output {
@@ -334,6 +357,36 @@ impl RollingTwapAndVariance {
             v_rem,
             lead_lag,
         })
+    }
+
+    /// Computes trailing 60-second ZOH TWAP in O(1) using incremental `stored_area`.
+    #[must_use]
+    pub fn twap_60s_fast(&mut self, now_ms: u64) -> Option<f64> {
+        let cutoff = now_ms.saturating_sub(self.config.window_ms);
+        let first = self.sample_at(0)?;
+        if first.ts_ms > now_ms {
+            return None;
+        }
+        let last = self.last_sample()?;
+        if last.ts_ms > now_ms {
+            return self.twap_over_window(cutoff, now_ms);
+        }
+        self.evict_expired_before(cutoff);
+        let first = self.sample_at(0)?;
+        let eff_start = cutoff.max(first.ts_ms);
+        let pre_trim = if first.ts_ms < cutoff {
+            first.price_usd * ((cutoff - first.ts_ms) as f64)
+        } else {
+            0.0
+        };
+        let tail = last.price_usd * (now_ms.saturating_sub(last.ts_ms) as f64);
+        let area = (self.stored_area - pre_trim) + tail;
+        let total_dt = now_ms.saturating_sub(eff_start) as f64;
+        if total_dt > 0.0 {
+            Some(area / total_dt)
+        } else {
+            Some(last.price_usd)
+        }
     }
 
     fn resolve_lead_lag(
@@ -370,19 +423,91 @@ impl RollingTwapAndVariance {
         }
     }
 
-    fn compute_terminal_tracker(&self, now_ms: u64, expiry_ms: u64) -> (bool, f64, Option<f64>) {
+    fn update_terminal_tracker(&mut self, now_ms: u64, expiry_ms: u64) -> (bool, f64, Option<f64>) {
         let term_start = expiry_ms.saturating_sub(self.config.window_ms);
         if now_ms < term_start {
             return (false, 0.0, None);
         }
         let span = expiry_ms.saturating_sub(term_start);
+        let t_end = now_ms.min(expiry_ms);
         let frac = if span == 0 {
             1.0
         } else {
-            ((now_ms.min(expiry_ms) - term_start) as f64 / span as f64).clamp(0.0, 1.0)
+            ((t_end - term_start) as f64 / span as f64).clamp(0.0, 1.0)
         };
-        let twap = self.twap_over_window(term_start, now_ms.min(expiry_ms));
+        let last_ts = self.last_sample().map_or(0, |s| s.ts_ms);
+        let can_step = self.term_valid
+            && self.term_expiry_ms == expiry_ms
+            && t_end >= self.term_last_ts_ms
+            && last_ts <= t_end;
+        let twap = if can_step {
+            self.advance_terminal_area(t_end)
+        } else {
+            self.init_terminal_area(term_start, t_end, expiry_ms)
+        };
         (true, frac, twap)
+    }
+
+    fn init_terminal_area(&mut self, term_start: u64, t_end: u64, expiry_ms: u64) -> Option<f64> {
+        let Some((area, total_ms)) = self.integrate_area_and_dt(term_start, t_end) else {
+            self.term_valid = false;
+            return self.last_active_price_at(t_end);
+        };
+        self.term_expiry_ms = expiry_ms;
+        self.term_last_ts_ms = t_end;
+        self.term_area = area;
+        self.term_total_ms = total_ms;
+        self.term_valid = true;
+        if total_ms > 0 {
+            Some(area / total_ms as f64)
+        } else {
+            self.last_active_price_at(t_end)
+        }
+    }
+
+    fn advance_terminal_area(&mut self, t_end: u64) -> Option<f64> {
+        if t_end > self.term_last_ts_ms
+            && let Some((add_area, add_ms)) =
+                self.integrate_area_and_dt(self.term_last_ts_ms, t_end)
+        {
+            self.term_area += add_area;
+            self.term_total_ms = self.term_total_ms.saturating_add(add_ms);
+            self.term_last_ts_ms = t_end;
+        }
+        if self.term_total_ms > 0 {
+            Some(self.term_area / self.term_total_ms as f64)
+        } else {
+            self.last_active_price_at(t_end)
+        }
+    }
+
+    fn integrate_area_and_dt(&self, start_ms: u64, end_ms: u64) -> Option<(f64, u64)> {
+        let first = self.sample_at(0)?;
+        if first.ts_ms > end_ms || end_ms <= start_ms {
+            return None;
+        }
+        let eff_start = start_ms.max(first.ts_ms);
+        let mut area = 0.0_f64;
+        let mut total_ms = 0_u64;
+        let mut right_ts = end_ms;
+        for rev in 0..self.len {
+            let idx = self.len - 1 - rev;
+            let cur = self.sample_at(idx)?;
+            if cur.ts_ms < end_ms {
+                let seg_start = cur.ts_ms.max(eff_start);
+                let seg_end = right_ts.min(end_ms);
+                if seg_end > seg_start {
+                    let dt = seg_end - seg_start;
+                    area += cur.price_usd * (dt as f64);
+                    total_ms = total_ms.saturating_add(dt);
+                }
+            }
+            right_ts = cur.ts_ms;
+            if cur.ts_ms <= eff_start {
+                break;
+            }
+        }
+        Some((area, total_ms))
     }
 
     fn slot_idx(&self, logical: usize) -> usize {
@@ -445,16 +570,37 @@ impl RollingTwapAndVariance {
     }
 
     fn evict_expired_before(&mut self, cutoff_ms: u64) {
+        let mut popped_any = false;
         while self.len >= 2 {
-            if let Some(second) = self.sample_at(1)
-                && second.ts_ms <= cutoff_ms
-            {
-                self.head = (self.head + 1) % SPOT_RING_CAP;
-                self.len = self.len.saturating_sub(1);
-            } else {
+            let (Some(first), Some(second)) = (self.sample_at(0), self.sample_at(1)) else {
+                break;
+            };
+            if second.ts_ms > cutoff_ms {
                 break;
             }
+            let dt = second.ts_ms.saturating_sub(first.ts_ms) as f64;
+            self.stored_area = (self.stored_area - first.price_usd * dt).max(0.0);
+            self.head = (self.head + 1) % SPOT_RING_CAP;
+            self.len = self.len.saturating_sub(1);
+            self.evictions_since_resync = self.evictions_since_resync.saturating_add(1);
+            popped_any = true;
         }
+        if self.len <= 1 {
+            self.stored_area = 0.0;
+        } else if popped_any && self.evictions_since_resync >= 4_096 {
+            self.resync_stored_area();
+            self.evictions_since_resync = 0;
+        }
+    }
+
+    fn resync_stored_area(&mut self) {
+        let mut area = 0.0_f64;
+        for idx in 0..self.len.saturating_sub(1) {
+            if let (Some(cur), Some(next)) = (self.sample_at(idx), self.sample_at(idx + 1)) {
+                area += cur.price_usd * (next.ts_ms.saturating_sub(cur.ts_ms) as f64);
+            }
+        }
+        self.stored_area = area;
     }
 
     fn coalesce_oldest_pair(&mut self) {
@@ -487,6 +633,10 @@ impl RollingTwapAndVariance {
     fn append_sample(&mut self, sample: SpotSample) {
         if self.len >= SPOT_RING_CAP {
             return;
+        }
+        if let Some(prev) = self.last_sample() {
+            let dt = sample.ts_ms.saturating_sub(prev.ts_ms) as f64;
+            self.stored_area += prev.price_usd * dt;
         }
         let idx = self.slot_idx(self.len);
         if let Some(slot) = self.samples.get_mut(idx) {
@@ -665,6 +815,25 @@ mod tests {
         assert!(burst.sample_len() <= SPOT_RING_CAP);
         let twap = burst.twap_over_window(0, 60_000).unwrap();
         assert_close(twap, expected_weighted / 60_000.0, 1e-6);
+        let twap_fast = burst.twap_60s_fast(60_000).unwrap();
+        assert_close(twap_fast, twap, 1e-9);
+
+        // Incremental terminal tracker across eviction + rollover matches twap_over_window within 1e-9.
+        let mut term_test = RollingTwapAndVariance::new(Station2Config::default()).unwrap();
+        for step in 0_u64..150 {
+            let ts = 220_000 + step * 500; // 220s..294.5s across 240s term_start
+            let px = 90_000.0 + (step as f64) * 1.25;
+            term_test.push_spot(ts, px).unwrap();
+            let out = term_test.evaluate(ts + 100, 300_000, 0.50, None).unwrap();
+            let exact_60s = term_test
+                .twap_over_window((ts + 100).saturating_sub(60_000), ts + 100)
+                .unwrap();
+            assert_close(out.twap_60s_usd.unwrap(), exact_60s, 1e-9);
+            if ts + 100 >= 240_000 {
+                let exact_term = term_test.twap_over_window(240_000, ts + 100).unwrap();
+                assert_close(out.terminal_twap_usd.unwrap(), exact_term, 1e-9);
+            }
+        }
 
         // Out-of-order past timestamp ignored cleanly; non-finite rejected.
         burst.push_spot(100, 1.0).unwrap();
