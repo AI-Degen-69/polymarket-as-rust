@@ -210,18 +210,26 @@ impl RollingTwapAndVariance {
 
     /// Inserts one BTC spot sample, maintaining monotonic ZOH ordering in `[SpotSample; 1024]`.
     pub fn push_spot(&mut self, ts_ms: u64, price_usd: f64) -> Result<(), MathError> {
+        let _ = self.push_spot_accepted(ts_ms, price_usd)?;
+        Ok(())
+    }
+
+    /// Inserts one BTC spot sample, returning `true` if accepted or `false` if timestamp precedes `last`.
+    pub fn push_spot_accepted(&mut self, ts_ms: u64, price_usd: f64) -> Result<bool, MathError> {
         check_pos_finite(price_usd)?;
+        if let Some(last) = self.last_sample()
+            && ts_ms < last.ts_ms
+        {
+            return Ok(false);
+        }
         if self.term_valid && ts_ms <= self.term_last_ts_ms {
             self.term_valid = false;
         }
         if let Some(last) = self.last_sample() {
-            if ts_ms < last.ts_ms {
-                return Ok(());
-            }
             if ts_ms == last.ts_ms {
                 self.overwrite_tail_price(price_usd);
                 self.spot_dirty = true;
-                return Ok(());
+                return Ok(true);
             }
             self.update_spot_vol(last, ts_ms, price_usd);
         }
@@ -234,7 +242,24 @@ impl RollingTwapAndVariance {
         self.last_spot_ts_ms = Some(ts_ms);
         self.last_spot_usd = Some(price_usd);
         self.spot_dirty = true;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Returns passive lead-lag snapshot without consuming or mutating jump triggers.
+    #[must_use]
+    pub const fn peek_lead_lag(&self) -> LeadLagSignal {
+        LeadLagSignal {
+            p_spot_star: self.last_lead_lag.p_spot_star,
+            delta_p_star: 0.0,
+            sigma_binance: self.sigma_binance,
+            trigger_defensive_cancel: false,
+        }
+    }
+
+    /// Clears one-shot jump delta/cancel latch after a skipped/suppressed pipeline evaluation.
+    pub const fn clear_one_shot_lead_lag(&mut self) {
+        self.last_lead_lag.delta_p_star = 0.0;
+        self.last_lead_lag.trigger_defensive_cancel = false;
     }
 
     /// Updates empirical EWMA binary mid-price variance rate (`USD^2/s`).
@@ -341,9 +366,10 @@ impl RollingTwapAndVariance {
         }
         let tau_secs = expiry_ms.saturating_sub(now_ms) as f64 / 1000.0;
         let (sigma_eff_sq, v_rem) = self.compute_variance(tau_secs, p_mid)?;
-        let twap_60s_usd = self.twap_60s_fast(now_ms);
+        // Evaluate terminal tracker before post-expiry eviction if not yet locked at `expiry_ms`.
         let (terminal_window_active, terminal_lock_fraction, terminal_twap_usd) =
             self.update_terminal_tracker(now_ms, expiry_ms);
+        let twap_60s_usd = self.twap_60s_fast(now_ms);
         let lead_lag = self.resolve_lead_lag(strike_usd, tau_secs)?;
 
         Ok(Station2Output {
@@ -397,9 +423,14 @@ impl RollingTwapAndVariance {
         if let Some(spot) = self.last_spot_usd
             && (self.spot_dirty || self.last_strike_usd != strike_usd)
         {
-            return self.compute_lead_lag(spot, strike_usd, tau_secs);
+            let sig = self.compute_lead_lag(spot, strike_usd, tau_secs)?;
+            self.clear_one_shot_lead_lag();
+            return Ok(sig);
         }
-        Ok(self.last_lead_lag)
+        let mut sig = self.last_lead_lag;
+        sig.sigma_binance = self.sigma_binance;
+        self.clear_one_shot_lead_lag();
+        Ok(sig)
     }
 
     fn compute_variance(&self, tau_secs: f64, p_mid: f64) -> Result<(f64, f64), MathError> {
@@ -427,6 +458,11 @@ impl RollingTwapAndVariance {
         let term_start = expiry_ms.saturating_sub(self.config.window_ms);
         if now_ms < term_start {
             return (false, 0.0, None);
+        }
+        if self.term_valid && self.term_expiry_ms == expiry_ms && self.term_last_ts_ms == expiry_ms
+        {
+            let twap = (self.term_total_ms > 0).then(|| self.term_area / self.term_total_ms as f64);
+            return (true, 1.0, twap);
         }
         let span = expiry_ms.saturating_sub(term_start);
         let t_end = now_ms.min(expiry_ms);
@@ -840,5 +876,28 @@ mod tests {
         assert!(burst.last_spot_usd().unwrap() > 80_000.0);
         assert!(burst.push_spot(70_000, f64::NAN).is_err());
         assert!(burst.push_spot(70_000, 0.0).is_err());
+
+        // One-shot lead-lag never stays latched across consecutive silent evaluate() ticks.
+        ll.push_spot(2_000, 90_000.0).unwrap();
+        let _ = ll.evaluate(2_100, 300_000, 0.50, Some(90_000.0)).unwrap();
+        ll.push_spot(3_000, 90_250.0).unwrap();
+        let ev1 = ll.evaluate(3_100, 300_000, 0.50, Some(90_000.0)).unwrap();
+        assert!(ev1.lead_lag.trigger_defensive_cancel);
+        let ev2 = ll.evaluate(3_200, 300_000, 0.50, Some(90_000.0)).unwrap();
+        assert!(!ev2.lead_lag.trigger_defensive_cancel);
+        assert_eq!(ev2.lead_lag.delta_p_star, 0.0);
+
+        // Post-expiry terminal TWAP remains locked even under late or rejected OOO spots.
+        let mut locked = RollingTwapAndVariance::new(Station2Config::default()).unwrap();
+        locked.push_spot(240_000, 90_000.0).unwrap();
+        locked.push_spot(270_000, 90_200.0).unwrap();
+        let at_exp = locked.evaluate(300_000, 300_000, 0.50, None).unwrap();
+        assert_close(at_exp.terminal_twap_usd.unwrap(), 90_100.0, 1e-9);
+        assert!(!locked.push_spot_accepted(250_000, 80_000.0).unwrap());
+        let after_ooo = locked.evaluate(330_200, 300_000, 0.50, None).unwrap();
+        assert_close(after_ooo.terminal_twap_usd.unwrap(), 90_100.0, 1e-9);
+        locked.push_spot(330_000, 95_000.0).unwrap();
+        let after_exp = locked.evaluate(330_100, 300_000, 0.50, None).unwrap();
+        assert_close(after_exp.terminal_twap_usd.unwrap(), 90_100.0, 1e-9);
     }
 }

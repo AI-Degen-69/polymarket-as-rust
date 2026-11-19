@@ -230,7 +230,9 @@ impl MathPipeline {
         strike_usd: Option<f64>,
         expiry_ms: u64,
     ) -> Result<LeadLagSignal, MathError> {
-        self.st2.push_spot(ts_ms, spot_usd)?;
+        if !self.st2.push_spot_accepted(ts_ms, spot_usd)? {
+            return Ok(self.st2.peek_lead_lag());
+        }
         let tau_secs = expiry_ms.saturating_sub(ts_ms) as f64 / 1000.0;
         let sig = self.st2.compute_lead_lag(spot_usd, strike_usd, tau_secs)?;
         if sig.trigger_defensive_cancel {
@@ -262,7 +264,7 @@ impl MathPipeline {
         };
         if input.book_up.is_crossed() || input.book_dn.is_crossed() {
             flags.crossed_book = true;
-            flags.defensive_cancel = std::mem::take(&mut self.pending_defensive_cancel);
+            flags.defensive_cancel = self.take_defensive_cancel();
             return self.suppressed_result(
                 input,
                 None,
@@ -272,6 +274,11 @@ impl MathPipeline {
             );
         }
         self.evaluate_uncrossed(input, flags, eval_t0)
+    }
+
+    fn take_defensive_cancel(&mut self) -> bool {
+        self.st2.clear_one_shot_lead_lag();
+        std::mem::take(&mut self.pending_defensive_cancel)
     }
 
     fn evaluate_uncrossed(
@@ -285,7 +292,7 @@ impl MathPipeline {
             input.book_up.best_ask(),
             input.book_up.raw_mid_usd()?,
         ) else {
-            flags.defensive_cancel = std::mem::take(&mut self.pending_defensive_cancel);
+            flags.defensive_cancel = self.take_defensive_cancel();
             return self.suppressed_result(
                 input,
                 None,
@@ -303,7 +310,7 @@ impl MathPipeline {
         )?;
         let Some(sg_out) = sg_opt else {
             flags.sg_warming_up = true;
-            flags.defensive_cancel = std::mem::take(&mut self.pending_defensive_cancel);
+            flags.defensive_cancel = self.take_defensive_cancel();
             return self.suppressed_with_s1(input, raw_mid, flags, eval_t0, s1_ns);
         };
         flags.sg_clamped_to_bbo = sg_out.clamped_to_bbo;
@@ -337,8 +344,8 @@ impl MathPipeline {
                 .evaluate(input.now_ms, input.expiry_ms, sg_out.s_i, input.strike_usd)?;
         let t3 = clock_ns(&self.clock)?;
         let s2_ns = t3.saturating_sub(t2);
-        flags.defensive_cancel = st2_out.lead_lag.trigger_defensive_cancel
-            || std::mem::take(&mut self.pending_defensive_cancel);
+        let latched = std::mem::take(&mut self.pending_defensive_cancel);
+        flags.defensive_cancel = st2_out.lead_lag.trigger_defensive_cancel || latched;
 
         let kappa_out = self.st3.estimate(input.book_up, sg_out.s_i)?;
         let kappa_pos = FinitePosF64::try_new(kappa_out.kappa)?;
@@ -603,13 +610,34 @@ mod tests {
         let json_val = serde_json::to_value(active).unwrap();
         assert!(json_val["total_compute_ns"].is_u64());
 
-        // Fast-path Binance jump sets defensive_cancel immediately and surfaces on next evaluate().
+        // Fast-path Binance jump sets defensive_cancel once and clears on subsequent silent evaluate().
         let sig = pipe
             .on_binance_spot(100_450, 90_300.0, Some(90_000.0), 300_000)
             .unwrap();
         assert!(sig.trigger_defensive_cancel);
-        let after_jump = pipe.evaluate(&active_in).unwrap();
+        let jump_in = PipelineInput {
+            spot_usd: Some(90_300.0),
+            ..active_in
+        };
+        let after_jump = pipe.evaluate(&jump_in).unwrap();
         assert!(after_jump.flags.defensive_cancel);
+        let second_silent = pipe.evaluate(&jump_in).unwrap();
+        assert!(!second_silent.flags.defensive_cancel);
+        assert_eq!(second_silent.station2.unwrap().lead_lag.delta_p_star, 0.0);
+        assert!(
+            !second_silent
+                .station2
+                .unwrap()
+                .lead_lag
+                .trigger_defensive_cancel
+        );
+
+        // Out-of-order past spot timestamp is rejected cleanly without mutating delta_p_star.
+        let ooo = pipe
+            .on_binance_spot(50_000, 88_000.0, Some(90_000.0), 300_000)
+            .unwrap();
+        assert_eq!(ooo.delta_p_star, 0.0);
+        assert!(!ooo.trigger_defensive_cancel);
 
         // Epoch reset clears SG warmup cleanly.
         pipe.reset_epoch();

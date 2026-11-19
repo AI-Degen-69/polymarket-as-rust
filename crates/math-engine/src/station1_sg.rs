@@ -86,7 +86,8 @@ impl SavitzkyGolayFilter {
         tick_usd: f64,
     ) -> Result<Option<SgOutput>, MathError> {
         validate_sg_inputs(raw_mid, best_bid_usd, best_ask_usd, tick_usd)?;
-        self.push_sample(raw_mid);
+        let clean_mid = if raw_mid == 0.0 { 0.0 } else { raw_mid };
+        self.push_sample(clean_mid);
         if self.count < 5 {
             return Ok(None);
         }
@@ -103,10 +104,10 @@ impl SavitzkyGolayFilter {
             .sum();
         let (lo, hi) = clamp_bounds(best_bid_usd, best_ask_usd, tick_usd);
         let s_i = safe_clamp(sg_unclamped, lo, hi)?;
-        let clamped_to_bbo = (s_i - sg_unclamped).abs() > 1e-12;
+        let clamped_to_bbo = sg_unclamped < lo || sg_unclamped > hi;
 
         Ok(Some(SgOutput {
-            raw_mid,
+            raw_mid: clean_mid,
             sg_unclamped,
             s_i,
             clamped_to_bbo,
@@ -150,6 +151,12 @@ fn validate_sg_inputs(
     if !(0.0..=1.0).contains(&best_ask_usd) {
         return Err(MathError::OutOfRangePrice {
             value: best_ask_usd,
+        });
+    }
+    if best_bid_usd >= best_ask_usd {
+        return Err(MathError::CrossedBook {
+            best_bid_micro: (best_bid_usd * 1_000_000.0).round() as u64,
+            best_ask_micro: (best_ask_usd * 1_000_000.0).round() as u64,
         });
     }
     if tick_usd <= 0.0 || tick_usd >= 0.5 {
@@ -254,5 +261,9 @@ mod tests {
         assert!(filter.push(f64::NAN, 0.49, 0.51, 0.01).is_err());
         assert!(filter.push(0.50, f64::INFINITY, 0.51, 0.01).is_err());
         assert!(filter.push(-0.01, 0.49, 0.51, 0.01).is_err());
+        assert!(matches!(
+            filter.push(0.50, 0.51, 0.50, 0.01),
+            Err(MathError::CrossedBook { .. })
+        ));
     }
 }
