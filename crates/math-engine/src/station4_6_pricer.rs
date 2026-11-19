@@ -324,6 +324,7 @@ fn compute_station6(
     })
 }
 
+#[derive(Default)]
 struct Station6Flags {
     pair_adjusted: bool,
     clamped_up: bool,
@@ -338,13 +339,7 @@ fn apply_pair_and_post_only(
     (bid_up_floored, bid_dn_floored): (Option<MicroUsdc>, Option<MicroUsdc>),
     tick: MicroUsdc,
 ) -> (QuoteOutput, Station6Flags) {
-    let mut flags = Station6Flags {
-        pair_adjusted: false,
-        clamped_up: false,
-        clamped_dn: false,
-        suppressed_up: false,
-        suppressed_dn: false,
-    };
+    let mut flags = Station6Flags::default();
     let (up_paired, dn_paired, violated) = enforce_pair_cost(
         bid_up_floored,
         bid_dn_floored,
