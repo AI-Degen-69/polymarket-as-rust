@@ -13,9 +13,9 @@ use crate::error::FeedError;
 use crate::events::{BinanceSpotEvent, FeedHealthEvent, FeedId, FeedStats};
 use crate::parse::parse_decimal_e8;
 use crate::ws_common::{
-    ConnectStep, HealthThrottle, check_stale_watchdog, connect_ws_bounded, emit_disconnect,
-    emit_health_transition, empty_stats, finalize_stats, now_pair, push_ring_event,
-    record_parse_warning, sleep_until_cancel,
+    ConnectStep, HealthThrottle, check_stale_watchdog, close_ws_bounded, connect_ws_bounded,
+    emit_disconnect, emit_health_transition, empty_stats, finalize_stats, now_pair,
+    push_ring_event, record_parse_warning, sleep_until_cancel,
 };
 
 /// Default Binance Spot combined WebSocket stream URL (`@bookTicker` + `@aggTrade`).
@@ -188,12 +188,12 @@ impl BinanceSpotWsActor {
             let step = tokio::select! {
                 cmd = cmd_rx.recv() => match cmd {
                     None | Some(BinanceWsCommand::Shutdown) => {
-                        let _ = writer.send(Message::Close(None)).await;
+                        close_ws_bounded(writer).await;
                         Some(SessionExit::Shutdown)
                     }
                 },
                 _ = &mut rolling_sleep => {
-                    let _ = writer.send(Message::Close(None)).await;
+                    close_ws_bounded(writer).await;
                     self.emit_disconnect(health_tx, "23h rolling reconnect".to_string()).await?;
                     Some(SessionExit::Reconnect)
                 },
