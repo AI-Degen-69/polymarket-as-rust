@@ -495,13 +495,13 @@ polymarket-as-rust/
 - **PASS/FAIL Criteria:** PASS iff all 4 lifecycle phases, 4 risk tiers, continuous hysteresis, fault-injection breakers, backpressure conflation, and all Phase 0–3 regressions pass with zero deadlocks/panics.
 
 #### Phase 4 GATE CHECKLIST
-- [ ] `rtk cargo fmt --all -- --check` exits 0
-- [ ] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] `rtk cargo test --workspace` exits 0
-- [ ] `poly-as lifecycle --source sim-epoch --fast-forward` and `--inject-fault` tests verified
-- [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
-- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
-- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-4-complete` tag pushed
+- [x] `rtk cargo fmt --all -- --check` exits 0
+- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `rtk cargo test --workspace` exits 0
+- [x] `poly-as lifecycle --source sim-epoch --fast-forward` and `--inject-fault` tests verified
+- [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [x] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-4-complete` tag pushed
 
 ---
 
