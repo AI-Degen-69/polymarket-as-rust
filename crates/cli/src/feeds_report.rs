@@ -1010,6 +1010,14 @@ fn validate_replay_book_snap(
     if book.outcome != outcome {
         return Err("replay BookSnapshot outcome mismatch".into());
     }
+    if book.bids.len() > 10 || book.asks.len() > 10 {
+        return Err(format!(
+            "replay BookSnapshot exceeds 10-level limit (bids={}, asks={})",
+            book.bids.len(),
+            book.asks.len()
+        )
+        .into());
+    }
     FixedBook::<10>::try_from_slices(
         outcome,
         &book.bids,
@@ -1127,5 +1135,25 @@ mod tests {
         let _ = std::fs::remove_file(&non_mono);
         let _ = std::fs::remove_file(&empty);
         let _ = std::fs::remove_file(&unknown);
+    }
+
+    #[test]
+    fn adversarial_replay_rejects_book_snapshot_exceeding_10_levels() {
+        let too_deep = temp_path("over10");
+        let bids = (0..11)
+            .map(|i| {
+                let px = 500_000_u64 - (i as u64) * 10_000;
+                format!(r#"{{"price":{px},"size":1000000}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let line = format!(
+            r#"{{"ts_unix_ms":1,"mono_ns":10,"event":"poly_book","payload":{{"BookSnapshot":{{"outcome":"Up","book":{{"outcome":"Up","bids":[{bids}],"asks":[{{"price":510000,"size":1000000}}],"last_update_ns":10,"exchange_ts_ms":1000}},"rx_mono_ns":10,"exch_ts_ms":1000}}}}}}"#
+        );
+        std::fs::write(&too_deep, line).unwrap();
+        let err = run_replay(&too_deep, None).unwrap_err().to_string();
+        let _ = std::fs::remove_file(&too_deep);
+        assert!(err.contains("exceeds 10-level limit"), "err={err}");
+        assert!(err.contains("bids=11"), "err={err}");
     }
 }
