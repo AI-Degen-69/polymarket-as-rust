@@ -8,6 +8,7 @@ pub mod clob_rest;
 pub mod eip712;
 pub mod error;
 pub mod heartbeat;
+pub mod settlement;
 pub mod user_ws;
 
 pub use auth::{L2Headers, L2HmacSigner, compute_l2_signature, strip_query_string};
@@ -26,6 +27,12 @@ pub use error::ExecutionError;
 pub use heartbeat::{
     DEFAULT_HEARTBEAT_INTERVAL, HeartbeatRequest, HeartbeatResponse, OrderHeartbeatActor,
     execute_shutdown_cancel,
+};
+pub use settlement::{
+    ApprovalState, CTF_ADDRESS, DEFAULT_MIN_BATCH_MICRO, DEFAULT_RELAYER_URL, MergeTarget,
+    PUSD_ADDRESS, ROUTER_ADDRESS, RelayerClient, SettlementConfig, SettlementDecision,
+    SettlementReceipt, SettlementWorker, build_merge_calldata, check_preflight, decide_settlement,
+    merge_target_for_market, min_batch_for_gas, verify_wallet_type,
 };
 pub use user_ws::{
     ClobUserWsActor, DEFAULT_USER_WS_URL, FillReconciler, LegDelta, OrderRegistrySnapshot,
