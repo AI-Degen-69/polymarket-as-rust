@@ -17,8 +17,14 @@ use core_types::MathError;
 
 /// Station 1: Savitzky-Golay 5-point microstructure noise filter.
 pub mod station1_sg;
+/// Station 2: Rolling 60-second ZOH TWAP, variance decay, and cross-venue Binance lead-lag.
+pub mod station2_twap;
 
 pub use station1_sg::{CAUSAL_WEIGHTS, SYMMETRIC_WEIGHTS, SavitzkyGolayFilter, SgOutput};
+pub use station2_twap::{
+    LeadLagSignal, RollingTwapAndVariance, SpotSample, Station2Config, Station2Output, norm_cdf,
+    norm_pdf,
+};
 
 /// Clamps `val` to `[lo, hi]` after verifying all inputs are finite and `lo <= hi`.
 ///
