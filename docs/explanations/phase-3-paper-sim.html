@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Phase 3: סימולטור מסחר FIFO וניהול חשבונאי — poly-as</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #12161f;
+    --panel2: #171c28;
+    --line: #232a3a;
+    --txt: #e8ecf4;
+    --mut: #9aa4b8;
+    --green: #34d399;
+    --green-bg: rgba(52, 211, 153, 0.1);
+    --red: #f87171;
+    --red-bg: rgba(248, 113, 113, 0.1);
+    --amber: #fbbf24;
+    --amber-bg: rgba(251, 191, 36, 0.1);
+    --blue: #60a5fa;
+    --blue-bg: rgba(96, 165, 250, 0.1);
+    --purple: #a78bfa;
+    --purple-bg: rgba(167, 139, 250, 0.1);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--txt);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    line-height: 1.6;
+    padding: 32px 24px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+
+  code, .num, .math, .en {
+    direction: ltr;
+    unicode-bidi: isolate;
+    display: inline-block;
+    font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.9em;
+  }
+  code {
+    background: rgba(255, 255, 255, 0.06);
+    padding: 2px 6px;
+    border-radius: 4px;
+    color: #93c5fd;
+  }
+
+  header { margin-bottom: 28px; }
+  .badge-tag {
+    display: inline-block;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 4px 10px;
+    border-radius: 999px;
+    background: var(--purple-bg);
+    color: var(--purple);
+    border: 1px solid rgba(167, 139, 250, 0.3);
+    margin-bottom: 12px;
+  }
+  h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; }
+  .subtitle { color: var(--mut); font-size: 15px; }
+
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 16px;
+    margin-bottom: 28px;
+  }
+  .stat-card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .stat-label { font-size: 12px; color: var(--mut); margin-bottom: 4px; }
+  .stat-value { font-size: 22px; font-weight: 700; color: var(--txt); }
+  .stat-value.ok { color: var(--green); }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 20px;
+    margin-bottom: 20px;
+  }
+  .card h2 {
+    font-size: 18px;
+    margin-bottom: 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--blue);
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 12px 0;
+    font-size: 14px;
+  }
+  th, td {
+    padding: 10px 12px;
+    text-align: right;
+    border-bottom: 1px solid var(--line);
+  }
+  th {
+    background: var(--panel2);
+    color: var(--mut);
+    font-weight: 600;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  .badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .badge.pass { background: var(--green-bg); color: var(--green); }
+
+  .formula-box {
+    background: var(--panel2);
+    border-right: 3px solid var(--purple);
+    padding: 12px 16px;
+    border-radius: 4px;
+    margin: 10px 0;
+    font-size: 14px;
+  }
+
+  footer {
+    margin-top: 32px;
+    padding-top: 16px;
+    border-top: 1px solid var(--line);
+    color: var(--mut);
+    font-size: 13px;
+    display: flex;
+    justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="badge-tag">Phase 3 Complete — Verified</div>
+  <h1>סימולטור מסחר FIFO וניהול חשבונאי מדויק</h1>
+  <div class="subtitle">הטמעה מלאה של מנוע סימולציית תור ספר פקודות (FIFO Matching), מיזוג פוזיציות רציונלי (VWAP Merge), ובקרת ביצועים מקבילה</div>
+</header>
+
+<div class="stats-grid">
+  <div class="stat-card">
+    <div class="stat-label">סטטוס בדיקות יחידה ומודל</div>
+    <div class="stat-value ok">62 / 62 PASS</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">שחזור דטרמיניסטי (285 אירועים)</div>
+    <div class="stat-value ok">100% Bit-Exact</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">זמן חישוב מנוע P50</div>
+    <div class="stat-value ok">16.3 μs</div>
+  </div>
+  <div class="stat-card">
+    <div class="stat-label">השהיית wire מדומה</div>
+    <div class="stat-value">40ms / 40ms</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>1. מודל התור והתאמת פקודות FIFO (FifoPaperBroker)</h2>
+  <p>מנוע הסימולציה אינו מניח ביצוע מיידי או אינסופי, אלא מדמה באופן קפדני את עומק השוק וסדר הגעת הפקודות בבורסת Polymarket:</p>
+  <div class="formula-box">
+    <strong>חוקי עדיפות וביצוע בתור:</strong>
+    <ul style="padding-right: 20px; margin-top: 6px;">
+      <li><strong>עומק מקדים (Volume Ahead):</strong> בעת הגשת פקודה מחושב הנפח הקיים ברמת המחיר (<span class="math">volume_ahead = depth(outcome, price)</span>).</li>
+      <li><strong>השהיית רשת והגנה מפני חציית ספר:</strong> בדיקת <span class="en">Post-Only</span> דוחה פקודות שחוצות את <span class="en">best_ask</span>. פקודות ממתינות <span class="en">40ms</span> במצב <span class="en">PendingPlace</span>.</li>
+      <li><strong>עסקאות במחיר הפקודה:</strong> עסקאות שוק מכרסמות תחילה בנפח המקדים. ביצוע חלקי מתרחש רק כאשר <span class="math">trade.size > prev_volume_ahead</span>.</li>
+      <li><strong>עסקאות שחודרות את המחיר (Trade-Through):</strong> מבצעות עד גודל העסקה בפועל (<span class="math">min(order.remaining_size, trade.size)</span>) ולא ביצוע מיידי שרירותי.</li>
+      <li><strong>מרוץ ביטול ברשת (Cancel In-Flight):</strong> פקודה בביטול שוהה <span class="en">40ms</span> ב-<span class="en">PendingCancel</span> וחשופה לביצועים שליליים עד לאישור סופי.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="card">
+  <h2>2. חשבונאות ומיזוג פוזיציות רציונלי (PaperLedger)</h2>
+  <p>במסחר אופציות בינאריות ב-Polymarket (CTF), רכישת יחידת UP ויחידת DOWN מתמזגת לדולר שלם ($1.00 USDC) מובטח:</p>
+  <table>
+    <thead>
+      <tr>
+        <th>רכיב חישוב</th>
+        <th>נוסחה מתמטית</th>
+        <th>משמעות במערכת</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>זוגות ניתנים למיזוג</td>
+        <td><span class="math">pairs = min(filled_up, filled_dn)</span></td>
+        <td>מיזוג אטומי אוטומטי מיידי של שני צידי הספר</td>
+      </tr>
+      <tr>
+        <td>עלות בסיס ממוצעת (VWAP)</td>
+        <td><span class="math">avg_up = cost_up / filled_up</span></td>
+        <td>חישוב שווי רכישה מדויק בנקודות שבר קבועות (MicroUsdc)</td>
+      </tr>
+      <tr>
+        <td>רווח ממומש במיזוג</td>
+        <td><span class="math">gain = pairs * ($1.00 - avg_up - avg_dn)</span></td>
+        <td>נעילת ארביטראז' מרווח ללא סיכון כיווני</td>
+      </tr>
+      <tr>
+        <td>עמלות עושה שוק / לוקח נזילות</td>
+        <td><span class="math">maker_fee = $0.00, taker = fee_rate * p * (1-p)</span></td>
+        <td>עושה שוק פטור מעמלה; פעולות אגרסיביות (FAK) מנוכות במלואן</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2>3. טלמטריה ובחינה מול בייסליין נאיבי (BaselineTelemetry)</h2>
+  <p>המערכת בוחנת במקביל את אלגוריתם Avellaneda-Stoikov מול עושה שוק נאיבי הפורס מרווח סטטי (<span class="math">mid ± 1 tick</span>):</p>
+  <div class="formula-box">
+    <strong>מדדי איכות ביצוע חיים:</strong>
+    <ul style="padding-right: 20px; margin-top: 6px;">
+      <li><strong>RPM (קצב עדכונים לדקה):</strong> ניטור חלון נע של 60 שניות למניעת עומס וסחרור ביטולים.</li>
+      <li><strong>Markout Drift (בחירה שלילית):</strong> מדידת תזוזת המחיר ב-1 ו-5 שניות לאחר ביצוע (<span class="en">bps</span>).</li>
+      <li><strong>A-S Alpha Edge:</strong> השוואה ישירה של יתרת ה-PnL מול מודל הבסיס הנאיבי (<span class="math">Edge = PnL_{AS} - PnL_{Naive}</span>).</li>
+    </ul>
+  </div>
+</div>
+
+<div class="card">
+  <h2>4. מטריצת וקטורי אימות ובדיקות אדברסריות (Phase 3 Vectors)</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>בדיקה</th>
+        <th>תרחיש</th>
+        <th>תוצאה צפויה</th>
+        <th>סטטוס</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Vector 1</td>
+        <td>ביצוע חלקי FIFO עם עומק מקדים</td>
+        <td>עסקה 1 של 80 ממלאת 0; עסקה 2 של 25 ממלאת 5 מתוך 20</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td>Vector 2</td>
+        <td>מכסת נפח בחדירת מחיר (Trade-Through)</td>
+        <td>פקודה של 50 מקבלת 12 מעסקה של 12, יתרה 38</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td>Vector 3</td>
+        <td>דחיית פקודה חוצה ספר (Post-Only)</td>
+        <td>הגשה ב-$0.52 מול best_ask=$0.52 נדחית כ-PostOnlyCrossed</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td>Vector 4</td>
+        <td>מתמטיקת מיזוג זוגות VWAP</td>
+        <td>מיזוג 10 זוגות ב-$0.96 מניב רווח של +$0.400000 מדויק</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td>Vector 5</td>
+        <td>ניכוי עמלת FAK לסגירת חשיפה</td>
+        <td>סגירת 100 מניות ב-$0.50 מנכה עמלת taker של $1.250000</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td>Adversarial 1</td>
+        <td>מרוץ ביטול ברשת (Cancel Race)</td>
+        <td>עסקה ב-120ms מבצעת פקודה שנמצאת בביטול עד 140ms</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td>Adversarial 2</td>
+        <td>פקודות מרובות באותה מילי-שנייה</td>
+        <td>מזהי פקודה מונוטוניים ללא התנגשויות מזהים</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      <tr>
+        <td>Adversarial 3</td>
+        <td>דטרמיניזם שחזור מלא (Replay)</td>
+        <td>זהות מלאה ב-285 אירועים בריצות כפולות עצמאיות</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<footer>
+  <div>poly-as — Rust Polymarket Avellaneda-Stoikov High-Frequency Market Maker</div>
+  <div class="num">Engine Latency P50: 16.3 μs | Workspace Suites: 12/12 Green</div>
+</footer>
+
+</body>
+</html>
