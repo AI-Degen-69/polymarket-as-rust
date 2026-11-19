@@ -7,6 +7,7 @@ pub mod auth;
 pub mod clob_rest;
 pub mod eip712;
 pub mod error;
+pub mod heartbeat;
 
 pub use auth::{L2Headers, L2HmacSigner, compute_l2_signature, strip_query_string};
 pub use clob_rest::{
@@ -21,3 +22,7 @@ pub use eip712::{
     TYPED_DATA_SIGN_TYPE_STRING, generate_salt,
 };
 pub use error::ExecutionError;
+pub use heartbeat::{
+    DEFAULT_HEARTBEAT_INTERVAL, HeartbeatRequest, HeartbeatResponse, OrderHeartbeatActor,
+    execute_shutdown_cancel,
+};
