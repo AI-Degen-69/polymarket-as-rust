@@ -591,14 +591,14 @@ polymarket-as-rust/
 - **PASS/FAIL Criteria:** PASS iff all signing, HMAC, heartbeat recovery, maker-fill accounting, mock CLOB error handling, secret-redaction, release build, and workspace regression checks pass with `tau_3 < 80 us` and zero CRITICAL/HIGH reviewer findings.
 
 #### Phase 5 GATE CHECKLIST
-- [ ] `rtk cargo fmt --all -- --check` exits 0
-- [ ] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] `rtk cargo test --workspace` exits 0
-- [ ] `rtk cargo build --release` exits 0
-- [ ] `poly-as exec --mode dry-run --duration 60s` verified (`tau_3 < 80 us`, 0 leaked secrets, valid JSONL)
-- [ ] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
-- [ ] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
-- [ ] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-5-complete` tag pushed
+- [x] `rtk cargo fmt --all -- --check` exits 0
+- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `rtk cargo test --workspace` exits 0
+- [x] `rtk cargo build --release` exits 0
+- [x] `poly-as exec --mode dry-run --duration 60s` verified (`tau_3 < 80 us`, 0 leaked secrets, valid JSONL)
+- [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
+- [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
+- [x] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-5-complete` tag pushed (GitGuardian test-fixture finding dismissed by operator as false positive; HEAD secret-clean)
 
 ---
 
