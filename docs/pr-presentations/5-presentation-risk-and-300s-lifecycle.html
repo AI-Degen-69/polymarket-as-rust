@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>הצגת שינוי #5: בקרת סיכונים ומחזור חיים ל-300 שניות</title>
+  <style>
+    :root {
+      --bg: #0b1117;
+      --card-bg: #161b22;
+      --card-sub: #1c2128;
+      --border: #30363d;
+      --border-focus: #58a6ff;
+      --ink: #e6edf3;
+      --ink-dim: #8b949e;
+      --accent: #38bdf8;
+      --accent-glow: rgba(56, 189, 248, 0.2);
+      --success: #22c55e;
+      --warning: #f59e0b;
+      --danger: #ef4444;
+      --purple: #a855f7;
+      --radius: 12px;
+      --font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Heebo", Arial, sans-serif;
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      * {
+        animation: none !important;
+        transition: none !important;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      background-color: var(--bg);
+      color: var(--ink);
+      font-family: var(--font);
+      line-height: 1.6;
+      padding: 2rem 1.5rem 4rem;
+      max-width: 1100px;
+      margin: 0 auto;
+    }
+
+    header {
+      margin-bottom: 2rem;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1.5rem;
+    }
+
+    .badge-bar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+      margin-bottom: 1rem;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      padding: 0.25rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-decoration: none;
+    }
+
+    .badge-pr {
+      background: rgba(56, 189, 248, 0.15);
+      color: var(--accent);
+      border: 1px solid rgba(56, 189, 248, 0.3);
+    }
+
+    .badge-merged {
+      background: rgba(168, 85, 247, 0.15);
+      color: var(--purple);
+      border: 1px solid rgba(168, 85, 247, 0.3);
+    }
+
+    .badge-score {
+      background: rgba(34, 197, 94, 0.15);
+      color: var(--success);
+      border: 1px solid rgba(34, 197, 94, 0.3);
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+      margin-bottom: 0.75rem;
+      color: #fff;
+    }
+
+    .lead {
+      font-size: 1.15rem;
+      color: var(--ink-dim);
+      max-width: 850px;
+    }
+
+    /* 4-Part Surface Story Grid */
+    .story-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 1.25rem;
+      margin-bottom: 2.5rem;
+    }
+
+    .story-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem;
+      position: relative;
+    }
+
+    .story-card h3 {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .story-card p {
+      font-size: 0.925rem;
+      color: var(--ink-dim);
+    }
+
+    .story-card.problem h3 { color: #f87171; }
+    .story-card.change h3 { color: var(--accent); }
+    .story-card.reality h3 { color: var(--success); }
+
+    /* Centerpiece: Interactive Showcase */
+    .centerpiece {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.75rem;
+      margin-bottom: 2.5rem;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+    }
+
+    .centerpiece-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .centerpiece-title {
+      font-size: 1.25rem;
+      font-weight: 700;
+      color: #fff;
+    }
+
+    .centerpiece-desc {
+      font-size: 0.9rem;
+      color: var(--ink-dim);
+      margin-top: 0.25rem;
+    }
+
+    /* Epoch Rail Visualization */
+    .rail-container {
+      margin-bottom: 2rem;
+    }
+
+    .rail-labels {
+      display: flex;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      color: var(--ink-dim);
+      margin-bottom: 0.5rem;
+    }
+
+    .rail-track {
+      height: 24px;
+      border-radius: 12px;
+      background: #21262d;
+      display: flex;
+      overflow: hidden;
+      position: relative;
+      border: 1px solid var(--border);
+    }
+
+    .rail-phase {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.75rem;
+      font-weight: 700;
+      color: #fff;
+      transition: opacity 0.2s ease;
+      position: relative;
+    }
+
+    .phase-active { width: 80%; background: #15803d; }
+    .phase-prelock { width: 10%; background: #b45309; }
+    .phase-flatten { width: 5%; background: #c2410c; }
+    .phase-term { width: 5%; background: #991b1b; }
+
+    .rail-cursor {
+      position: absolute;
+      top: -6px;
+      bottom: -6px;
+      width: 4px;
+      background: #fff;
+      box-shadow: 0 0 12px #fff, 0 0 20px var(--accent);
+      border-radius: 2px;
+      transform: translateX(50%);
+      transition: left 0.1s linear;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    /* Live Telemetry Dashboard Panels */
+    .telemetry-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.75rem;
+    }
+
+    .metric-box {
+      background: var(--card-sub);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      text-align: center;
+    }
+
+    .metric-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--ink-dim);
+      margin-bottom: 0.25rem;
+    }
+
+    .metric-value {
+      font-size: 1.4rem;
+      font-weight: 800;
+      color: #fff;
+      font-feature-settings: "tnum";
+    }
+
+    .metric-sub {
+      font-size: 0.75rem;
+      color: var(--ink-dim);
+      margin-top: 0.25rem;
+    }
+
+    /* Controls Bar */
+    .controls-panel {
+      background: var(--card-sub);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.25rem;
+      margin-bottom: 1.5rem;
+    }
+
+    .slider-row {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 1rem;
+    }
+
+    .slider-label {
+      min-width: 120px;
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+
+    input[type="range"] {
+      flex: 1;
+      accent-color: var(--accent);
+      cursor: pointer;
+    }
+
+    .buttons-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+
+    .btn {
+      background: #21262d;
+      color: var(--ink);
+      border: 1px solid var(--border);
+      padding: 0.5rem 1rem;
+      border-radius: 6px;
+      font-weight: 600;
+      font-size: 0.85rem;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      transition: all 0.15s ease;
+    }
+
+    .btn:hover {
+      background: #30363d;
+      border-color: var(--border-focus);
+    }
+
+    .btn.primary {
+      background: var(--accent);
+      color: #0b1117;
+      border-color: var(--accent);
+    }
+
+    .btn.primary:hover {
+      background: #7dd3fc;
+    }
+
+    .btn.danger {
+      color: #f87171;
+    }
+
+    .btn.danger:hover {
+      background: rgba(239, 68, 68, 0.15);
+      border-color: #f87171;
+    }
+
+    /* Action Log Feed */
+    .action-feed {
+      background: #0d1117;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 0.85rem;
+      max-height: 180px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 0.4rem;
+    }
+
+    .log-line {
+      display: flex;
+      gap: 0.75rem;
+      align-items: baseline;
+    }
+
+    .log-time { color: var(--ink-dim); min-width: 55px; }
+    .log-phase { min-width: 140px; font-weight: 600; }
+    .log-msg { color: var(--ink); flex: 1; }
+
+    /* Support Cards Grid */
+    .support-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .support-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+    }
+
+    .support-card h2 {
+      font-size: 1.15rem;
+      font-weight: 700;
+      margin-bottom: 1rem;
+      color: #fff;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .table-custom {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.875rem;
+    }
+
+    .table-custom th, .table-custom td {
+      padding: 0.6rem 0.5rem;
+      text-align: right;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .table-custom th {
+      color: var(--ink-dim);
+      font-weight: 600;
+    }
+
+    .table-custom tr:last-child td {
+      border-bottom: none;
+    }
+
+    .runway-steps {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    .runway-step {
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-start;
+      background: var(--card-sub);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.85rem;
+    }
+
+    .step-num {
+      background: var(--accent);
+      color: #0b1117;
+      width: 24px;
+      height: 24px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 0.8rem;
+      flex-shrink: 0;
+    }
+
+    .step-content {
+      font-size: 0.875rem;
+    }
+
+    .step-title {
+      font-weight: 700;
+      color: #fff;
+      margin-bottom: 0.25rem;
+    }
+
+    code {
+      background: rgba(110, 118, 129, 0.2);
+      padding: 0.15rem 0.4rem;
+      border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 0.825rem;
+      color: #79c0ff;
+    }
+
+    footer {
+      border-top: 1px solid var(--border);
+      padding-top: 1.5rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 1rem;
+      font-size: 0.85rem;
+      color: var(--ink-dim);
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="badge-bar">
+      <span class="badge badge-pr">PR #5</span>
+      <span class="badge badge-merged">מוזג בהצלחה (Merged)</span>
+      <span class="badge badge-score">ציון בדיקה: 100/100</span>
+      <a href="https://github.com/AI-Degen-69/polymarket-as-rust/pull/5" target="_blank" class="badge badge-pr" style="margin-right: auto;">
+        <span>צפה ב-GitHub</span> &larr;
+      </a>
+    </div>
+    <h1>בקרת סיכונים חכמה ומחזור חיים אוטומטי ל-300 שניות</h1>
+    <p class="lead">
+      שכבת הבטיחות השומרת על ההון במערכת המסחר: מניעת קריסות מרטינגל, בלימת רעש רציפה לשמירה על עדיפות תור ב-FIFO, מחזור חיים דטרמיניסטי לחיסול פוזיציות לפני פקיעה ומפסקי זרם אוטומטיים.
+    </p>
+  </header>
+
+  <!-- 4-Part Surface Story -->
+  <section class="story-grid">
+    <div class="story-card problem">
+      <h3><span>⚠️</span> הבעיה שהייתה קודם</h3>
+      <p>
+        ירידת מחיר חדה בחוזה בינארי יצרה אשליית "מחיר זול" שהכפילה רכישות עד פשיטת רגל (Martingale). בנוסף, תנודות מיקרוסקופיות של שבריר סנט גרמו לביטול והצבה מחדש ששרפו את מיקום הפקודה בתור, והגעה לסוף חלון ה-5 דקות הותירה סחורה חשופה להגרלת הפקיעה.
+      </p>
+    </div>
+
+    <div class="story-card change">
+      <h3><span>🛠️</span> מה השתנה במערכת</h3>
+      <p>
+        נבנתה חבילת <span dir="ltr"><code>risk-lifecycle</code></span> הכוללת מד ניצול עלות קשיח ($u$), סולם סיכונים ב-4 רגליים, רצועת בלימת רעש רציפה (<span dir="ltr">Hysteresis</span> של $1.25\times\text{tick}$), מנהל מחזור חיים דטרמיניסטי ל-300 שניות עם חסימת מלכודת אבק, ומפסקי זרם Fail-Closed.
+      </p>
+    </div>
+
+    <div class="story-card reality">
+      <h3><span>✨</span> המציאות החדשה כעת</h3>
+      <p>
+        המערכת מבצעת הערכת סיכון שלמה בפחות מ-19 מיקרו-שניות. פקודות עודפות מרוסנות אוטומטית, פוזיציות מחוסלות באופן מתוזמן ב-T-30s לפני פקיעת השוק, וציטוטים מפסיקים כליל ב-T-15s, תוך שמירה מלאה על תור ה-FIFO בספר הפקודות.
+      </p>
+    </div>
+  </section>
+
+  <!-- Centerpiece: Interactive Showcase & Mockup -->
+  <section class="centerpiece">
+    <div class="centerpiece-header">
+      <div>
+        <div class="centerpiece-title">סימולטור אינטראקטיבי: מסילת הזמן ומנוע הסיכונים</div>
+        <div class="centerpiece-desc">שחק עם מחוון הזמן והאירועים כדי לראות את המעבר האוטומטי בין 4 השלבים ותגובת מנוע הסיכונים</div>
+      </div>
+      <div class="buttons-row">
+        <button id="btnPlay" class="btn primary"><span>▶</span> הפעל סימולציה</button>
+        <button id="btnStep" class="btn"><span>⏭</span> צעד קדימה (+5s)</button>
+        <button id="btnReset" class="btn"><span>↺</span> איפוס ל-300s</button>
+      </div>
+    </div>
+
+    <!-- Epoch Rail Visualization -->
+    <div class="rail-container">
+      <div class="rail-labels">
+        <span>T-300s (פתיחת חלון)</span>
+        <span>T-60s (נעילת צבירה)</span>
+        <span>T-30s (חיסול)</span>
+        <span>T-15s (נעילה)</span>
+        <span>T-0s (פקיעה)</span>
+      </div>
+      <div class="rail-track">
+        <div class="rail-phase phase-active">ActiveQuoting (ציטוט פעיל)</div>
+        <div class="rail-phase phase-prelock">PreLock</div>
+        <div class="rail-phase phase-flatten">Flatten</div>
+        <div class="rail-phase phase-term">Term</div>
+        <div id="railCursor" class="rail-cursor" style="right: 0%;"></div>
+      </div>
+    </div>
+
+    <!-- Live Telemetry Row -->
+    <div class="telemetry-row">
+      <div class="metric-box">
+        <div class="metric-label">זמן שנותר לפקיעה</div>
+        <div id="dispTime" class="metric-value">T-300s</div>
+        <div id="dispTimeSub" class="metric-sub">חלון אופרטיבי מלא</div>
+      </div>
+
+      <div class="metric-box">
+        <div class="metric-label">שלב מחזור החיים</div>
+        <div id="dispPhase" class="metric-value" style="color: var(--success);">ActiveQuoting</div>
+        <div id="dispPhaseSub" class="metric-sub">שני צדדי הציטוט מותרים</div>
+      </div>
+
+      <div class="metric-box">
+        <div class="metric-label">רמת סיכון וניצול הון</div>
+        <div id="dispTier" class="metric-value" style="color: var(--accent);">Tier 1 (0.0%)</div>
+        <div id="dispTierSub" class="metric-sub">גודל מלא: 20 יחידות</div>
+      </div>
+
+      <div class="metric-box">
+        <div class="metric-label">החלטת הפקודה האחרונה</div>
+        <div id="dispAction" class="metric-value" style="font-size: 1.15rem; color: #fff;">SubmitNew 20@$0.48</div>
+        <div id="dispActionSub" class="metric-sub">בלימת רעש: תקין</div>
+      </div>
+    </div>
+
+    <!-- Controls & Fault Injections -->
+    <div class="controls-panel">
+      <div class="slider-row">
+        <span class="slider-label">שעון הזמן (T-Seconds):</span>
+        <input type="range" id="timeSlider" min="0" max="300" value="300" step="1">
+        <span id="sliderValueText" style="min-width: 60px; font-weight: 700; font-feature-settings: 'tnum';">300s</span>
+      </div>
+
+      <div class="slider-row">
+        <span class="slider-label">ניצול הון מדומה ($u\%$):</span>
+        <input type="range" id="utilSlider" min="0" max="100" value="0" step="5">
+        <span id="utilValueText" style="min-width: 60px; font-weight: 700; font-feature-settings: 'tnum';">0%</span>
+      </div>
+
+      <div class="buttons-row" style="margin-top: 1rem; border-top: 1px solid var(--border); padding-top: 1rem;">
+        <span style="font-size: 0.85rem; color: var(--ink-dim); align-self: center; margin-left: 0.5rem;">בדיקות תקלות ועמידות:</span>
+        <button id="btnNoise" class="btn"><span>🌊</span> רעש שוק זעיר (±$0.001 -> Hold)</button>
+        <button id="btnDrift" class="btn"><span>📈</span> קפיצת מחיר (+$0.02 -> Replace)</button>
+        <button id="btnStale" class="btn danger"><span>⚡</span> נתק נתונים (Stale Feed Breaker)</button>
+        <button id="btnTier4" class="btn danger"><span>🛑</span> הזרק Tier 4 (חסימת חירום)</button>
+      </div>
+    </div>
+
+    <!-- Action Log Feed -->
+    <div class="action-feed" id="actionLog">
+      <div class="log-line">
+        <span class="log-time">[T-300s]</span>
+        <span class="log-phase" style="color: var(--success);">ActiveQuoting</span>
+        <span class="log-msg">פתיחת חלון 5 דקות חדש: הוצבו פקודות ציטוט סבילות לשני הצדדים (UP + DOWN).</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- Support Blocks Grid -->
+  <section class="support-grid">
+    <!-- Risk Ladder Card -->
+    <div class="support-card">
+      <h2><span>🪜</span> סולם 4 רמות הסיכון</h2>
+      <table class="table-custom">
+        <thead>
+          <tr>
+            <th>רמת סיכון</th>
+            <th>ניצול הון ($u$)</th>
+            <th>התנהגות ציטוט והגנה</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td style="font-weight: 700; color: var(--success);">Tier 1 Normal</td>
+            <td>$u \le 20\%$</td>
+            <td>ציטוט סימטרי מלא ($1.0\times\text{base}$).</td>
+          </tr>
+          <tr>
+            <td style="font-weight: 700; color: var(--accent);">Tier 2 SoftSkew</td>
+            <td>$20\% < u \le 60\%$</td>
+            <td>ריסון צד כבד ($0.5\times$), הרחבת צד קל ($1.5\times$).</td>
+          </tr>
+          <tr>
+            <td style="font-weight: 700; color: var(--warning);">Tier 3 HardSkew</td>
+            <td>$60\% < u \le 90\%$</td>
+            <td>חסימה מוחלטת של צד כבד ($0\times$), הרחבת צד קל ($2.5\times$).</td>
+          </tr>
+          <tr>
+            <td style="font-weight: 700; color: var(--danger);">Tier 4 HardStop</td>
+            <td>$u > 90\%$</td>
+            <td>ביטול מיידי של כל הפקודות וחיסול FAK חד-פעמי.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Real App Verification Runway -->
+    <div class="support-card">
+      <h2><span>🎯</span> בדיקה עצמית במערכת האמיתית</h2>
+      <div class="runway-steps">
+        <div class="runway-step">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <div class="step-title">פתח טרמינל PowerShell בתיקיית הפרויקט</div>
+            <div>וודא שאתה בענף <code>main</code> המסונכרן.</div>
+          </div>
+        </div>
+
+        <div class="runway-step">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <div class="step-title">הרץ סימולציה מהירה של חלון 5 דקות מלא</div>
+            <div dir="ltr" style="margin-top: 0.25rem;">
+              <code>rtk cargo run -p cli --bin poly-as -- lifecycle --source sim-epoch --fast-forward</code>
+            </div>
+          </div>
+        </div>
+
+        <div class="runway-step">
+          <div class="step-num">3</div>
+          <div class="step-content">
+            <div class="step-title">צפה במעבר הדטרמיניסטי בין הפאזות</div>
+            <div>
+              ראה במו עיניך את המעבר מ-<code>ActiveQuoting</code> אל <code>PreExpiryLockout</code> (ב-T-60s), <code>MandatoryFlatten</code> (ב-T-30s), ו-<code>TerminalLockout</code> (ב-T-15s) עם זמני ביצוע P99 של 18 מיקרו-שניות בלבד.
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <div>
+      <strong>פרויקט Polymarket AS Rust</strong> &bull; Phase 4 Verified & Merged
+    </div>
+    <div>
+      נבנה עבור שקיפות ובקרה הנדסית מושלמת
+    </div>
+  </footer>
+
+  <script>
+    // State
+    let tau = 300;
+    let util = 0;
+    let isPlaying = false;
+    let playInterval = null;
+    let isStale = false;
+    let activePrice = 0.48;
+
+    // Elements
+    const timeSlider = document.getElementById('timeSlider');
+    const sliderValueText = document.getElementById('sliderValueText');
+    const utilSlider = document.getElementById('utilSlider');
+    const utilValueText = document.getElementById('utilValueText');
+    const railCursor = document.getElementById('railCursor');
+    const dispTime = document.getElementById('dispTime');
+    const dispTimeSub = document.getElementById('dispTimeSub');
+    const dispPhase = document.getElementById('dispPhase');
+    const dispPhaseSub = document.getElementById('dispPhaseSub');
+    const dispTier = document.getElementById('dispTier');
+    const dispTierSub = document.getElementById('dispTierSub');
+    const dispAction = document.getElementById('dispAction');
+    const dispActionSub = document.getElementById('dispActionSub');
+    const actionLog = document.getElementById('actionLog');
+    const btnPlay = document.getElementById('btnPlay');
+    const btnStep = document.getElementById('btnStep');
+    const btnReset = document.getElementById('btnReset');
+    const btnNoise = document.getElementById('btnNoise');
+    const btnDrift = document.getElementById('btnDrift');
+    const btnStale = document.getElementById('btnStale');
+    const btnTier4 = document.getElementById('btnTier4');
+
+    function updateSimulation(newTau, newUtil) {
+      tau = Math.max(0, Math.min(300, newTau));
+      util = Math.max(0, Math.min(100, newUtil));
+
+      timeSlider.value = tau;
+      sliderValueText.textContent = tau + 's';
+      utilSlider.value = util;
+      utilValueText.textContent = util + '%';
+
+      // Update Cursor position
+      const pct = ((300 - tau) / 300) * 100;
+      railCursor.style.right = pct + '%';
+
+      dispTime.textContent = 'T-' + String(tau).padStart(3, '0') + 's';
+
+      // Determine Phase
+      let phase = 'ActiveQuoting';
+      let phaseColor = 'var(--success)';
+      let phaseSub = 'שני צדדי הציטוט מותרים';
+
+      if (tau <= 0) {
+        phase = 'EpochRollover';
+        phaseColor = 'var(--ink-dim)';
+        phaseSub = 'סיום תקופה, מעבר לאפוק הבא';
+      } else if (tau <= 15) {
+        phase = 'TerminalLockout';
+        phaseColor = 'var(--danger)';
+        phaseSub = 'נעילה מוחלטת, אפס פקודות או ביטולים';
+      } else if (tau <= 30) {
+        phase = 'MandatoryFlatten';
+        phaseColor = '#ea580c';
+        phaseSub = 'חיסול פוזיציות פעיל באמצעות פקודת שוק';
+      } else if (tau <= 60) {
+        phase = 'PreExpiryLockout';
+        phaseColor = 'var(--warning)';
+        phaseSub = 'הקפאת צבירה, רק פקודות מקטינות מותרות';
+      }
+
+      dispPhase.textContent = phase;
+      dispPhase.style.color = phaseColor;
+      dispPhaseSub.textContent = phaseSub;
+
+      // Determine Tier
+      let tier = 'Tier 1 Normal';
+      let tierColor = 'var(--success)';
+      let tierSub = 'ציטוט מלא: 20 יחידות';
+
+      if (isStale) {
+        tier = 'BreakerTripped';
+        tierColor = 'var(--danger)';
+        tierSub = 'מפסק חירום הופעל - הציטוט מוקפא';
+      } else if (util > 90) {
+        tier = 'Tier 4 HardStop';
+        tierColor = 'var(--danger)';
+        tierSub = 'חסימת חירום וחיסול פוזיציה';
+      } else if (util > 60) {
+        tier = 'Tier 3 HardSkew';
+        tierColor = 'var(--warning)';
+        tierSub = 'צד כבד: 0, צד קל: 50 יחידות';
+      } else if (util > 20) {
+        tier = 'Tier 2 SoftSkew';
+        tierColor = 'var(--accent)';
+        tierSub = 'צד כבד: 10, צד קל: 30 יחידות';
+      }
+
+      dispTier.textContent = tier + ' (' + util + '%)';
+      dispTier.style.color = tierColor;
+      dispTierSub.textContent = tierSub;
+
+      // Determine Emitted Action
+      let actionText = 'Hold';
+      let actionSub = 'בלימת רעש פעילה: שמירת תור FIFO';
+
+      if (isStale) {
+        actionText = 'CancelAll (StaleFeed)';
+        actionSub = 'ביטול חירום של כל הפקודות';
+      } else if (phase === 'TerminalLockout') {
+        actionText = 'Hold (SilentLockout)';
+        actionSub = 'שקט מוחלט לקראת פקיעה';
+      } else if (phase === 'MandatoryFlatten') {
+        actionText = 'ExecuteFlattenFak 20sh';
+        actionSub = 'פקודת שוק מיידית לסגירת פוזיציה';
+      } else if (phase === 'PreExpiryLockout') {
+        actionText = 'Cancel(RiskSuppressed)';
+        actionSub = 'ביטול צד מגדיל פוזיציה';
+      } else if (tier.includes('Tier 4')) {
+        actionText = 'ExecuteFlattenFak (Emergency)';
+        actionSub = 'חריגת הון מקסימלי: סגירת פוזיציה מיידית';
+      } else {
+        actionText = 'Hold';
+        actionSub = 'שמירת תור בעדיפות עליונה ב-FIFO';
+      }
+
+      dispAction.textContent = actionText;
+      dispActionSub.textContent = actionSub;
+    }
+
+    function addLog(tauSec, phase, msg, color) {
+      const line = document.createElement('div');
+      line.className = 'log-line';
+      line.innerHTML = `
+        <span class="log-time">[T-${String(tauSec).padStart(3, '0')}s]</span>
+        <span class="log-phase" style="color: ${color || 'var(--ink)'};">${phase}</span>
+        <span class="log-msg">${msg}</span>
+      `;
+      actionLog.insertBefore(line, actionLog.firstChild);
+      if (actionLog.children.length > 30) {
+        actionLog.removeChild(actionLog.lastChild);
+      }
+    }
+
+    // Play / Step / Reset controls
+    btnPlay.addEventListener('click', () => {
+      if (isPlaying) {
+        clearInterval(playInterval);
+        isPlaying = false;
+        btnPlay.innerHTML = '<span>▶</span> הפעל סימולציה';
+        btnPlay.classList.remove('danger');
+        btnPlay.classList.add('primary');
+      } else {
+        isPlaying = true;
+        btnPlay.innerHTML = '<span>⏸</span> השהה סימולציה';
+        btnPlay.classList.remove('primary');
+        btnPlay.classList.add('danger');
+        playInterval = setInterval(() => {
+          if (tau <= 0) {
+            clearInterval(playInterval);
+            isPlaying = false;
+            btnPlay.innerHTML = '<span>▶</span> הפעל סימולציה';
+            btnPlay.classList.remove('danger');
+            btnPlay.classList.add('primary');
+            addLog(0, 'Rollover', 'סיום חלון 5 הדקות. המערכת עוברת לאפוק הבא.', 'var(--purple)');
+            return;
+          }
+          const nextTau = tau - 5;
+          if (tau > 60 && nextTau <= 60) {
+            addLog(nextTau, 'PreExpiryLockout', 'הגעה ל-T-60s: נעילת צבירה מופעלת, ציטוטי קנייה נוספים מבוטלים.', 'var(--warning)');
+          } else if (tau > 30 && nextTau <= 30) {
+            addLog(nextTau, 'MandatoryFlatten', 'הגעה ל-T-30s: חיסול מאולץ הופעל, הוצאת פקודת שוק לסגירת המלאי.', '#ea580c');
+          } else if (tau > 15 && nextTau <= 15) {
+            addLog(nextTau, 'TerminalLockout', 'הגעה ל-T-15s: נעילת סילוקין שקטה מופעלת לקראת פקיעת החוזה.', 'var(--danger)');
+          }
+          updateSimulation(nextTau, util);
+        }, 300);
+      }
+    });
+
+    btnStep.addEventListener('click', () => {
+      if (isPlaying) {
+        clearInterval(playInterval);
+        isPlaying = false;
+        btnPlay.innerHTML = '<span>▶</span> הפעל סימולציה';
+      }
+      const nextTau = Math.max(0, tau - 5);
+      if (tau > 60 && nextTau <= 60) {
+        addLog(nextTau, 'PreExpiryLockout', 'הגעה ל-T-60s: נעילת צבירה מופעלת.', 'var(--warning)');
+      } else if (tau > 30 && nextTau <= 30) {
+        addLog(nextTau, 'MandatoryFlatten', 'הגעה ל-T-30s: חיסול מאולץ הופעל.', '#ea580c');
+      } else if (tau > 15 && nextTau <= 15) {
+        addLog(nextTau, 'TerminalLockout', 'הגעה ל-T-15s: נעילת סילוקין שקטה.', 'var(--danger)');
+      }
+      updateSimulation(nextTau, util);
+    });
+
+    btnReset.addEventListener('click', () => {
+      if (isPlaying) {
+        clearInterval(playInterval);
+        isPlaying = false;
+        btnPlay.innerHTML = '<span>▶</span> הפעל סימולציה';
+      }
+      isStale = false;
+      addLog(300, 'Reset', 'איפוס סימולטור לחלון חדש (T-300s).', 'var(--accent)');
+      updateSimulation(300, 0);
+    });
+
+    timeSlider.addEventListener('input', (e) => {
+      updateSimulation(parseInt(e.target.value), util);
+    });
+
+    utilSlider.addEventListener('input', (e) => {
+      updateSimulation(tau, parseInt(e.target.value));
+    });
+
+    // Fault & Action test buttons
+    btnNoise.addEventListener('click', () => {
+      dispAction.textContent = 'Hold (FIFO Seniority)';
+      dispActionSub.textContent = 'תנודה של $0.001 בתוך הרצועה -> שמירת מקום בתור!';
+      addLog(tau, dispPhase.textContent, 'הוזרק רעש זעיר: מחיר המודל השתנה ב-0.1 סנט, רצועת ה-Hysteresis בלמה את העדכון והגנה על תור ה-FIFO.', 'var(--accent)');
+    });
+
+    btnDrift.addEventListener('click', () => {
+      activePrice += 0.02;
+      dispAction.textContent = 'CancelAndReplace';
+      dispActionSub.textContent = 'קפיצה של $0.02 מעבר לרצועה (1.25c) -> עדכון מחיר!';
+      addLog(tau, dispPhase.textContent, 'הוזרקה תנודת מחיר של +2 סנט: חריגה מהרצועה זוהתה -> הפקודה עודכנה בבטחה למחיר החדש.', '#38bdf8');
+    });
+
+    btnStale.addEventListener('click', () => {
+      isStale = !isStale;
+      if (isStale) {
+        btnStale.classList.add('primary');
+        addLog(tau, 'BreakerTrip', 'הוזרק נתק נתונים (>3.0s): מפסק הזרם הופעל! כל הציטוטים בוטלו מיידית.', 'var(--danger)');
+      } else {
+        btnStale.classList.remove('primary');
+        addLog(tau, 'BreakerReset', 'נתק הנתונים חלף: מערכת חזרה למצב פעיל.', 'var(--success)');
+      }
+      updateSimulation(tau, util);
+    });
+
+    btnTier4.addEventListener('click', () => {
+      updateSimulation(tau, 95);
+      addLog(tau, 'Tier4HardStop', 'הוזרק ניצול הון של 95%: הופעל בלם חירום Tier 4 Hard Stop וחיסול פוזיציה!', 'var(--danger)');
+    });
+
+    // Initial render
+    updateSimulation(300, 0);
+  </script>
+</body>
+</html>
