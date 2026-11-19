@@ -32,7 +32,7 @@ pub(crate) enum TraceSourceMode {
 }
 
 impl TraceSourceMode {
-    const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Live => "live",
             Self::Replay => "replay",

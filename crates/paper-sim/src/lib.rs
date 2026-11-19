@@ -31,4 +31,6 @@ pub use fifo_book::{
     FifoBrokerConfig, FifoPaperBroker, NewOrderParams, QueueDecayPolicy, SimFill, SimOrder,
     SimOrderStatus,
 };
-pub use telemetry::{BaselineTelemetry, FillMarkoutProbe, NaiveBaselineEngine, TrajectorySnapshot};
+pub use telemetry::{
+    BaselineTelemetry, FillMarkoutProbe, NaiveBaselineEngine, NaiveQuotesInput, TrajectorySnapshot,
+};
