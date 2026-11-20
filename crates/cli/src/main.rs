@@ -20,6 +20,8 @@ mod lifecycle_cmd;
 mod lifecycle_report;
 mod paper_cmd;
 mod paper_report;
+mod sandbox_cmd;
+mod sandbox_report;
 mod trace_cmd;
 mod trace_report;
 
@@ -27,7 +29,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use core_types::{KappaMode, SgMode, VarianceMode};
+use core_types::{KappaMode, NexWsVersion, SgMode, VarianceMode};
 
 use exec_cmd::{ExecArgs, ExecMode};
 use feeds_cmd::FeedsArgs;
@@ -79,6 +81,78 @@ enum CliExecMode {
     DryRun,
     #[value(name = "canary-live")]
     CanaryLive,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliWsVersion {
+    #[value(name = "original")]
+    Original,
+    #[value(name = "subs-v2")]
+    SubsV2,
+}
+
+#[derive(Debug, Subcommand)]
+enum SandboxCommands {
+    /// Prove the allowlisted public route: egress IP, pinned ingress, TCP 443, TLS SNI/Host, GET /health.
+    Health {
+        /// Fail when the observed egress IPv4 differs from NEX_ALLOWLISTED_EGRESS_IP.
+        #[arg(long, default_value_t = false)]
+        require_allowlisted_egress: bool,
+        /// Output path for structured JSONL telemetry.
+        #[arg(long, default_value = "logs/sandbox-health.jsonl")]
+        jsonl: PathBuf,
+    },
+    /// List sandbox markets through Gamma preprod edge credentials (NEX CLOB fallback).
+    Markets {
+        /// Maximum markets requested.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Output path for structured JSONL telemetry.
+        #[arg(long, default_value = "logs/sandbox-markets.jsonl")]
+        jsonl: PathBuf,
+    },
+    /// Read `GET /book?token_id=...` for one sandbox outcome.
+    Book {
+        /// Sandbox outcome asset ID (V2 position ID or CTF token ID).
+        #[arg(long)]
+        asset_id: String,
+        /// Output path for structured JSONL telemetry.
+        #[arg(long, default_value = "logs/sandbox-book.jsonl")]
+        jsonl: PathBuf,
+    },
+    /// Place, read back, and cancel the minimum-size post-only limit buy at one tick.
+    Validate {
+        /// Sandbox outcome asset ID to quote.
+        #[arg(long)]
+        asset_id: String,
+        /// Explicit acknowledgement that this is an Amoy test-pUSD sandbox order.
+        #[arg(long, default_value_t = false)]
+        confirm_sandbox_trade: bool,
+        /// Output path for structured JSONL telemetry.
+        #[arg(long, default_value = "logs/sandbox-validate.jsonl")]
+        jsonl: PathBuf,
+    },
+    /// Stream the NEX market and authenticated user feeds with heartbeats and snapshot rebuilds.
+    Feeds {
+        /// UP / Yes outcome asset ID.
+        #[arg(long)]
+        up_asset_id: String,
+        /// DOWN / No outcome asset ID.
+        #[arg(long)]
+        dn_asset_id: String,
+        /// Capture duration (`20s`, `60s`).
+        #[arg(long, default_value = "20s")]
+        duration: String,
+        /// Wire path family (`original` or `subs-v2`).
+        #[arg(long, value_enum, default_value_t = CliWsVersion::SubsV2)]
+        ws_version: CliWsVersion,
+        /// Test hook: force a socket rollover after N seconds to exercise snapshot rebuild.
+        #[arg(long)]
+        reconnect_after_secs: Option<u64>,
+        /// Output path for structured JSONL telemetry.
+        #[arg(long, default_value = "logs/sandbox-feeds.jsonl")]
+        jsonl: PathBuf,
+    },
 }
 
 #[derive(Debug, Parser)]
@@ -194,6 +268,12 @@ enum Commands {
         #[arg(long, default_value = "logs/phase4-lifecycle.jsonl")]
         jsonl: PathBuf,
     },
+    /// NEX sandbox (Amoy 80002) health gate, market discovery, validation order, and feeds.
+    Sandbox {
+        /// Sandbox subcommand.
+        #[command(subcommand)]
+        action: SandboxCommands,
+    },
     /// Phase 5 execution tracer: EIP-712 signing, dry-run dispatch, and settlement preview.
     Exec {
         /// Execution safety mode (`dry-run` default or `canary-live`).
@@ -307,6 +387,54 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             base_size,
             jsonl,
         }),
+        Commands::Sandbox { action } => match action {
+            SandboxCommands::Health {
+                require_allowlisted_egress,
+                jsonl,
+            } => sandbox_cmd::run(
+                jsonl,
+                sandbox_cmd::SandboxAction::Health {
+                    require_allowlisted_egress,
+                },
+            ),
+            SandboxCommands::Markets { limit, jsonl } => {
+                sandbox_cmd::run(jsonl, sandbox_cmd::SandboxAction::Markets { limit })
+            }
+            SandboxCommands::Book { asset_id, jsonl } => {
+                sandbox_cmd::run(jsonl, sandbox_cmd::SandboxAction::Book { asset_id })
+            }
+            SandboxCommands::Validate {
+                asset_id,
+                confirm_sandbox_trade,
+                jsonl,
+            } => sandbox_cmd::run(
+                jsonl,
+                sandbox_cmd::SandboxAction::Validate {
+                    asset_id,
+                    confirm_sandbox_trade,
+                },
+            ),
+            SandboxCommands::Feeds {
+                up_asset_id,
+                dn_asset_id,
+                duration,
+                ws_version,
+                reconnect_after_secs,
+                jsonl,
+            } => sandbox_cmd::run(
+                jsonl,
+                sandbox_cmd::SandboxAction::Feeds {
+                    up_asset_id,
+                    dn_asset_id,
+                    duration,
+                    ws_version: match ws_version {
+                        CliWsVersion::Original => NexWsVersion::Original,
+                        CliWsVersion::SubsV2 => NexWsVersion::SubsV2,
+                    },
+                    reconnect_after_secs,
+                },
+            ),
+        },
         Commands::Exec {
             mode,
             confirm_live_capital,
@@ -477,6 +605,61 @@ mod tests {
                 assert_eq!(inventory, 20);
             }
             _ => panic!("expected Trace"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_sandbox_health_and_feeds() {
+        let health = Cli::try_parse_from(["poly-as", "sandbox", "health"]).unwrap();
+        match health.command {
+            Commands::Sandbox {
+                action:
+                    SandboxCommands::Health {
+                        require_allowlisted_egress,
+                        jsonl,
+                    },
+            } => {
+                assert!(!require_allowlisted_egress);
+                assert_eq!(jsonl, PathBuf::from("logs/sandbox-health.jsonl"));
+            }
+            _ => panic!("expected sandbox health"),
+        }
+
+        let feeds = Cli::try_parse_from([
+            "poly-as",
+            "sandbox",
+            "feeds",
+            "--up-asset-id",
+            "111",
+            "--dn-asset-id",
+            "222",
+            "--duration",
+            "30s",
+            "--ws-version",
+            "subs-v2",
+            "--reconnect-after-secs",
+            "10",
+        ])
+        .unwrap();
+        match feeds.command {
+            Commands::Sandbox {
+                action:
+                    SandboxCommands::Feeds {
+                        up_asset_id,
+                        dn_asset_id,
+                        duration,
+                        ws_version,
+                        reconnect_after_secs,
+                        ..
+                    },
+            } => {
+                assert_eq!(up_asset_id, "111");
+                assert_eq!(dn_asset_id, "222");
+                assert_eq!(duration, "30s");
+                assert!(matches!(ws_version, CliWsVersion::SubsV2));
+                assert_eq!(reconnect_after_secs, Some(10));
+            }
+            _ => panic!("expected sandbox feeds"),
         }
     }
 
