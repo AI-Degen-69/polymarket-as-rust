@@ -72,7 +72,7 @@ pub struct WireOrder {
     #[serde(rename = "signatureType")]
     pub signature_type: u8,
     pub signature: String,
-    pub timestamp: u64,
+    pub timestamp: String,
     pub expiration: String,
     pub metadata: String,
     pub builder: String,
@@ -96,7 +96,7 @@ impl WireOrder {
             side: side_str.to_string(),
             signature_type: order.signatureType,
             signature: signature_hex,
-            timestamp: order.timestamp.to::<u64>(),
+            timestamp: order.timestamp.to_string(),
             expiration: "0".to_string(),
             metadata: metadata_str,
             builder: builder_str,
@@ -994,5 +994,24 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_wire_order_timestamp_is_millisecond_string() {
+        let (_, order_signer, _) = make_test_signer().expect("test signer");
+        let ts_ms = 1_700_000_000_123u64;
+        let order = order_signer
+            .build_order(1, "111", 10_000, 10_000, true, ts_ms)
+            .expect("build order");
+
+        assert_eq!(order.timestamp.to_string(), "1700000000123");
+
+        let wire = WireOrder::from_order(&order, "0xsig".to_string());
+        let json = serde_json::to_value(&wire).expect("serialize");
+        assert_eq!(
+            json.get("timestamp").and_then(|v| v.as_str()),
+            Some("1700000000123"),
+            "CLOB wire timestamp must keep the signed millisecond value as a string"
+        );
     }
 }
