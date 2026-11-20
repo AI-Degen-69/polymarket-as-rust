@@ -72,7 +72,7 @@ pub struct WireOrder {
     #[serde(rename = "signatureType")]
     pub signature_type: u8,
     pub signature: String,
-    pub timestamp: u64,
+    pub timestamp: String,
     pub expiration: String,
     pub metadata: String,
     pub builder: String,
@@ -96,7 +96,7 @@ impl WireOrder {
             side: side_str.to_string(),
             signature_type: order.signatureType,
             signature: signature_hex,
-            timestamp: order.timestamp.to::<u64>(),
+            timestamp: order.timestamp.to_string(),
             expiration: "0".to_string(),
             metadata: metadata_str,
             builder: builder_str,

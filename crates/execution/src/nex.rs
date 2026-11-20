@@ -303,10 +303,10 @@ pub struct NexDiscovery {
     pub markets: Vec<NexMarket>,
 }
 
-fn unix_secs_now() -> u64 {
+fn unix_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
+        .map(|d| d.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
 }
 
@@ -1046,6 +1046,15 @@ impl NexTradingSession {
         book: &NexBook,
         outcome: core_types::Outcome,
     ) -> Result<(crate::eip712::Order, String, NexOrderGuards), ExecutionError> {
+        // NEX sandbox validate signs the Amoy ExchangeV3 domain (`version "3"`).
+        // Fail closed on CTF markets instead of signing with the wrong domain
+        // (venue would reject with `invalid EOA signature`).
+        if market.version != ProtocolVersion::PolyV2 {
+            return Err(ExecutionError::Config(format!(
+                "sandbox validate requires a PolyV2 market (ExchangeV3 80002); got {:?} for {}",
+                market.version, market.condition_id
+            )));
+        }
         let asset_id = market.asset_id(outcome);
         if !book.asset_id.is_empty() && book.asset_id != asset_id {
             return Err(ExecutionError::Config(format!(
@@ -1095,7 +1104,7 @@ impl NexTradingSession {
             expiry_ts_ms: book.timestamp_ms.saturating_add(300_000),
             strike_price_usd: None,
         };
-        let order_timestamp_secs = unix_secs_now();
+        let order_timestamp_ms = unix_millis_now();
         let domain = MarketDomain::for_market_on_chain(
             &descriptor,
             self.profile.chain_id,
@@ -1107,7 +1116,7 @@ impl NexTradingSession {
             encoded.maker_amount,
             encoded.taker_amount,
             true,
-            order_timestamp_secs,
+            order_timestamp_ms,
         )?;
         let signature = self.signer.sign_order(&order, &domain)?;
         Ok((order, signature, guards))

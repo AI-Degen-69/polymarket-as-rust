@@ -297,6 +297,9 @@ impl OrderSigner {
     }
 
     /// Prepares an 11-field `Order` struct.
+    ///
+    /// `timestamp_ms` is Unix milliseconds (CLOB wire `timestamp` is a millisecond
+    /// string; the same value is signed in the EIP-712 struct).
     pub fn build_order(
         &self,
         salt: u64,
@@ -304,7 +307,7 @@ impl OrderSigner {
         maker_amount: u64,
         taker_amount: u64,
         side_buy: bool,
-        timestamp_secs: u64,
+        timestamp_ms: u64,
     ) -> Result<Order, ExecutionError> {
         let token_id = U256::from_str(token_id_decimal_str).map_err(|err| {
             ExecutionError::Signing(format!("Invalid token_id '{token_id_decimal_str}': {err}"))
@@ -321,7 +324,7 @@ impl OrderSigner {
             takerAmount: U256::from(taker_amount),
             side,
             signatureType: self.wallet_mode.as_u8(),
-            timestamp: U256::from(timestamp_secs),
+            timestamp: U256::from(timestamp_ms),
             metadata: FixedBytes::ZERO,
             builder: FixedBytes::ZERO,
         })
