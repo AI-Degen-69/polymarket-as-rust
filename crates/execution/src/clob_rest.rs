@@ -285,13 +285,13 @@ impl ClobRestClient {
             });
         }
         if !status.is_success() {
-            let _ = self.record_error_status(status);
+            self.record_error_status(status)?;
             return Err(ExecutionError::Rest {
                 status_code: Some(status.as_u16()),
                 detail: format!("get order request failed: '{text}'"),
             });
         }
-        let _ = self.record_error_status(status);
+        self.record_error_status(status)?;
         serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
             status_code: Some(status.as_u16()),
             detail: format!("Failed to parse single order '{text}': {err}"),

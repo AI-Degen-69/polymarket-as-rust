@@ -126,11 +126,13 @@ pub(crate) fn run(jsonl_path: PathBuf, action: SandboxAction) -> Result<(), Box<
                 run_feeds(
                     &profile,
                     &jsonl_path,
-                    &up_asset_id,
-                    &dn_asset_id,
-                    &duration,
-                    ws_version,
-                    reconnect_after_secs,
+                    FeedSpec {
+                        up_asset_id,
+                        dn_asset_id,
+                        duration,
+                        ws_version,
+                        reconnect_after_secs,
+                    },
                 )
                 .await
             }
@@ -306,18 +308,28 @@ impl FeedSessionState {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+struct FeedSpec {
+    up_asset_id: String,
+    dn_asset_id: String,
+    duration: String,
+    ws_version: NexWsVersion,
+    reconnect_after_secs: Option<u64>,
+}
+
 async fn run_feeds(
     profile: &SandboxProfile,
     jsonl_path: &Path,
-    up_asset_id: &str,
-    dn_asset_id: &str,
-    duration_raw: &str,
-    ws_version: NexWsVersion,
-    reconnect_after_secs: Option<u64>,
+    spec: FeedSpec,
 ) -> Result<(), Box<dyn Error>> {
+    let FeedSpec {
+        up_asset_id,
+        dn_asset_id,
+        duration,
+        ws_version,
+        reconnect_after_secs,
+    } = spec;
     print_sandbox_header("feeds", jsonl_path);
-    let duration = Duration::from_secs(parse_duration_secs(duration_raw)?);
+    let duration = Duration::from_secs(parse_duration_secs(&duration)?);
     let _timer_guard = HighResTimerGuard::acquire_1ms()?;
     let gate = check_public_connection(profile).await?;
     print_gate(&gate);
@@ -327,7 +339,7 @@ async fn run_feeds(
     write_sandbox_event(&mut jsonl, "sandbox_health_gate", &gate)?;
 
     // Resolve the parent market so the user feed can filter by condition ID.
-    let market = find_market_by_asset(profile, up_asset_id).await?;
+    let market = find_market_by_asset(profile, &up_asset_id).await?;
     print_market_summary(&market);
 
     // Only subs-v2 has application connection limits; original feeds are unlimited.
@@ -341,7 +353,7 @@ async fn run_feeds(
         profile.clob_url.clone(),
         "https://api.binance.com",
     )?;
-    let mut config = ClobWsConfig::new(up_asset_id, dn_asset_id);
+    let mut config = ClobWsConfig::new(&up_asset_id, &dn_asset_id);
     config.ws_url = profile.market_ws_url(ws_version);
     config.ping_interval = Duration::from_secs(10);
     config.pong_timeout = Duration::from_secs(15);
@@ -370,8 +382,8 @@ async fn run_feeds(
         match open_user_feed(
             profile,
             &market.condition_id,
-            up_asset_id,
-            dn_asset_id,
+            &up_asset_id,
+            &dn_asset_id,
             ws_version,
         )
         .await

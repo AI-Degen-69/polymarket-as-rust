@@ -484,6 +484,8 @@ async fn list_gamma_markets(
         .unwrap_or_default();
     let mut markets = Vec::with_capacity(items.len());
     for item in &items {
+        // A single malformed market should not hide the rest of the page; an
+        // entirely unparseable page is an error below.
         if let Ok(m) = gamma_market_from_value(item) {
             markets.push(m);
         }
@@ -820,8 +822,13 @@ pub async fn fetch_book(
 }
 
 fn parse_levels(value: Option<&Value>) -> Result<Vec<BookLevel>, ExecutionError> {
-    let Some(items) = value.and_then(Value::as_array) else {
+    let Some(value) = value else {
         return Ok(Vec::new());
+    };
+    let Some(items) = value.as_array() else {
+        return Err(ExecutionError::Parse(
+            "book side must be an array or null".into(),
+        ));
     };
     let mut levels = Vec::with_capacity(items.len());
     for item in items {
@@ -1106,6 +1113,69 @@ impl NexTradingSession {
         Ok((order, signature, guards))
     }
 
+    /// Reads the order once, retrying a 404 briefly while the venue replicates it.
+    async fn read_back(&self, order_id: &str) -> Result<Option<OpenOrderRecord>, ExecutionError> {
+        for attempt in 0..3 {
+            match self.rest.get_order(order_id).await {
+                Ok(record) => return Ok(Some(record)),
+                Err(ExecutionError::Rest {
+                    status_code: Some(404),
+                    ..
+                }) if attempt < 2 => {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Err(ExecutionError::Rest {
+                    status_code: Some(404),
+                    ..
+                }) => return Ok(None),
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(None)
+    }
+
+    /// Cancels a still-live remainder; a filled or matched order needs no cancel.
+    async fn cancel_remaining(
+        &self,
+        order_id: &str,
+        readback: Option<&OpenOrderRecord>,
+    ) -> Result<Option<String>, ExecutionError> {
+        let Some(record) = readback else {
+            return Ok(Some(
+                "order not visible on read; reconcile fills via authenticated /data/trades and the user feed before asserting positions"
+                    .to_string(),
+            ));
+        };
+        if !record.status.eq_ignore_ascii_case("LIVE") {
+            return Ok(Some(format!(
+                "no cancel needed; read-back status='{}' size_matched='{}'",
+                record.status, record.size_matched
+            )));
+        }
+        match self.rest.cancel_order(order_id).await {
+            Ok(cancel) => {
+                if let Some(reason) = cancel.not_canceled.get(order_id) {
+                    return Err(ExecutionError::Rest {
+                        status_code: Some(409),
+                        detail: format!(
+                            "cancel rejected for {order_id}: {reason}; reconcile fills and retry before asserting flat"
+                        ),
+                    });
+                }
+                Ok(Some(format!(
+                    "canceled={:?} not_canceled={:?}",
+                    cancel.canceled, cancel.not_canceled
+                )))
+            }
+            Err(ExecutionError::Rest { detail, .. }) if detail.contains("order_not_found") => {
+                Ok(Some(format!(
+                    "order_not_found on cancel; reconcile fills before asserting positions ({detail})"
+                )))
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Places the documented validation order, reads it back, and cancels the remainder.
     ///
     /// A match precedes settlement: this method never asserts a position change.
@@ -1141,67 +1211,11 @@ impl NexTradingSession {
             });
         }
 
-        let mut readback = None;
-        for attempt in 0..3 {
-            match self.rest.get_order(&placement.order_id).await {
-                Ok(record) => {
-                    readback = Some(record);
-                    break;
-                }
-                Err(ExecutionError::Rest {
-                    status_code: Some(404),
-                    ..
-                }) => {
-                    if attempt < 2 {
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                }
-                Err(err) => return Err(err),
-            }
-        }
+        let readback = self.read_back(&placement.order_id).await?;
         let readback_missing = readback.is_none();
-
-        let cancel_detail = if readback_missing {
-            Some(
-                "order not visible on read; reconcile fills via authenticated /data/trades and the user feed before asserting positions"
-                    .to_string(),
-            )
-        } else if let Some(record) = &readback {
-            if record.status.eq_ignore_ascii_case("LIVE") {
-                match self.rest.cancel_order(&placement.order_id).await {
-                    Ok(cancel) => {
-                        if let Some(reason) = cancel.not_canceled.get(&placement.order_id) {
-                            return Err(ExecutionError::Rest {
-                                status_code: Some(409),
-                                detail: format!(
-                                    "cancel rejected for {}: {reason}; reconcile fills and retry before asserting flat",
-                                    placement.order_id
-                                ),
-                            });
-                        }
-                        Some(format!(
-                            "canceled={:?} not_canceled={:?}",
-                            cancel.canceled, cancel.not_canceled
-                        ))
-                    }
-                    Err(ExecutionError::Rest { detail, .. })
-                        if detail.contains("order_not_found") =>
-                    {
-                        Some(format!(
-                            "order_not_found on cancel; reconcile fills before asserting positions ({detail})"
-                        ))
-                    }
-                    Err(err) => return Err(err),
-                }
-            } else {
-                Some(format!(
-                    "no cancel needed; read-back status='{}' size_matched='{}'",
-                    record.status, record.size_matched
-                ))
-            }
-        } else {
-            None
-        };
+        let cancel_detail = self
+            .cancel_remaining(&placement.order_id, readback.as_ref())
+            .await?;
 
         Ok(NexValidationOutcome {
             origin: DataOrigin::Sandbox,
