@@ -1162,6 +1162,15 @@ impl NexTradingSession {
                         ),
                     });
                 }
+                if !cancel.canceled.iter().any(|id| id.as_str() == order_id) {
+                    return Err(ExecutionError::Rest {
+                        status_code: Some(409),
+                        detail: format!(
+                            "cancel not confirmed for {order_id} (canceled={:?}); reconcile fills before asserting flat",
+                            cancel.canceled
+                        ),
+                    });
+                }
                 Ok(Some(format!(
                     "canceled={:?} not_canceled={:?}",
                     cancel.canceled, cancel.not_canceled
