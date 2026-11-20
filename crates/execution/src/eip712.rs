@@ -44,13 +44,19 @@ impl Default for DepositWalletConstants {
 impl DepositWalletConstants {
     #[must_use]
     pub fn new() -> Self {
+        Self::for_chain(POLYGON_CHAIN_ID)
+    }
+
+    /// Builds constants for an arbitrary EVM chain id (NEX sandbox uses Amoy `80002`).
+    #[must_use]
+    pub fn for_chain(chain_id: u64) -> Self {
         Self {
             typed_data_sign_type_hash: alloy::primitives::keccak256(
                 TYPED_DATA_SIGN_TYPE_STRING.as_bytes(),
             ),
             name_hash: alloy::primitives::keccak256(DEPOSIT_WALLET_DOMAIN_NAME.as_bytes()),
             version_hash: alloy::primitives::keccak256(DEPOSIT_WALLET_DOMAIN_VERSION.as_bytes()),
-            chain_id_bytes: U256::from(POLYGON_CHAIN_ID).to_be_bytes::<32>(),
+            chain_id_bytes: U256::from(chain_id).to_be_bytes::<32>(),
         }
     }
 
@@ -98,24 +104,31 @@ pub struct MarketDomain {
 }
 
 impl MarketDomain {
-    /// Builds precomputed domain separator for given market descriptor.
+    /// Builds precomputed domain separator for given market descriptor on Polygon `137`.
     #[must_use]
     pub fn for_market(market: &MarketDescriptor) -> Self {
-        let (exchange_address, domain_version) = match market.version {
-            ProtocolVersion::PolyV2 => (POLY_V2_EXCHANGE, "3"),
-            ProtocolVersion::CtfV1 => {
-                if market.neg_risk {
-                    (CTF_NEG_RISK_EXCHANGE, "2")
-                } else {
-                    (CTF_EXCHANGE, "2")
-                }
-            }
+        let exchange_address = exchange_for_market(market);
+        Self::for_market_on_chain(market, POLYGON_CHAIN_ID, exchange_address)
+    }
+
+    /// Builds the domain for a market on an explicit chain and exchange contract.
+    ///
+    /// NEX sandbox uses this with Amoy (`80002`) and the onboarding-provided exchange.
+    #[must_use]
+    pub fn for_market_on_chain(
+        market: &MarketDescriptor,
+        chain_id: u64,
+        exchange_address: Address,
+    ) -> Self {
+        let domain_version = match market.version {
+            ProtocolVersion::PolyV2 => "3",
+            ProtocolVersion::CtfV1 => "2",
         };
 
         let domain = eip712_domain! {
             name: EXCHANGE_DOMAIN_NAME,
             version: domain_version,
-            chain_id: POLYGON_CHAIN_ID,
+            chain_id: chain_id,
             verifying_contract: exchange_address,
         };
         let domain_separator = domain.hash_struct();
@@ -125,6 +138,28 @@ impl MarketDomain {
             domain_version,
             domain,
             domain_separator,
+        }
+    }
+
+    /// Chain id embedded in the produced EIP-712 domain.
+    #[must_use]
+    pub fn chain_id(&self) -> u64 {
+        self.domain
+            .chain_id
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(POLYGON_CHAIN_ID)
+    }
+}
+
+fn exchange_for_market(market: &MarketDescriptor) -> Address {
+    match market.version {
+        ProtocolVersion::PolyV2 => POLY_V2_EXCHANGE,
+        ProtocolVersion::CtfV1 => {
+            if market.neg_risk {
+                CTF_NEG_RISK_EXCHANGE
+            } else {
+                CTF_EXCHANGE
+            }
         }
     }
 }
@@ -249,6 +284,16 @@ impl OrderSigner {
     #[must_use]
     pub fn wallet_mode(&self) -> WalletMode {
         self.wallet_mode
+    }
+
+    /// Re-targets the signer at another EVM chain (NEX sandbox: Amoy `80002`).
+    ///
+    /// Only affects `DepositWallet1271` domain constants; EOA order signatures
+    /// derive their chain from the supplied `MarketDomain`.
+    #[must_use]
+    pub fn for_chain(mut self, chain_id: u64) -> Self {
+        self.deposit_constants = DepositWalletConstants::for_chain(chain_id);
+        self
     }
 
     /// Prepares an 11-field `Order` struct.
@@ -392,6 +437,7 @@ mod tests {
     use super::*;
     use alloy::primitives::Signature;
     use core_types::money::{FeeSchedule, MicroUsdc, SharesMicro};
+    use core_types::sandbox::{NEX_AMOY_EXCHANGE, NEX_CHAIN_ID};
 
     fn random_address() -> Address {
         use rand::RngCore;
@@ -541,6 +587,22 @@ mod tests {
         let recovered = signer.verify_signature(&order, &sig_hex, &domain)?;
         assert_eq!(recovered, signer.eoa_address());
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_amoy_sandbox_domain_uses_chain_80002() -> Result<(), Box<dyn std::error::Error>> {
+        let nex_exchange: Address = NEX_AMOY_EXCHANGE.parse()?;
+        let market = dummy_market(ProtocolVersion::PolyV2, false);
+        let domain = MarketDomain::for_market_on_chain(&market, NEX_CHAIN_ID, nex_exchange);
+        assert_eq!(domain.chain_id(), NEX_CHAIN_ID);
+        assert_eq!(domain.exchange_address, nex_exchange);
+
+        let signer = OrderSigner::new_ephemeral(WalletMode::Eoa, None)?.for_chain(NEX_CHAIN_ID);
+        let order = signer.build_order(7, "111", 50_000, 5_000_000, true, 1_785_000_000)?;
+        let sig = signer.sign_order(&order, &domain)?;
+        let recovered = signer.verify_signature(&order, &sig, &domain)?;
+        assert_eq!(recovered, signer.eoa_address());
         Ok(())
     }
 

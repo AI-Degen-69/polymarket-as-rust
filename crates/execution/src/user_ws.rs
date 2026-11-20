@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use core_types::DataOrigin;
 use core_types::money::{DecimalFracPolicy, MICRO_SCALE, parse_decimal_scaled};
 use futures_util::{SinkExt, StreamExt};
 use secrecy::{ExposeSecret, SecretString};
@@ -78,8 +79,10 @@ impl LegDelta {
 }
 
 /// Lock-free published view of fills and order state (single writer: the user WS actor).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
 pub struct OrderRegistrySnapshot {
+    /// Provenance tag: sandbox fills and balances never enter production estimates.
+    pub origin: DataOrigin,
     /// Final on-chain UP inventory (micro-shares). Only this feeds settlement.
     pub confirmed_up: i64,
     /// Final on-chain DOWN inventory (micro-shares).
@@ -161,6 +164,17 @@ impl FillReconciler {
     /// Starts in `reconciling` state: no quoting until the first REST parity check passes.
     #[must_use]
     pub fn new(maker_address: &str, up_token: &str, dn_token: &str) -> Self {
+        Self::new_with_origin(DataOrigin::Production, maker_address, up_token, dn_token)
+    }
+
+    /// Same as [`Self::new`], tagging every published fill/balance with `origin`.
+    #[must_use]
+    pub fn new_with_origin(
+        origin: DataOrigin,
+        maker_address: &str,
+        up_token: &str,
+        dn_token: &str,
+    ) -> Self {
         Self {
             maker_address: maker_address.to_ascii_lowercase(),
             up_token: up_token.to_string(),
@@ -169,6 +183,7 @@ impl FillReconciler {
             open_orders: HashSet::new(),
             trades: HashMap::new(),
             snap: OrderRegistrySnapshot {
+                origin,
                 reconciling: true,
                 ..OrderRegistrySnapshot::default()
             },

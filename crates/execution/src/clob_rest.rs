@@ -105,7 +105,7 @@ impl WireOrder {
 }
 
 /// Response returned from `POST /order` or elements in `POST /orders`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderPlacementResponse {
     #[serde(alias = "ok", default)]
     pub success: bool,
@@ -139,7 +139,7 @@ pub struct CancelResponse {
 }
 
 /// Open order representation from `GET /data/orders`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenOrderRecord {
     pub id: String,
     pub status: String,
@@ -245,6 +245,56 @@ impl ClobRestClient {
             consecutive_auth_errors: Arc::new(AtomicU32::new(0)),
             last_auth_error_ts: Arc::new(AtomicU64::new(0)),
             circuit_breaker_tripped: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// Creates a client reusing a pre-configured `reqwest::Client` (e.g. pinned NEX ingress DNS).
+    #[must_use]
+    pub fn with_http_client(
+        base_url: impl Into<String>,
+        signer: L2HmacSigner,
+        http: Client,
+    ) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            http,
+            signer,
+            consecutive_auth_errors: Arc::new(AtomicU32::new(0)),
+            last_auth_error_ts: Arc::new(AtomicU64::new(0)),
+            circuit_breaker_tripped: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Retrieves one order by ID, including canceled or fully matched orders (`GET /data/order/{id}`).
+    ///
+    /// # Errors
+    /// Returns a 404 `order_not_found` detail when the venue has no record of the ID.
+    pub async fn get_order(&self, order_id: &str) -> Result<OpenOrderRecord, ExecutionError> {
+        let path = format!("/data/order/{order_id}");
+        let headers = self.signer.sign_request_now("GET", &path, None)?;
+        let url = format!("{}{path}", self.base_url);
+        let req = headers.apply_to_request(self.http.get(&url));
+        let resp = req.send().await?;
+        let status = resp.status();
+        let text = resp.text().await?;
+
+        if status == StatusCode::NOT_FOUND {
+            return Err(ExecutionError::Rest {
+                status_code: Some(404),
+                detail: format!("order_not_found: {order_id}"),
+            });
+        }
+        if !status.is_success() {
+            self.record_error_status(status)?;
+            return Err(ExecutionError::Rest {
+                status_code: Some(status.as_u16()),
+                detail: format!("get order request failed: '{text}'"),
+            });
+        }
+        self.record_error_status(status)?;
+        serde_json::from_str(&text).map_err(|err| ExecutionError::Rest {
+            status_code: Some(status.as_u16()),
+            detail: format!("Failed to parse single order '{text}': {err}"),
         })
     }
 

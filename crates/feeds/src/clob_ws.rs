@@ -46,7 +46,8 @@ pub struct ClobWsConfig {
     pub pong_timeout: Duration,
     /// Inactivity watchdog threshold triggering `StaleTimeout` + reconnect (`3,000ms` default).
     pub stale_timeout: Duration,
-    /// Delay before attempting reconnect after socket closure or failure (`500ms` default).
+    /// Base delay before reconnect; doubles per consecutive failed session up to 30s
+    /// (`500ms` default). Resets after a session reaches `Ready`.
     pub reconnect_backoff: Duration,
 }
 
@@ -77,6 +78,8 @@ pub enum ClobWsCommand {
         /// Next epoch DOWN asset ID.
         new_asset_id_dn: String,
     },
+    /// Force a real socket drop and reconnect (exercises backoff + REST resync + snapshot rebuild).
+    ForceReconnect,
     /// Graceful shutdown request.
     Shutdown,
 }
@@ -94,6 +97,7 @@ pub struct ClobMarketWsActor {
     dn_synced: bool,
     ready_emitted: bool,
     crossed_since: Option<Instant>,
+    reconnect_attempts: u32,
     stats: FeedStats,
     tracker: LatencyTracker,
     clock: MonotonicClock,
@@ -124,6 +128,7 @@ impl ClobMarketWsActor {
             dn_synced: false,
             ready_emitted: false,
             crossed_since: None,
+            reconnect_attempts: 0,
             stats: empty_stats(FeedId::PolymarketClob),
             tracker: LatencyTracker::new()?,
             clock: MonotonicClock::start(),
@@ -207,6 +212,9 @@ impl ClobMarketWsActor {
             ConnectStep::Command(None | Some(ClobWsCommand::Shutdown)) => {
                 Ok(Err(SessionExit::Shutdown))
             }
+            ConnectStep::Command(Some(ClobWsCommand::ForceReconnect)) => {
+                Ok(Err(SessionExit::ImmediateReconnect))
+            }
             ConnectStep::Command(Some(ClobWsCommand::Rollover {
                 new_asset_id_up,
                 new_asset_id_dn,
@@ -261,6 +269,7 @@ impl ClobMarketWsActor {
     ) -> Result<(), FeedError> {
         if self.up_synced && self.dn_synced && !self.ready_emitted {
             self.ready_emitted = true;
+            self.reconnect_attempts = 0;
             self.emit_transition(health_tx, false).await?;
         }
         Ok(())
@@ -428,6 +437,10 @@ impl ClobMarketWsActor {
             None | Some(ClobWsCommand::Shutdown) => {
                 close_ws_bounded(io.writer).await;
                 Ok(Some(SessionExit::Shutdown))
+            }
+            Some(ClobWsCommand::ForceReconnect) => {
+                close_ws_bounded(io.writer).await;
+                Ok(Some(SessionExit::Reconnect))
             }
             Some(ClobWsCommand::Rollover {
                 new_asset_id_up,
@@ -729,9 +742,21 @@ impl ClobMarketWsActor {
         Ok(())
     }
 
+    /// Exponential backoff from the configured base, capped at 30s. Resets once a
+    /// session reaches `Ready` so a long-lived feed does not inherit old failures.
+    fn next_reconnect_delay(&mut self) -> Duration {
+        let shift = self.reconnect_attempts.min(6);
+        self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+        self.config
+            .reconnect_backoff
+            .saturating_mul(1_u32 << shift)
+            .min(Duration::from_secs(30))
+    }
+
     async fn wait_reconnect_cmd(&mut self, cmd_rx: &mut mpsc::Receiver<ClobWsCommand>) -> bool {
+        let delay = self.next_reconnect_delay();
         tokio::select! {
-            _ = tokio::time::sleep(self.config.reconnect_backoff) => false,
+            _ = tokio::time::sleep(delay) => false,
             cmd = cmd_rx.recv() => self.handle_pending_cmd(cmd) == SessionExit::Shutdown,
         }
     }
@@ -739,6 +764,7 @@ impl ClobMarketWsActor {
     fn handle_pending_cmd(&mut self, cmd: Option<ClobWsCommand>) -> SessionExit {
         match cmd {
             None | Some(ClobWsCommand::Shutdown) => SessionExit::Shutdown,
+            Some(ClobWsCommand::ForceReconnect) => SessionExit::Reconnect,
             Some(ClobWsCommand::Rollover {
                 new_asset_id_up,
                 new_asset_id_dn,
