@@ -166,7 +166,51 @@ Healthy run observed: `sessions=2`, `snapshots=6`, `reconnects=1`,
 `snapshot_rebuild_ok=true`, PONG received. `quoting_allowed=false` is normal on an empty
 book; all JSONL rows carry `"origin":"sandbox"`, `"network":"nex-amoy-80002"`.
 
-## 6. Do not simulate
+## 6. Post-Whitelist Activation Checklist & Common Pitfalls
+
+Run these steps in order once the NEX allowlist shows your egress IP.
+
+### Pitfall 1 — EOA vs Deposit Address
+
+`NEX_TRADING_ADDRESS` and `POLYMARKET_PRIVATE_KEY` must be the same **EOA whose private key
+you control**. Never paste a Polymarket Deposit or Proxy address here: the sandbox signs with
+that key, and a deposit address has no key. Approvals and order signatures fail otherwise.
+
+### Pitfall 2 — Builder Auth vs CLOB L2 Creds
+
+1Password Builder Auth credentials are for the **Relayer only**. Never put them in
+`NEX_API_*` or `CLOB_API_*`. Sandbox L2 creds come from `scripts/nex_create_l2_key.py`.
+
+### Activation steps
+
+1. Verify Amoy POL and pUSD balances for the EOA, and confirm token approvals (§3).
+2. Create L2 creds. Start with `--nonce 0`; retry with `--derive` on a nonce conflict:
+
+   ```powershell
+   python3 scripts/nex_create_l2_key.py --nonce 0
+   python3 scripts/nex_create_l2_key.py --nonce 0 --derive
+   ```
+
+3. Check the route and discovery. Pick a clean `PolyV2` asset with `neg_risk=false`:
+
+   ```powershell
+   cargo run -p cli --bin poly-as -- sandbox health --require-allowlisted-egress
+   cargo run -p cli --bin poly-as -- sandbox markets --limit 20
+   ```
+
+4. Place and cancel the minimum-size post-only order. Confirm **0 open orders** after cancel:
+
+   ```powershell
+   cargo run -p cli --bin poly-as -- sandbox validate --confirm-sandbox-trade
+   ```
+
+5. Run the feeds for ~10–15s. Check that the authenticated `/ws/user` session connects:
+
+   ```powershell
+   cargo run -p cli --bin poly-as -- sandbox feeds
+   ```
+
+## 7. Do not simulate
 
 If health, discovery, book, validate, or feeds is blocked (allowlist, 401/403, funding,
 empty books), report the blocker. Do not build a mock exchange or local fills.
