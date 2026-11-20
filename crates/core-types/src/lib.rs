@@ -21,6 +21,8 @@ pub mod error;
 pub mod market;
 /// Fixed-point 1e6 micro-USDC / micro-share arithmetic, tick snapping, wire encoding, and fee math.
 pub mod money;
+/// NEX sandbox (Amoy `80002`) profile, WebSocket paths, and data-origin tags.
+pub mod sandbox;
 /// HDR latency histogram tracking and atomic newline-delimited JSON telemetry writer.
 pub mod telemetry;
 
@@ -36,6 +38,12 @@ pub use money::{
     ONE_DOLLAR_MICRO, ONE_SHARE_MICRO, OrderSide, SIZE_STEP_MICRO, SharesMicro, SignedSharesMicro,
     TickPrecision, WireAmounts, encode_buy_amounts, encode_sell_amounts, floor_to_tick,
     parse_decimal_micro, parse_decimal_scaled,
+};
+pub use sandbox::{
+    DataOrigin, NEX_AMOY_EXCHANGE, NEX_AMOY_POSITION_MANAGER, NEX_CHAIN_ID, NEX_CLOB_URL,
+    NEX_GAMMA_URL, NEX_INGRESS_IP, NEX_MARKET_WS_PATH, NEX_RELAYER_URL, NEX_USER_WS_PATH,
+    NEX_V2_MARKET_CAP_PER_IP, NEX_V2_MARKET_WS_PATH, NEX_V2_USER_CAP_PER_IP,
+    NEX_V2_USER_CAP_PER_KEY, NEX_V2_USER_WS_PATH, NEX_WS_URL, NexWsVersion, SandboxProfile,
 };
 pub use telemetry::{JsonlWriter, LatencySummary, LatencyTracker};
 
