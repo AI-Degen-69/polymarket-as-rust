@@ -396,7 +396,7 @@ fn sign_and_record(
             wire.maker_amount,
             wire.taker_amount,
             true,
-            ts_ms / 1000,
+            ts_ms,
         )?;
         // tau_3 is pure EIP-712 signing: salt/build happen before the timer so
         // CSPRNG jitter does not inflate the signing budget.

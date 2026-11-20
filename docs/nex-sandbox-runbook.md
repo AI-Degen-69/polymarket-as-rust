@@ -33,7 +33,10 @@ AMOY_RPC_URL=<amoy-rpc>
 ```
 
 Never put sandbox secrets in production `CLOB_API_KEY` / Gamma / relayer vars, and never
-point NEX hosts at production. `SandboxProfile` rejects production host/key/address fail-closed.
+point NEX hosts at production. `SandboxProfile` fails closed on any host other than the four
+sandbox hosts, on chain IDs other than 80002, and on the three known production exchange
+addresses. It checks only addresses and key presence, not key ownership, so keep production
+keys out of sandbox settings yourself.
 
 ## 1. Allowlist `31.168.108.54/32`
 
@@ -172,9 +175,14 @@ Run these steps in order once the NEX allowlist shows your egress IP.
 
 ### Pitfall 1 — EOA vs Deposit Address
 
-`NEX_TRADING_ADDRESS` and `POLYMARKET_PRIVATE_KEY` must be the same **EOA whose private key
-you control**. Never paste a Polymarket Deposit or Proxy address here: the sandbox signs with
-that key, and a deposit address has no key. Approvals and order signatures fail otherwise.
+In `NEX_WALLET_MODE=eoa`, `NEX_TRADING_ADDRESS` and `POLYMARKET_PRIVATE_KEY` must be the same
+**EOA whose private key you control**. Never paste a Polymarket Deposit or Proxy address here:
+the sandbox signs with that key, and a deposit address has no key.
+
+In `NEX_WALLET_MODE=deposit-wallet`, `NEX_TRADING_ADDRESS` must be the Deposit Wallet address.
+`POLYMARKET_PRIVATE_KEY` stays the signing EOA key. The sandbox does not compare the two.
+
+The steps below assume `NEX_WALLET_MODE=eoa`.
 
 ### Pitfall 2 — Builder Auth vs CLOB L2 Creds
 

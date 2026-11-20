@@ -998,27 +998,20 @@ mod tests {
 
     #[test]
     fn test_wire_order_timestamp_is_millisecond_string() {
-        let order = WireOrder {
-            salt: 1,
-            maker: "0xmaker".to_string(),
-            signer: "0xsigner".to_string(),
-            token_id: "111".to_string(),
-            maker_amount: "10000".to_string(),
-            taker_amount: "10000".to_string(),
-            side: "BUY".to_string(),
-            signature_type: 0,
-            signature: "0xsig".to_string(),
-            timestamp: 1_700_000_000_123u64.to_string(),
-            expiration: "0".to_string(),
-            metadata: "0x0".to_string(),
-            builder: "0x0".to_string(),
-        };
+        let (_, order_signer, _) = make_test_signer().expect("test signer");
+        let ts_ms = 1_700_000_000_123u64;
+        let order = order_signer
+            .build_order(1, "111", 10_000, 10_000, true, ts_ms)
+            .expect("build order");
 
-        let json = serde_json::to_value(&order).expect("serialize");
+        assert_eq!(order.timestamp.to_string(), "1700000000123");
+
+        let wire = WireOrder::from_order(&order, "0xsig".to_string());
+        let json = serde_json::to_value(&wire).expect("serialize");
         assert_eq!(
             json.get("timestamp").and_then(|v| v.as_str()),
             Some("1700000000123"),
-            "CLOB wire timestamp must stay a millisecond string"
+            "CLOB wire timestamp must keep the signed millisecond value as a string"
         );
     }
 }

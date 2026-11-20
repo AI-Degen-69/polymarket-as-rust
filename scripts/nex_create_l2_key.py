@@ -12,14 +12,15 @@ Requires in .env:
   NEX_CLOB_URL=https://nex.preprod.defi.euw2.polymarket.sh
 """
 import argparse
+import http.client
+import json
 import os
+import tempfile
 import time
 import urllib.request
-import json
 from pathlib import Path
 
 from eth_account import Account
-from eth_account.messages import encode_typed_data
 
 
 def load_dotenv(path: Path) -> dict:
@@ -34,6 +35,21 @@ def load_dotenv(path: Path) -> dict:
     return vals
 
 
+def save_dotenv(path: Path, lines: list[str]) -> None:
+    """Write atomically: a failed save leaves the original .env intact."""
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".env.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--nonce", default="0")
@@ -43,11 +59,11 @@ def main() -> int:
 
     env_path = Path(".env")
     vals = load_dotenv(env_path)
-    get = lambda k: os.environ.get(k) or vals.get(k) or ""
 
-    priv = get("POLYMARKET_PRIVATE_KEY")
-    addr = get("NEX_TRADING_ADDRESS")
-    host = (get("NEX_CLOB_URL") or "https://nex.preprod.defi.euw2.polymarket.sh").rstrip("/")
+    # Wallet values come from .env only, so shell exports cannot mix two wallets.
+    priv = vals.get("POLYMARKET_PRIVATE_KEY", "")
+    addr = vals.get("NEX_TRADING_ADDRESS", "")
+    host = (vals.get("NEX_CLOB_URL") or "https://nex.preprod.defi.euw2.polymarket.sh").rstrip("/")
     if not priv or not addr:
         print("missing POLYMARKET_PRIVATE_KEY or NEX_TRADING_ADDRESS in local .env (values redacted)")
         return 2
@@ -90,38 +106,45 @@ def main() -> int:
     try:
         with urllib.request.urlopen(req, timeout=20) as r:
             body = json.loads(r.read().decode())
-    except Exception as e:
+    except (OSError, ValueError, http.client.HTTPException) as e:
         print(f"key bootstrap failed: {type(e).__name__} (no secrets shown). "
               f"Try --derive if key exists, or confirm egress allowlist + /health 200.")
         return 1
 
-    api_key = body.get("apiKey", "")
-    secret = body.get("secret", "")
-    passphrase = body.get("passphrase", "")
-    if not (api_key and secret and passphrase):
+    api_key = body.get("apiKey") if isinstance(body, dict) else None
+    secret = body.get("secret") if isinstance(body, dict) else None
+    passphrase = body.get("passphrase") if isinstance(body, dict) else None
+    creds = (api_key, secret, passphrase)
+    if not all(isinstance(v, str) and v for v in creds):
         print("unexpected response shape (keys redacted). Not writing .env.")
         return 1
 
-    # update .env in place, preserving other lines
-    lines = env_path.read_text().splitlines() if env_path.exists() else []
-    out: dict = {}
-    order = []
+    # update .env in place, preserving comments and line order
+    lines = env_path.read_text(encoding="utf-8").splitlines() if env_path.exists() else []
+    updates = {
+        "NEX_API_KEY": api_key,
+        "NEX_API_SECRET": secret,
+        "NEX_API_PASSPHRASE": passphrase,
+    }
+    out: list[str] = []
+    seen: set[str] = set()
     for line in lines:
         if "=" in line and not line.startswith("#"):
-            k = line.split("=", 1)[0].strip()
-            order.append(line)
-            out[k] = line
-    def set_k(k: str, v: str):
-        nl = f"{k}={v}"
-        if k in out:
-            idx = next(i for i, l in enumerate(order) if l.startswith(k + "="))
-            order[idx] = nl
-        else:
-            order.append(nl)
-    set_k("NEX_API_KEY", api_key)
-    set_k("NEX_API_SECRET", secret)
-    set_k("NEX_API_PASSPHRASE", passphrase)
-    env_path.write_text("\n".join(order) + "\n")
+            key = line.split("=", 1)[0].strip()
+            if key in updates:
+                if key not in seen:  # drop duplicate assignments, keep one
+                    seen.add(key)
+                    out.append(f"{key}={updates[key]}")
+                continue
+        out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={value}")
+    try:
+        save_dotenv(env_path, out)
+    except OSError as exc:
+        print(f"saving .env failed: {type(exc).__name__} (original .env left intact).")
+        return 1
     print("wrote NEX_API_KEY/SECRET/PASSPHRASE to local .env (values redacted, not printed). "
           "Re-run sandbox feeds to verify 401 is gone.")
     return 0
