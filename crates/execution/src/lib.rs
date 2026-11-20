@@ -3,11 +3,22 @@
 //! Provides production execution actors, L2 HMAC signing, dual-protocol EIP-712 order signing,
 //! heartbeat keep-alive, maker fill reconciliation, and settlement workers.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )
+)]
+
 pub mod auth;
 pub mod clob_rest;
 pub mod eip712;
 pub mod error;
 pub mod heartbeat;
+pub mod nex;
 pub mod settlement;
 pub mod user_ws;
 
@@ -27,6 +38,12 @@ pub use error::ExecutionError;
 pub use heartbeat::{
     DEFAULT_HEARTBEAT_INTERVAL, HeartbeatRequest, HeartbeatResponse, OrderHeartbeatActor,
     execute_shutdown_cancel,
+};
+pub use nex::{
+    NEX_STALE_AFTER_MS, NexBook, NexDiscovery, NexFeedBudget, NexFeedPermit, NexFeedReadiness,
+    NexGateReport, NexHttp, NexMarket, NexOrderGuards, NexTradingSession, NexValidationOutcome,
+    check_public_connection, discover_markets, fetch_book, fetch_market_by_condition,
+    find_market_by_asset,
 };
 pub use settlement::{
     ApprovalState, CTF_ADDRESS, DEFAULT_MIN_BATCH_MICRO, DEFAULT_RELAYER_URL, MergeTarget,

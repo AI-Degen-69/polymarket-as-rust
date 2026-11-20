@@ -1,4 +1,4 @@
-use core_types::MathError;
+use core_types::{MathError, WireError};
 
 /// Execution and settlement error variants for Polymarket CLOB operations.
 #[derive(Debug, thiserror::Error)]
@@ -45,6 +45,10 @@ pub enum ExecutionError {
     /// Mathematical or configuration error from core-types.
     #[error("Core math error: {0}")]
     Core(#[from] MathError),
+
+    /// Fixed-point wire encoding error (tick, price bounds, size rounding).
+    #[error("Wire encoding error: {0}")]
+    Wire(#[from] WireError),
 
     /// Channel send or receive error.
     #[error("Channel error: {0}")]
