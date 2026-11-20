@@ -198,16 +198,18 @@ that key, and a deposit address has no key. Approvals and order signatures fail 
    cargo run -p cli --bin poly-as -- sandbox markets --limit 20
    ```
 
-4. Place and cancel the minimum-size post-only order. Confirm **0 open orders** after cancel:
+4. Place and cancel the minimum-size post-only order on that asset. Confirm **0 open orders**
+   after cancel:
 
    ```powershell
-   cargo run -p cli --bin poly-as -- sandbox validate --confirm-sandbox-trade
+   cargo run -p cli --bin poly-as -- sandbox validate --asset-id <TOKEN_ID> --confirm-sandbox-trade
    ```
 
-5. Run the feeds for ~10–15s. Check that the authenticated `/ws/user` session connects:
+5. Run the feeds for ~15s. Check that the authenticated `/ws/user` session connects:
 
    ```powershell
-   cargo run -p cli --bin poly-as -- sandbox feeds
+   cargo run -p cli --bin poly-as -- sandbox feeds `
+     --up-asset-id <UP_ID> --dn-asset-id <DN_ID> --duration 15s
    ```
 
 ## 7. Do not simulate
