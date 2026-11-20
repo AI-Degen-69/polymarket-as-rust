@@ -262,6 +262,7 @@ async fn run_validate(
 struct FeedSessionState {
     connected_sessions: u64,
     snapshots_seen: u64,
+    snapshots_after_reconnect: u64,
     snapshot_seen: bool,
     up_has_liquidity: bool,
     dn_has_liquidity: bool,
@@ -277,6 +278,7 @@ impl FeedSessionState {
         Self {
             connected_sessions: 0,
             snapshots_seen: 0,
+            snapshots_after_reconnect: 0,
             snapshot_seen: false,
             up_has_liquidity: false,
             dn_has_liquidity: false,
@@ -484,6 +486,10 @@ async fn run_feeds(
             state.last_market_msg = Some(Instant::now());
             if let PolyMarketEvent::BookSnapshot { outcome, book, .. } = &event {
                 state.snapshots_seen = state.snapshots_seen.saturating_add(1);
+                if state.connected_sessions >= 2 {
+                    state.snapshots_after_reconnect =
+                        state.snapshots_after_reconnect.saturating_add(1);
+                }
                 state.snapshot_seen = true;
                 let has_liquidity = book.bid_len() > 0 || book.ask_len() > 0;
                 match outcome {
@@ -622,8 +628,7 @@ async fn run_feeds(
         connected_sessions: state.connected_sessions,
         snapshots_seen: state.snapshots_seen,
         ready_events: state.ready_events,
-        snapshot_rebuild_ok: state.connected_sessions >= 2
-            && state.snapshots_seen >= 2 * state.connected_sessions,
+        snapshot_rebuild_ok: state.snapshots_after_reconnect >= 2,
         book_has_liquidity: state.book_has_liquidity(),
         quoting_allowed: final_readiness.quoting_allowed(),
         user_feed: &user_status,
