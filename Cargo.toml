@@ -33,6 +33,7 @@ arc-swap = "1.7"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
+core_affinity = "0.8"
 dotenvy = "0.15"
 futures-util = "0.3"
 hdrhistogram = "7.5"

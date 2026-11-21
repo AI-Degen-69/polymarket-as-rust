@@ -1,5 +1,6 @@
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use arc_swap::ArcSwap;
 use core_types::{MicroUsdc, Outcome, SharesMicro};
@@ -218,6 +219,200 @@ impl ActorPipelineHarness {
     /// Updates the order registry snapshot from the Execution actor.
     pub fn publish_registry_snapshot(&self, snapshot: OrderRegistrySnapshot) {
         self.registry_slot.store(Arc::new(snapshot));
+    }
+}
+
+/// Optional zero-based logical processor assignment for the dedicated actor threads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CorePinning {
+    /// Logical core for the Pricing actor thread (`--pin-pricing-core`).
+    pub pricing_core: Option<usize>,
+    /// Logical core for the Risk actor thread (`--pin-risk-core`).
+    pub risk_core: Option<usize>,
+}
+
+impl CorePinning {
+    /// Returns `true` when at least one actor thread is explicitly pinned.
+    pub fn is_active(&self) -> bool {
+        self.pricing_core.is_some() || self.risk_core.is_some()
+    }
+
+    /// Renders the human-readable pinning status for the CLI startup banner.
+    pub fn summary(&self) -> String {
+        let pricing = self
+            .pricing_core
+            .map_or_else(|| "unpinned".to_string(), |core| format!("core {core}"));
+        let risk = self
+            .risk_core
+            .map_or_else(|| "unpinned".to_string(), |core| format!("core {core}"));
+        format!("Pricing {pricing}, Risk {risk}")
+    }
+}
+
+/// Pins the calling OS thread to a zero-based logical core (`--pin-*-core`).
+///
+/// Returns `Err(ThreadPinning)` when the core index is outside the host's logical
+/// processor set or the OS rejects the affinity mask, so a bad flag never silently
+/// degrades into unpinned scheduling.
+pub fn pin_thread_to_core(core: usize) -> Result<(), RiskLifecycleError> {
+    let cores = core_affinity::get_core_ids().ok_or_else(|| {
+        RiskLifecycleError::ThreadPinning("logical core enumeration unavailable".to_string())
+    })?;
+    let id = *cores.get(core).ok_or_else(|| {
+        RiskLifecycleError::ThreadPinning(format!(
+            "logical core {core} out of range ({} available)",
+            cores.len()
+        ))
+    })?;
+    if core_affinity::set_for_current(id) {
+        Ok(())
+    } else {
+        Err(RiskLifecycleError::ThreadPinning(format!(
+            "OS rejected affinity mask for logical core {core}"
+        )))
+    }
+}
+
+/// Named handle for one supervised actor OS thread.
+struct SupervisedActor {
+    name: &'static str,
+    handle: JoinHandle<()>,
+}
+
+/// Watches the dedicated Pricing and Risk actor threads for unexpected exits.
+///
+/// A healthy actor thread only returns after `shutdown_flag()` is raised. A panic
+/// or premature return is a fatal topology fault: the supervisor fires an
+/// emergency `CancelAll` on the priority lane and reports the fault so the caller
+/// can exit non-zero instead of leaving orphan resting quotes.
+pub struct ActorSupervisor {
+    harness: ActorPipelineHarness,
+    shutdown: Arc<AtomicBool>,
+    threads: Vec<SupervisedActor>,
+    pin_fault: Arc<Mutex<Option<String>>>,
+}
+
+impl ActorSupervisor {
+    /// Creates a supervisor bound to the shared actor harness and shutdown flag.
+    pub fn new(harness: ActorPipelineHarness) -> Self {
+        let shutdown = Arc::clone(&harness.shutdown);
+        Self {
+            harness,
+            shutdown,
+            threads: Vec::new(),
+            pin_fault: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Shared shutdown flag; set it to request a clean actor exit.
+    pub fn shutdown_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown)
+    }
+
+    /// Spawns a dedicated OS thread for one actor, pinning it to `core` when provided.
+    pub fn spawn<F>(
+        &mut self,
+        name: &'static str,
+        core: Option<usize>,
+        body: F,
+    ) -> Result<(), RiskLifecycleError>
+    where
+        F: FnOnce() + Send + 'static,
+    {
+        let pin_fault = Arc::clone(&self.pin_fault);
+        let handle = std::thread::Builder::new()
+            .name(format!("poly-as-{name}"))
+            .spawn(move || {
+                let pinned = match core {
+                    Some(core) => match pin_thread_to_core(core) {
+                        Ok(()) => true,
+                        Err(err) => {
+                            if let Ok(mut slot) = pin_fault.lock() {
+                                *slot = Some(err.to_string());
+                            }
+                            false
+                        }
+                    },
+                    None => true,
+                };
+                if pinned {
+                    body();
+                }
+            })
+            .map_err(|err| {
+                RiskLifecycleError::ThreadPinning(format!("cannot spawn {name} thread: {err}"))
+            })?;
+        self.threads.push(SupervisedActor { name, handle });
+        Ok(())
+    }
+
+    /// Joins every actor thread, firing an emergency `CancelAll` if one exit was unexpected.
+    pub fn join(mut self) -> Result<(), RiskLifecycleError> {
+        let mut fault: Option<(String, String)> = None;
+        let threads = std::mem::take(&mut self.threads);
+        for actor in threads {
+            let outcome = actor.handle.join();
+            if fault.is_some() {
+                continue;
+            }
+            match outcome {
+                Ok(()) if self.shutdown.load(Ordering::Acquire) => {}
+                Ok(()) => {
+                    fault = Some((
+                        actor.name.to_string(),
+                        "actor thread exited before shutdown was requested".to_string(),
+                    ));
+                }
+                Err(payload) => {
+                    fault = Some((actor.name.to_string(), panic_message(payload.as_ref())));
+                }
+            }
+        }
+        if fault.is_none()
+            && let Ok(slot) = self.pin_fault.lock()
+            && let Some(reason) = slot.clone()
+        {
+            fault = Some(("pinning".to_string(), reason));
+        }
+        match fault {
+            None => Ok(()),
+            Some((actor, reason)) => {
+                self.fire_emergency_cancel(format!("Actor thread '{actor}' faulted: {reason}"));
+                Err(RiskLifecycleError::ActorThreadFault { actor, reason })
+            }
+        }
+    }
+
+    /// Sends `CancelAll` on the priority lane, guaranteeing delivery off the async runtime.
+    fn fire_emergency_cancel(&self, reason: String) {
+        let tx = self.harness.priority_tx.clone();
+        if tx
+            .try_send(ExecutionCommand::CancelAll {
+                reason: reason.clone(),
+            })
+            .is_ok()
+        {
+            return;
+        }
+        let spawned = std::thread::Builder::new()
+            .name("poly-as-emergency-cancel".to_string())
+            .spawn(move || {
+                let _ = tx.blocking_send(ExecutionCommand::CancelAll { reason });
+            });
+        if let Ok(handle) = spawned {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Extracts a printable message from a caught panic payload.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(msg) = payload.downcast_ref::<&str>() {
+        (*msg).to_string()
+    } else if let Some(msg) = payload.downcast_ref::<String>() {
+        msg.clone()
+    } else {
+        "panicked with a non-string payload".to_string()
     }
 }
 
@@ -861,5 +1056,108 @@ mod tests {
 
         let cmd = priority_rx.try_recv().unwrap();
         assert!(matches!(cmd, ExecutionCommand::ExecuteFlattenFak { .. }));
+    }
+
+    #[test]
+    fn test_supervisor_fires_emergency_cancel_on_actor_panic() {
+        // Fault injection: a Risk actor thread panics mid-run. The supervisor must
+        // catch the exit, fire emergency CancelAll on the priority lane, and report
+        // the fault so the CLI exits non-zero.
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+        let mut supervisor = ActorSupervisor::new(harness);
+
+        supervisor
+            .spawn("risk", None, || {
+                std::panic::panic_any("injected risk actor fault");
+            })
+            .unwrap();
+
+        let err = supervisor.join().unwrap_err();
+        assert!(matches!(
+            err,
+            RiskLifecycleError::ActorThreadFault { ref actor, .. } if actor == "risk"
+        ));
+
+        match priority_rx.try_recv() {
+            Ok(ExecutionCommand::CancelAll { reason }) => {
+                assert!(reason.contains("risk"), "unexpected reason: {reason}");
+            }
+            other => panic!("expected emergency CancelAll, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_supervisor_flags_actor_exit_before_shutdown() {
+        // An actor that returns without the shutdown flag set leaves orphan quotes:
+        // the supervisor must treat the clean-but-premature exit as a fault.
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+        let mut supervisor = ActorSupervisor::new(harness);
+
+        supervisor.spawn("pricing", None, || {}).unwrap();
+
+        let err = supervisor.join().unwrap_err();
+        assert!(matches!(
+            err,
+            RiskLifecycleError::ActorThreadFault { ref actor, .. } if actor == "pricing"
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(ExecutionCommand::CancelAll { .. })
+        ));
+    }
+
+    #[test]
+    fn test_supervisor_accepts_ordered_shutdown() {
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+        let mut supervisor = ActorSupervisor::new(harness);
+        let shutdown = supervisor.shutdown_flag();
+
+        supervisor
+            .spawn("risk", None, move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+            .unwrap();
+
+        supervisor.shutdown_flag().store(true, Ordering::Release);
+        supervisor.join().unwrap();
+        assert!(priority_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_pin_thread_to_core_rejects_out_of_range_core() {
+        assert!(matches!(
+            pin_thread_to_core(usize::MAX),
+            Err(RiskLifecycleError::ThreadPinning(_))
+        ));
+    }
+
+    #[test]
+    fn test_pin_thread_to_core_accepts_available_core() {
+        let cores = core_affinity::get_core_ids().unwrap_or_default();
+        if cores.is_empty() {
+            return;
+        }
+        pin_thread_to_core(0).unwrap();
+    }
+
+    #[test]
+    fn test_supervisor_pinned_thread_join_is_clean() {
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+        let mut supervisor = ActorSupervisor::new(harness.clone());
+        let shutdown = supervisor.shutdown_flag();
+
+        supervisor
+            .spawn("pricing", Some(0), move || {
+                while !shutdown.load(Ordering::Acquire) {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            })
+            .unwrap();
+
+        harness.shutdown.store(true, Ordering::Release);
+        supervisor.join().unwrap();
+        assert!(priority_rx.try_recv().is_err());
     }
 }

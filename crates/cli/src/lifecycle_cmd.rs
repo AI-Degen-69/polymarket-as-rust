@@ -1,24 +1,26 @@
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use core_types::{
-    ClockOffsetEstimator, EngineConfig, FixedBook, HighResTimerGuard, JsonlWriter, LatencyTracker,
-    MarketDescriptor, MicroUsdc, MonotonicClock, ONE_SHARE_MICRO, Outcome, SharesMicro,
-    SignedSharesMicro,
+    ClockOffsetEstimator, EngineConfig, FeeSchedule, FixedBook, HighResTimerGuard, JsonlWriter,
+    LatencyTracker, MarketDescriptor, MicroUsdc, MonotonicClock, ONE_SHARE_MICRO, Outcome,
+    SharesMicro, SignedSharesMicro,
 };
 use feeds::{
     BinanceSpotEvent, BookMaintainer, DEFAULT_RING_CAPACITY, GammaDiscoveryClient, PolyMarketEvent,
 };
 use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 use risk_lifecycle::{
-    ActorPipelineHarness, BreakerConfig, BreakerStatus, CircuitBreakers, DollarNotionalRiskEngine,
-    EpochLifecycleController, EpochPhase, FaultInjection, FlattenAction, HysteresisConfig,
-    HysteresisGate, LifecycleConfig, OrderRegistrySnapshot, QuoteProposal, RiskActor, RiskConfig,
-    RiskTier,
+    ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerStatus, CircuitBreakers,
+    CorePinning, DollarNotionalRiskEngine, EpochLifecycleController, EpochPhase, ExecutionCommand,
+    FaultInjection, FlattenAction, HysteresisConfig, HysteresisGate, LifecycleConfig,
+    OrderRegistrySnapshot, QuoteProposal, RiskActor, RiskActorTrace, RiskConfig, RiskTier,
 };
 use rtrb::RingBuffer;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
 use crate::lifecycle_report::{
@@ -62,10 +64,192 @@ pub(crate) struct LifecycleArgs {
     pub(crate) fault: CliFaultMode,
     pub(crate) v_max: u64,
     pub(crate) base_size: u64,
+    pub(crate) pinning: CorePinning,
     pub(crate) jsonl: PathBuf,
 }
 
+/// One Pricing actor tick handed to the pinned Pricing OS thread.
+struct PricingJob {
+    seq: u64,
+    now_ms: u64,
+    expiry_ms: u64,
+    tick_size_micro: MicroUsdc,
+    fee_schedule: FeeSchedule,
+    book_up: FixedBook<10>,
+    book_dn: FixedBook<10>,
+    spot_usd: Option<f64>,
+    strike_usd: Option<f64>,
+}
+
+struct PricingAck {
+    total_compute_ns: u64,
+    error: Option<String>,
+}
+
+/// One Risk actor tick handed to the pinned Risk OS thread.
+struct RiskJob {
+    now_ns: u64,
+    clock_offset_ms: i64,
+    step_count: u64,
+}
+
+#[derive(Default)]
+struct RiskAck {
+    trace: Option<RiskActorTrace>,
+    risk_ns: u64,
+    orders_submitted: usize,
+    orders_replaced: usize,
+    orders_canceled: usize,
+    flattens_executed: usize,
+    error: Option<String>,
+}
+
+/// Pricing actor body executed on its dedicated (optionally pinned) OS thread.
+fn pricing_actor_loop(
+    mut pipeline: MathPipeline,
+    harness: ActorPipelineHarness,
+    mut jobs: mpsc::Receiver<(PricingJob, oneshot::Sender<PricingAck>)>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while let Some((job, ack)) = jobs.blocking_recv() {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        let input = PipelineInput {
+            now_ms: job.now_ms,
+            expiry_ms: job.expiry_ms,
+            tick_size_micro: job.tick_size_micro,
+            fee_schedule: job.fee_schedule,
+            inventory_q: SignedSharesMicro(0),
+            book_up: &job.book_up,
+            book_dn: &job.book_dn,
+            spot_usd: job.spot_usd,
+            strike_usd: job.strike_usd,
+            active_bid_up: None,
+            active_bid_dn: None,
+        };
+
+        let reply = match pipeline.evaluate(&input) {
+            Ok(trace) => {
+                harness.publish_quote(QuoteProposal {
+                    seq: job.seq,
+                    now_ms: job.now_ms,
+                    expiry_ms: job.expiry_ms,
+                    tick_size_micro: job.tick_size_micro,
+                    quote: trace.quote,
+                    bid_up_raw: trace.pricer.map_or(0.0, |p| p.bid_up_raw),
+                    bid_dn_raw: trace.pricer.map_or(0.0, |p| p.bid_dn_raw),
+                    best_bid_up: trace.best_bid_up,
+                    best_bid_dn: trace.best_bid_dn,
+                    best_ask_up: trace.best_ask_up,
+                    best_ask_dn: trace.best_ask_dn,
+                    defensive_cancel: trace.flags.defensive_cancel,
+                    total_compute_ns: trace.timings.total_compute_ns,
+                });
+                PricingAck {
+                    total_compute_ns: trace.timings.total_compute_ns,
+                    error: None,
+                }
+            }
+            Err(err) => PricingAck {
+                total_compute_ns: 0,
+                error: Some(err.to_string()),
+            },
+        };
+
+        let failed = reply.error.is_some();
+        if ack.send(reply).is_err() || failed {
+            break;
+        }
+    }
+}
+
+/// Risk actor body executed on its dedicated (optionally pinned) OS thread.
+fn risk_actor_loop(
+    mut actor: RiskActor,
+    mut priority_rx: mpsc::Receiver<ExecutionCommand>,
+    mut routine_rx: mpsc::Receiver<ExecutionCommand>,
+    mut jobs: mpsc::Receiver<(RiskJob, oneshot::Sender<RiskAck>)>,
+    shutdown: Arc<AtomicBool>,
+) {
+    while let Some((job, ack)) = jobs.blocking_recv() {
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+
+        let start = std::time::Instant::now();
+        let stepped = actor.step(job.now_ns, job.clock_offset_ms);
+        let mut report = RiskAck {
+            risk_ns: start.elapsed().as_nanos() as u64,
+            ..Default::default()
+        };
+
+        match stepped {
+            Ok(trace) => report.trace = trace,
+            Err(err) => {
+                report.error = Some(err.to_string());
+                let _ = ack.send(report);
+                break;
+            }
+        }
+
+        while let Ok(cmd) = priority_rx.try_recv() {
+            match cmd {
+                ExecutionCommand::CancelAll { .. } => report.orders_canceled += 2,
+                ExecutionCommand::ExecuteFlattenFak { .. } => report.flattens_executed += 1,
+                _ => {}
+            }
+        }
+
+        while let Ok(cmd) = routine_rx.try_recv() {
+            match cmd {
+                ExecutionCommand::SubmitNew {
+                    outcome,
+                    price,
+                    size,
+                } => {
+                    report.orders_submitted += 1;
+                    actor.hysteresis_mut().on_place_ack(
+                        outcome,
+                        format!("live_{}", job.step_count),
+                        price,
+                        size,
+                    );
+                }
+                ExecutionCommand::CancelAndReplace {
+                    outcome,
+                    new_price,
+                    new_size,
+                    ..
+                } => {
+                    report.orders_replaced += 1;
+                    let _ = actor.hysteresis_mut().on_cancel_ack(outcome);
+                    actor.hysteresis_mut().on_place_ack(
+                        outcome,
+                        format!("live_{}", job.step_count),
+                        new_price,
+                        new_size,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        if ack.send(report).is_err() {
+            break;
+        }
+    }
+}
+
 pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
+    if args.source == LifecycleSourceMode::SimEpoch && args.pinning.is_active() {
+        return Err(
+            "--pin-pricing-core/--pin-risk-core apply to the live actor topology; \
+             sim-epoch runs a deterministic single-thread epoch loop"
+                .into(),
+        );
+    }
+
     let _timer_guard = HighResTimerGuard::acquire_1ms()?;
     let clock = MonotonicClock::start();
 
@@ -419,7 +603,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
         health_tx,
     )?;
 
-    let (harness, mut priority_rx, mut routine_rx) = ActorPipelineHarness::new(64, 16);
+    let (harness, priority_rx, routine_rx) = ActorPipelineHarness::new(64, 16);
 
     let v_max_micro = MicroUsdc(args.v_max.saturating_mul(1_000_000));
     let risk_config = RiskConfig {
@@ -447,7 +631,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     let breaker_config = BreakerConfig::default();
     let breakers = CircuitBreakers::new(breaker_config, desc.tick_size_micro, clock.now_ns()?);
 
-    let mut risk_actor = RiskActor::new(
+    let risk_actor = RiskActor::new(
         harness.clone(),
         risk_engine,
         hysteresis,
@@ -457,7 +641,29 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     );
 
     let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg)?;
-    let mut math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
+    let math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
+
+    println!(
+        "  Actors: {} | supervisor armed (unexpected thread exit -> emergency CancelAll + non-zero exit)",
+        args.pinning.summary()
+    );
+
+    // Dedicated Pricing and Risk OS threads (optionally pinned) under a supervisor.
+    let mut supervisor = ActorSupervisor::new(harness.clone());
+    let actor_shutdown = supervisor.shutdown_flag();
+    let (pricing_tx, pricing_rx) = mpsc::channel::<(PricingJob, oneshot::Sender<PricingAck>)>(4);
+    let (risk_tx, risk_rx) = mpsc::channel::<(RiskJob, oneshot::Sender<RiskAck>)>(4);
+
+    let pricing_harness = harness.clone();
+    let pricing_shutdown = Arc::clone(&actor_shutdown);
+    supervisor.spawn("pricing", args.pinning.pricing_core, move || {
+        pricing_actor_loop(math_pipeline, pricing_harness, pricing_rx, pricing_shutdown);
+    })?;
+
+    let risk_shutdown = Arc::clone(&actor_shutdown);
+    supervisor.spawn("risk", args.pinning.risk_core, move || {
+        risk_actor_loop(risk_actor, priority_rx, routine_rx, risk_rx, risk_shutdown);
+    })?;
 
     let mut book_up = BookMaintainer::new(Outcome::Up);
     let mut book_dn = BookMaintainer::new(Outcome::Down);
@@ -467,6 +673,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     let fallback_dn = FixedBook::<10>::empty(Outcome::Down);
 
     let deadline = tokio::time::Instant::now() + duration_limit;
+    let mut loop_error: Option<String> = None;
     let mut step_count = 0u64;
     let mut current_phase: Option<EpochPhase> = None;
     let mut current_tier = RiskTier::Tier1Normal;
@@ -544,52 +751,66 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
             }
         }
 
-        let snap_up = latest_up.as_ref().unwrap_or(&fallback_up);
-        let snap_dn = latest_dn.as_ref().unwrap_or(&fallback_dn);
-
-        let pipe_input = PipelineInput {
-            now_ms,
-            expiry_ms: desc.expiry_ts_ms,
-            tick_size_micro: desc.tick_size_micro,
-            fee_schedule: desc.fee_schedule,
-            inventory_q: SignedSharesMicro(0),
-            book_up: snap_up,
-            book_dn: snap_dn,
-            spot_usd: latest_spot,
-            strike_usd: desc.strike_price_usd.map(|f| f.get()),
-            active_bid_up: None,
-            active_bid_dn: None,
-        };
-
-        let trace = math_pipeline.evaluate(&pipe_input)?;
-        pricing_lat.record_ns(trace.timings.total_compute_ns)?;
+        let snap_up = *latest_up.as_ref().unwrap_or(&fallback_up);
+        let snap_dn = *latest_dn.as_ref().unwrap_or(&fallback_dn);
 
         step_count += 1;
-        let proposal = QuoteProposal {
+        let pricing_job = PricingJob {
             seq: step_count,
             now_ms,
             expiry_ms: desc.expiry_ts_ms,
             tick_size_micro: desc.tick_size_micro,
-            quote: trace.quote,
-            bid_up_raw: trace.pricer.map_or(0.0, |p| p.bid_up_raw),
-            bid_dn_raw: trace.pricer.map_or(0.0, |p| p.bid_dn_raw),
-            best_bid_up: trace.best_bid_up,
-            best_bid_dn: trace.best_bid_dn,
-            best_ask_up: trace.best_ask_up,
-            best_ask_dn: trace.best_ask_dn,
-            defensive_cancel: trace.flags.defensive_cancel,
-            total_compute_ns: trace.timings.total_compute_ns,
+            fee_schedule: desc.fee_schedule,
+            book_up: snap_up,
+            book_dn: snap_dn,
+            spot_usd: latest_spot,
+            strike_usd: desc.strike_price_usd.map(|f| f.get()),
         };
-        harness.publish_quote(proposal);
 
-        let risk_start = clock.now_ns()?;
-        let clock_drift = offset_est.offset_ms().unwrap_or(0);
-        let trace_opt = risk_actor.step(now_ns, clock_drift)?;
-        let risk_ns = clock.now_ns()?.saturating_sub(risk_start);
+        let (pricing_ack_tx, pricing_ack_rx) = oneshot::channel();
+        if pricing_tx
+            .send((pricing_job, pricing_ack_tx))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        let pricing_ack = match pricing_ack_rx.await {
+            Ok(ack) => ack,
+            Err(_) => break,
+        };
+        if let Some(err) = pricing_ack.error {
+            loop_error = Some(format!("Pricing actor failed: {err}"));
+            break;
+        }
+        pricing_lat.record_ns(pricing_ack.total_compute_ns)?;
+
+        let risk_job = RiskJob {
+            now_ns,
+            clock_offset_ms: offset_est.offset_ms().unwrap_or(0),
+            step_count,
+        };
+        let (risk_ack_tx, risk_ack_rx) = oneshot::channel();
+        if risk_tx.send((risk_job, risk_ack_tx)).await.is_err() {
+            break;
+        }
+        let risk_ack = match risk_ack_rx.await {
+            Ok(ack) => ack,
+            Err(_) => break,
+        };
+        if let Some(err) = risk_ack.error {
+            loop_error = Some(format!("Risk actor failed: {err}"));
+            break;
+        }
+        let risk_ns = risk_ack.risk_ns;
         risk_lat.record_ns(risk_ns)?;
-        total_lat.record_ns(trace.timings.total_compute_ns + risk_ns)?;
+        total_lat.record_ns(pricing_ack.total_compute_ns + risk_ns)?;
+        stats.orders_submitted += risk_ack.orders_submitted;
+        stats.orders_replaced += risk_ack.orders_replaced;
+        stats.orders_canceled += risk_ack.orders_canceled;
+        stats.flattens_executed += risk_ack.flattens_executed;
 
-        if let Some(r_trace) = trace_opt {
+        if let Some(r_trace) = risk_ack.trace {
             stats.ticks_evaluated += 1;
 
             if current_phase != Some(r_trace.phase) {
@@ -629,53 +850,6 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                 current_tier = r_trace.tier;
             }
 
-            // Drain channels
-            while let Ok(cmd) = priority_rx.try_recv() {
-                match cmd {
-                    risk_lifecycle::ExecutionCommand::CancelAll { .. } => {
-                        stats.orders_canceled += 2
-                    }
-                    risk_lifecycle::ExecutionCommand::ExecuteFlattenFak { .. } => {
-                        stats.flattens_executed += 1
-                    }
-                    _ => {}
-                }
-            }
-
-            while let Ok(cmd) = routine_rx.try_recv() {
-                match cmd {
-                    risk_lifecycle::ExecutionCommand::SubmitNew {
-                        outcome,
-                        price,
-                        size,
-                    } => {
-                        stats.orders_submitted += 1;
-                        risk_actor.hysteresis_mut().on_place_ack(
-                            outcome,
-                            format!("live_{step_count}"),
-                            price,
-                            size,
-                        );
-                    }
-                    risk_lifecycle::ExecutionCommand::CancelAndReplace {
-                        outcome,
-                        new_price,
-                        new_size,
-                        ..
-                    } => {
-                        stats.orders_replaced += 1;
-                        let _ = risk_actor.hysteresis_mut().on_cancel_ack(outcome);
-                        risk_actor.hysteresis_mut().on_place_ack(
-                            outcome,
-                            format!("live_{step_count}"),
-                            new_price,
-                            new_size,
-                        );
-                    }
-                    _ => {}
-                }
-            }
-
             print_lifecycle_step(&LifecycleStepRow {
                 tau_secs,
                 phase: r_trace.phase,
@@ -686,7 +860,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                 net_delta: 0,
                 action_up: &r_trace.action_up,
                 action_dn: &r_trace.action_dn,
-                pricing_ns: trace.timings.total_compute_ns,
+                pricing_ns: pricing_ack.total_compute_ns,
                 risk_ns,
             });
 
@@ -711,7 +885,16 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
+    actor_shutdown.store(true, Ordering::Release);
+    drop(pricing_tx);
+    drop(risk_tx);
+    let supervisor_result = supervisor.join();
     shutdown_actors(handles, cfg.polybolt_enabled).await;
+
+    if let Some(message) = loop_error {
+        return Err(message.into());
+    }
+    supervisor_result?;
 
     let p_summary = pricing_lat.summary();
     let r_summary = risk_lat.summary();

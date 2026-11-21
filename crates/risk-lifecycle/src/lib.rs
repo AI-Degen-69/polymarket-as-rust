@@ -31,8 +31,8 @@ pub use lifecycle::{
     EpochLifecycleController, EpochPhase, LifecycleAction, LifecycleConfig, LifecycleInput,
 };
 pub use runtime::{
-    ActorPipelineHarness, ExecutionCommand, FaultInjection, QuoteProposal, RiskActor,
-    RiskActorTrace,
+    ActorPipelineHarness, ActorSupervisor, CorePinning, ExecutionCommand, FaultInjection,
+    QuoteProposal, RiskActor, RiskActorTrace, pin_thread_to_core,
 };
 pub use station7_risk::{
     DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot, RiskConfig, RiskDecision,

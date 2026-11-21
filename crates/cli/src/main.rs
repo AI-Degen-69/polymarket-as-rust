@@ -264,6 +264,12 @@ enum Commands {
         /// Base order size in whole shares (`20` default).
         #[arg(long, default_value_t = 20)]
         base_size: u64,
+        /// Pin the live Pricing actor OS thread to a zero-based logical CPU core.
+        #[arg(long)]
+        pin_pricing_core: Option<usize>,
+        /// Pin the live Risk actor OS thread to a zero-based logical CPU core.
+        #[arg(long)]
+        pin_risk_core: Option<usize>,
         /// Output path for structured JSONL telemetry log.
         #[arg(long, default_value = "logs/phase4-lifecycle.jsonl")]
         jsonl: PathBuf,
@@ -368,6 +374,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             inject_fault,
             v_max,
             base_size,
+            pin_pricing_core,
+            pin_risk_core,
             jsonl,
         } => lifecycle_cmd::run(LifecycleArgs {
             source: match source {
@@ -385,6 +393,10 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             v_max,
             base_size,
+            pinning: risk_lifecycle::CorePinning {
+                pricing_core: pin_pricing_core,
+                risk_core: pin_risk_core,
+            },
             jsonl,
         }),
         Commands::Sandbox { action } => match action {
