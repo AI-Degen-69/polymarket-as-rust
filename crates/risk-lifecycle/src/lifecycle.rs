@@ -136,6 +136,7 @@ pub struct EpochLifecycleController {
     config: LifecycleConfig,
     last_phase: Option<EpochPhase>,
     rollover_emitted: bool,
+    last_expiry_ms: Option<u64>,
 }
 
 impl EpochLifecycleController {
@@ -146,6 +147,7 @@ impl EpochLifecycleController {
             config,
             last_phase: None,
             rollover_emitted: false,
+            last_expiry_ms: None,
         })
     }
 
@@ -155,6 +157,14 @@ impl EpochLifecycleController {
         input: &LifecycleInput,
         snapshot: &OrderRegistrySnapshot,
     ) -> LifecycleAction {
+        if self
+            .last_expiry_ms
+            .is_some_and(|prev| prev != input.expiry_ms)
+        {
+            self.reset_for_new_epoch();
+        }
+        self.last_expiry_ms = Some(input.expiry_ms);
+
         let tau_ms = input.expiry_ms.saturating_sub(input.now_ms);
         let tau_secs = tau_ms / 1000;
 
@@ -258,21 +268,27 @@ impl EpochLifecycleController {
                     LifecycleAction::CancelAllResting {
                         phase,
                         tau_secs,
-                        reason: "Flatten order in flight; resting quotes canceled".to_string(),
+                        reason: format!(
+                            "Flatten order in flight; resting quotes canceled (heavy={heavy_leg:?}, ask_up={:?}, bid_up={:?}, ask_dn={:?}, bid_dn={:?})",
+                            input.best_ask_up,
+                            input.best_bid_up,
+                            input.best_ask_dn,
+                            input.best_bid_dn
+                        ),
                     }
                 } else {
                     let delta_micro = SharesMicro::from_raw(net_delta_shares);
                     match heavy_leg {
                         Some(Outcome::Up) => {
                             // Long UP: buy DOWN at ask or sell UP at bid.
-                            if let Some(ask_dn) = input.best_ask_dn {
+                            if let Some(ask_dn) = input.best_ask_dn.filter(|p| p.0 > 0) {
                                 LifecycleAction::ExecuteFlattenFak {
                                     outcome: Outcome::Down,
                                     price: ask_dn,
                                     size: delta_micro,
                                     reason: "Mandatory flatten BUY DOWN at ask".to_string(),
                                 }
-                            } else if let Some(bid_up) = input.best_bid_up {
+                            } else if let Some(bid_up) = input.best_bid_up.filter(|p| p.0 > 0) {
                                 LifecycleAction::ExecuteFlattenFak {
                                     outcome: Outcome::Up,
                                     price: bid_up,
@@ -283,20 +299,23 @@ impl EpochLifecycleController {
                                 LifecycleAction::CancelAllResting {
                                     phase,
                                     tau_secs,
-                                    reason: "Mandatory flatten liquidity unavailable".to_string(),
+                                    reason: format!(
+                                        "Mandatory flatten liquidity unavailable (heavy=Up, ask_dn={:?}, bid_up={:?})",
+                                        input.best_ask_dn, input.best_bid_up
+                                    ),
                                 }
                             }
                         }
                         Some(Outcome::Down) => {
                             // Long DOWN: buy UP at ask or sell DOWN at bid.
-                            if let Some(ask_up) = input.best_ask_up {
+                            if let Some(ask_up) = input.best_ask_up.filter(|p| p.0 > 0) {
                                 LifecycleAction::ExecuteFlattenFak {
                                     outcome: Outcome::Up,
                                     price: ask_up,
                                     size: delta_micro,
                                     reason: "Mandatory flatten BUY UP at ask".to_string(),
                                 }
-                            } else if let Some(bid_dn) = input.best_bid_dn {
+                            } else if let Some(bid_dn) = input.best_bid_dn.filter(|p| p.0 > 0) {
                                 LifecycleAction::ExecuteFlattenFak {
                                     outcome: Outcome::Down,
                                     price: bid_dn,
@@ -307,7 +326,10 @@ impl EpochLifecycleController {
                                 LifecycleAction::CancelAllResting {
                                     phase,
                                     tau_secs,
-                                    reason: "Mandatory flatten liquidity unavailable".to_string(),
+                                    reason: format!(
+                                        "Mandatory flatten liquidity unavailable (heavy=Down, ask_up={:?}, bid_dn={:?})",
+                                        input.best_ask_up, input.best_bid_dn
+                                    ),
                                 }
                             }
                         }
@@ -332,6 +354,7 @@ impl EpochLifecycleController {
     pub fn reset_for_new_epoch(&mut self) {
         self.last_phase = None;
         self.rollover_emitted = false;
+        self.last_expiry_ms = None;
     }
 }
 
@@ -447,5 +470,68 @@ mod tests {
             controller.evaluate(&input_expired, &snapshot),
             LifecycleAction::EpochRollover { .. }
         ));
+    }
+
+    #[test]
+    fn test_mandatory_flatten_net_19_emits_execute_flatten_fak() {
+        let mut controller = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let expiry_ms = 300_000;
+        let now_ms = 275_000; // tau = 25s (MandatoryFlatten: 15 < tau <= 30)
+
+        // Q = (0, 19) -> net_delta = -19 -> buy 19 UP at best_ask_up.
+        let snapshot_short_up = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::ZERO,
+            unhedged_dn: SharesMicro::from_raw(19 * ONE_SHARE_MICRO),
+            ..Default::default()
+        };
+        let input_with_ask_up = LifecycleInput {
+            now_ms,
+            expiry_ms,
+            best_ask_up: Some(MicroUsdc(520_000)),
+            best_ask_dn: Some(MicroUsdc(490_000)),
+            best_bid_up: Some(MicroUsdc(500_000)),
+            best_bid_dn: Some(MicroUsdc(480_000)),
+            flatten_in_flight: false,
+        };
+        assert_eq!(
+            controller.evaluate(&input_with_ask_up, &snapshot_short_up),
+            LifecycleAction::ExecuteFlattenFak {
+                outcome: Outcome::Up,
+                price: MicroUsdc(520_000),
+                size: SharesMicro::from_raw(19 * ONE_SHARE_MICRO),
+                reason: "Mandatory flatten BUY UP at ask".to_string(),
+            }
+        );
+
+        // When best_ask_up is unavailable, fallback sells 19 DN at best_bid_dn.
+        let input_bid_dn_only = LifecycleInput {
+            best_ask_up: None,
+            ..input_with_ask_up
+        };
+        assert_eq!(
+            controller.evaluate(&input_bid_dn_only, &snapshot_short_up),
+            LifecycleAction::ExecuteFlattenFak {
+                outcome: Outcome::Down,
+                price: MicroUsdc(480_000),
+                size: SharesMicro::from_raw(19 * ONE_SHARE_MICRO),
+                reason: "Mandatory flatten SELL DOWN at bid".to_string(),
+            }
+        );
+
+        // Q = (19, 0) -> net_delta = +19 -> buy 19 DN at best_ask_dn.
+        let snapshot_long_up = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(19 * ONE_SHARE_MICRO),
+            unhedged_dn: SharesMicro::ZERO,
+            ..Default::default()
+        };
+        assert_eq!(
+            controller.evaluate(&input_with_ask_up, &snapshot_long_up),
+            LifecycleAction::ExecuteFlattenFak {
+                outcome: Outcome::Down,
+                price: MicroUsdc(490_000),
+                size: SharesMicro::from_raw(19 * ONE_SHARE_MICRO),
+                reason: "Mandatory flatten BUY DOWN at ask".to_string(),
+            }
+        );
     }
 }

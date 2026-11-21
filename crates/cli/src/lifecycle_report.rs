@@ -2,7 +2,7 @@ use core_types::{
     JsonlWriter, LatencySummary, MICRO_SCALE, MicroUsdc, OrderSide, Outcome, SharesMicro,
 };
 use paper_sim::{MergeEvent, SimFill};
-use risk_lifecycle::{BreakerStatus, EpochPhase, OrderAction, RiskTier};
+use risk_lifecycle::{BreakerStatus, EpochPhase, OrderAction, RiskActorTrace, RiskTier};
 use serde::Serialize;
 use std::path::Path;
 
@@ -85,11 +85,81 @@ struct RiskTierEvent {
     heavy_leg: Option<Outcome>,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct OrderActionTelemetry<'a> {
+    pub(crate) phase: Option<EpochPhase>,
+    pub(crate) cancel_all_reason: Option<&'a str>,
+    pub(crate) flatten_in_flight: Option<bool>,
+    pub(crate) best_bid_up: Option<MicroUsdc>,
+    pub(crate) best_ask_up: Option<MicroUsdc>,
+    pub(crate) best_bid_dn: Option<MicroUsdc>,
+    pub(crate) best_ask_dn: Option<MicroUsdc>,
+}
+
+impl<'a> OrderActionTelemetry<'a> {
+    pub(crate) fn from_trace(trace: &'a RiskActorTrace) -> Self {
+        if trace.phase == EpochPhase::MandatoryFlatten || trace.cancel_all_reason.is_some() {
+            Self {
+                phase: Some(trace.phase),
+                cancel_all_reason: trace.cancel_all_reason.as_deref(),
+                flatten_in_flight: Some(trace.flatten_in_flight),
+                best_bid_up: trace.best_bid_up,
+                best_ask_up: trace.best_ask_up,
+                best_bid_dn: trace.best_bid_dn,
+                best_ask_dn: trace.best_ask_dn,
+            }
+        } else {
+            Self::default()
+        }
+    }
+}
+
 #[derive(Serialize)]
-struct OrderActionEvent {
+struct OrderActionEvent<'a> {
     outcome: Outcome,
     action: OrderAction,
     tau_secs: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<EpochPhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cancel_all_reason: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    flatten_in_flight: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_bid_up_micro: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_ask_up_micro: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_bid_dn_micro: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_ask_dn_micro: Option<u64>,
+}
+
+pub(crate) struct CancelAllRecord<'a> {
+    pub(crate) market_slug: &'a str,
+    pub(crate) phase: Option<EpochPhase>,
+    pub(crate) tau_secs: u64,
+    pub(crate) canceled_count: usize,
+    pub(crate) flatten_in_flight: Option<bool>,
+    pub(crate) best_bid_up: Option<MicroUsdc>,
+    pub(crate) best_ask_up: Option<MicroUsdc>,
+    pub(crate) best_bid_dn: Option<MicroUsdc>,
+    pub(crate) best_ask_dn: Option<MicroUsdc>,
+    pub(crate) reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct CancelAllEvent<'a> {
+    market_slug: &'a str,
+    phase: Option<EpochPhase>,
+    tau_secs: u64,
+    canceled_count: usize,
+    flatten_in_flight: Option<bool>,
+    best_bid_up_micro: Option<u64>,
+    best_ask_up_micro: Option<u64>,
+    best_bid_dn_micro: Option<u64>,
+    best_ask_dn_micro: Option<u64>,
+    reason: &'a str,
 }
 
 #[derive(Serialize)]
@@ -220,8 +290,18 @@ pub(crate) struct LifecycleStepRow<'a> {
     pub(crate) net_delta: i64,
     pub(crate) action_up: &'a OrderAction,
     pub(crate) action_dn: &'a OrderAction,
+    pub(crate) cancel_all_reason: Option<&'a str>,
+    pub(crate) flatten_in_flight: bool,
+    pub(crate) best_bid_up: Option<MicroUsdc>,
+    pub(crate) best_ask_up: Option<MicroUsdc>,
+    pub(crate) best_bid_dn: Option<MicroUsdc>,
+    pub(crate) best_ask_dn: Option<MicroUsdc>,
     pub(crate) pricing_ns: u64,
     pub(crate) risk_ns: u64,
+}
+
+fn fmt_opt_usd(px: Option<MicroUsdc>) -> String {
+    px.map_or_else(|| "none".to_string(), |p| format!("${p}"))
 }
 
 pub(crate) fn print_lifecycle_step(row: &LifecycleStepRow<'_>) {
@@ -232,20 +312,44 @@ pub(crate) fn print_lifecycle_step(row: &LifecycleStepRow<'_>) {
     let total_us = (row.pricing_ns + row.risk_ns) / 1_000;
     let risk_us = row.risk_ns / 1_000;
 
-    println!(
-        "  T-{:03}s  {:<20} {:<13} {:>5.1}% ({:>2},{:>2},d={:>+2})  UP: {:<16} | DN: {:<16} [Risk: {}us, Total: {}us]",
-        row.tau_secs,
-        format!("{:?}", row.phase),
-        format!("{:?}", row.tier),
-        u_pct,
-        row.q_up.as_u64() / 1_000_000,
-        row.q_dn.as_u64() / 1_000_000,
-        row.net_delta,
-        up_str,
-        dn_str,
-        risk_us,
-        total_us,
-    );
+    if row.phase == EpochPhase::MandatoryFlatten || row.cancel_all_reason.is_some() {
+        let reason = row.cancel_all_reason.unwrap_or("none");
+        println!(
+            "  T-{:03}s  {:<20} {:<13} {:>5.1}% ({:>2},{:>2},d={:>+2})  UP: {:<16} | DN: {:<16} [Risk: {}us, Total: {}us] | fif={} UP={}/{} DN={}/{} reason={}",
+            row.tau_secs,
+            format!("{:?}", row.phase),
+            format!("{:?}", row.tier),
+            u_pct,
+            row.q_up.as_u64() / 1_000_000,
+            row.q_dn.as_u64() / 1_000_000,
+            row.net_delta,
+            up_str,
+            dn_str,
+            risk_us,
+            total_us,
+            row.flatten_in_flight,
+            fmt_opt_usd(row.best_bid_up),
+            fmt_opt_usd(row.best_ask_up),
+            fmt_opt_usd(row.best_bid_dn),
+            fmt_opt_usd(row.best_ask_dn),
+            reason,
+        );
+    } else {
+        println!(
+            "  T-{:03}s  {:<20} {:<13} {:>5.1}% ({:>2},{:>2},d={:>+2})  UP: {:<16} | DN: {:<16} [Risk: {}us, Total: {}us]",
+            row.tau_secs,
+            format!("{:?}", row.phase),
+            format!("{:?}", row.tier),
+            u_pct,
+            row.q_up.as_u64() / 1_000_000,
+            row.q_dn.as_u64() / 1_000_000,
+            row.net_delta,
+            up_str,
+            dn_str,
+            risk_us,
+            total_us,
+        );
+    }
 }
 
 fn format_action(action: &OrderAction) -> String {
@@ -513,6 +617,7 @@ pub(crate) fn record_order_action_jsonl(
     outcome: Outcome,
     action: &OrderAction,
     tau_secs: u64,
+    telemetry: OrderActionTelemetry<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     jsonl.write_event(
         now_ms,
@@ -522,6 +627,39 @@ pub(crate) fn record_order_action_jsonl(
             outcome,
             action: action.clone(),
             tau_secs,
+            phase: telemetry.phase,
+            cancel_all_reason: telemetry.cancel_all_reason,
+            flatten_in_flight: telemetry.flatten_in_flight,
+            best_bid_up_micro: telemetry.best_bid_up.map(|p| p.0),
+            best_ask_up_micro: telemetry.best_ask_up.map(|p| p.0),
+            best_bid_dn_micro: telemetry.best_bid_dn.map(|p| p.0),
+            best_ask_dn_micro: telemetry.best_ask_dn.map(|p| p.0),
+        },
+    )?;
+    Ok(())
+}
+
+pub(crate) fn record_cancel_all_jsonl(
+    jsonl: &mut JsonlWriter,
+    now_ms: u64,
+    mono_ns: u64,
+    record: CancelAllRecord<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    jsonl.write_event(
+        now_ms,
+        mono_ns,
+        "cancel_all",
+        &CancelAllEvent {
+            market_slug: record.market_slug,
+            phase: record.phase,
+            tau_secs: record.tau_secs,
+            canceled_count: record.canceled_count,
+            flatten_in_flight: record.flatten_in_flight,
+            best_bid_up_micro: record.best_bid_up.map(|p| p.0),
+            best_ask_up_micro: record.best_ask_up.map(|p| p.0),
+            best_bid_dn_micro: record.best_bid_dn.map(|p| p.0),
+            best_ask_dn_micro: record.best_ask_dn.map(|p| p.0),
+            reason: record.reason,
         },
     )?;
     Ok(())

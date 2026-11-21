@@ -139,6 +139,9 @@ pub enum FaultInjection {
     BinanceJump,
 }
 
+/// Default maximum duration (`2s`) a single-flight flatten lock remains active without ACK/clear.
+pub const DEFAULT_FLATTEN_IN_FLIGHT_TIMEOUT_NS: u64 = 2_000_000_000;
+
 /// Unified telemetry trace record emitted by the Risk Actor on every evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskActorTrace {
@@ -160,6 +163,18 @@ pub struct RiskActorTrace {
     pub action_dn: OrderAction,
     /// Whether emergency flatten was commanded.
     pub flatten_action: FlattenAction,
+    /// Reason when `CancelAll` or a flatten hold/failure occurred.
+    pub cancel_all_reason: Option<String>,
+    /// Whether the single-flight flatten guard is currently armed.
+    pub flatten_in_flight: bool,
+    /// Orderbook best bid for UP outcome observed on this tick.
+    pub best_bid_up: Option<MicroUsdc>,
+    /// Orderbook best ask for UP outcome observed on this tick.
+    pub best_ask_up: Option<MicroUsdc>,
+    /// Orderbook best bid for DOWN outcome observed on this tick.
+    pub best_bid_dn: Option<MicroUsdc>,
+    /// Orderbook best ask for DOWN outcome observed on this tick.
+    pub best_ask_dn: Option<MicroUsdc>,
     /// Risk thread evaluation latency in nanoseconds.
     pub risk_eval_ns: u64,
 }
@@ -425,6 +440,9 @@ pub struct RiskActor {
     breakers: CircuitBreakers,
     fault: FaultInjection,
     flatten_in_flight: bool,
+    flatten_in_flight_since_ns: Option<u64>,
+    flatten_in_flight_timeout_ns: u64,
+    last_expiry_ms: Option<u64>,
     last_processed_seq: u64,
 }
 
@@ -446,6 +464,9 @@ impl RiskActor {
             breakers,
             fault,
             flatten_in_flight: false,
+            flatten_in_flight_since_ns: None,
+            flatten_in_flight_timeout_ns: DEFAULT_FLATTEN_IN_FLIGHT_TIMEOUT_NS,
+            last_expiry_ms: None,
             last_processed_seq: 0,
         }
     }
@@ -492,11 +513,12 @@ impl RiskActor {
         // 2. Evaluate Circuit Breakers:
         let breaker_status = self.breakers.check_status(now_ns, clock_offset_ms);
         if let BreakerStatus::Tripped { reason } = breaker_status {
+            let cancel_reason = format!("Circuit breaker tripped: {reason:?}");
             let _ = self
                 .harness
                 .priority_tx
                 .try_send(ExecutionCommand::CancelAll {
-                    reason: format!("Circuit breaker tripped: {reason:?}"),
+                    reason: cancel_reason.clone(),
                 });
             return Ok(Some(RiskActorTrace {
                 now_ms,
@@ -508,8 +530,31 @@ impl RiskActor {
                 action_up: OrderAction::Hold,
                 action_dn: OrderAction::Hold,
                 flatten_action: FlattenAction::None,
+                cancel_all_reason: Some(cancel_reason),
+                flatten_in_flight: self.flatten_in_flight,
+                best_bid_up: proposal.best_bid_up,
+                best_ask_up: proposal.best_ask_up,
+                best_bid_dn: proposal.best_bid_dn,
+                best_ask_dn: proposal.best_ask_dn,
                 risk_eval_ns: start_time.elapsed().as_nanos() as u64,
             }));
+        }
+
+        // Clear stale or completed single-flight flatten guards before evaluating lifecycle/risk.
+        if self.last_expiry_ms.is_some_and(|prev| prev != expiry_ms) {
+            self.clear_flatten_in_flight();
+            self.lifecycle.reset_for_new_epoch();
+        } else if now_ms >= expiry_ms {
+            self.clear_flatten_in_flight();
+        }
+        self.last_expiry_ms = Some(expiry_ms);
+
+        let flatten_timed_out = self.flatten_in_flight
+            && self.flatten_in_flight_since_ns.is_some_and(|since| {
+                now_ns.saturating_sub(since) >= self.flatten_in_flight_timeout_ns
+            });
+        if snapshot.unhedged_up == snapshot.unhedged_dn || flatten_timed_out {
+            self.clear_flatten_in_flight();
         }
 
         // 3. Evaluate 300s Epoch Lifecycle:
@@ -535,10 +580,15 @@ impl RiskActor {
         // Handle lifecycle emergency actions:
         match lifecycle_action {
             LifecycleAction::CancelAllResting { reason, .. } => {
+                if phase == EpochPhase::TerminalLockout {
+                    self.clear_flatten_in_flight();
+                }
                 let _ = self
                     .harness
                     .priority_tx
-                    .try_send(ExecutionCommand::CancelAll { reason });
+                    .try_send(ExecutionCommand::CancelAll {
+                        reason: reason.clone(),
+                    });
                 Ok(Some(RiskActorTrace {
                     now_ms,
                     tau_secs,
@@ -549,6 +599,12 @@ impl RiskActor {
                     action_up: OrderAction::Hold,
                     action_dn: OrderAction::Hold,
                     flatten_action: FlattenAction::None,
+                    cancel_all_reason: Some(reason),
+                    flatten_in_flight: self.flatten_in_flight,
+                    best_bid_up: proposal.best_bid_up,
+                    best_ask_up: proposal.best_ask_up,
+                    best_bid_dn: proposal.best_bid_dn,
+                    best_ask_dn: proposal.best_ask_dn,
                     risk_eval_ns: start_time.elapsed().as_nanos() as u64,
                 }))
             }
@@ -558,16 +614,36 @@ impl RiskActor {
                 size,
                 reason,
             } => {
-                self.flatten_in_flight = true;
-                let _ = self
+                let (flatten_action, cancel_all_reason) = if self
                     .harness
                     .priority_tx
                     .try_send(ExecutionCommand::ExecuteFlattenFak {
                         outcome,
                         price,
                         size,
-                        reason,
-                    });
+                        reason: reason.clone(),
+                    })
+                    .is_ok()
+                {
+                    self.flatten_in_flight = true;
+                    self.flatten_in_flight_since_ns = Some(now_ns);
+                    (
+                        FlattenAction::FlattenFak {
+                            outcome,
+                            price,
+                            size,
+                        },
+                        None,
+                    )
+                } else {
+                    self.clear_flatten_in_flight();
+                    (
+                        FlattenAction::None,
+                        Some(format!(
+                            "Flatten try_send failed (priority channel full): {reason}"
+                        )),
+                    )
+                };
                 Ok(Some(RiskActorTrace {
                     now_ms,
                     tau_secs,
@@ -577,11 +653,13 @@ impl RiskActor {
                     breaker: breaker_status,
                     action_up: OrderAction::Hold,
                     action_dn: OrderAction::Hold,
-                    flatten_action: FlattenAction::FlattenFak {
-                        outcome,
-                        price,
-                        size,
-                    },
+                    flatten_action,
+                    cancel_all_reason,
+                    flatten_in_flight: self.flatten_in_flight,
+                    best_bid_up: proposal.best_bid_up,
+                    best_ask_up: proposal.best_ask_up,
+                    best_bid_dn: proposal.best_bid_dn,
+                    best_ask_dn: proposal.best_ask_dn,
                     risk_eval_ns: start_time.elapsed().as_nanos() as u64,
                 }))
             }
@@ -590,11 +668,12 @@ impl RiskActor {
                 min_order_size,
                 ..
             } => {
+                let reason = "Residual dust below min order size".to_string();
                 let _ = self
                     .harness
                     .priority_tx
                     .try_send(ExecutionCommand::CancelAll {
-                        reason: "Residual dust below min order size".to_string(),
+                        reason: reason.clone(),
                     });
                 Ok(Some(RiskActorTrace {
                     now_ms,
@@ -609,6 +688,12 @@ impl RiskActor {
                         unhedged_shares,
                         min_order_size,
                     },
+                    cancel_all_reason: Some(reason),
+                    flatten_in_flight: self.flatten_in_flight,
+                    best_bid_up: proposal.best_bid_up,
+                    best_ask_up: proposal.best_ask_up,
+                    best_bid_dn: proposal.best_bid_dn,
+                    best_ask_dn: proposal.best_ask_dn,
                     risk_eval_ns: start_time.elapsed().as_nanos() as u64,
                 }))
             }
@@ -616,9 +701,16 @@ impl RiskActor {
                 expired_expiry_ms,
                 paired_shares_to_settle,
             } => {
-                let _ = self.harness.priority_tx.try_send(ExecutionCommand::CancelAll {
-                    reason: format!("Epoch rollover for expiry {expired_expiry_ms} with {paired_shares_to_settle:?} paired"),
-                });
+                self.clear_flatten_in_flight();
+                let reason = format!(
+                    "Epoch rollover for expiry {expired_expiry_ms} with {paired_shares_to_settle:?} paired"
+                );
+                let _ = self
+                    .harness
+                    .priority_tx
+                    .try_send(ExecutionCommand::CancelAll {
+                        reason: reason.clone(),
+                    });
                 Ok(Some(RiskActorTrace {
                     now_ms,
                     tau_secs,
@@ -629,6 +721,12 @@ impl RiskActor {
                     action_up: OrderAction::Hold,
                     action_dn: OrderAction::Hold,
                     flatten_action: FlattenAction::None,
+                    cancel_all_reason: Some(reason),
+                    flatten_in_flight: self.flatten_in_flight,
+                    best_bid_up: proposal.best_bid_up,
+                    best_ask_up: proposal.best_ask_up,
+                    best_bid_dn: proposal.best_bid_dn,
+                    best_ask_dn: proposal.best_ask_dn,
                     risk_eval_ns: start_time.elapsed().as_nanos() as u64,
                 }))
             }
@@ -694,22 +792,35 @@ impl RiskActor {
 
                 let risk_decision = self.risk_engine.evaluate(&eval_snapshot, &risk_input)?;
 
+                let mut trace_flatten = risk_decision.flatten;
+                let mut cancel_all_reason = None;
                 if let FlattenAction::FlattenFak {
                     outcome,
                     price,
                     size,
                 } = risk_decision.flatten
                 {
-                    self.flatten_in_flight = true;
-                    let _ =
-                        self.harness
-                            .priority_tx
-                            .try_send(ExecutionCommand::ExecuteFlattenFak {
-                                outcome,
-                                price,
-                                size,
-                                reason: "Station 7 Tier 4 Hard Stop flatten".to_string(),
-                            });
+                    let reason = "Station 7 Tier 4 Hard Stop flatten".to_string();
+                    if self
+                        .harness
+                        .priority_tx
+                        .try_send(ExecutionCommand::ExecuteFlattenFak {
+                            outcome,
+                            price,
+                            size,
+                            reason: reason.clone(),
+                        })
+                        .is_ok()
+                    {
+                        self.flatten_in_flight = true;
+                        self.flatten_in_flight_since_ns = Some(now_ns);
+                    } else {
+                        self.clear_flatten_in_flight();
+                        trace_flatten = FlattenAction::None;
+                        cancel_all_reason = Some(format!(
+                            "Flatten try_send failed (priority channel full): {reason}"
+                        ));
+                    }
                 }
 
                 // If accumulation prohibited in PreExpiryLockout, zero out the accumulating leg:
@@ -780,7 +891,13 @@ impl RiskActor {
                     breaker: breaker_status,
                     action_up,
                     action_dn,
-                    flatten_action: risk_decision.flatten,
+                    flatten_action: trace_flatten,
+                    cancel_all_reason,
+                    flatten_in_flight: self.flatten_in_flight,
+                    best_bid_up: proposal.best_bid_up,
+                    best_ask_up: proposal.best_ask_up,
+                    best_bid_dn: proposal.best_bid_dn,
+                    best_ask_dn: proposal.best_ask_dn,
                     risk_eval_ns: start_time.elapsed().as_nanos() as u64,
                 }))
             }
@@ -856,9 +973,21 @@ impl RiskActor {
         &mut self.hysteresis
     }
 
+    /// Returns whether the single-flight emergency flatten guard is currently armed.
+    #[must_use]
+    pub fn flatten_in_flight(&self) -> bool {
+        self.flatten_in_flight
+    }
+
+    /// Overrides the single-flight flatten timeout in nanoseconds (for bounded recovery).
+    pub fn set_flatten_in_flight_timeout_ns(&mut self, timeout_ns: u64) {
+        self.flatten_in_flight_timeout_ns = timeout_ns;
+    }
+
     /// Clears the single-flight emergency flatten guard after execution completes or is canceled.
     pub fn clear_flatten_in_flight(&mut self) {
         self.flatten_in_flight = false;
+        self.flatten_in_flight_since_ns = None;
     }
 
     /// Records receipt of a Polymarket feed message for the staleness breaker.
@@ -887,7 +1016,8 @@ impl RiskActor {
         self.hysteresis.set_state(Outcome::Up, OrderSlotState::Idle);
         self.hysteresis
             .set_state(Outcome::Down, OrderSlotState::Idle);
-        self.flatten_in_flight = false;
+        self.clear_flatten_in_flight();
+        self.last_expiry_ms = None;
         self.breakers = CircuitBreakers::new(BreakerConfig::default(), new_tick_size, now_ns);
     }
 }
@@ -1234,5 +1364,195 @@ mod tests {
         harness.shutdown.store(true, Ordering::Release);
         supervisor.join().unwrap();
         assert!(priority_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_mandatory_flatten_net_19_and_try_send_drop_recovery() {
+        // Bounded priority capacity = 1 so we can simulate a dropped priority try_send.
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(1, 16);
+
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+
+        // Q = (0, 19) -> net = -19 shares.
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::ZERO,
+            unhedged_dn: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
+            ..Default::default()
+        });
+
+        let expiry_ms = 300_000;
+        let proposal = QuoteProposal {
+            seq: 1,
+            now_ms: expiry_ms - 25_000, // T-25s -> MandatoryFlatten
+            expiry_ms,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Suppressed(math_engine::SuppressionReason::WarmingUp),
+            bid_up_raw: 0.48,
+            bid_dn_raw: 0.48,
+            best_bid_up: Some(MicroUsdc(500_000)),
+            best_bid_dn: Some(MicroUsdc(480_000)),
+            best_ask_up: Some(MicroUsdc(520_000)),
+            best_ask_dn: Some(MicroUsdc(490_000)),
+            defensive_cancel: false,
+            total_compute_ns: 5_000,
+        };
+        harness.publish_quote(proposal);
+
+        // Pre-fill the priority channel so try_send(ExecuteFlattenFak) fails on tick 1.
+        harness
+            .priority_tx
+            .try_send(ExecutionCommand::CancelAll {
+                reason: "saturate priority channel".to_string(),
+            })
+            .unwrap();
+
+        let trace_dropped = risk_actor.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(trace_dropped.phase, EpochPhase::MandatoryFlatten);
+        assert_eq!(trace_dropped.flatten_action, FlattenAction::None);
+        assert!(!trace_dropped.flatten_in_flight);
+        assert!(!risk_actor.flatten_in_flight());
+        assert!(
+            trace_dropped
+                .cancel_all_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("try_send failed"))
+        );
+
+        // Drain the pre-filled command and run the next tick.
+        let _ = priority_rx.try_recv().unwrap();
+        let trace_recovered = risk_actor.step(101_000_000, 0).unwrap().unwrap();
+        assert_eq!(trace_recovered.phase, EpochPhase::MandatoryFlatten);
+        assert!(trace_recovered.flatten_in_flight);
+        assert!(risk_actor.flatten_in_flight());
+        assert_eq!(
+            trace_recovered.flatten_action,
+            FlattenAction::FlattenFak {
+                outcome: Outcome::Up,
+                price: MicroUsdc(520_000),
+                size: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
+            }
+        );
+
+        let cmd = priority_rx.try_recv().unwrap();
+        assert_eq!(
+            cmd,
+            ExecutionCommand::ExecuteFlattenFak {
+                outcome: Outcome::Up,
+                price: MicroUsdc(520_000),
+                size: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
+                reason: "Mandatory flatten BUY UP at ask".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_flatten_in_flight_timeout_and_epoch_reset_recovery() {
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+        risk_actor.set_flatten_in_flight_timeout_ns(500_000_000); // 500ms bounded expiry
+
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::ZERO,
+            unhedged_dn: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
+            ..Default::default()
+        });
+
+        let expiry_1 = 300_000;
+        let base_proposal = QuoteProposal {
+            seq: 1,
+            now_ms: expiry_1 - 25_000,
+            expiry_ms: expiry_1,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Suppressed(math_engine::SuppressionReason::WarmingUp),
+            bid_up_raw: 0.48,
+            bid_dn_raw: 0.48,
+            best_bid_up: Some(MicroUsdc(500_000)),
+            best_bid_dn: Some(MicroUsdc(480_000)),
+            best_ask_up: Some(MicroUsdc(520_000)),
+            best_ask_dn: Some(MicroUsdc(490_000)),
+            defensive_cancel: false,
+            total_compute_ns: 5_000,
+        };
+        harness.publish_quote(base_proposal);
+
+        // Tick 1 at t=100ms sends initial ExecuteFlattenFak and arms flatten_in_flight.
+        let t1 = risk_actor.step(100_000_000, 0).unwrap().unwrap();
+        assert!(t1.flatten_in_flight);
+        assert!(matches!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::ExecuteFlattenFak { .. }
+        ));
+
+        // Tick 2 at t=300ms (< 500ms timeout) holds via CancelAllResting with explicit reason.
+        let t2 = risk_actor.step(300_000_000, 0).unwrap().unwrap();
+        assert!(t2.flatten_in_flight);
+        assert_eq!(t2.flatten_action, FlattenAction::None);
+        assert!(
+            t2.cancel_all_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("Flatten order in flight"))
+        );
+        assert!(matches!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAll { .. }
+        ));
+
+        // Tick 3 at t=700ms (>= 500ms timeout) auto-clears guard and retries ExecuteFlattenFak.
+        let t3 = risk_actor.step(700_000_000, 0).unwrap().unwrap();
+        assert!(t3.flatten_in_flight);
+        assert!(matches!(
+            t3.flatten_action,
+            FlattenAction::FlattenFak { .. }
+        ));
+        assert!(matches!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::ExecuteFlattenFak { .. }
+        ));
+
+        // Tick 4: epoch changes to expiry_2 -> clears stale flatten_in_flight automatically.
+        let expiry_2 = 600_000;
+        harness.publish_quote(QuoteProposal {
+            seq: 2,
+            now_ms: expiry_2 - 25_000,
+            expiry_ms: expiry_2,
+            ..base_proposal
+        });
+        // Even with timeout set very large, expiry change resets the guard so a new flatten fires.
+        risk_actor.set_flatten_in_flight_timeout_ns(60_000_000_000);
+        let t4 = risk_actor.step(800_000_000, 0).unwrap().unwrap();
+        assert!(t4.flatten_in_flight);
+        assert!(matches!(
+            t4.flatten_action,
+            FlattenAction::FlattenFak { .. }
+        ));
+        assert!(matches!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::ExecuteFlattenFak { .. }
+        ));
     }
 }
