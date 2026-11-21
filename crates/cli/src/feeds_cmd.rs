@@ -39,6 +39,24 @@ pub(crate) struct ActorHandles {
     polybolt_task: JoinHandle<Result<FeedStats, feeds::FeedError>>,
 }
 
+impl ActorHandles {
+    /// Commands `ClobMarketWsActor` to unsubscribe from the expired token pair and
+    /// subscribe to the newly discovered 5m market tokens without tearing down the socket.
+    pub(crate) async fn send_clob_rollover(
+        &self,
+        new_asset_id_up: String,
+        new_asset_id_dn: String,
+    ) -> Result<(), Box<dyn Error>> {
+        self.clob_cmd
+            .send(ClobWsCommand::Rollover {
+                new_asset_id_up,
+                new_asset_id_dn,
+            })
+            .await
+            .map_err(|e| format!("failed to send CLOB rollover command: {e}").into())
+    }
+}
+
 struct Rings<'a> {
     poly_cons: &'a mut rtrb::Consumer<PolyMarketEvent>,
     binance_cons: &'a mut rtrb::Consumer<BinanceSpotEvent>,

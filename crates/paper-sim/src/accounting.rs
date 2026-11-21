@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use crate::error::PaperSimError;
 use crate::fifo_book::SimFill;
 
+/// Default maker rebate share (`20%` scaled by `10^6`) applied to counterfactual maker fee pool.
+pub const DEFAULT_MAKER_REBATE_SHARE_E6: u64 = 200_000;
+
 /// Event emitted when matching UP and DOWN shares are atomically merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MergeEvent {
@@ -91,6 +94,7 @@ impl PaperLedger {
                 .maker_weighted_volume_micro
                 .checked_add(wv_micro)
                 .ok_or(PaperSimError::ArithmeticOverflow)?;
+            self.refresh_estimated_rebate();
         }
 
         // Fill cost = filled_shares * price / 10^6
@@ -354,6 +358,35 @@ impl PaperLedger {
     #[must_use]
     pub fn net_pnl_micro(&self, mid_up: MicroUsdc, mid_dn: MicroUsdc) -> i64 {
         self.realized_pnl_micro + self.unrealized_pnl_micro(mid_up, mid_dn)
+    }
+
+    /// Updates `estimated_rebate_micro` deterministically from accumulated maker weighted volume.
+    pub fn refresh_estimated_rebate(&mut self) {
+        let fee_rate = self.fee_schedule.fee_rate_e6 as u128;
+        let rebate_share = DEFAULT_MAKER_REBATE_SHARE_E6 as u128;
+        let scale_sq = (MICRO_SCALE as u128) * (MICRO_SCALE as u128);
+        let rebate_u128 = self
+            .maker_weighted_volume_micro
+            .saturating_mul(fee_rate)
+            .saturating_mul(rebate_share)
+            / scale_sq;
+        self.estimated_rebate_micro = u64::try_from(rebate_u128).unwrap_or(u64::MAX);
+    }
+
+    /// Settles residual binary inventory at epoch expiry (`winning_outcome` pays `$1.00`,
+    /// losing outcome pays `$0.00`), locks the resulting PnL into `realized_pnl_micro`,
+    /// and clears active leg balances and cost basis for the next epoch.
+    ///
+    /// Returns the PnL delta realized by this terminal settlement.
+    pub fn settle_epoch(&mut self, winning_outcome: Outcome) -> i64 {
+        let settled_total = self.settlement_pnl_micro(winning_outcome);
+        let epoch_settlement_delta = settled_total.saturating_sub(self.realized_pnl_micro);
+        self.realized_pnl_micro = settled_total;
+        self.filled_up = SharesMicro::ZERO;
+        self.filled_dn = SharesMicro::ZERO;
+        self.cost_basis_up_micro = 0;
+        self.cost_basis_dn_micro = 0;
+        epoch_settlement_delta
     }
 
     /// Computes terminal binary settlement PnL when the epoch resolves

@@ -444,6 +444,20 @@ impl HysteresisGate {
         }
     }
 
+    /// Handles fill event for a specific order ID, ignoring stale fills from superseded orders.
+    pub fn on_fill_for_order(
+        &mut self,
+        outcome: Outcome,
+        filled_order_id: &str,
+        filled_shares: SharesMicro,
+    ) {
+        if let OrderSlotState::Live { order_id, .. } = self.state(outcome)
+            && order_id == filled_order_id
+        {
+            self.on_fill(outcome, filled_shares);
+        }
+    }
+
     /// Transitions slot into `PendingReconcile` on unverified errors.
     pub fn on_reconcile_required(&mut self, outcome: Outcome, order_id: String) {
         self.set_state(outcome, OrderSlotState::PendingReconcile { order_id });

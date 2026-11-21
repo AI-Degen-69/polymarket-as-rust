@@ -8,14 +8,14 @@ use math_engine::QuoteOutput;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use crate::breakers::{BreakerStatus, CircuitBreakers};
+use crate::breakers::{BreakerConfig, BreakerStatus, CircuitBreakers};
 use crate::error::RiskLifecycleError;
 use crate::lifecycle::{EpochLifecycleController, EpochPhase, LifecycleAction, LifecycleInput};
 use crate::station7_risk::{
     DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot, RiskEvaluationInput, RiskTier,
 };
 use crate::station8_hysteresis::{
-    CancelReason, HysteresisGate, HysteresisInput, OrderAction, SizedQuote,
+    CancelReason, HysteresisGate, HysteresisInput, OrderAction, OrderSlotState, SizedQuote,
 };
 
 /// Conflated, latest-wins quote proposal published lock-free from Pricing to Risk.
@@ -652,7 +652,47 @@ impl RiskActor {
                     flatten_in_flight: self.flatten_in_flight,
                 };
 
-                let risk_decision = self.risk_engine.evaluate(&snapshot, &risk_input)?;
+                // Deduct each slot's own Live resting order from evaluation exposure/cash so a
+                // single-slot replacement does not stack against itself and trigger false churn or Tier4.
+                let mut eval_snapshot = snapshot;
+                for outcome in [Outcome::Up, Outcome::Down] {
+                    if let OrderSlotState::Live {
+                        price,
+                        remaining_size,
+                        ..
+                    } = self.hysteresis.state(outcome)
+                    {
+                        let slot_notional = ((remaining_size.0 as u128 * price.0 as u128)
+                            / core_types::MICRO_SCALE as u128)
+                            as u64;
+                        match outcome {
+                            Outcome::Up => {
+                                eval_snapshot.open_bid_shares_up = eval_snapshot
+                                    .open_bid_shares_up
+                                    .saturating_sub(*remaining_size);
+                                eval_snapshot.open_bid_notional_up = eval_snapshot
+                                    .open_bid_notional_up
+                                    .saturating_sub(MicroUsdc(slot_notional));
+                            }
+                            Outcome::Down => {
+                                eval_snapshot.open_bid_shares_dn = eval_snapshot
+                                    .open_bid_shares_dn
+                                    .saturating_sub(*remaining_size);
+                                eval_snapshot.open_bid_notional_dn = eval_snapshot
+                                    .open_bid_notional_dn
+                                    .saturating_sub(MicroUsdc(slot_notional));
+                            }
+                        }
+                        eval_snapshot.available_usdc_micro = MicroUsdc(
+                            eval_snapshot
+                                .available_usdc_micro
+                                .0
+                                .saturating_add(slot_notional),
+                        );
+                    }
+                }
+
+                let risk_decision = self.risk_engine.evaluate(&eval_snapshot, &risk_input)?;
 
                 if let FlattenAction::FlattenFak {
                     outcome,
@@ -814,6 +854,41 @@ impl RiskActor {
     /// Accessor for hysteresis gate.
     pub fn hysteresis_mut(&mut self) -> &mut HysteresisGate {
         &mut self.hysteresis
+    }
+
+    /// Clears the single-flight emergency flatten guard after execution completes or is canceled.
+    pub fn clear_flatten_in_flight(&mut self) {
+        self.flatten_in_flight = false;
+    }
+
+    /// Records receipt of a Polymarket feed message for the staleness breaker.
+    pub fn record_poly_heartbeat(&mut self, now_ns: u64) {
+        self.breakers.record_poly_heartbeat(now_ns);
+    }
+
+    /// Records receipt of a Binance feed message for the staleness breaker.
+    pub fn record_binance_heartbeat(&mut self, now_ns: u64) {
+        self.breakers.record_binance_heartbeat(now_ns);
+    }
+
+    /// Signals a dynamic tick-size change to the circuit breakers.
+    pub fn on_tick_size_change(&mut self, new_tick: MicroUsdc) {
+        self.breakers.on_tick_size_change(new_tick);
+    }
+
+    /// Acknowledges that the pricing pipeline has recomputed using the updated tick size.
+    pub fn acknowledge_tick_size_sync(&mut self) {
+        self.breakers.acknowledge_tick_size_sync();
+    }
+
+    /// Resets lifecycle, hysteresis order slots, flatten guard, and circuit breakers for a new 300s epoch.
+    pub fn reset_for_new_epoch(&mut self, new_tick_size: MicroUsdc, now_ns: u64) {
+        self.lifecycle.reset_for_new_epoch();
+        self.hysteresis.set_state(Outcome::Up, OrderSlotState::Idle);
+        self.hysteresis
+            .set_state(Outcome::Down, OrderSlotState::Idle);
+        self.flatten_in_flight = false;
+        self.breakers = CircuitBreakers::new(BreakerConfig::default(), new_tick_size, now_ns);
     }
 }
 
