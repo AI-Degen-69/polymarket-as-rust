@@ -275,3 +275,34 @@ fn test_vector_5_taker_flatten_fee_deduction() {
     assert_eq!(ledger.filled_up, SharesMicro::ZERO);
     assert_eq!(ledger.cost_basis_up_micro, 0);
 }
+
+#[test]
+fn test_vector_6_maker_rebate_accrual_and_epoch_settlement() {
+    let mut ledger = PaperLedger::new(FeeSchedule::btc_5m_default());
+
+    // Maker fill: 100 shares UP @ $0.50 -> wV = 100 * 0.50 * 0.50 = 25.00
+    // Counterfactual fee = 25 * 0.05 = $1.25; 20% maker rebate share = $0.25 = 250_000 micro-USDC.
+    let fill = SimFill {
+        sim_id: 1,
+        outcome: Outcome::Up,
+        side: OrderSide::Buy,
+        price: MicroUsdc(500_000),
+        filled_shares: SharesMicro(100_000_000),
+        fill_ts_ms: 100,
+        is_maker: true,
+    };
+    assert!(ledger.record_fill(&fill).unwrap().is_none());
+    assert_eq!(ledger.maker_weighted_volume_micro, 25_000_000);
+    assert_eq!(ledger.estimated_rebate_micro, 250_000);
+
+    // Settle epoch with UP winning: 100 UP @ $1.00 - $50.00 cost = +$50.00
+    let expected_settled = ledger.settlement_pnl_micro(Outcome::Up);
+    assert_eq!(expected_settled, 50_000_000);
+    let delta = ledger.settle_epoch(Outcome::Up);
+    assert_eq!(delta, 50_000_000);
+    assert_eq!(ledger.realized_pnl_micro, 50_000_000);
+    assert_eq!(ledger.filled_up, SharesMicro::ZERO);
+    assert_eq!(ledger.filled_dn, SharesMicro::ZERO);
+    assert_eq!(ledger.cost_basis_up_micro, 0);
+    assert_eq!(ledger.cost_basis_dn_micro, 0);
+}

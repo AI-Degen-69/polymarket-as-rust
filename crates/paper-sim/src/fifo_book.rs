@@ -456,9 +456,14 @@ impl FifoPaperBroker {
     /// Returns active resting order for an outcome and side (if any).
     #[must_use]
     pub fn active_order(&self, outcome: Outcome, side: OrderSide) -> Option<&SimOrder> {
-        self.orders
-            .values()
-            .find(|o| o.outcome == outcome && o.side == side && o.status.is_active())
+        self.orders.values().rev().find(|o| {
+            o.outcome == outcome
+                && o.side == side
+                && matches!(
+                    o.status,
+                    SimOrderStatus::PendingPlace { .. } | SimOrderStatus::Live
+                )
+        })
     }
 
     /// Returns total active unhedged open bid notional in micro-USDC for an outcome.
@@ -466,7 +471,12 @@ impl FifoPaperBroker {
     pub fn open_bid_notional(&self, outcome: Outcome) -> u64 {
         let mut notional = 0_u64;
         for order in self.orders.values() {
-            if order.outcome == outcome && order.side == OrderSide::Buy && order.status.is_active()
+            if order.outcome == outcome
+                && order.side == OrderSide::Buy
+                && matches!(
+                    order.status,
+                    SimOrderStatus::PendingPlace { .. } | SimOrderStatus::Live
+                )
             {
                 let cost = (order.remaining_size.0 as u128 * order.price.0 as u128
                     / core_types::MICRO_SCALE as u128) as u64;
@@ -481,7 +491,12 @@ impl FifoPaperBroker {
     pub fn open_bid_shares(&self, outcome: Outcome) -> SharesMicro {
         let mut total = 0_u64;
         for order in self.orders.values() {
-            if order.outcome == outcome && order.side == OrderSide::Buy && order.status.is_active()
+            if order.outcome == outcome
+                && order.side == OrderSide::Buy
+                && matches!(
+                    order.status,
+                    SimOrderStatus::PendingPlace { .. } | SimOrderStatus::Live
+                )
             {
                 total = total.saturating_add(order.remaining_size.0);
             }
