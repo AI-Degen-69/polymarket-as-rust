@@ -11,6 +11,7 @@ workspace = true
 [dependencies]
 arc-swap.workspace = true
 chrono.workspace = true
+core_affinity.workspace = true
 core-types = { path = "../core-types" }
 hdrhistogram.workspace = true
 math-engine = { path = "../math-engine" }

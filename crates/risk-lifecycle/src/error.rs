@@ -26,4 +26,17 @@ pub enum RiskLifecycleError {
     /// Order registry desync or illegal state transition.
     #[error("FSM or registry error: {0}")]
     StateError(String),
+
+    /// Failed to apply an OS thread affinity mask for a pinned actor thread.
+    #[error("thread pinning failed: {0}")]
+    ThreadPinning(String),
+
+    /// A supervised actor thread panicked or exited before shutdown was requested.
+    #[error("actor thread '{actor}' faulted: {reason}")]
+    ActorThreadFault {
+        /// Actor name (`pricing` or `risk`).
+        actor: String,
+        /// Human-readable fault cause.
+        reason: String,
+    },
 }
