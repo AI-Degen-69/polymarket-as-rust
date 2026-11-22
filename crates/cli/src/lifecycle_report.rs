@@ -23,6 +23,11 @@ const PHASE_BADGE_WIDTH: usize = 10;
 const TIER_BADGE_WIDTH: usize = 4;
 /// Fixed value width keeps `Pricing` / `Risk` / `Total` labels aligned across latency rows.
 const LATENCY_VALUE_WIDTH: usize = 10;
+/// Fixed visible column widths for `|`-delimited heartbeat sections.
+const HB_BTC_WIDTH: usize = 19;
+const HB_BOOK_WIDTH: usize = 38;
+const HB_QUOTE_WIDTH: usize = 29;
+const HB_INV_WIDTH: usize = 28;
 
 /// Content of the middle badge column: epoch phase, or any other badge such as `[MAKER]`.
 #[derive(Debug, Clone, Copy)]
@@ -389,12 +394,7 @@ pub(crate) fn print_lifecycle_header(
     );
     println!("{}", t.divider());
     match display {
-        LifecycleDisplayMode::Stream => println!(
-            "{}",
-            t.muted(
-                "UTC       Tau    Phase      Tier  Util | BTC vs Strike | UP BBO    DN BBO    | Quotes (Pair)  | Inv      | PnL"
-            )
-        ),
+        LifecycleDisplayMode::Stream => println!("{}", format_stream_header(t)),
         LifecycleDisplayMode::Raw => println!(
             "{}",
             t.muted(
@@ -403,6 +403,17 @@ pub(crate) fn print_lifecycle_header(
         ),
     }
     println!("{}", t.divider());
+}
+
+fn format_stream_header(t: Theme) -> String {
+    let prefix = "UTC       Tau    Event     Phase      Tier   Util";
+    let btc = theme::pad_visible_right("BTC vs Strike", HB_BTC_WIDTH);
+    let book = theme::pad_visible_right("Book (UP / DN)", HB_BOOK_WIDTH);
+    let quote = theme::pad_visible_right("Quote (Pair)", HB_QUOTE_WIDTH);
+    let inv = theme::pad_visible_right("Inv (UP/DN, Δ)", HB_INV_WIDTH);
+    t.muted(&format!(
+        "{prefix} | {btc} | {book} | {quote} | {inv} | PnL"
+    ))
 }
 
 /// Prints a prominent banner at the start of an epoch or upon rollover.
@@ -466,6 +477,8 @@ pub(crate) struct LifecycleStreamReporter {
     last_heartbeat_ms: Option<u64>,
     last_suppression: Option<SuppressionReason>,
     last_cancel_all_reason: Option<String>,
+    last_quoted_up: Option<MicroUsdc>,
+    last_quoted_dn: Option<MicroUsdc>,
 }
 
 impl LifecycleStreamReporter {
@@ -476,6 +489,8 @@ impl LifecycleStreamReporter {
             last_heartbeat_ms: None,
             last_suppression: None,
             last_cancel_all_reason: None,
+            last_quoted_up: None,
+            last_quoted_dn: None,
         }
     }
 
@@ -483,6 +498,8 @@ impl LifecycleStreamReporter {
         self.last_heartbeat_ms = None;
         self.last_suppression = None;
         self.last_cancel_all_reason = None;
+        self.last_quoted_up = None;
+        self.last_quoted_dn = None;
     }
 
     pub(crate) fn on_step(&mut self, row: &LifecycleStepRow<'_>) {
@@ -502,8 +519,8 @@ impl LifecycleStreamReporter {
         let t = self.theme;
         let utc = format_utc_hms(row.now_ms);
         let u_pct = (row.u_e6 as f64) / 10_000.0;
-        let up_str = format_action_styled(t, row.action_up);
-        let dn_str = format_action_styled(t, row.action_dn);
+        let up_str = format_action_styled(t, Outcome::Up, row.action_up, None);
+        let dn_str = format_action_styled(t, Outcome::Down, row.action_dn, None);
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
         let suppr_note = match row.quote {
             QuoteOutput::Suppressed(reason) => {
@@ -513,7 +530,7 @@ impl LifecycleStreamReporter {
         };
 
         let base = format!(
-            "{} T-{:03}s {} {} {:>5.1}% ({:>2},{:>2},d={:>+2})  UP: {} | DN: {} [Risk: {}, Total: {}]{}",
+            "{} T-{:03}s {} {} {:>5.1}% ({:>2},{:>2},d={:>+2})  {} | {} [Risk: {}, Total: {}]{}",
             t.muted(&utc),
             row.tau_secs,
             t.phase_badge(row.phase),
@@ -617,10 +634,21 @@ impl LifecycleStreamReporter {
         }
 
         if has_up_action || has_dn_action || cancel_all_changed {
-            let up_str = format_action_styled(t, row.action_up);
-            let dn_str = format_action_styled(t, row.action_dn);
+            let prev_price_for =
+                |cached: Option<MicroUsdc>, resting: Option<MicroUsdc>, action: &OrderAction| {
+                    match action {
+                        OrderAction::CancelAndReplace { new_price, .. } => {
+                            cached.or(resting).filter(|&p| p != *new_price)
+                        }
+                        _ => cached,
+                    }
+                };
+            let prev_up = prev_price_for(self.last_quoted_up, row.resting_bid_up, row.action_up);
+            let prev_dn = prev_price_for(self.last_quoted_dn, row.resting_bid_dn, row.action_dn);
+            let up_str = format_action_styled(t, Outcome::Up, row.action_up, prev_up);
+            let dn_str = format_action_styled(t, Outcome::Down, row.action_dn, prev_dn);
             let mut action_line = format!(
-                "{}UP {} | DN {}",
+                "{}{up_str} | {dn_str}",
                 row_prefix(
                     t,
                     &utc,
@@ -629,9 +657,26 @@ impl LifecycleStreamReporter {
                     Some(MidColumn::Phase(row.phase)),
                     Some(row.tier)
                 ),
-                up_str,
-                dn_str,
             );
+            let replace_reason = |action: &OrderAction| match action {
+                OrderAction::CancelAndReplace { reason, .. } => Some(*reason),
+                _ => None,
+            };
+            match (replace_reason(row.action_up), replace_reason(row.action_dn)) {
+                (Some(r_up), Some(r_dn)) if r_up == r_dn => {
+                    action_line.push_str(&format!(" | {}", t.muted(&format!("({r_up:?})"))));
+                }
+                (Some(r_up), Some(r_dn)) => {
+                    action_line.push_str(&format!(
+                        " | {}",
+                        t.muted(&format!("(UP: {r_up:?}, DN: {r_dn:?})"))
+                    ));
+                }
+                (Some(r), None) | (None, Some(r)) => {
+                    action_line.push_str(&format!(" | {}", t.muted(&format!("({r:?})"))));
+                }
+                (None, None) => {}
+            }
             if let Some(reason) = row.cancel_all_reason {
                 action_line.push_str(&format!(
                     " | fif={} UP={} DN={} reason={}",
@@ -643,6 +688,15 @@ impl LifecycleStreamReporter {
             }
             lines.push(action_line);
         }
+
+        let next_quoted = |action: &OrderAction, resting: Option<MicroUsdc>| match action {
+            OrderAction::SubmitNew { price, .. } => Some(*price),
+            OrderAction::CancelAndReplace { new_price, .. } => Some(*new_price),
+            OrderAction::Cancel { .. } => None,
+            OrderAction::Hold => resting,
+        };
+        self.last_quoted_up = next_quoted(row.action_up, row.resting_bid_up);
+        self.last_quoted_dn = next_quoted(row.action_dn, row.resting_bid_dn);
 
         // 3. Latency breaches (compare raw nanoseconds; fixed-width values align the labels)
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
@@ -688,14 +742,27 @@ impl LifecycleStreamReporter {
         let up_bbo = Theme::fmt_bbo(row.best_bid_up, row.best_ask_up);
         let dn_bbo = Theme::fmt_bbo(row.best_bid_dn, row.best_ask_dn);
         let quotes = Theme::fmt_pair_quotes(row.resting_bid_up, row.resting_bid_dn);
-        let q_up_sh = row.q_up.as_u64() / 1_000_000;
-        let q_dn_sh = row.q_dn.as_u64() / 1_000_000;
-        let inv = format!("{q_up_sh}/{q_dn_sh}/{:+}", row.net_delta);
+        let net_delta_micro = i128::from(row.q_up.as_u64()) - i128::from(row.q_dn.as_u64());
         let pnl = t.fmt_pnl(row.net_pnl_micro);
         let sep = t.muted("|");
 
+        let btc_col = theme::pad_visible_right(&format!("BTC {btc}"), HB_BTC_WIDTH);
+        let book_col =
+            theme::pad_visible_right(&format!("Book UP {up_bbo} DN {dn_bbo}"), HB_BOOK_WIDTH);
+        let quote_col = theme::pad_visible_right(&format!("Quote {quotes}"), HB_QUOTE_WIDTH);
+        let inv_col = theme::pad_visible_right(
+            &format!(
+                "Inv {}U/{}D (Δ{})",
+                fmt_shares_2dp(row.q_up.as_u64()),
+                fmt_shares_2dp(row.q_dn.as_u64()),
+                fmt_signed_shares_2dp(net_delta_micro),
+            ),
+            HB_INV_WIDTH,
+        );
+        let pnl_col = format!("PnL {pnl}");
+
         format!(
-            "{}{:>5.1}% {sep} BTC {} {sep} UP {} DN {} {sep} Q {} {sep} {} {sep} {}",
+            "{}{:>5.1}% {sep} {btc_col} {sep} {book_col} {sep} {quote_col} {sep} {inv_col} {sep} {pnl_col}",
             row_prefix(
                 t,
                 utc,
@@ -705,41 +772,56 @@ impl LifecycleStreamReporter {
                 Some(row.tier)
             ),
             u_pct,
-            btc,
-            up_bbo,
-            dn_bbo,
-            quotes,
-            inv,
-            pnl,
         )
     }
 }
 
-fn format_action_styled(t: Theme, action: &OrderAction) -> String {
+fn format_action_styled(
+    t: Theme,
+    outcome: Outcome,
+    action: &OrderAction,
+    prev_price: Option<MicroUsdc>,
+) -> String {
+    let leg_plain = match outcome {
+        Outcome::Up => "UP",
+        Outcome::Down => "DN",
+    };
+    let leg = match outcome {
+        Outcome::Up => t.bold_green("UP"),
+        Outcome::Down => t.bold_red("DN"),
+    };
     match action {
-        OrderAction::Hold => t.muted("Hold"),
-        OrderAction::SubmitNew {
-            outcome,
-            price,
-            size,
-        } => {
-            let leg = match outcome {
-                Outcome::Up => t.bold_green("UP"),
-                Outcome::Down => t.bold_red("DN"),
-            };
-            format!("{} {} @ {}", fmt_shares_3dp(*size), leg, fmt_cents(*price))
+        OrderAction::Hold => format!("{leg_plain} {}", t.muted("Hold")),
+        OrderAction::SubmitNew { price, size, .. } => format!(
+            "{} {} @ {}",
+            fmt_shares_3dp(*size),
+            leg,
+            Theme::fmt_cents(Some(*price))
+        ),
+        OrderAction::Cancel { reason, .. } => {
+            format!("{leg} {}", t.yellow(&format!("Cancel({reason:?})")))
         }
-        OrderAction::Cancel { reason, .. } => t.yellow(&format!("Cancel({reason:?})")),
         OrderAction::CancelAndReplace {
             new_price,
             new_size,
-            reason,
             ..
-        } => t.cyan(&format!(
-            "Replace({reason:?}) {}@{}",
-            new_size.as_u64() / 1_000_000,
-            Theme::fmt_price_compact(Some(*new_price))
-        )),
+        } => match prev_price {
+            Some(old) => format!(
+                "{} {} {} @ {} -> {}",
+                t.cyan("Requote"),
+                fmt_shares_3dp(*new_size),
+                leg,
+                t.strikethrough(&Theme::fmt_cents(Some(old))),
+                Theme::fmt_cents(Some(*new_price)),
+            ),
+            None => format!(
+                "{} {} {} @ {}",
+                t.cyan("Requote"),
+                fmt_shares_3dp(*new_size),
+                leg,
+                Theme::fmt_cents(Some(*new_price)),
+            ),
+        },
     }
 }
 
@@ -759,17 +841,30 @@ fn fmt_shares_3dp(shares: SharesMicro) -> String {
     }
 }
 
-/// Formats a dollar price as cents (`50c`), keeping up to 2 decimals for sub-cent prices.
-fn fmt_cents(price: MicroUsdc) -> String {
-    let cents = price.0 / 10_000;
-    let mut digits = format!("{:02}", (price.0 % 10_000) / 100);
-    while digits.ends_with('0') {
-        digits.pop();
-    }
-    if digits.is_empty() {
-        format!("{cents}c")
+/// Formats micro-shares rounded to 2 decimal places, trimming trailing zeros (`0`, `1.5`, `20`).
+fn fmt_shares_2dp(raw_micro: u64) -> String {
+    let hundredths = raw_micro.saturating_add(5_000) / 10_000;
+    let whole = hundredths / 100;
+    let rem = hundredths % 100;
+    if rem == 0 {
+        whole.to_string()
+    } else if rem.is_multiple_of(10) {
+        format!("{whole}.{}", rem / 10)
     } else {
-        format!("{cents}.{digits}c")
+        format!("{whole}.{rem:02}")
+    }
+}
+
+/// Formats signed micro-share inventory delta up to 2 decimal places (`0`, `+20`, `-1.5`).
+fn fmt_signed_shares_2dp(delta_micro: i128) -> String {
+    let mag_micro = u64::try_from(delta_micro.unsigned_abs()).unwrap_or(u64::MAX);
+    let mag = fmt_shares_2dp(mag_micro);
+    if mag == "0" {
+        mag
+    } else if delta_micro < 0 {
+        format!("-{mag}")
+    } else {
+        format!("+{mag}")
     }
 }
 
@@ -829,7 +924,7 @@ pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, f
         Badge::Taker
     };
     println!(
-        "{}#{} {} {} {:>9} @ {}",
+        "{}#{} {} {} {} @ {}",
         row_prefix(
             t,
             &utc,
@@ -839,10 +934,10 @@ pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, f
             Some(tier)
         ),
         fill.sim_id,
-        leg,
         side,
+        leg,
         fmt_shares_3dp(fill.filled_shares),
-        fmt_cents(fill.price),
+        Theme::fmt_cents(Some(fill.price)),
     );
 }
 
@@ -867,9 +962,9 @@ pub(crate) fn print_lifecycle_merge(
             Some(tier),
         ),
         merge.merged_pairs,
-        Theme::fmt_price_compact(Some(merge.pair_cost)),
-        Theme::fmt_price_compact(Some(merge.avg_cost_up)),
-        Theme::fmt_price_compact(Some(merge.avg_cost_dn)),
+        Theme::fmt_cents(Some(merge.pair_cost)),
+        Theme::fmt_cents(Some(merge.avg_cost_up)),
+        Theme::fmt_cents(Some(merge.avg_cost_dn)),
         t.fmt_pnl(merge.realized_gain_micro),
         total_merged
     );
@@ -895,8 +990,8 @@ pub(crate) fn print_lifecycle_flatten(
         t.muted(market_slug),
         t.bold(leg),
         side.as_str(),
-        size,
-        Theme::fmt_price_compact(Some(price)),
+        fmt_shares_3dp(size),
+        Theme::fmt_cents(Some(price)),
         t.yellow(reason)
     );
 }
@@ -1416,9 +1511,16 @@ mod tests {
         assert_eq!(fmt_shares_3dp(SharesMicro::from_raw(10_000)), "0.01");
         assert_eq!(fmt_shares_3dp(SharesMicro::from_raw(2_500_000)), "2.5");
         assert_eq!(fmt_shares_3dp(SharesMicro::from_raw(1_234_560)), "1.234");
-        assert_eq!(fmt_cents(MicroUsdc(500_000)), "50c");
-        assert_eq!(fmt_cents(MicroUsdc(550_000)), "55c");
-        assert_eq!(fmt_cents(MicroUsdc(555_000)), "55.5c");
+        assert_eq!(fmt_shares_2dp(0), "0");
+        assert_eq!(fmt_shares_2dp(1_500_000), "1.5");
+        assert_eq!(fmt_shares_2dp(20_000_000), "20");
+        assert_eq!(fmt_shares_2dp(1_250_000), "1.25");
+        assert_eq!(fmt_signed_shares_2dp(0), "0");
+        assert_eq!(fmt_signed_shares_2dp(20_000_000), "+20");
+        assert_eq!(fmt_signed_shares_2dp(-1_500_000), "-1.5");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(500_000))), "50¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(550_000))), "55¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(555_000))), "55.5¢");
     }
 
     #[test]
@@ -1466,13 +1568,13 @@ mod tests {
         let l0 = rep.format_step(&sample_row(base_ms, 300, &hold, &hold));
         assert_eq!(l0.len(), 1);
         assert!(l0[0].contains("[QUOTE]"));
-        assert!(l0[0].contains("♥ [HB]"));
-        assert!(l0[0].contains("+$14 (+2bp)"));
-        assert!(l0[0].contains("UP .51/.52 DN .48/.49"));
-        assert!(l0[0].contains("Q .50/.47 (.97)"));
-        assert!(l0[0].contains("20/0/+20"));
-        assert!(l0[0].contains("+$0.20"));
-        assert!(l0[0].chars().count() <= 135);
+        assert!(l0[0].contains("[♥ BEAT]"));
+        assert!(l0[0].contains("BTC +$14 (+2bp)"));
+        assert!(l0[0].contains("Book UP 51¢/52¢ DN 48¢/49¢"));
+        assert!(l0[0].contains("Quote 50¢/47¢ (97¢)"));
+        assert!(l0[0].contains("Inv 20U/0D (Δ+20)"));
+        assert!(l0[0].contains("PnL +$0.20"));
+        assert!(l0[0].chars().count() <= 195);
 
         // 100ms..4900ms idle Hold ticks emit nothing.
         for offset in (100..5_000).step_by(100) {
@@ -1551,8 +1653,99 @@ mod tests {
         let act_lines = rep.format_step(&sample_row(base_ms + 600, 299, &submit, &cancel));
         assert_eq!(act_lines.len(), 1);
         assert!(act_lines[0].contains("[ORDER]"));
-        assert!(act_lines[0].contains("20 UP @ 50c"));
-        assert!(act_lines[0].contains("Cancel(RiskSuppressed)"));
+        assert!(act_lines[0].contains("20 UP @ 50¢"));
+        assert!(act_lines[0].contains("DN Cancel(RiskSuppressed)"));
+
+        let replace = OrderAction::CancelAndReplace {
+            outcome: Outcome::Down,
+            old_order_id: "ord-2".to_string(),
+            new_price: MicroUsdc(370_000),
+            new_size: SharesMicro::from_raw(20 * 1_000_000),
+            reason: CancelReason::DeadbandDrift,
+        };
+        let rep_lines = rep.format_step(&sample_row(base_ms + 650, 299, &hold, &replace));
+        assert_eq!(rep_lines.len(), 1);
+        assert!(rep_lines[0].contains("UP Hold | Requote 20 DN @ ~47¢~ -> 37¢ | (DeadbandDrift)"));
+
+        // Paired requote tracks prior SubmitNew prices in both plain and styled modes.
+        for (mode_idx, theme) in [Theme::plain(), Theme::styled()].into_iter().enumerate() {
+            let mut paired_rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, theme);
+            let sub_up = OrderAction::SubmitNew {
+                outcome: Outcome::Up,
+                price: MicroUsdc(500_000),
+                size: SharesMicro::from_raw(20 * 1_000_000),
+            };
+            let sub_dn = OrderAction::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(480_000),
+                size: SharesMicro::from_raw(20 * 1_000_000),
+            };
+            paired_rep.format_step(&sample_row(base_ms, 300, &sub_up, &sub_dn));
+
+            let req_up = OrderAction::CancelAndReplace {
+                outcome: Outcome::Up,
+                old_order_id: "ord-u".to_string(),
+                new_price: MicroUsdc(494_800),
+                new_size: SharesMicro::from_raw(20 * 1_000_000),
+                reason: CancelReason::DeadbandDrift,
+            };
+            let req_dn = OrderAction::CancelAndReplace {
+                outcome: Outcome::Down,
+                old_order_id: "ord-d".to_string(),
+                new_price: MicroUsdc(465_200),
+                new_size: SharesMicro::from_raw(20 * 1_000_000),
+                reason: CancelReason::DeadbandDrift,
+            };
+            let lines = paired_rep.format_step(&sample_row(base_ms + 100, 299, &req_up, &req_dn));
+            assert_eq!(lines.len(), 1);
+            if mode_idx == 0 {
+                assert!(lines[0].contains(
+                    "Requote 20 UP @ ~50¢~ -> 49.48¢ | Requote 20 DN @ ~48¢~ -> 46.52¢ | (DeadbandDrift)"
+                ));
+            } else {
+                assert!(lines[0].contains("\x1b[2;9m50¢\x1b[0m"));
+                assert!(lines[0].contains("\x1b[2;9m48¢\x1b[0m"));
+                assert!(lines[0].contains("\x1b[2m(DeadbandDrift)\x1b[0m"));
+            }
+        }
+
+        // Same-price CancelAndReplace (e.g. size-only ExcessiveSize) omits redundant strikethrough.
+        let mut size_only_rep =
+            LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let sub_same = OrderAction::SubmitNew {
+            outcome: Outcome::Up,
+            price: MicroUsdc(500_000),
+            size: SharesMicro::from_raw(20 * 1_000_000),
+        };
+        size_only_rep.format_step(&sample_row(base_ms, 300, &sub_same, &hold));
+        let resize_up = OrderAction::CancelAndReplace {
+            outcome: Outcome::Up,
+            old_order_id: "ord-u".to_string(),
+            new_price: MicroUsdc(500_000),
+            new_size: SharesMicro::from_raw(10 * 1_000_000),
+            reason: CancelReason::ExcessiveSize,
+        };
+        let resize_lines =
+            size_only_rep.format_step(&sample_row(base_ms + 100, 299, &resize_up, &hold));
+        assert_eq!(resize_lines.len(), 1);
+        assert!(resize_lines[0].contains("Requote 10 UP @ 50¢ | DN Hold | (ExcessiveSize)"));
+        assert!(!resize_lines[0].contains("~50¢~"));
+
+        // Epoch rollover reset clears cached prior quote prices so stale prices do not leak.
+        size_only_rep.reset_epoch();
+        let post_reset_req = OrderAction::CancelAndReplace {
+            outcome: Outcome::Up,
+            old_order_id: "ord-u2".to_string(),
+            new_price: MicroUsdc(480_000),
+            new_size: SharesMicro::from_raw(10 * 1_000_000),
+            reason: CancelReason::ExcessiveSize,
+        };
+        let mut next_epoch_row = sample_row(base_ms + 200, 300, &post_reset_req, &hold);
+        next_epoch_row.resting_bid_up = None;
+        let post_reset = size_only_rep.format_step(&next_epoch_row);
+        assert_eq!(post_reset.len(), 2);
+        assert!(post_reset[0].contains("Requote 10 UP @ 48¢ | DN Hold | (ExcessiveSize)"));
+        assert!(!post_reset[0].contains("~"));
 
         // Latency breach emits immediately.
         let mut lat_row = sample_row(base_ms + 700, 299, &hold, &hold);
@@ -1668,5 +1861,130 @@ mod tests {
         assert!(r_lines[0].contains("[LATENCY]"));
         assert!(r_lines[0].contains("10.001us"));
         assert!(r_lines[0].contains("Risk"));
+    }
+
+    #[test]
+    fn heartbeat_pipe_columns_align_across_varying_rows_plain_and_styled() {
+        let hold = OrderAction::Hold;
+        let base_ms = 1_795_345_200_000_u64;
+
+        let mut row1 = sample_row(base_ms, 178, &hold, &hold);
+        row1.u_e6 = 20_000;
+        row1.best_bid_up = Some(MicroUsdc(210_000));
+        row1.best_ask_up = Some(MicroUsdc(220_000));
+        row1.best_bid_dn = Some(MicroUsdc(780_000));
+        row1.best_ask_dn = Some(MicroUsdc(790_000));
+        row1.resting_bid_up = Some(MicroUsdc(210_000));
+        row1.resting_bid_dn = Some(MicroUsdc(740_000));
+        row1.net_pnl_micro = 157_800;
+
+        let mut row2 = sample_row(base_ms + 5_000, 173, &hold, &hold);
+        row2.phase = EpochPhase::PreExpiryLockout;
+        row2.tier = RiskTier::Tier2ModerateSkew;
+        row2.u_e6 = 455_000;
+        row2.spot_usd = Some(89_971.0);
+        row2.best_bid_up = None;
+        row2.best_ask_up = Some(MicroUsdc(10_000));
+        row2.best_bid_dn = Some(MicroUsdc(990_000));
+        row2.best_ask_dn = None;
+        row2.resting_bid_up = None;
+        row2.resting_bid_dn = Some(MicroUsdc(780_000));
+        row2.q_up = SharesMicro::ZERO;
+        row2.q_dn = SharesMicro::from_raw(1_500_000);
+        row2.net_delta = -1;
+        row2.net_pnl_micro = -202_800;
+
+        let mut row3 = sample_row(base_ms + 10_000, 28, &hold, &hold);
+        row3.phase = EpochPhase::MandatoryFlatten;
+        row3.tier = RiskTier::Tier3OneSided;
+        row3.u_e6 = 800_000;
+        row3.spot_usd = None;
+        row3.best_bid_up = None;
+        row3.best_ask_up = None;
+        row3.best_bid_dn = Some(MicroUsdc(500_000));
+        row3.best_ask_dn = Some(MicroUsdc(510_000));
+        row3.resting_bid_up = Some(MicroUsdc(500_000));
+        row3.resting_bid_dn = None;
+        row3.q_up = SharesMicro::from_raw(20_250_000);
+        row3.q_dn = SharesMicro::from_raw(10_500_000);
+        row3.net_delta = 9;
+        row3.net_pnl_micro = 0;
+
+        let mut row4 = sample_row(base_ms + 15_000, 5, &hold, &hold);
+        row4.phase = EpochPhase::TerminalLockout;
+        row4.tier = RiskTier::Tier4HardStop;
+        row4.u_e6 = 1_000_000;
+        row4.spot_usd = Some(88_766.0);
+        row4.resting_bid_up = Some(MicroUsdc(500_000));
+        row4.resting_bid_dn = Some(MicroUsdc(500_000));
+        row4.q_up = SharesMicro::ZERO;
+        row4.q_dn = SharesMicro::ZERO;
+        row4.net_delta = 0;
+        row4.net_pnl_micro = 1_234_567;
+
+        let mut row5 = sample_row(base_ms + 20_000, 140, &hold, &hold);
+        row5.u_e6 = 200_000;
+        row5.spot_usd = None;
+        row5.best_bid_up = Some(MicroUsdc(473_318));
+        row5.best_ask_up = Some(MicroUsdc(503_318));
+        row5.best_bid_dn = Some(MicroUsdc(466_682));
+        row5.best_ask_dn = Some(MicroUsdc(496_682));
+        row5.resting_bid_up = Some(MicroUsdc(499_439));
+        row5.resting_bid_dn = Some(MicroUsdc(465_196));
+        row5.q_up = SharesMicro::from_raw(1_000_250_000);
+        row5.q_dn = SharesMicro::ZERO;
+        row5.net_delta = 1_000;
+        row5.net_pnl_micro = 0;
+
+        let pipe_cols = |line: &str| -> Vec<usize> {
+            theme::strip_ansi(line)
+                .chars()
+                .enumerate()
+                .filter_map(|(idx, ch)| (ch == '|').then_some(idx))
+                .collect()
+        };
+
+        for theme in [Theme::plain(), Theme::styled()] {
+            let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, theme);
+            let header = format_stream_header(theme);
+            let expected_pipes = pipe_cols(&header);
+            assert_eq!(expected_pipes.len(), 5, "header must contain 5 separators");
+
+            let lines: Vec<String> = [&row1, &row2, &row3, &row4, &row5]
+                .into_iter()
+                .map(|row| {
+                    let emitted = rep.format_step(row);
+                    assert_eq!(emitted.len(), 1);
+                    emitted.into_iter().next().expect("heartbeat emitted")
+                })
+                .collect();
+
+            let stripped_r2 = theme::strip_ansi(&lines[1]);
+            assert!(stripped_r2.contains("Inv 0U/1.5D (Δ-1.5)"));
+            assert!(stripped_r2.contains("Book UP --/1¢ DN 99¢/--"));
+            assert!(stripped_r2.contains("Quote --/78¢"));
+
+            let stripped_r3 = theme::strip_ansi(&lines[2]);
+            assert!(stripped_r3.contains("Inv 20.25U/10.5D (Δ+9.75)"));
+
+            let stripped_r4 = theme::strip_ansi(&lines[3]);
+            assert!(stripped_r4.contains("Inv 0U/0D (Δ0)"));
+            assert!(stripped_r4.contains("Quote 50¢/50¢ (100¢)"));
+
+            let stripped_r5 = theme::strip_ansi(&lines[4]);
+            assert!(stripped_r5.contains("Book UP 47.33¢/50.33¢ DN 46.67¢/49.67¢"));
+            assert!(stripped_r5.contains("Quote 49.94¢/46.52¢ (96.46¢)"));
+            assert!(stripped_r5.contains("Inv 1000.25U/0D (Δ+1000.25)"));
+
+            for (idx, line) in lines.iter().enumerate() {
+                assert_eq!(
+                    pipe_cols(line),
+                    expected_pipes,
+                    "row {idx} pipes misaligned:\nheader: {}\nrow:    {}",
+                    theme::strip_ansi(&header),
+                    theme::strip_ansi(line),
+                );
+            }
+        }
     }
 }

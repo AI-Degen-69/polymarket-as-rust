@@ -176,7 +176,7 @@ pub(crate) fn print_order_event(action: &str, order: &SimOrder) {
         action_styled,
         outcome_str,
         side_str,
-        Theme::fmt_price_compact(Some(order.price)),
+        Theme::fmt_cents(Some(order.price)),
         order.original_size,
         order.volume_ahead,
         order.status.as_str()
@@ -201,7 +201,7 @@ pub(crate) fn print_trade_eval(
         "  {} {:<2} | px={} | sz={:<6} | vol_ahead: {:<6} -> {:<6} | reachable: {:<6} | filled: {:<6}",
         t.badge(Badge::Trade),
         outcome_str,
-        Theme::fmt_price_compact(Some(price)),
+        Theme::fmt_cents(Some(price)),
         size,
         vol_ahead_before,
         vol_ahead_after,
@@ -223,7 +223,7 @@ pub(crate) fn print_fill_event(fill: &SimFill) {
         outcome_str,
         fill.side.as_str(),
         fill.filled_shares,
-        Theme::fmt_price_compact(Some(fill.price)),
+        Theme::fmt_cents(Some(fill.price)),
         fill.is_maker
     );
 }
@@ -234,9 +234,9 @@ pub(crate) fn print_merge_event(merge: &MergeEvent, total_merged: SharesMicro) {
         "  {} {:<6} pairs | pair_cost={} (UP={}, DN={}) -> PnL={} (total_merged={})",
         t.badge(Badge::Merge),
         merge.merged_pairs,
-        Theme::fmt_price_compact(Some(merge.pair_cost)),
-        Theme::fmt_price_compact(Some(merge.avg_cost_up)),
-        Theme::fmt_price_compact(Some(merge.avg_cost_dn)),
+        Theme::fmt_cents(Some(merge.pair_cost)),
+        Theme::fmt_cents(Some(merge.avg_cost_up)),
+        Theme::fmt_cents(Some(merge.avg_cost_dn)),
         t.fmt_pnl(merge.realized_gain_micro),
         total_merged
     );
