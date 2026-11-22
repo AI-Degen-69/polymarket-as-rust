@@ -13,17 +13,17 @@ pub struct PricerConfig {
     pub gamma: FinitePosF64,
     /// Whether Station 4 adds `gamma * V_rem` to `(2/gamma) * ln(1 + gamma/kappa)` (`true` default).
     pub include_variance_spread: bool,
-    /// Whether Station 4 enforces taker-fee profitability floor `fee_rate*p*(1-p) + tick` (`true` default).
+    /// Whether Station 4 enforces taker-fee profitability floor `fee_rate*p*(1-p) + tick` (`false` default).
     pub enforce_fee_floor: bool,
-    /// Minimum combined spread floor in micro-USDC (`20_000` = `$0.02` default).
+    /// Minimum combined spread floor in micro-USDC (`10_000` = `$0.01` default).
     pub min_combined_spread_micro: MicroUsdc,
-    /// Minimum combined spread floor in integer ticks (`2` default).
+    /// Minimum combined spread floor in integer ticks (`1` default).
     pub min_spread_ticks: u32,
     /// Maximum allowed sum `bid_up + bid_dn` in micro-USDC (`980_000` = `$0.98` default).
     pub max_combined_bid_micro: MicroUsdc,
     /// Optional cross-tick pair-cost loss budget in micro-USDC (`None` disables cross-tick cap).
     pub max_cross_tick_loss_micro: Option<u64>,
-    /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`None` disables entry guard).
+    /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
 }
 
@@ -34,16 +34,16 @@ impl PricerConfig {
         Self {
             gamma,
             include_variance_spread: true,
-            enforce_fee_floor: true,
-            min_combined_spread_micro: MicroUsdc(20_000),
-            min_spread_ticks: 2,
+            enforce_fee_floor: false,
+            min_combined_spread_micro: MicroUsdc(10_000),
+            min_spread_ticks: 1,
             max_combined_bid_micro: MicroUsdc(980_000),
             max_cross_tick_loss_micro: None,
-            max_entry_prob: None,
+            max_entry_prob: Some(0.80),
         }
     }
 
-    /// Constructs the locked default configuration (`gamma = 0.15`, `spread >= $0.02`, `pair <= $0.98`).
+    /// Constructs the locked default configuration (`gamma = 0.15`, `spread >= $0.01`, `pair <= $0.98`, `max_entry_prob = 0.80`).
     pub fn try_default() -> Result<Self, MathError> {
         let gamma = FinitePosF64::try_new(0.15)?;
         Ok(Self::from_gamma(gamma))
@@ -762,25 +762,31 @@ mod tests {
         assert!(tr_short.bid_dn_floored.is_none());
 
         // Dynamic tick change 0.01 -> 0.001 at tail p=0.02 produces valid 3-decimal ticks, pair_cost <= 0.98.
+        // Disable entry guard for this sub-case so flat tail tick alignment is exercised directly.
+        let mut tail_cfg = PricerConfig::try_default().unwrap();
+        tail_cfg.max_entry_prob = None;
+        let tail_pricer = DualBidPricer::new(tail_cfg).unwrap();
         let mut inp_tail = make_input(0, 1_000, base_bounds());
         inp_tail.s_i = 0.02;
-        let tr_tail = pricer.price(&inp_tail, &clock).unwrap();
-        if let QuoteOutput::Active {
-            bid_up,
-            bid_dn,
-            pair_cost_micro,
-            ..
-        } = tr_tail.quote
-        {
-            if let Some(u) = bid_up {
-                assert_eq!(u.0 % 1_000, 0);
+        let tr_tail = tail_pricer.price(&inp_tail, &clock).unwrap();
+        match tr_tail.quote {
+            QuoteOutput::Active {
+                bid_up,
+                bid_dn,
+                pair_cost_micro,
+                ..
+            } => {
+                if let Some(u) = bid_up {
+                    assert_eq!(u.0 % 1_000, 0);
+                }
+                if let Some(d) = bid_dn {
+                    assert_eq!(d.0 % 1_000, 0);
+                }
+                if let Some(p) = pair_cost_micro {
+                    assert!(p.0 <= 980_000);
+                }
             }
-            if let Some(d) = bid_dn {
-                assert_eq!(d.0 % 1_000, 0);
-            }
-            if let Some(p) = pair_cost_micro {
-                assert!(p.0 <= 980_000);
-            }
+            other => panic!("expected Active quote for tail tick-size check, got {other:?}"),
         }
 
         // Pair-cost 1-tick step-down ($0.99 -> $0.98) and unresolvable ($1.00 -> PairMarginViolation).

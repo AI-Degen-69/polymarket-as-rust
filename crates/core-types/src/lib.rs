@@ -226,15 +226,17 @@ mod tests {
         assert_eq!(cfg.wallet_mode, WalletMode::DepositWallet1271);
         assert_eq!(cfg.max_notional_per_leg_micro, MicroUsdc(50_000_000));
         assert_eq!(cfg.base_order_size_shares, SharesMicro(20_000_000));
-        assert_eq!(cfg.min_combined_spread_micro, MicroUsdc(20_000));
+        assert_eq!(cfg.min_combined_spread_micro, MicroUsdc(10_000));
+        assert_eq!(cfg.min_spread_ticks, 1);
         assert_eq!(cfg.max_combined_bid_micro, MicroUsdc(980_000));
         assert_eq!(cfg.variance_mode, VarianceMode::BinaryCara);
         assert_eq!(cfg.kappa_mode, KappaMode::TradeNormalizedDepth);
         assert_eq!(cfg.sg_mode, SgMode::Causal);
         assert!(!cfg.polybolt_enabled);
         assert!(cfg.include_variance_spread);
+        assert!(!cfg.enforce_fee_floor);
         assert_eq!(cfg.max_cross_tick_loss_micro, None);
-        assert_eq!(cfg.max_entry_prob, None);
+        assert_eq!(cfg.max_entry_prob, Some(0.80));
 
         let json = serde_json::to_string(&cfg).unwrap();
         let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();

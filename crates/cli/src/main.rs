@@ -1047,10 +1047,11 @@ mod tests {
                 math.apply_to(&mut cfg).unwrap();
                 assert_eq!(cfg.gamma, 0.15);
                 assert!(cfg.include_variance_spread);
-                assert_eq!(cfg.min_spread_ticks, 2);
-                assert_eq!(cfg.min_combined_spread_micro, core_types::MicroUsdc(20_000));
+                assert_eq!(cfg.min_spread_ticks, 1);
+                assert_eq!(cfg.min_combined_spread_micro, core_types::MicroUsdc(10_000));
                 assert_eq!(cfg.max_combined_bid_micro, core_types::MicroUsdc(980_000));
-                assert!(cfg.enforce_fee_floor);
+                assert!(!cfg.enforce_fee_floor);
+                assert_eq!(cfg.max_entry_prob, Some(0.80));
             }
             _ => panic!("expected Paper"),
         }
@@ -1207,7 +1208,7 @@ mod tests {
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
                 assert_eq!(cfg.max_cross_tick_loss_micro, Some(0));
-                assert_eq!(cfg.max_entry_prob, None);
+                assert_eq!(cfg.max_entry_prob, Some(0.80));
             }
             _ => panic!("expected Paper"),
         }
