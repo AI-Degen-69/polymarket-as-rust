@@ -108,6 +108,27 @@ impl From<CliQueueDecay> for paper_sim::QueueDecayPolicy {
     }
 }
 
+/// CLI override value for `--max-entry-prob` supporting either a probability bound or `off`/`none`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MaxEntryProbOverride {
+    Off,
+    Value(f64),
+}
+
+fn parse_max_entry_prob_override(raw: &str) -> Result<MaxEntryProbOverride, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(MaxEntryProbOverride::Off);
+    }
+    let val = trimmed.parse::<f64>().map_err(|_| {
+        format!("invalid --max-entry-prob '{raw}': expected finite float in (0.5, 1.0) or 'off'")
+    })?;
+    if !val.is_finite() || val <= 0.5 || val >= 1.0 {
+        return Err("`--max-entry-prob` must be finite in (0.5, 1.0) or 'off'".to_string());
+    }
+    Ok(MaxEntryProbOverride::Value(val))
+}
+
 /// Optional Stations 4–6 math competitiveness overrides for live/replay A/B testing.
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub(crate) struct MathOverrides {
@@ -120,18 +141,18 @@ pub(crate) struct MathOverrides {
     /// Override whether Station 4 adds `gamma * V_rem` variance spread (`true` default).
     #[arg(long)]
     pub(crate) include_variance_spread: Option<bool>,
-    /// Override minimum spread floor in ticks (`2` default; `1` allows 1-cent BBO joining).
+    /// Override minimum spread floor in ticks (`1` default; `2` restores legacy 2-tick floor).
     #[arg(long)]
     pub(crate) min_spread_ticks: Option<u32>,
-    /// Override whether Station 4 enforces taker-fee spread floor (`true` default; auto-disabled at 1 tick unless set).
+    /// Override whether Station 4 enforces taker-fee spread floor (`false` default; auto-disabled when `--min-spread-ticks 1` unless set).
     #[arg(long)]
     pub(crate) fee_spread_floor: Option<bool>,
     /// Optional maximum allowed cross-tick pair loss in micro-USDC (`0` enforces `cost_old + bid_new <= max_combined_bid_micro`).
     #[arg(long)]
     pub(crate) max_cross_tick_loss_micro: Option<u64>,
-    /// Optional extreme-probability entry guard in `(0.5, 1.0)` blocking fresh directional entries outside `[1 - p_max, p_max]`.
-    #[arg(long)]
-    pub(crate) max_entry_prob: Option<f64>,
+    /// Override extreme-probability entry guard in `(0.5, 1.0)` (`0.80` default; pass `off` or `none` to disable).
+    #[arg(long, value_parser = parse_max_entry_prob_override)]
+    pub(crate) max_entry_prob: Option<MaxEntryProbOverride>,
 }
 
 impl MathOverrides {
@@ -178,11 +199,16 @@ impl MathOverrides {
         if let Some(loss) = self.max_cross_tick_loss_micro {
             cfg.max_cross_tick_loss_micro = Some(loss);
         }
-        if let Some(p_max) = self.max_entry_prob {
-            if !p_max.is_finite() || p_max <= 0.5 || p_max >= 1.0 {
-                return Err("`--max-entry-prob` must be finite in (0.5, 1.0)".into());
+        if let Some(entry_prob) = self.max_entry_prob {
+            match entry_prob {
+                MaxEntryProbOverride::Off => cfg.max_entry_prob = None,
+                MaxEntryProbOverride::Value(p_max) => {
+                    if !p_max.is_finite() || p_max <= 0.5 || p_max >= 1.0 {
+                        return Err("`--max-entry-prob` must be finite in (0.5, 1.0)".into());
+                    }
+                    cfg.max_entry_prob = Some(p_max);
+                }
             }
-            cfg.max_entry_prob = Some(p_max);
         }
         cfg.validate()?;
         Ok(())
@@ -1056,6 +1082,26 @@ mod tests {
             _ => panic!("expected Paper"),
         }
 
+        let trace_legacy = Cli::try_parse_from([
+            "poly-as",
+            "trace",
+            "--min-spread-ticks",
+            "2",
+            "--fee-spread-floor",
+            "true",
+        ])
+        .unwrap();
+        match trace_legacy.command {
+            Commands::Trace { math, .. } => {
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.min_spread_ticks, 2);
+                assert_eq!(cfg.min_combined_spread_micro, core_types::MicroUsdc(20_000));
+                assert!(cfg.enforce_fee_floor);
+            }
+            _ => panic!("expected Trace"),
+        }
+
         let trace_override = Cli::try_parse_from([
             "poly-as",
             "trace",
@@ -1192,7 +1238,7 @@ mod tests {
             Commands::Lifecycle { math, .. } => {
                 assert!(math.is_any_set());
                 assert_eq!(math.max_cross_tick_loss_micro, Some(20_000));
-                assert_eq!(math.max_entry_prob, Some(0.85));
+                assert_eq!(math.max_entry_prob, Some(MaxEntryProbOverride::Value(0.85)));
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
                 assert_eq!(cfg.max_cross_tick_loss_micro, Some(20_000));
@@ -1213,14 +1259,37 @@ mod tests {
             _ => panic!("expected Paper"),
         }
 
+        for off_flag in ["off", "none"] {
+            let parsed_off =
+                Cli::try_parse_from(["poly-as", "paper", "--max-entry-prob", off_flag]).unwrap();
+            match parsed_off.command {
+                Commands::Paper { math, .. } => {
+                    assert!(math.is_any_set());
+                    assert_eq!(math.max_entry_prob, Some(MaxEntryProbOverride::Off));
+                    let mut cfg = core_types::EngineConfig::default();
+                    math.apply_to(&mut cfg).unwrap();
+                    assert_eq!(cfg.max_entry_prob, None);
+                }
+                _ => panic!("expected Paper"),
+            }
+        }
+
         for bad_prob in [0.5, 0.49, 1.0, 1.05, f64::NAN, f64::INFINITY] {
             let mut cfg = core_types::EngineConfig::default();
             let err = MathOverrides {
-                max_entry_prob: Some(bad_prob),
+                max_entry_prob: Some(MaxEntryProbOverride::Value(bad_prob)),
                 ..Default::default()
             }
             .apply_to(&mut cfg);
             assert!(err.is_err(), "expected error for max_entry_prob={bad_prob}");
+        }
+
+        for bad_cli_prob in ["0.5", "1.0", "bogus"] {
+            assert!(
+                Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-prob", bad_cli_prob])
+                    .is_err(),
+                "expected CLI parse error for --max-entry-prob {bad_cli_prob}"
+            );
         }
 
         assert!(
