@@ -18,6 +18,11 @@ use crate::exec_report::{
     record_settlement_preview, record_signed_order, record_summary_jsonl,
 };
 
+/// Synthetic signatures excluded from tau_3 metrics (cold-start, lazy statics).
+const DRY_RUN_SIGN_WARMUP: usize = 50;
+/// Measured synthetic signatures so P99 reflects steady state, not one spike.
+const DRY_RUN_SIGN_SAMPLES: usize = 1000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecMode {
     DryRun,
@@ -189,9 +194,31 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     let order_signer =
         OrderSigner::new_ephemeral(WalletMode::DepositWallet1271, Some(synth_wallet))?;
     let l2_signer = L2HmacSigner::new_ephemeral_dry_run(synth_wallet_hex.clone(), "dry-run-key");
+    let tick_precision = TickPrecision::from_micro(market.tick_size_micro)?;
+
+    // tau_3 P99 must reflect steady-state signing, not a two-sample cold-start
+    // spike. Warmup samples are excluded; only measured samples feed the gate.
+    // Building the probe order (and its salt) stays outside the timed section,
+    // exactly as the real order path times only `sign_order`.
+    let probe_wire = encode_buy_amounts(
+        MicroUsdc::from_raw(520_000),
+        SharesMicro::from_raw(20_000_000),
+        tick_precision,
+    )?;
+    let probe_order = order_signer.build_order(
+        execution::generate_salt(),
+        &market.asset_id_up,
+        probe_wire.maker_amount,
+        probe_wire.taker_amount,
+        true,
+        unix_ms_now(),
+    )?;
+    warm_and_measure_signing(&order_signer, &domain, &mut sign_lat, &probe_order)?;
+    println!(
+        "      signing probe:      {DRY_RUN_SIGN_WARMUP} warmup (excluded) + {DRY_RUN_SIGN_SAMPLES} measured synthetic sigs"
+    );
 
     let mut pipeline = MathPipeline::new(MathPipelineConfig::try_default()?, clock)?;
-    let tick_precision = TickPrecision::from_micro(market.tick_size_micro)?;
     let display_ticks = (duration_secs.clamp(1, 60) as usize).clamp(6, 12);
 
     for tick in 0..display_ticks {
@@ -327,20 +354,8 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
         &sign_summary,
     )?;
 
-    if cfg!(debug_assertions) {
-        if sign_summary.p99_ns > 10_000_000 {
-            return Err(format!(
-                "tau_3 signing P99 {}us exceeds debug budget 10000us",
-                sign_summary.p99_ns / 1000
-            )
-            .into());
-        }
-    } else if sign_summary.p99_ns > 80_000 {
-        return Err(format!(
-            "tau_3 signing P99 {}us exceeds 80us budget",
-            sign_summary.p99_ns / 1000
-        )
-        .into());
+    if let Some(msg) = signing_budget_violation(sign_summary.p99_ns) {
+        return Err(msg.into());
     }
     if stats.active_quotes == 0 {
         return Err("no active quotes produced during dry-run".into());
@@ -437,6 +452,49 @@ fn sign_and_record(
     Ok(total_sign_ns / 2)
 }
 
+/// Warms up the signer (excluded from metrics), then records exactly
+/// `DRY_RUN_SIGN_SAMPLES` timings of pure EIP-712 signing into `sign_lat`.
+fn warm_and_measure_signing(
+    order_signer: &OrderSigner,
+    domain: &MarketDomain,
+    sign_lat: &mut LatencyTracker,
+    order: &execution::Order,
+) -> Result<(), Box<dyn Error>> {
+    use std::time::Instant;
+    let mut sign_once = |record: bool| -> Result<(), Box<dyn Error>> {
+        // Timed section is only `sign_order`; salt/build stay out of tau_3.
+        let t0 = Instant::now();
+        let _ = order_signer.sign_order(order, domain)?;
+        let elapsed_ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        if record {
+            sign_lat.record_ns(elapsed_ns.max(1))?;
+        }
+        Ok(())
+    };
+    for _ in 0..DRY_RUN_SIGN_WARMUP {
+        sign_once(false)?;
+    }
+    for _ in 0..DRY_RUN_SIGN_SAMPLES {
+        sign_once(true)?;
+    }
+    Ok(())
+}
+
+/// Returns the tau_3 budget violation message, if the P99 exceeds the gate.
+fn signing_budget_violation(p99_ns: u64) -> Option<String> {
+    if cfg!(debug_assertions) {
+        (p99_ns > 10_000_000).then(|| {
+            format!(
+                "tau_3 signing P99 {}us exceeds debug budget 10000us",
+                p99_ns / 1000
+            )
+        })
+    } else {
+        (p99_ns > 80_000)
+            .then(|| format!("tau_3 signing P99 {}us exceeds 80us budget", p99_ns / 1000))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,5 +517,44 @@ mod tests {
         assert_eq!(parse_duration_secs("500ms").unwrap_or(0), 1);
         assert_eq!(parse_duration_secs("1m").unwrap_or(0), 60);
         assert!(parse_duration_secs("bogus").is_err());
+    }
+
+    #[test]
+    fn dry_run_probe_counts_only_measured_samples() -> Result<(), Box<dyn Error>> {
+        let market = synth_market();
+        let domain = MarketDomain::for_market(&market);
+        let wallet = ephemeral_wallet();
+        let signer = OrderSigner::new_ephemeral(WalletMode::DepositWallet1271, Some(wallet))?;
+        let order = signer.build_order(
+            execution::generate_salt(),
+            &market.asset_id_up,
+            5_200_000,
+            20_000_000,
+            true,
+            1_782_753_357,
+        )?;
+        let mut sign_lat = LatencyTracker::new()?;
+
+        warm_and_measure_signing(&signer, &domain, &mut sign_lat, &order)?;
+
+        let summary = sign_lat.summary();
+        assert_eq!(summary.count, DRY_RUN_SIGN_SAMPLES as u64);
+        assert!(
+            summary.count >= 100,
+            "P99 needs a steady-state sample count, got {}",
+            summary.count
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn signing_budget_gate_bounds() {
+        let budget_ns = if cfg!(debug_assertions) {
+            10_000_000
+        } else {
+            80_000
+        };
+        assert!(signing_budget_violation(budget_ns).is_none());
+        assert!(signing_budget_violation(budget_ns + 1).is_some());
     }
 }
