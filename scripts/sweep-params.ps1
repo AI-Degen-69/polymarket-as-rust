@@ -9,18 +9,20 @@
     Primary host is Windows 11 PowerShell (pwsh); the script also resolves the
     correct executable name on Linux/macOS and respects CARGO_TARGET_DIR.
 .EXAMPLE
-    pwsh -File scripts/sweep-params.ps1 -InputPath logs/feeds.jsonl
+    pwsh -File scripts/sweep-params.ps1
 .EXAMPLE
-    pwsh -File scripts/sweep-params.ps1 -InputPath logs/feeds.jsonl -Gammas 0.02,0.08,0.15 -VarianceSpreads false
+    pwsh -File scripts/sweep-params.ps1 -InputPath logs/captures/22-11_05-56-27Z_20s_1w.jsonl -Gammas 0.02,0.08,0.15 -VarianceSpreads false
 .NOTES
-    Each invocation writes its outputs to a unique timestamped folder under
-    logs/sweeps/ so concurrent runs never share output files and can never
-    overwrite -InputPath.
+    Each invocation writes its outputs to a unique UTC-timestamped folder under
+    logs/sweeps/<DD-MM_HH-MM-SSZ>_<N>runs_<capture-stem>/ so concurrent runs
+    never share output files and can never overwrite -InputPath.
 #>
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$InputPath,
+    [Parameter(Mandatory = $false)]
+    [string]$InputPath = "",
+
+    [switch]$Latest,
 
     [string[]]$Gammas = @("0.02", "0.05", "0.08", "0.12", "0.15"),
 
@@ -63,14 +65,33 @@ foreach ($v in $parsedVarSpreads) {
     }
 }
 
-if (-not (Test-Path -LiteralPath $InputPath)) {
-    throw "Input capture file not found: $InputPath"
-}
-$resolvedInput = (Resolve-Path -LiteralPath $InputPath).Path
-
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $repoRoot
 try {
+    if ($Latest -and -not [string]::IsNullOrWhiteSpace($InputPath)) {
+        throw "Cannot pass both -InputPath and -Latest"
+    }
+
+    if ([string]::IsNullOrWhiteSpace($InputPath)) {
+        $capturesDir = Join-Path $repoRoot "logs/captures"
+        if (-not (Test-Path -LiteralPath $capturesDir)) {
+            throw "Captures directory not found: $capturesDir (pass -InputPath or run poly-as feeds --discover)"
+        }
+        $latestFile = Get-ChildItem -LiteralPath $capturesDir -Filter "*.jsonl" -File |
+            Where-Object { -not $_.Name.EndsWith(".inprogress.jsonl", [System.StringComparison]::OrdinalIgnoreCase) } |
+            Sort-Object -Property LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        if ($null -eq $latestFile) {
+            throw "No finalized .jsonl captures found in $capturesDir (pass -InputPath or run poly-as feeds --discover)"
+        }
+        $resolvedInput = $latestFile.FullName
+        Write-Host "[SWEEP] Auto-selected latest capture: $resolvedInput" -ForegroundColor Cyan
+    } else {
+        if (-not (Test-Path -LiteralPath $InputPath)) {
+            throw "Input capture file not found: $InputPath"
+        }
+        $resolvedInput = (Resolve-Path -LiteralPath $InputPath).Path
+    }
     if ($BinPath -ne "") {
         $binPath = $BinPath
         if (-not (Test-Path -LiteralPath $binPath)) {
@@ -99,10 +120,11 @@ try {
         }
     }
 
-    $stamp = Get-Date -Format "yyyyMMdd-HHmmss-fff"
-    $runId = [guid]::NewGuid().ToString("N").Substring(0, 8)
+    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count
+    $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
+    $captureStem = [System.IO.Path]::GetFileNameWithoutExtension($resolvedInput)
     $sweepBase = Join-Path $repoRoot "logs/sweeps"
-    $sweepDir = Join-Path $sweepBase ("sweep-{0}-{1}" -f $stamp, $runId)
+    $sweepDir = Join-Path $sweepBase ("{0}_{1}runs_{2}" -f $stamp, $totalRuns, $captureStem)
     New-Item -ItemType Directory -Force -Path $sweepDir | Out-Null
     Write-Host "[SWEEP] Output folder: $sweepDir" -ForegroundColor Cyan
     if ($resolvedInput.StartsWith($sweepDir, [System.StringComparison]::OrdinalIgnoreCase)) {
@@ -110,7 +132,6 @@ try {
     }
 
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count
     $runIdx = 0
 
     foreach ($gamma in $parsedGammas) {
@@ -120,7 +141,7 @@ try {
         foreach ($varStr in $parsedVarSpreads) {
             foreach ($minTicks in $parsedMinTicks) {
                 $runIdx++
-                $stem = "sweep-g$gammaTag-var$varStr-t$minTicks-b$MaxCombinedBidMicro-$QueueDecay"
+                $stem = "g${gammaTag}_var-${varStr}_t${minTicks}_b${MaxCombinedBidMicro}_${QueueDecay}"
                 $outJsonl = Join-Path $sweepDir "$stem.jsonl"
                 $outLog = Join-Path $sweepDir "$stem.log"
 
@@ -186,16 +207,25 @@ try {
         }
     }
 
-    Write-Host ""
-    Write-Host "=== OFFLINE PARAMETER SWEEP RESULTS (sorted by NetPnL desc) ===" -ForegroundColor Green
-    Write-Host ('Input: {0} | V_max=${1} | Base={2}sh | MaxPair=${3} | Decay={4}' -f $InputPath, $VMax, $BaseSize, ($MaxCombinedBidMicro / 1e6).ToString("0.00", $inv), $QueueDecay)
-    Write-Host ("Outputs: {0}" -f $sweepDir)
     $sorted = $results | Sort-Object -Property NetPnLNum -Descending
     $fmt = "{0,-6} {1,-6} {2,4} {3,5} {4,6} {5,7} {6,9} {7,9} {8,9} {9,7} {10,9} {11,9} {12,4} {13,6} {14,6}"
-    Write-Host ($fmt -f "Gamma", "VarSpr", "MinT", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s")
-    Write-Host ($fmt -f "-----", "------", "----", "-----", "------", "-------", "--------", "--------", "--------", "------", "--------", "---------", "---", "-----", "-----")
+    $summaryLines = [System.Collections.Generic.List[string]]::new()
+    $summaryLines.Add("=== OFFLINE PARAMETER SWEEP RESULTS (sorted by NetPnL desc) ===")
+    $summaryLines.Add(('Input: {0} | V_max=${1} | Base={2}sh | MaxPair=${3} | Decay={4}' -f $resolvedInput, $VMax, $BaseSize, ($MaxCombinedBidMicro / 1e6).ToString("0.00", $inv), $QueueDecay))
+    $summaryLines.Add(("Outputs: {0}" -f $sweepDir))
+    $summaryLines.Add(($fmt -f "Gamma", "VarSpr", "MinT", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s"))
+    $summaryLines.Add(($fmt -f "-----", "------", "----", "-----", "------", "-------", "--------", "--------", "--------", "------", "--------", "---------", "---", "-----", "-----"))
     foreach ($r in $sorted) {
-        Write-Host ($fmt -f $r.Gamma, $r.VarSpr, $r.MinT, $r.Fills, $r.Merges, $r.Pairs, $r.Realized, $r.Unreal, $r.NetPnL, $r.Rebate, $r.BasePnL, $r.AlphaEdge, $r.RPM, $r.MO1s, $r.MO5s)
+        $summaryLines.Add(($fmt -f $r.Gamma, $r.VarSpr, $r.MinT, $r.Fills, $r.Merges, $r.Pairs, $r.Realized, $r.Unreal, $r.NetPnL, $r.Rebate, $r.BasePnL, $r.AlphaEdge, $r.RPM, $r.MO1s, $r.MO5s))
+    }
+
+    $summaryPath = Join-Path $sweepDir "summary.txt"
+    $summaryLines | Set-Content -LiteralPath $summaryPath -Encoding utf8
+
+    Write-Host ""
+    Write-Host $summaryLines[0] -ForegroundColor Green
+    for ($i = 1; $i -lt $summaryLines.Count; $i++) {
+        Write-Host $summaryLines[$i]
     }
 }
 finally {
