@@ -27,7 +27,7 @@ const LATENCY_VALUE_WIDTH: usize = 10;
 const HB_BTC_WIDTH: usize = 19;
 const HB_BOOK_WIDTH: usize = 38;
 const HB_QUOTE_WIDTH: usize = 29;
-const HB_INV_WIDTH: usize = 25;
+const HB_INV_WIDTH: usize = 28;
 
 /// Content of the middle badge column: epoch phase, or any other badge such as `[MAKER]`.
 #[derive(Debug, Clone, Copy)]
@@ -638,7 +638,7 @@ impl LifecycleStreamReporter {
                 |cached: Option<MicroUsdc>, resting: Option<MicroUsdc>, action: &OrderAction| {
                     match action {
                         OrderAction::CancelAndReplace { new_price, .. } => {
-                            cached.or_else(|| resting.filter(|&p| p != *new_price))
+                            cached.or(resting).filter(|&p| p != *new_price)
                         }
                         _ => cached,
                     }
@@ -1709,6 +1709,44 @@ mod tests {
             }
         }
 
+        // Same-price CancelAndReplace (e.g. size-only ExcessiveSize) omits redundant strikethrough.
+        let mut size_only_rep =
+            LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let sub_same = OrderAction::SubmitNew {
+            outcome: Outcome::Up,
+            price: MicroUsdc(500_000),
+            size: SharesMicro::from_raw(20 * 1_000_000),
+        };
+        size_only_rep.format_step(&sample_row(base_ms, 300, &sub_same, &hold));
+        let resize_up = OrderAction::CancelAndReplace {
+            outcome: Outcome::Up,
+            old_order_id: "ord-u".to_string(),
+            new_price: MicroUsdc(500_000),
+            new_size: SharesMicro::from_raw(10 * 1_000_000),
+            reason: CancelReason::ExcessiveSize,
+        };
+        let resize_lines =
+            size_only_rep.format_step(&sample_row(base_ms + 100, 299, &resize_up, &hold));
+        assert_eq!(resize_lines.len(), 1);
+        assert!(resize_lines[0].contains("Requote 10 UP @ 50¢ | DN Hold | (ExcessiveSize)"));
+        assert!(!resize_lines[0].contains("~50¢~"));
+
+        // Epoch rollover reset clears cached prior quote prices so stale prices do not leak.
+        size_only_rep.reset_epoch();
+        let post_reset_req = OrderAction::CancelAndReplace {
+            outcome: Outcome::Up,
+            old_order_id: "ord-u2".to_string(),
+            new_price: MicroUsdc(480_000),
+            new_size: SharesMicro::from_raw(10 * 1_000_000),
+            reason: CancelReason::ExcessiveSize,
+        };
+        let mut next_epoch_row = sample_row(base_ms + 200, 300, &post_reset_req, &hold);
+        next_epoch_row.resting_bid_up = None;
+        let post_reset = size_only_rep.format_step(&next_epoch_row);
+        assert_eq!(post_reset.len(), 2);
+        assert!(post_reset[0].contains("Requote 10 UP @ 48¢ | DN Hold | (ExcessiveSize)"));
+        assert!(!post_reset[0].contains("~"));
+
         // Latency breach emits immediately.
         let mut lat_row = sample_row(base_ms + 700, 299, &hold, &hold);
         lat_row.pricing_ns = 31_000;
@@ -1893,9 +1931,9 @@ mod tests {
         row5.best_ask_dn = Some(MicroUsdc(496_682));
         row5.resting_bid_up = Some(MicroUsdc(499_439));
         row5.resting_bid_dn = Some(MicroUsdc(465_196));
-        row5.q_up = SharesMicro::from_raw(20_000_000);
+        row5.q_up = SharesMicro::from_raw(1_000_250_000);
         row5.q_dn = SharesMicro::ZERO;
-        row5.net_delta = 20;
+        row5.net_delta = 1_000;
         row5.net_pnl_micro = 0;
 
         let pipe_cols = |line: &str| -> Vec<usize> {
@@ -1936,6 +1974,7 @@ mod tests {
             let stripped_r5 = theme::strip_ansi(&lines[4]);
             assert!(stripped_r5.contains("Book UP 47.33¢/50.33¢ DN 46.67¢/49.67¢"));
             assert!(stripped_r5.contains("Quote 49.94¢/46.52¢ (96.46¢)"));
+            assert!(stripped_r5.contains("Inv 1000.25U/0D (Δ+1000.25)"));
 
             for (idx, line) in lines.iter().enumerate() {
                 assert_eq!(
