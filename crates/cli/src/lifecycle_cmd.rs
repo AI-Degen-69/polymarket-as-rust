@@ -548,7 +548,6 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                             now_ns,
                             &reason,
                         )?;
-                        stats.flattens_executed += 1;
                         risk_actor.clear_flatten_in_flight();
 
                         let (target_shares, opposite_shares) = match outcome {
@@ -559,6 +558,7 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                             target_shares.as_u64().abs_diff(opposite_shares.as_u64());
                         let flatten_raw = size.as_u64().min(net_delta_raw);
                         if flatten_raw > 0 {
+                            stats.flattens_executed += 1;
                             let side = if target_shares > opposite_shares {
                                 OrderSide::Sell
                             } else {
@@ -1413,6 +1413,14 @@ impl LivePaperSimulator {
                 .map(|o| o.sim_id)
         });
         if let Some(sim_id) = sim_id_opt {
+            if let Some(order) = self.broker.orders().get(&sim_id)
+                && matches!(
+                    order.status,
+                    SimOrderStatus::PendingCancel { .. } | SimOrderStatus::Cancelled
+                )
+            {
+                return false;
+            }
             return self.broker.cancel(sim_id, now_ms).is_ok();
         }
         false
@@ -2284,7 +2292,10 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
 
                 let tau_secs = sim.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
                 if now_ms >= sim.desc.expiry_ts_ms || (sim.market_resolved_flag && tau_secs == 0) {
-                    sim.settle_expired_epoch_if_needed(now_ms, now_ns, &mut jsonl)?;
+                    if let Err(err) = sim.settle_expired_epoch_if_needed(now_ms, now_ns, &mut jsonl) {
+                        loop_error = Some(err.to_string());
+                        break;
+                    }
                     let probe_due = last_rollover_probe
                         .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
                     if probe_due {
@@ -2307,7 +2318,10 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                                     loop_error = Some(err.to_string());
                                     break;
                                 }
-                                sim.rollover_to_market(next_desc, now_ms, now_ns, &mut jsonl)?;
+                                if let Err(err) = sim.rollover_to_market(next_desc, now_ms, now_ns, &mut jsonl) {
+                                    loop_error = Some(err.to_string());
+                                    break;
+                                }
                                 last_rollover_probe = None;
                             }
                             Err(err) => {

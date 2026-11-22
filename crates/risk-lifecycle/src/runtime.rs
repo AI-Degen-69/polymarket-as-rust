@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use core_types::{MicroUsdc, Outcome, SharesMicro};
 use math_engine::QuoteOutput;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TrySendError};
 
 use crate::breakers::{BreakerConfig, BreakerStatus, CircuitBreakers};
 use crate::error::RiskLifecycleError;
@@ -614,36 +614,47 @@ impl RiskActor {
                 size,
                 reason,
             } => {
-                let (flatten_action, cancel_all_reason) = if self
-                    .harness
-                    .priority_tx
-                    .try_send(ExecutionCommand::ExecuteFlattenFak {
-                        outcome,
-                        price,
-                        size,
-                        reason: reason.clone(),
-                    })
-                    .is_ok()
-                {
-                    self.flatten_in_flight = true;
-                    self.flatten_in_flight_since_ns = Some(now_ns);
-                    (
-                        FlattenAction::FlattenFak {
+                let (flatten_action, cancel_all_reason) =
+                    match self
+                        .harness
+                        .priority_tx
+                        .try_send(ExecutionCommand::ExecuteFlattenFak {
                             outcome,
                             price,
                             size,
-                        },
-                        None,
-                    )
-                } else {
-                    self.clear_flatten_in_flight();
-                    (
-                        FlattenAction::None,
-                        Some(format!(
-                            "Flatten try_send failed (priority channel full): {reason}"
-                        )),
-                    )
-                };
+                            reason: reason.clone(),
+                        }) {
+                        Ok(()) => {
+                            self.flatten_in_flight = true;
+                            self.flatten_in_flight_since_ns = Some(now_ns);
+                            (
+                                FlattenAction::FlattenFak {
+                                    outcome,
+                                    price,
+                                    size,
+                                },
+                                None,
+                            )
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            self.clear_flatten_in_flight();
+                            (
+                                FlattenAction::None,
+                                Some(format!(
+                                    "Flatten try_send failed (priority channel full): {reason}"
+                                )),
+                            )
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            self.clear_flatten_in_flight();
+                            (
+                                FlattenAction::None,
+                                Some(format!(
+                                    "Flatten try_send failed (priority channel closed): {reason}"
+                                )),
+                            )
+                        }
+                    };
                 Ok(Some(RiskActorTrace {
                     now_ms,
                     tau_secs,
@@ -801,7 +812,7 @@ impl RiskActor {
                 } = risk_decision.flatten
                 {
                     let reason = "Station 7 Tier 4 Hard Stop flatten".to_string();
-                    if self
+                    match self
                         .harness
                         .priority_tx
                         .try_send(ExecutionCommand::ExecuteFlattenFak {
@@ -809,17 +820,25 @@ impl RiskActor {
                             price,
                             size,
                             reason: reason.clone(),
-                        })
-                        .is_ok()
-                    {
-                        self.flatten_in_flight = true;
-                        self.flatten_in_flight_since_ns = Some(now_ns);
-                    } else {
-                        self.clear_flatten_in_flight();
-                        trace_flatten = FlattenAction::None;
-                        cancel_all_reason = Some(format!(
-                            "Flatten try_send failed (priority channel full): {reason}"
-                        ));
+                        }) {
+                        Ok(()) => {
+                            self.flatten_in_flight = true;
+                            self.flatten_in_flight_since_ns = Some(now_ns);
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            self.clear_flatten_in_flight();
+                            trace_flatten = FlattenAction::None;
+                            cancel_all_reason = Some(format!(
+                                "Flatten try_send failed (priority channel full): {reason}"
+                            ));
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            self.clear_flatten_in_flight();
+                            trace_flatten = FlattenAction::None;
+                            cancel_all_reason = Some(format!(
+                                "Flatten try_send failed (priority channel closed): {reason}"
+                            ));
+                        }
                     }
                 }
 
