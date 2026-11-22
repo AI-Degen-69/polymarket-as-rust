@@ -84,64 +84,108 @@ impl NaiveBaselineEngine {
         }
     }
 
-    /// Updates naive quotes pegged strictly to `mid - 1 tick` on both sides.
-    pub fn update_quotes(&mut self, input: NaiveQuotesInput) {
-        let tick_micro = input.tick.tick_micro();
-
-        // Update UP naive quote
-        if let Some(mid) = input.mid_up
-            && mid.0 > tick_micro.0
-        {
-            let target_price = MicroUsdc(mid.0.saturating_sub(tick_micro.0));
-            let should_replace = match self.active_up_id.and_then(|id| self.broker.get_order(id)) {
-                Some(order) => order.price != target_price || !order.status.is_active(),
-                None => true,
-            };
-            if should_replace {
-                if let Some(old_id) = self.active_up_id {
-                    let _ = self.broker.cancel(old_id, input.now_ms);
-                }
-                if let Ok(new_id) = self.broker.submit_new(NewOrderParams {
-                    outcome: Outcome::Up,
-                    side: OrderSide::Buy,
-                    price: target_price,
-                    size: self.base_size,
-                    now_ms: input.now_ms,
-                    current_best_bid: input.best_bid_up,
-                    current_best_ask: input.best_ask_up,
-                    book_depth_at_price: input.depth_up,
-                }) {
-                    self.active_up_id = Some(new_id);
-                }
+    /// Computes the tick-quantized `mid - 1 tick` passive bid, clamped strictly below `best_ask`.
+    #[must_use]
+    pub const fn target_bid_price(
+        mid: Option<MicroUsdc>,
+        best_ask: Option<MicroUsdc>,
+        tick: TickPrecision,
+    ) -> Option<MicroUsdc> {
+        let Some(mid_px) = mid else {
+            return None;
+        };
+        let tick_raw = tick.tick_micro().0;
+        if mid_px.0 <= tick_raw {
+            return None;
+        }
+        let raw_target = mid_px.0.saturating_sub(tick_raw);
+        let mut aligned = (raw_target / tick_raw) * tick_raw;
+        if let Some(ask) = best_ask {
+            let max_passive = (ask.0.saturating_sub(tick_raw) / tick_raw) * tick_raw;
+            if aligned > max_passive {
+                aligned = max_passive;
             }
         }
+        if aligned < tick_raw {
+            None
+        } else {
+            Some(MicroUsdc(aligned))
+        }
+    }
 
-        // Update DOWN naive quote
-        if let Some(mid) = input.mid_dn
-            && mid.0 > tick_micro.0
-        {
-            let target_price = MicroUsdc(mid.0.saturating_sub(tick_micro.0));
-            let should_replace = match self.active_dn_id.and_then(|id| self.broker.get_order(id)) {
-                Some(order) => order.price != target_price || !order.status.is_active(),
-                None => true,
-            };
-            if should_replace {
-                if let Some(old_id) = self.active_dn_id {
-                    let _ = self.broker.cancel(old_id, input.now_ms);
-                }
-                if let Ok(new_id) = self.broker.submit_new(NewOrderParams {
-                    outcome: Outcome::Down,
-                    side: OrderSide::Buy,
-                    price: target_price,
-                    size: self.base_size,
-                    now_ms: input.now_ms,
-                    current_best_bid: input.best_bid_dn,
-                    current_best_ask: input.best_ask_dn,
-                    book_depth_at_price: input.depth_dn,
-                }) {
-                    self.active_dn_id = Some(new_id);
+    /// Updates naive quotes pegged to tick-quantized `mid - 1 tick` on both sides.
+    pub fn update_quotes(&mut self, input: NaiveQuotesInput) {
+        let up_target = Self::target_bid_price(input.mid_up, input.best_ask_up, input.tick);
+        self.update_leg_quote(
+            Outcome::Up,
+            up_target,
+            input.best_bid_up,
+            input.best_ask_up,
+            input.depth_up,
+            input.now_ms,
+        );
+
+        let dn_target = Self::target_bid_price(input.mid_dn, input.best_ask_dn, input.tick);
+        self.update_leg_quote(
+            Outcome::Down,
+            dn_target,
+            input.best_bid_dn,
+            input.best_ask_dn,
+            input.depth_dn,
+            input.now_ms,
+        );
+    }
+
+    fn update_leg_quote(
+        &mut self,
+        outcome: Outcome,
+        target: Option<MicroUsdc>,
+        best_bid: Option<MicroUsdc>,
+        best_ask: Option<MicroUsdc>,
+        depth: SharesMicro,
+        now_ms: u64,
+    ) {
+        let active_id = match outcome {
+            Outcome::Up => self.active_up_id,
+            Outcome::Down => self.active_dn_id,
+        };
+        let Some(target_price) = target else {
+            if let Some(old_id) = active_id {
+                let _ = self.broker.cancel(old_id, now_ms);
+                match outcome {
+                    Outcome::Up => self.active_up_id = None,
+                    Outcome::Down => self.active_dn_id = None,
                 }
             }
+            return;
+        };
+
+        let should_replace = match active_id.and_then(|id| self.broker.get_order(id)) {
+            Some(order) => order.price != target_price || !order.status.is_active(),
+            None => true,
+        };
+        if !should_replace {
+            return;
+        }
+        if let Some(old_id) = active_id {
+            let _ = self.broker.cancel(old_id, now_ms);
+        }
+        let next_id = self
+            .broker
+            .submit_new(NewOrderParams {
+                outcome,
+                side: OrderSide::Buy,
+                price: target_price,
+                size: self.base_size,
+                now_ms,
+                current_best_bid: best_bid,
+                current_best_ask: best_ask,
+                book_depth_at_price: depth,
+            })
+            .ok();
+        match outcome {
+            Outcome::Up => self.active_up_id = next_id,
+            Outcome::Down => self.active_dn_id = next_id,
         }
     }
 
@@ -399,5 +443,139 @@ impl BaselineTelemetry {
     #[must_use]
     pub fn pending_markout_probe_count(&self) -> usize {
         self.markout_probes.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core_types::ONE_SHARE_MICRO;
+
+    use crate::fifo_book::{QueueDecayPolicy, SimOrderStatus};
+
+    use super::*;
+
+    #[test]
+    fn naive_baseline_quantizes_half_cent_mid_and_respects_volume_ahead() {
+        let cfg = FifoBrokerConfig {
+            order_latency_ms: 0,
+            cancel_latency_ms: 0,
+            queue_decay_policy: QueueDecayPolicy::Conservative,
+        };
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut engine = NaiveBaselineEngine::new(cfg, FeeSchedule::btc_5m_default(), base_size);
+
+        engine.update_quotes(NaiveQuotesInput {
+            mid_up: Some(MicroUsdc(345_000)),
+            mid_dn: None,
+            best_bid_up: Some(MicroUsdc(340_000)),
+            best_ask_up: Some(MicroUsdc(350_000)),
+            best_bid_dn: None,
+            best_ask_dn: None,
+            tick: TickPrecision::Cent,
+            depth_up: SharesMicro(50 * ONE_SHARE_MICRO),
+            depth_dn: SharesMicro::ZERO,
+            now_ms: 1_000,
+        });
+
+        let up_id = engine.active_up_id.unwrap();
+        let order = engine.broker.get_order(up_id).unwrap();
+        assert_eq!(order.price, MicroUsdc(330_000));
+        assert_eq!(order.price.0 % 10_000, 0);
+        assert_eq!(order.volume_ahead, SharesMicro(50 * ONE_SHARE_MICRO));
+
+        // 30-share print at $0.33 consumes queue ahead only (0 fills).
+        engine.on_public_trade_with_side(
+            Outcome::Up,
+            OrderSide::Sell,
+            MicroUsdc(330_000),
+            SharesMicro(30 * ONE_SHARE_MICRO),
+            1_000,
+        );
+        assert_eq!(engine.ledger.total_fills_count, 0);
+        let order_after_1 = engine.broker.get_order(up_id).unwrap();
+        assert_eq!(order_after_1.remaining_size, base_size);
+        assert_eq!(
+            order_after_1.volume_ahead,
+            SharesMicro(20 * ONE_SHARE_MICRO)
+        );
+
+        // 25-share print at $0.33 drains remaining 20sh ahead and fills 5sh.
+        engine.on_public_trade_with_side(
+            Outcome::Up,
+            OrderSide::Sell,
+            MicroUsdc(330_000),
+            SharesMicro(25 * ONE_SHARE_MICRO),
+            1_100,
+        );
+        assert_eq!(engine.ledger.total_fills_count, 1);
+        let order_after_2 = engine.broker.get_order(up_id).unwrap();
+        assert_eq!(order_after_2.volume_ahead, SharesMicro::ZERO);
+        assert_eq!(
+            order_after_2.remaining_size,
+            SharesMicro(base_size.0 - 5 * ONE_SHARE_MICRO)
+        );
+    }
+
+    #[test]
+    fn naive_baseline_clamps_below_best_ask_and_cancels_when_unquotable() {
+        assert_eq!(
+            NaiveBaselineEngine::target_bid_price(
+                Some(MicroUsdc(500_000)),
+                Some(MicroUsdc(480_000)),
+                TickPrecision::Cent,
+            ),
+            Some(MicroUsdc(470_000))
+        );
+        assert_eq!(
+            NaiveBaselineEngine::target_bid_price(
+                Some(MicroUsdc(345_000)),
+                Some(MicroUsdc(10_000)),
+                TickPrecision::Cent,
+            ),
+            None
+        );
+
+        let cfg = FifoBrokerConfig {
+            order_latency_ms: 0,
+            cancel_latency_ms: 0,
+            queue_decay_policy: QueueDecayPolicy::Conservative,
+        };
+        let mut engine = NaiveBaselineEngine::new(
+            cfg,
+            FeeSchedule::btc_5m_default(),
+            SharesMicro(20 * ONE_SHARE_MICRO),
+        );
+        engine.update_quotes(NaiveQuotesInput {
+            mid_up: Some(MicroUsdc(500_000)),
+            mid_dn: None,
+            best_bid_up: Some(MicroUsdc(490_000)),
+            best_ask_up: Some(MicroUsdc(510_000)),
+            best_bid_dn: None,
+            best_ask_dn: None,
+            tick: TickPrecision::Cent,
+            depth_up: SharesMicro::ZERO,
+            depth_dn: SharesMicro::ZERO,
+            now_ms: 1_000,
+        });
+        let order_id = engine.active_up_id.unwrap();
+
+        // best_ask == $0.01 leaves no legal passive tick -> cancel active order.
+        engine.update_quotes(NaiveQuotesInput {
+            mid_up: Some(MicroUsdc(500_000)),
+            mid_dn: None,
+            best_bid_up: None,
+            best_ask_up: Some(MicroUsdc(10_000)),
+            best_bid_dn: None,
+            best_ask_dn: None,
+            tick: TickPrecision::Cent,
+            depth_up: SharesMicro::ZERO,
+            depth_dn: SharesMicro::ZERO,
+            now_ms: 1_100,
+        });
+        assert!(engine.active_up_id.is_none());
+        assert_eq!(
+            engine.broker.get_order(order_id).unwrap().status,
+            SimOrderStatus::Cancelled
+        );
     }
 }
