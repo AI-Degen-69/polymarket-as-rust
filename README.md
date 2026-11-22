@@ -8,7 +8,7 @@ Pure-Rust, terminal-first Avellaneda-Stoikov dual-bid market maker for Polymarke
 | :--- | :--- | :--- |
 | Phase 0 | `core-types` and `poly-as doctor` | Complete |
 | Phase 1 | `feeds` and `poly-as feeds` | Complete |
-| Phases 2–5 | `math-engine`, `paper-sim`, `risk-lifecycle`, and `execution` | Planned — see [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) |
+| Phases 2–5 | `math-engine`, `paper-sim`, `risk-lifecycle`, and `execution` | Complete — tagged `phase-2-complete` through `phase-5-complete` |
 
 ## Workspace Crates
 
