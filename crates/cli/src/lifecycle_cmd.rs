@@ -1,5 +1,7 @@
 use std::error::Error;
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -31,6 +33,7 @@ use rtrb::RingBuffer;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
+use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent, canonical_target_path};
 use crate::lifecycle_report::{
     CancelAllRecord, LifecycleReportStats, LifecycleStepRow, OrderActionTelemetry,
     print_breaker_trip, print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten,
@@ -45,6 +48,7 @@ use crate::lifecycle_report::{
 pub(crate) enum LifecycleSourceMode {
     Live,
     SimEpoch,
+    Replay,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +74,7 @@ impl From<CliFaultMode> for FaultInjection {
 
 pub(crate) struct LifecycleArgs {
     pub(crate) source: LifecycleSourceMode,
+    pub(crate) input: Option<PathBuf>,
     pub(crate) duration: String,
     pub(crate) fast_forward: bool,
     pub(crate) fault: CliFaultMode,
@@ -299,14 +304,31 @@ fn risk_actor_loop(
     }
 }
 
+fn resolve_replay_input(input: Option<&Path>, jsonl: &Path) -> Result<PathBuf, Box<dyn Error>> {
+    let input_path = input.map_or_else(
+        || PathBuf::from("logs/phase1-feeds.jsonl"),
+        Path::to_path_buf,
+    );
+    if !input_path.exists() {
+        return Err(format!("replay input `{}` does not exist", input_path.display()).into());
+    }
+    if canonical_target_path(&input_path)? == canonical_target_path(jsonl)? {
+        return Err("refusing to overwrite `--input` replay log with `--jsonl` output".into());
+    }
+    Ok(input_path)
+}
+
 pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
     let mut check_cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut check_cfg)?;
 
+    if args.input.is_some() && args.source != LifecycleSourceMode::Replay {
+        return Err("`--input` is only valid with `--source replay`".into());
+    }
     if args.source == LifecycleSourceMode::SimEpoch && args.math.is_any_set() {
         return Err(
             "math override flags (--gamma, --max-combined-bid-micro, --include-variance-spread, \
-             --min-spread-ticks, --fee-spread-floor) apply only to `--source live`; \
+             --min-spread-ticks, --fee-spread-floor) apply only to `--source live` or `--source replay`; \
              sim-epoch uses synthetic quote proposals"
                 .into(),
         );
@@ -318,6 +340,20 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
+    let replay_input = if args.source == LifecycleSourceMode::Replay {
+        if args.fault != CliFaultMode::None {
+            return Err("`--inject-fault` is not supported with `--source replay`".into());
+        }
+        if args.pinning.is_active() {
+            return Err(
+                "--pin-pricing-core/--pin-risk-core are not supported with `--source replay`"
+                    .into(),
+            );
+        }
+        Some(resolve_replay_input(args.input.as_deref(), &args.jsonl)?)
+    } else {
+        None
+    };
 
     let _timer_guard = HighResTimerGuard::acquire_1ms()?;
     let clock = MonotonicClock::start();
@@ -326,6 +362,7 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
         match args.source {
             LifecycleSourceMode::Live => "Live WebSockets",
             LifecycleSourceMode::SimEpoch => "Simulated 5m Epoch (SimEpoch)",
+            LifecycleSourceMode::Replay => "Offline Replay (JSONL)",
         },
         args.v_max,
         args.base_size,
@@ -348,6 +385,11 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
         match args.source {
             LifecycleSourceMode::SimEpoch => run_sim_epoch(args, clock).await,
             LifecycleSourceMode::Live => run_live_epoch(args, clock).await,
+            LifecycleSourceMode::Replay => {
+                let input_path =
+                    replay_input.ok_or_else(|| "missing resolved replay input path".to_string())?;
+                run_replay_epoch(args, input_path, clock).await
+            }
         }
     })
 }
@@ -2163,6 +2205,120 @@ fn build_risk_actor(
     ))
 }
 
+struct ManagedLifecycleSession {
+    sim: LivePaperSimulator,
+    supervisor: ActorSupervisor,
+    actor_shutdown: Arc<AtomicBool>,
+    pricing_tx: mpsc::Sender<(PricingJob, oneshot::Sender<PricingAck>)>,
+    risk_tx: mpsc::Sender<(RiskJob, oneshot::Sender<RiskAck>)>,
+}
+
+impl ManagedLifecycleSession {
+    fn shutdown_returning_sim(self) -> Result<LivePaperSimulator, Box<dyn Error>> {
+        self.actor_shutdown.store(true, Ordering::Release);
+        drop(self.pricing_tx);
+        drop(self.risk_tx);
+        self.supervisor.join()?;
+        Ok(self.sim)
+    }
+}
+
+fn spawn_managed_session(
+    desc: MarketDescriptor,
+    cfg: &EngineConfig,
+    args: &LifecycleArgs,
+    initial_now_ns: u64,
+    clock: MonotonicClock,
+) -> Result<ManagedLifecycleSession, Box<dyn Error>> {
+    let (harness, priority_rx, routine_rx) = ActorPipelineHarness::new(64, 16);
+    let v_max_micro = MicroUsdc(args.v_max.saturating_mul(1_000_000));
+    let min_order_shares = (desc.min_order_size_micro.as_u64() / ONE_SHARE_MICRO).max(1);
+
+    let risk_actor = build_risk_actor(
+        harness.clone(),
+        v_max_micro,
+        args.base_size,
+        min_order_shares,
+        desc.tick_size_micro,
+        initial_now_ns,
+        args.fault.into(),
+    )?;
+
+    let pipe_cfg = MathPipelineConfig::from_engine_config(cfg)?;
+    let math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
+
+    let broker_cfg = FifoBrokerConfig {
+        queue_decay_policy: args.queue_decay,
+        ..FifoBrokerConfig::default()
+    };
+    let sim = LivePaperSimulator::new(
+        desc,
+        broker_cfg,
+        v_max_micro,
+        args.base_size,
+        harness.clone(),
+        priority_rx,
+        routine_rx,
+    )?;
+
+    let mut supervisor = ActorSupervisor::new(harness);
+    let actor_shutdown = supervisor.shutdown_flag();
+    let (pricing_tx, pricing_rx) = mpsc::channel::<(PricingJob, oneshot::Sender<PricingAck>)>(4);
+    let (risk_tx, risk_rx) = mpsc::channel::<(RiskJob, oneshot::Sender<RiskAck>)>(4);
+
+    let pricing_harness = sim.harness.clone();
+    let pricing_shutdown = Arc::clone(&actor_shutdown);
+    supervisor.spawn("pricing", args.pinning.pricing_core, move || {
+        pricing_actor_loop(math_pipeline, pricing_harness, pricing_rx, pricing_shutdown);
+    })?;
+
+    let risk_shutdown = Arc::clone(&actor_shutdown);
+    supervisor.spawn("risk", args.pinning.risk_core, move || {
+        risk_actor_loop(risk_actor, risk_rx, risk_shutdown);
+    })?;
+
+    Ok(ManagedLifecycleSession {
+        sim,
+        supervisor,
+        actor_shutdown,
+        pricing_tx,
+        risk_tx,
+    })
+}
+
+fn finalize_and_report_session(
+    sim: &mut LivePaperSimulator,
+    final_ms: u64,
+    final_ns: u64,
+    source_tag: &str,
+    (pricing_lat, risk_lat, total_lat): (
+        &mut LatencyTracker,
+        &mut LatencyTracker,
+        &mut LatencyTracker,
+    ),
+    mut jsonl: JsonlWriter,
+) -> Result<(), Box<dyn Error>> {
+    sim.finalize_stats(final_ms, final_ns, &mut jsonl)?;
+    let p_summary = pricing_lat.summary();
+    let r_summary = risk_lat.summary();
+    let t_summary = total_lat.summary();
+
+    print_lifecycle_summary(&sim.stats, &p_summary, &r_summary, &t_summary);
+    record_lifecycle_summary_jsonl(
+        &mut jsonl,
+        final_ms,
+        final_ns,
+        source_tag,
+        &sim.desc.slug,
+        &sim.stats,
+        &p_summary,
+        &r_summary,
+        &t_summary,
+    )?;
+    jsonl.close()?;
+    Ok(())
+}
+
 async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(), Box<dyn Error>> {
     let mut cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut cfg)?;
@@ -2199,36 +2355,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
         health_tx,
     )?;
 
-    let (harness, priority_rx, routine_rx) = ActorPipelineHarness::new(64, 16);
-    let v_max_micro = MicroUsdc(args.v_max.saturating_mul(1_000_000));
-    let min_order_shares = (desc.min_order_size_micro.as_u64() / ONE_SHARE_MICRO).max(1);
-
-    let risk_actor = build_risk_actor(
-        harness.clone(),
-        v_max_micro,
-        args.base_size,
-        min_order_shares,
-        desc.tick_size_micro,
-        base_mono_ns,
-        args.fault.into(),
-    )?;
-
-    let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg)?;
-    let math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
-
-    let broker_cfg = FifoBrokerConfig {
-        queue_decay_policy: args.queue_decay,
-        ..FifoBrokerConfig::default()
-    };
-    let mut sim = LivePaperSimulator::new(
-        desc,
-        broker_cfg,
-        v_max_micro,
-        args.base_size,
-        harness.clone(),
-        priority_rx,
-        routine_rx,
-    )?;
+    let mut sess = spawn_managed_session(desc, &cfg, &args, base_mono_ns, clock)?;
 
     println!(
         "  Actors: {} | local 8-station FIFO paper simulator armed (V_max=${}, base={}sh, 40ms wire latency)",
@@ -2236,22 +2363,6 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
         args.v_max,
         args.base_size
     );
-
-    let mut supervisor = ActorSupervisor::new(harness);
-    let actor_shutdown = supervisor.shutdown_flag();
-    let (pricing_tx, pricing_rx) = mpsc::channel::<(PricingJob, oneshot::Sender<PricingAck>)>(4);
-    let (risk_tx, risk_rx) = mpsc::channel::<(RiskJob, oneshot::Sender<RiskAck>)>(4);
-
-    let pricing_harness = sim.harness.clone();
-    let pricing_shutdown = Arc::clone(&actor_shutdown);
-    supervisor.spawn("pricing", args.pinning.pricing_core, move || {
-        pricing_actor_loop(math_pipeline, pricing_harness, pricing_rx, pricing_shutdown);
-    })?;
-
-    let risk_shutdown = Arc::clone(&actor_shutdown);
-    supervisor.spawn("risk", args.pinning.risk_core, move || {
-        risk_actor_loop(risk_actor, risk_rx, risk_shutdown);
-    })?;
 
     let deadline = tokio::time::Instant::now() + duration_limit;
     let sleep_deadline = tokio::time::sleep_until(deadline);
@@ -2283,16 +2394,16 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                         | BinanceSpotEvent::AggTrade { rx_mono_ns, .. } => rx_mono_ns,
                     };
                     let ev_ts_ms = base_adj_ms.saturating_add(rx_ns.saturating_sub(base_mono_ns) / 1_000_000);
-                    sim.on_binance_event(ev, ev_ts_ms);
+                    sess.sim.on_binance_event(ev, ev_ts_ms);
                 }
                 while let Ok(ev) = oracle_cons.pop() {
-                    sim.on_oracle_event(ev);
+                    sess.sim.on_oracle_event(ev);
                 }
                 while let Ok(ev) = poly_cons.pop() {
-                    sim.on_poly_event(ev, now_ms, now_ns, &mut jsonl)?;
+                    sess.sim.on_poly_event(ev, now_ms, now_ns, &mut jsonl)?;
                 }
                 while let Ok(ev) = health_rx.try_recv() {
-                    sim.on_health_event(ev);
+                    sess.sim.on_health_event(ev);
                 }
 
                 let mut latencies = LiveLatencies {
@@ -2301,10 +2412,11 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                     total: &mut total_lat,
                 };
                 let actors = LiveActorChannels {
-                    pricing_tx: &pricing_tx,
-                    risk_tx: &risk_tx,
+                    pricing_tx: &sess.pricing_tx,
+                    risk_tx: &sess.risk_tx,
                 };
-                if let Err(err) = sim
+                if let Err(err) = sess
+                    .sim
                     .step_tick(
                         now_ms,
                         now_ns,
@@ -2319,9 +2431,9 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                     break;
                 }
 
-                let tau_secs = sim.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
-                if now_ms >= sim.desc.expiry_ts_ms || (sim.market_resolved_flag && tau_secs == 0) {
-                    if let Err(err) = sim.settle_expired_epoch_if_needed(now_ms, now_ns, &mut jsonl) {
+                let tau_secs = sess.sim.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
+                if now_ms >= sess.sim.desc.expiry_ts_ms || (sess.sim.market_resolved_flag && tau_secs == 0) {
+                    if let Err(err) = sess.sim.settle_expired_epoch_if_needed(now_ms, now_ns, &mut jsonl) {
                         loop_error = Some(err.to_string());
                         break;
                     }
@@ -2332,7 +2444,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                         match discover_next_5m_market(
                             &discovery,
                             &offset_est,
-                            &sim.desc.condition_id,
+                            &sess.sim.desc.condition_id,
                         )
                         .await
                         {
@@ -2347,7 +2459,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                                     loop_error = Some(err.to_string());
                                     break;
                                 }
-                                if let Err(err) = sim.rollover_to_market(next_desc, now_ms, now_ns, &mut jsonl) {
+                                if let Err(err) = sess.sim.rollover_to_market(next_desc, now_ms, now_ns, &mut jsonl) {
                                     loop_error = Some(err.to_string());
                                     break;
                                 }
@@ -2356,7 +2468,7 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                             Err(err) => {
                                 eprintln!(
                                     "  [ROLLOVER] Awaiting next 5m BTC market after {}: {err}",
-                                    sim.desc.slug
+                                    sess.sim.desc.slug
                                 );
                             }
                         }
@@ -2369,7 +2481,14 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     let final_ns = clock.now_ns()?;
     let final_ms = base_adj_ms.saturating_add(final_ns.saturating_sub(base_mono_ns) / 1_000_000);
 
-    actor_shutdown.store(true, Ordering::Release);
+    sess.actor_shutdown.store(true, Ordering::Release);
+    let ManagedLifecycleSession {
+        mut sim,
+        supervisor,
+        pricing_tx,
+        risk_tx,
+        ..
+    } = sess;
     drop(pricing_tx);
     drop(risk_tx);
     let supervisor_result = supervisor.join();
@@ -2380,25 +2499,305 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     }
     supervisor_result?;
 
-    sim.finalize_stats(final_ms, final_ns, &mut jsonl)?;
-    let p_summary = pricing_lat.summary();
-    let r_summary = risk_lat.summary();
-    let t_summary = total_lat.summary();
-
-    print_lifecycle_summary(&sim.stats, &p_summary, &r_summary, &t_summary);
-    record_lifecycle_summary_jsonl(
-        &mut jsonl,
+    finalize_and_report_session(
+        &mut sim,
         final_ms,
         final_ns,
         "live",
-        &sim.desc.slug,
-        &sim.stats,
-        &p_summary,
-        &r_summary,
-        &t_summary,
-    )?;
-    jsonl.close()?;
+        (&mut pricing_lat, &mut risk_lat, &mut total_lat),
+        jsonl,
+    )
+}
+
+async fn run_replay_epoch(
+    args: LifecycleArgs,
+    input_path: PathBuf,
+    clock: MonotonicClock,
+) -> Result<(), Box<dyn Error>> {
+    let mut cfg = EngineConfig::from_env()?;
+    args.math.apply_to(&mut cfg)?;
+    let mut jsonl = JsonlWriter::create(&args.jsonl)?;
+    let mut pricing_lat = LatencyTracker::new()?;
+    let mut risk_lat = LatencyTracker::new()?;
+    let mut total_lat = LatencyTracker::new()?;
+
+    let reader = BufReader::new(File::open(&input_path)?);
+    let mut max_outer_mono = 0_u64;
+    let mut time_anchor: Option<(u64, u64)> = None;
+    let mut next_eval_ms: Option<u64> = None;
+    let mut last_sim_ms = 0_u64;
+    let mut last_sim_ns = 0_u64;
+    let mut epoch = 0_u64;
+    let mut session: Option<ManagedLifecycleSession> = None;
+
+    for line_res in reader.lines() {
+        let line = line_res?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let env: RawJsonlEnvelope = serde_json::from_str(&line)?;
+        if env.mono_ns < max_outer_mono {
+            return Err(format!(
+                "non-monotonic replay mono_ns: {} < {}",
+                env.mono_ns, max_outer_mono
+            )
+            .into());
+        }
+        max_outer_mono = env.mono_ns;
+
+        let (anchor_ts_ms, anchor_mono_ns) =
+            *time_anchor.get_or_insert((env.ts_unix_ms, env.mono_ns));
+        let cur_sim_ns = env.mono_ns.saturating_sub(anchor_mono_ns);
+        let cur_sim_ms = anchor_ts_ms.saturating_add(cur_sim_ns / 1_000_000);
+        last_sim_ms = cur_sim_ms;
+        last_sim_ns = cur_sim_ns;
+
+        if let Some(sess) = session.as_mut() {
+            let mut latencies = LiveLatencies {
+                pricing: &mut pricing_lat,
+                risk: &mut risk_lat,
+                total: &mut total_lat,
+            };
+            step_replay_eval_grid(
+                sess,
+                anchor_ts_ms,
+                cur_sim_ms,
+                &mut next_eval_ms,
+                &mut latencies,
+                &mut jsonl,
+            )
+            .await?;
+        }
+
+        match env.event.as_str() {
+            "market_discovered" => {
+                let desc: MarketDescriptor = serde_json::from_value(env.payload)?;
+                desc.validate()?;
+                if let Some(sess) = session.as_mut() {
+                    if desc.condition_id != sess.sim.desc.condition_id {
+                        epoch = epoch.saturating_add(1);
+                        sess.sim
+                            .rollover_to_market(desc, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                        next_eval_ms = Some(cur_sim_ms.saturating_add(100));
+                    }
+                } else {
+                    let sess = spawn_managed_session(desc, &cfg, &args, cur_sim_ns, clock)?;
+                    next_eval_ms = Some(cur_sim_ms.saturating_add(100));
+                    session = Some(sess);
+                }
+            }
+            "binance_tick" => {
+                if let Some(sess) = session.as_mut() {
+                    let ev: BinanceSpotEvent = serde_json::from_value(env.payload)?;
+                    sess.sim.on_binance_event(ev, cur_sim_ms);
+                }
+            }
+            "polybolt_event" => {
+                if let Some(sess) = session.as_mut() {
+                    let ev: OracleTwapEvent = serde_json::from_value(env.payload)?;
+                    sess.sim.on_oracle_event(ev);
+                }
+            }
+            "poly_book" | "poly_price_change" | "poly_trade" | "poly_tick_size" | "poly_bba" => {
+                if let Some(sess) = session.as_mut() {
+                    let ev = replay_poly_to_market_event(env.event.as_str(), env.payload, epoch)?;
+                    sess.sim
+                        .on_poly_event(ev, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                }
+            }
+            "clock_sync" | "feed_health" | "feeds_summary" => {}
+            other => {
+                return Err(format!("unknown event `{other}` in replay input").into());
+            }
+        }
+    }
+
+    let mut sess = session.ok_or("replay file contains no `market_discovered` event")?;
+    {
+        let (anchor_ts_ms, _) = time_anchor.unwrap_or((last_sim_ms, 0));
+        let mut latencies = LiveLatencies {
+            pricing: &mut pricing_lat,
+            risk: &mut risk_lat,
+            total: &mut total_lat,
+        };
+        step_replay_eval_grid(
+            &mut sess,
+            anchor_ts_ms,
+            last_sim_ms,
+            &mut next_eval_ms,
+            &mut latencies,
+            &mut jsonl,
+        )
+        .await?;
+    }
+    if last_sim_ms >= sess.sim.desc.expiry_ts_ms {
+        sess.sim
+            .settle_expired_epoch_if_needed(last_sim_ms, last_sim_ns, &mut jsonl)?;
+    }
+
+    let mut sim = sess.shutdown_returning_sim()?;
+    finalize_and_report_session(
+        &mut sim,
+        last_sim_ms,
+        last_sim_ns,
+        "replay",
+        (&mut pricing_lat, &mut risk_lat, &mut total_lat),
+        jsonl,
+    )
+}
+
+async fn step_replay_eval_grid(
+    sess: &mut ManagedLifecycleSession,
+    anchor_ts_ms: u64,
+    cur_sim_ms: u64,
+    next_eval_ms: &mut Option<u64>,
+    latencies: &mut LiveLatencies<'_>,
+    jsonl: &mut JsonlWriter,
+) -> Result<(), Box<dyn Error>> {
+    const MAX_REPLAY_GAP_CATCHUP_MS: u64 = 600_000;
+    if let Some(target) = *next_eval_ms
+        && cur_sim_ms.saturating_sub(target) > MAX_REPLAY_GAP_CATCHUP_MS
+    {
+        eprintln!(
+            "WARN: replay timestamp gap of {}ms exceeds {MAX_REPLAY_GAP_CATCHUP_MS}ms; fast-forwarding evaluation grid",
+            cur_sim_ms.saturating_sub(target)
+        );
+        *next_eval_ms = Some(cur_sim_ms);
+    }
+
+    while let Some(eval_ms) = *next_eval_ms {
+        if cur_sim_ms < eval_ms {
+            break;
+        }
+        let eval_ns = eval_ms
+            .saturating_sub(anchor_ts_ms)
+            .saturating_mul(1_000_000);
+        let actors = LiveActorChannels {
+            pricing_tx: &sess.pricing_tx,
+            risk_tx: &sess.risk_tx,
+        };
+        sess.sim
+            .step_tick(eval_ms, eval_ns, 0, &actors, latencies, jsonl)
+            .await?;
+        *next_eval_ms = Some(eval_ms.saturating_add(100));
+    }
     Ok(())
+}
+
+fn replay_poly_to_market_event(
+    tag: &str,
+    payload: serde_json::Value,
+    epoch: u64,
+) -> Result<PolyMarketEvent, Box<dyn Error>> {
+    let ev: ReplayPolyEvent = serde_json::from_value(payload)?;
+    match ev {
+        ReplayPolyEvent::BookSnapshot {
+            outcome,
+            book,
+            rx_mono_ns,
+            exch_ts_ms,
+        } => {
+            if tag != "poly_book" {
+                return Err(format!("outer tag `{tag}` mismatches BookSnapshot").into());
+            }
+            let fixed = FixedBook::<10>::try_from_slices(
+                outcome,
+                &book.bids,
+                &book.asks,
+                book.last_update_ns,
+                book.exchange_ts_ms,
+            )?;
+            Ok(PolyMarketEvent::BookSnapshot {
+                outcome,
+                book: fixed,
+                rx_mono_ns,
+                exch_ts_ms,
+                epoch,
+            })
+        }
+        ReplayPolyEvent::PriceChange {
+            outcome,
+            side,
+            price,
+            size,
+            best_bid,
+            best_ask,
+            rx_mono_ns,
+            exch_ts_ms,
+        } => {
+            if tag != "poly_price_change" {
+                return Err(format!("outer tag `{tag}` mismatches PriceChange").into());
+            }
+            Ok(PolyMarketEvent::PriceChange {
+                outcome,
+                side,
+                price,
+                size,
+                best_bid,
+                best_ask,
+                rx_mono_ns,
+                exch_ts_ms,
+                epoch,
+            })
+        }
+        ReplayPolyEvent::LastTrade {
+            outcome,
+            side,
+            price,
+            size,
+            rx_mono_ns,
+            exch_ts_ms,
+        } => {
+            if tag != "poly_trade" {
+                return Err(format!("outer tag `{tag}` mismatches LastTrade").into());
+            }
+            Ok(PolyMarketEvent::LastTrade {
+                outcome,
+                side,
+                price,
+                size,
+                rx_mono_ns,
+                exch_ts_ms,
+                epoch,
+            })
+        }
+        ReplayPolyEvent::TickSizeChange {
+            outcome,
+            new_tick_micro,
+            rx_mono_ns,
+            exch_ts_ms,
+        } => {
+            if tag != "poly_tick_size" {
+                return Err(format!("outer tag `{tag}` mismatches TickSizeChange").into());
+            }
+            Ok(PolyMarketEvent::TickSizeChange {
+                outcome,
+                new_tick_micro,
+                rx_mono_ns,
+                exch_ts_ms,
+                epoch,
+            })
+        }
+        ReplayPolyEvent::BestBidAsk {
+            outcome,
+            best_bid,
+            best_ask,
+            rx_mono_ns,
+            exch_ts_ms,
+        } => {
+            if tag != "poly_bba" {
+                return Err(format!("outer tag `{tag}` mismatches BestBidAsk").into());
+            }
+            Ok(PolyMarketEvent::BestBidAsk {
+                outcome,
+                best_bid,
+                best_ask,
+                rx_mono_ns,
+                exch_ts_ms,
+                epoch,
+            })
+        }
+    }
 }
 
 async fn discover_live_market(
@@ -3407,6 +3806,7 @@ mod tests {
     fn sim_epoch_rejects_math_override_flags_explicitly() {
         let err = run(LifecycleArgs {
             source: LifecycleSourceMode::SimEpoch,
+            input: None,
             duration: "10s".to_string(),
             fast_forward: true,
             fault: CliFaultMode::None,
@@ -3425,5 +3825,340 @@ mod tests {
             err.to_string().contains("sim-epoch"),
             "expected sim-epoch error message, got: {err}"
         );
+    }
+
+    fn write_replay_fixture(path: &Path, include_second_epoch: bool) {
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let desc1 = test_market("btc-5m-replay-e1", start_ms, expiry_ms);
+        let up_snap = test_book(Outcome::Up, 490_000, 510_000, 5, start_ms + 10);
+        let dn_snap = test_book(Outcome::Down, 490_000, 510_000, 5, start_ms + 15);
+        let base_mono = 1_000_000_000_u64;
+
+        let mut writer = JsonlWriter::create(path).unwrap();
+        writer
+            .write_event(start_ms, base_mono, "market_discovered", &desc1)
+            .unwrap();
+        writer
+            .write_event(
+                start_ms + 5,
+                base_mono + 5_000_000,
+                "binance_tick",
+                &BinanceSpotEvent::BookTicker {
+                    bid_e8: 9_000_000_000_000,
+                    ask_e8: 9_000_100_000_000,
+                    bid_qty_e8: 100_000_000,
+                    ask_qty_e8: 100_000_000,
+                    update_id: 1,
+                    rx_mono_ns: base_mono + 5_000_000,
+                },
+            )
+            .unwrap();
+        writer
+            .write_event(
+                start_ms + 10,
+                base_mono + 10_000_000,
+                "poly_book",
+                &PolyMarketEvent::BookSnapshot {
+                    outcome: Outcome::Up,
+                    book: up_snap,
+                    rx_mono_ns: base_mono + 10_000_000,
+                    exch_ts_ms: start_ms + 10,
+                    epoch: 0,
+                },
+            )
+            .unwrap();
+        writer
+            .write_event(
+                start_ms + 15,
+                base_mono + 15_000_000,
+                "poly_book",
+                &PolyMarketEvent::BookSnapshot {
+                    outcome: Outcome::Down,
+                    book: dn_snap,
+                    rx_mono_ns: base_mono + 15_000_000,
+                    exch_ts_ms: start_ms + 15,
+                    epoch: 0,
+                },
+            )
+            .unwrap();
+        // Advance past 5-point SG warmup (500ms) + 40ms order latency so bids go Live.
+        writer
+            .write_event(
+                start_ms + 620,
+                base_mono + 620_000_000,
+                "binance_tick",
+                &BinanceSpotEvent::BookTicker {
+                    bid_e8: 9_000_000_000_000,
+                    ask_e8: 9_000_100_000_000,
+                    bid_qty_e8: 100_000_000,
+                    ask_qty_e8: 100_000_000,
+                    update_id: 2,
+                    rx_mono_ns: base_mono + 620_000_000,
+                },
+            )
+            .unwrap();
+        // Hit both resting UP and DN bids to trigger deterministic fills + merge.
+        writer
+            .write_event(
+                start_ms + 750,
+                base_mono + 750_000_000,
+                "poly_trade",
+                &PolyMarketEvent::LastTrade {
+                    outcome: Outcome::Up,
+                    side: OrderSide::Sell,
+                    price: MicroUsdc(400_000),
+                    size: SharesMicro(15 * ONE_SHARE_MICRO),
+                    rx_mono_ns: base_mono + 750_000_000,
+                    exch_ts_ms: start_ms + 750,
+                    epoch: 0,
+                },
+            )
+            .unwrap();
+        writer
+            .write_event(
+                start_ms + 850,
+                base_mono + 850_000_000,
+                "poly_trade",
+                &PolyMarketEvent::LastTrade {
+                    outcome: Outcome::Down,
+                    side: OrderSide::Sell,
+                    price: MicroUsdc(400_000),
+                    size: SharesMicro(15 * ONE_SHARE_MICRO),
+                    rx_mono_ns: base_mono + 850_000_000,
+                    exch_ts_ms: start_ms + 850,
+                    epoch: 0,
+                },
+            )
+            .unwrap();
+        writer
+            .write_event(
+                start_ms + 1_050,
+                base_mono + 1_050_000_000,
+                "binance_tick",
+                &BinanceSpotEvent::AggTrade {
+                    price_e8: 9_000_050_000_000,
+                    qty_e8: 50_000_000,
+                    is_buyer_maker: false,
+                    exch_ts_ms: start_ms + 1_050,
+                    rx_mono_ns: base_mono + 1_050_000_000,
+                },
+            )
+            .unwrap();
+
+        if include_second_epoch {
+            let e2_start = expiry_ms;
+            let e2_expiry = e2_start + 300_000;
+            let desc2 = test_market("btc-5m-replay-e2", e2_start, e2_expiry);
+            let e2_mono = base_mono + 300_100 * 1_000_000;
+            writer
+                .write_event(e2_start + 100, e2_mono, "market_discovered", &desc2)
+                .unwrap();
+            writer
+                .write_event(
+                    e2_start + 110,
+                    e2_mono + 10_000_000,
+                    "poly_book",
+                    &PolyMarketEvent::BookSnapshot {
+                        outcome: Outcome::Up,
+                        book: test_book(Outcome::Up, 490_000, 500_000, 5, e2_start + 110),
+                        rx_mono_ns: e2_mono + 10_000_000,
+                        exch_ts_ms: e2_start + 110,
+                        epoch: 1,
+                    },
+                )
+                .unwrap();
+            writer
+                .write_event(
+                    e2_start + 115,
+                    e2_mono + 15_000_000,
+                    "poly_book",
+                    &PolyMarketEvent::BookSnapshot {
+                        outcome: Outcome::Down,
+                        book: test_book(Outcome::Down, 500_000, 510_000, 5, e2_start + 115),
+                        rx_mono_ns: e2_mono + 15_000_000,
+                        exch_ts_ms: e2_start + 115,
+                        epoch: 1,
+                    },
+                )
+                .unwrap();
+            writer
+                .write_event(
+                    e2_start + 350,
+                    e2_mono + 250_000_000,
+                    "binance_tick",
+                    &BinanceSpotEvent::AggTrade {
+                        price_e8: 9_001_000_000_000,
+                        qty_e8: 50_000_000,
+                        is_buyer_maker: false,
+                        exch_ts_ms: e2_start + 350,
+                        rx_mono_ns: e2_mono + 250_000_000,
+                    },
+                )
+                .unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    fn read_summary_payload(jsonl_path: &Path) -> serde_json::Value {
+        let contents = std::fs::read_to_string(jsonl_path).unwrap();
+        contents
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .find(|v| v["event"].as_str() == Some("summary"))
+            .expect("summary event must be recorded")["payload"]
+            .clone()
+    }
+
+    #[test]
+    fn replay_cli_validation_and_math_overrides() {
+        let fixture = temp_jsonl_path("replay_val_in");
+        let out = temp_jsonl_path("replay_val_out");
+        write_replay_fixture(&fixture, false);
+
+        // `--input` rejected with `--source live`.
+        let err_live = run(LifecycleArgs {
+            source: LifecycleSourceMode::Live,
+            input: Some(fixture.clone()),
+            duration: "10s".to_string(),
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            jsonl: out.clone(),
+        })
+        .unwrap_err();
+        assert!(err_live.to_string().contains("--input"), "err={err_live}");
+
+        // `--input == --jsonl` rejected with `--source replay`.
+        let err_overwrite = run(LifecycleArgs {
+            source: LifecycleSourceMode::Replay,
+            input: Some(fixture.clone()),
+            duration: "10s".to_string(),
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            jsonl: fixture.clone(),
+        })
+        .unwrap_err();
+        assert!(
+            err_overwrite.to_string().contains("overwrite"),
+            "err={err_overwrite}"
+        );
+
+        // Math overrides + queue-decay accepted with `--source replay`.
+        let ok_res = run(LifecycleArgs {
+            source: LifecycleSourceMode::Replay,
+            input: Some(fixture.clone()),
+            duration: "10s".to_string(),
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Optimistic,
+            math: crate::MathOverrides {
+                gamma: Some(0.02),
+                include_variance_spread: Some(false),
+                min_spread_ticks: Some(1),
+                max_combined_bid_micro: Some(990_000),
+                fee_spread_floor: Some(false),
+            },
+            pinning: CorePinning::default(),
+            jsonl: out.clone(),
+        });
+        assert!(ok_res.is_ok(), "replay failed: {ok_res:?}");
+
+        let _ = std::fs::remove_file(&fixture);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn replay_is_deterministic_across_runs() {
+        let fixture = temp_jsonl_path("replay_det_in");
+        let out_a = temp_jsonl_path("replay_det_a");
+        let out_b = temp_jsonl_path("replay_det_b");
+        write_replay_fixture(&fixture, false);
+
+        let make_args = |jsonl: PathBuf| LifecycleArgs {
+            source: LifecycleSourceMode::Replay,
+            input: Some(fixture.clone()),
+            duration: "10s".to_string(),
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Optimistic,
+            math: crate::MathOverrides {
+                gamma: Some(0.02),
+                include_variance_spread: Some(false),
+                min_spread_ticks: Some(1),
+                max_combined_bid_micro: Some(990_000),
+                fee_spread_floor: Some(false),
+            },
+            pinning: CorePinning::default(),
+            jsonl,
+        };
+
+        run(make_args(out_a.clone())).unwrap();
+        run(make_args(out_b.clone())).unwrap();
+
+        let sum_a = read_summary_payload(&out_a);
+        let sum_b = read_summary_payload(&out_b);
+        for key in [
+            "ticks_evaluated",
+            "orders_submitted",
+            "orders_replaced",
+            "orders_canceled",
+            "orders_held",
+            "fills_count",
+            "merges_count",
+            "realized_pnl_micro",
+            "unrealized_pnl_micro",
+            "baseline_pnl_micro",
+        ] {
+            assert_eq!(sum_a[key], sum_b[key], "mismatch on {key}");
+        }
+        assert!(sum_a["fills_count"].as_u64().unwrap() >= 1);
+
+        let _ = std::fs::remove_file(&fixture);
+        let _ = std::fs::remove_file(&out_a);
+        let _ = std::fs::remove_file(&out_b);
+    }
+
+    #[test]
+    fn replay_handles_multi_epoch_rollover_cleanly() {
+        let fixture = temp_jsonl_path("replay_multi_in");
+        let out = temp_jsonl_path("replay_multi_out");
+        write_replay_fixture(&fixture, true);
+
+        run(LifecycleArgs {
+            source: LifecycleSourceMode::Replay,
+            input: Some(fixture.clone()),
+            duration: "10s".to_string(),
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            jsonl: out.clone(),
+        })
+        .unwrap();
+
+        let sum = read_summary_payload(&out);
+        assert_eq!(sum["epoch_rollovers"].as_u64().unwrap(), 1);
+        let contents = std::fs::read_to_string(&out).unwrap();
+        assert!(contents.contains("\"event\":\"epoch_rollover\""));
+
+        let _ = std::fs::remove_file(&fixture);
+        let _ = std::fs::remove_file(&out);
     }
 }
