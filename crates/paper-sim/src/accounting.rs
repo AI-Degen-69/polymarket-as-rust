@@ -50,6 +50,15 @@ pub struct PaperLedger {
     pub total_fills_count: u64,
     /// Active market fee schedule.
     pub fee_schedule: FeeSchedule,
+    /// Maker rebates locked in before prior fee-schedule transitions.
+    #[serde(default)]
+    carried_rebate_micro: u64,
+    /// Cumulative maker weighted volume already accounted under prior fee schedules.
+    #[serde(default)]
+    rate_volume_base_micro: u128,
+    /// Fee rate (`fee_rate_e6`) currently paired with `rate_volume_base_micro`.
+    #[serde(default)]
+    active_fee_rate_e6: u64,
 }
 
 impl PaperLedger {
@@ -67,7 +76,10 @@ impl PaperLedger {
             estimated_rebate_micro: 0,
             total_pairs_merged: SharesMicro::ZERO,
             total_fills_count: 0,
+            active_fee_rate_e6: fee_schedule.fee_rate_e6,
             fee_schedule,
+            carried_rebate_micro: 0,
+            rate_volume_base_micro: 0,
         }
     }
 
@@ -80,6 +92,7 @@ impl PaperLedger {
             .ok_or(PaperSimError::ArithmeticOverflow)?;
 
         if fill.is_maker {
+            self.sync_fee_schedule_change();
             // Maker fee is zero on Polymarket CLOB.
             // Accumulate maker weighted volume: shares * p * (1 - p)
             let p_raw = fill.price.0;
@@ -210,6 +223,19 @@ impl PaperLedger {
         price: MicroUsdc,
         shares: SharesMicro,
     ) -> Result<MicroUsdc, PaperSimError> {
+        let (fee, _) = self.record_taker_flatten_with_merge(outcome, side, price, shares)?;
+        Ok(fee)
+    }
+
+    /// Records an aggressive simulated taker flatten (FAK) order and returns any
+    /// resulting atomic pair merge event when a buy-side flatten pairs opposite shares.
+    pub fn record_taker_flatten_with_merge(
+        &mut self,
+        outcome: Outcome,
+        side: OrderSide,
+        price: MicroUsdc,
+        shares: SharesMicro,
+    ) -> Result<(MicroUsdc, Option<MergeEvent>), PaperSimError> {
         let fee = self.fee_schedule.compute_taker_fee_micro(shares, price)?;
         self.fees_paid_micro = self
             .fees_paid_micro
@@ -222,7 +248,7 @@ impl PaperLedger {
 
         // Adjust position
         let notional = ((shares.0 as u128 * price.0 as u128) / (MICRO_SCALE as u128)) as u64;
-        match side {
+        let merge_event = match side {
             OrderSide::Sell => {
                 // Selling long position
                 match outcome {
@@ -273,6 +299,7 @@ impl PaperLedger {
                         }
                     }
                 }
+                None
             }
             OrderSide::Buy => {
                 // Buying shares aggressively
@@ -302,12 +329,14 @@ impl PaperLedger {
                 }
                 let pairs_to_merge = self.filled_up.0.min(self.filled_dn.0);
                 if pairs_to_merge > 0 {
-                    let _ = self.execute_pair_merge(pairs_to_merge)?;
+                    Some(self.execute_pair_merge(pairs_to_merge)?)
+                } else {
+                    None
                 }
             }
-        }
+        };
 
-        Ok(fee)
+        Ok((fee, merge_event))
     }
 
     /// Returns the volume-weighted average price (VWAP) of active UP shares.
@@ -360,17 +389,45 @@ impl PaperLedger {
         self.realized_pnl_micro + self.unrealized_pnl_micro(mid_up, mid_dn)
     }
 
-    /// Updates `estimated_rebate_micro` deterministically from accumulated maker weighted volume.
-    pub fn refresh_estimated_rebate(&mut self) {
-        let fee_rate = self.fee_schedule.fee_rate_e6 as u128;
+    fn compute_rebate_for_volume(weighted_volume_micro: u128, fee_rate_e6: u64) -> u64 {
+        let fee_rate = fee_rate_e6 as u128;
         let rebate_share = DEFAULT_MAKER_REBATE_SHARE_E6 as u128;
         let scale_sq = (MICRO_SCALE as u128) * (MICRO_SCALE as u128);
-        let rebate_u128 = self
-            .maker_weighted_volume_micro
+        let rebate_u128 = weighted_volume_micro
             .saturating_mul(fee_rate)
             .saturating_mul(rebate_share)
             / scale_sq;
-        self.estimated_rebate_micro = u64::try_from(rebate_u128).unwrap_or(u64::MAX);
+        u64::try_from(rebate_u128).unwrap_or(u64::MAX)
+    }
+
+    fn sync_fee_schedule_change(&mut self) {
+        if self.fee_schedule.fee_rate_e6 != self.active_fee_rate_e6 {
+            let prev_wv = self
+                .maker_weighted_volume_micro
+                .saturating_sub(self.rate_volume_base_micro);
+            let prev_rebate = Self::compute_rebate_for_volume(prev_wv, self.active_fee_rate_e6);
+            self.carried_rebate_micro = self.carried_rebate_micro.saturating_add(prev_rebate);
+            self.rate_volume_base_micro = self.maker_weighted_volume_micro;
+            self.active_fee_rate_e6 = self.fee_schedule.fee_rate_e6;
+        }
+    }
+
+    /// Updates the active market fee schedule while locking in previously accrued maker rebates.
+    pub fn set_fee_schedule(&mut self, next_schedule: FeeSchedule) {
+        self.fee_schedule = next_schedule;
+        self.sync_fee_schedule_change();
+        self.refresh_estimated_rebate();
+    }
+
+    /// Updates `estimated_rebate_micro` deterministically from accumulated maker weighted volume.
+    pub fn refresh_estimated_rebate(&mut self) {
+        self.sync_fee_schedule_change();
+        let current_wv = self
+            .maker_weighted_volume_micro
+            .saturating_sub(self.rate_volume_base_micro);
+        let current_rebate =
+            Self::compute_rebate_for_volume(current_wv, self.fee_schedule.fee_rate_e6);
+        self.estimated_rebate_micro = self.carried_rebate_micro.saturating_add(current_rebate);
     }
 
     /// Settles residual binary inventory at epoch expiry (`winning_outcome` pays `$1.00`,

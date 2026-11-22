@@ -330,6 +330,32 @@ impl FifoPaperBroker {
         trade_size: SharesMicro,
         now_ms: u64,
     ) -> Vec<SimFill> {
+        self.on_public_trade_inner(outcome, None, trade_price, trade_size, now_ms)
+    }
+
+    /// Evaluates a directional public trade event against fillable resting orders on the book.
+    ///
+    /// Only sell-aggressor trades (`OrderSide::Sell`) can consume resting buy orders,
+    /// and only buy-aggressor trades (`OrderSide::Buy`) can consume resting sell orders.
+    pub fn on_public_trade_with_side(
+        &mut self,
+        outcome: Outcome,
+        trade_side: OrderSide,
+        trade_price: MicroUsdc,
+        trade_size: SharesMicro,
+        now_ms: u64,
+    ) -> Vec<SimFill> {
+        self.on_public_trade_inner(outcome, Some(trade_side), trade_price, trade_size, now_ms)
+    }
+
+    fn on_public_trade_inner(
+        &mut self,
+        outcome: Outcome,
+        trade_side: Option<OrderSide>,
+        trade_price: MicroUsdc,
+        trade_size: SharesMicro,
+        now_ms: u64,
+    ) -> Vec<SimFill> {
         self.update_time(now_ms);
 
         let mut fills = Vec::new();
@@ -345,6 +371,9 @@ impl FifoPaperBroker {
 
             match order.side {
                 OrderSide::Buy => {
+                    if matches!(trade_side, Some(OrderSide::Buy)) {
+                        continue;
+                    }
                     if trade_price.0 < order.price.0 {
                         // Traded strictly through our bid
                         let fill_qty = order.remaining_size.0.min(trade_avail);
@@ -386,6 +415,9 @@ impl FifoPaperBroker {
                     }
                 }
                 OrderSide::Sell => {
+                    if matches!(trade_side, Some(OrderSide::Sell)) {
+                        continue;
+                    }
                     if trade_price.0 > order.price.0 {
                         // Traded strictly through our ask
                         let fill_qty = order.remaining_size.0.min(trade_avail);
@@ -488,7 +520,9 @@ impl FifoPaperBroker {
                 && order.side == OrderSide::Buy
                 && matches!(
                     order.status,
-                    SimOrderStatus::PendingPlace { .. } | SimOrderStatus::Live
+                    SimOrderStatus::PendingPlace { .. }
+                        | SimOrderStatus::Live
+                        | SimOrderStatus::PendingCancel { .. }
                 )
             {
                 let cost = (order.remaining_size.0 as u128 * order.price.0 as u128
@@ -508,7 +542,9 @@ impl FifoPaperBroker {
                 && order.side == OrderSide::Buy
                 && matches!(
                     order.status,
-                    SimOrderStatus::PendingPlace { .. } | SimOrderStatus::Live
+                    SimOrderStatus::PendingPlace { .. }
+                        | SimOrderStatus::Live
+                        | SimOrderStatus::PendingCancel { .. }
                 )
             {
                 total = total.saturating_add(order.remaining_size.0);
