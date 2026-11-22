@@ -78,6 +78,21 @@ impl Theme {
         }
     }
 
+    /// Resolves styling from an explicit `--color` flag, TTY state, `NO_COLOR`, and VT support.
+    pub(crate) const fn from_choice_with_vt(
+        choice: ColorChoice,
+        is_tty: bool,
+        no_color: bool,
+        vt_supported: bool,
+    ) -> Self {
+        let base = Self::from_choice(choice, is_tty, no_color);
+        if base.color && is_tty && !vt_supported {
+            Self::plain()
+        } else {
+            base
+        }
+    }
+
     /// Deterministic styled theme (for `--color always` and unit tests).
     pub(crate) const fn styled() -> Self {
         Self {
@@ -372,7 +387,7 @@ impl Theme {
     pub(crate) fn fmt_latency_us(self, ns: u64, budget_us: u64) -> String {
         let us = ns / 1_000;
         let raw = format!("{us}us");
-        if us > budget_us {
+        if ns > budget_us.saturating_mul(1_000) {
             self.bold_red(&raw)
         } else {
             self.green(&raw)
@@ -394,9 +409,21 @@ pub(crate) fn no_color_env() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|val| !val.is_empty())
 }
 
+fn resolve_stdout_theme(choice: ColorChoice) -> Theme {
+    let is_tty = std::io::stdout().is_terminal();
+    let no_color = no_color_env();
+    let base = Theme::from_choice(choice, is_tty, no_color);
+    let vt_supported = if base.is_color() && is_tty {
+        core_types::enable_stdout_vt_processing()
+    } else {
+        true
+    };
+    Theme::from_choice_with_vt(choice, is_tty, no_color, vt_supported)
+}
+
 /// Initializes the process-wide terminal theme from the global `--color` flag.
 pub(crate) fn init(choice: ColorChoice) {
-    let theme = Theme::from_choice(choice, std::io::stdout().is_terminal(), no_color_env());
+    let theme = resolve_stdout_theme(choice);
     let state = if theme.is_color() {
         STATE_STYLED
     } else {
@@ -410,11 +437,7 @@ pub(crate) fn current() -> Theme {
     match THEME_STATE.load(Ordering::Relaxed) {
         STATE_STYLED => Theme::styled(),
         STATE_PLAIN => Theme::plain(),
-        _ => Theme::from_choice(
-            ColorChoice::Auto,
-            std::io::stdout().is_terminal(),
-            no_color_env(),
-        ),
+        _ => resolve_stdout_theme(ColorChoice::Auto),
     }
 }
 
@@ -559,5 +582,42 @@ mod tests {
         let styled = Theme::styled();
         assert_eq!(styled.fmt_latency_us(12_000, 25), "\x1b[32m12us\x1b[0m");
         assert_eq!(styled.fmt_latency_us(31_000, 25), "\x1b[1;31m31us\x1b[0m");
+    }
+
+    #[test]
+    fn latency_formatter_checks_sub_microsecond_boundaries_without_overflow() {
+        let styled = Theme::styled();
+        // Exact budgets stay green; +1ns breaches turn bold red even when truncated us matches.
+        assert_eq!(styled.fmt_latency_us(10_000, 10), "\x1b[32m10us\x1b[0m");
+        assert_eq!(styled.fmt_latency_us(10_001, 10), "\x1b[1;31m10us\x1b[0m");
+        assert_eq!(styled.fmt_latency_us(25_000, 25), "\x1b[32m25us\x1b[0m");
+        assert_eq!(styled.fmt_latency_us(25_001, 25), "\x1b[1;31m25us\x1b[0m");
+        assert_eq!(styled.fmt_latency_us(100_000, 100), "\x1b[32m100us\x1b[0m");
+        assert_eq!(
+            styled.fmt_latency_us(100_001, 100),
+            "\x1b[1;31m100us\x1b[0m"
+        );
+        // Large budget does not overflow when converting to nanoseconds.
+        assert_eq!(
+            styled.fmt_latency_us(u64::MAX, u64::MAX),
+            format!("\x1b[32m{}us\x1b[0m", u64::MAX / 1_000)
+        );
+    }
+
+    #[test]
+    fn vt_processing_fallback_disables_color_on_unsupported_tty() {
+        assert_eq!(
+            Theme::from_choice_with_vt(ColorChoice::Auto, true, false, false),
+            Theme::plain()
+        );
+        assert_eq!(
+            Theme::from_choice_with_vt(ColorChoice::Always, true, false, false),
+            Theme::plain()
+        );
+        // Non-TTY `--color always` does not require a Windows console handle.
+        assert_eq!(
+            Theme::from_choice_with_vt(ColorChoice::Always, false, false, false),
+            Theme::styled()
+        );
     }
 }

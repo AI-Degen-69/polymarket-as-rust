@@ -47,6 +47,44 @@ pub use sandbox::{
 };
 pub use telemetry::{JsonlWriter, LatencySummary, LatencyTracker};
 
+/// Enables `ENABLE_VIRTUAL_TERMINAL_PROCESSING` on the Windows stdout console handle.
+///
+/// Returns `true` if ANSI escape sequences are supported (always `true` on non-Windows targets),
+/// or `false` if stdout is not a VT-capable console or enabling the flag fails.
+#[cfg(windows)]
+#[must_use]
+pub fn enable_stdout_vt_processing() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE,
+        SetConsoleMode,
+    };
+
+    // SAFETY: `GetStdHandle` with `STD_OUTPUT_HANDLE` returns the process stdout handle or
+    // `INVALID_HANDLE_VALUE`/null without dereferencing memory.
+    let handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut mode: u32 = 0;
+    // SAFETY: `handle` is a valid non-null handle and `mode` points to a writable `u32`.
+    if unsafe { GetConsoleMode(handle, &mut mode) } == 0 {
+        return false;
+    }
+    if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 {
+        return true;
+    }
+    // SAFETY: `handle` was verified as a console output handle by `GetConsoleMode`.
+    unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 }
+}
+
+/// Non-Windows stub: POSIX terminals interpret ANSI escape sequences natively.
+#[cfg(not(windows))]
+#[must_use]
+pub fn enable_stdout_vt_processing() -> bool {
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;

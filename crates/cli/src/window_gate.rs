@@ -92,12 +92,12 @@ pub(crate) fn format_countdown_line(
     target_utc: &str,
 ) -> String {
     format!(
-        "  {} Mid-window ({:.1}s in) | next fresh boundary {} UTC in {:>5.1}s {}",
+        "  {} Mid-window ({:.1}s in) | next {} UTC in {:>5.1}s {}",
         t.badge(Badge::Wait),
         elapsed_s,
         t.cyan(target_utc),
         remaining_s,
-        t.muted("(Ctrl+C to cancel)")
+        t.muted("(Ctrl+C)")
     )
 }
 
@@ -380,5 +380,40 @@ mod tests {
         assert!(plain.contains("42.3s in"));
         assert!(plain.contains("257.7s"));
         assert!(plain.contains("11:05:00Z UTC"));
+    }
+
+    fn visible_char_len(s: &str) -> usize {
+        let mut count = 0usize;
+        let mut in_escape = false;
+        for ch in s.chars() {
+            if in_escape {
+                if ch == 'm' {
+                    in_escape = false;
+                }
+            } else if ch == '\x1b' {
+                in_escape = true;
+            } else {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn tty_countdown_line_with_padding_fits_under_80_columns() {
+        // Worst-case 3-digit elapsed/remaining seconds in a 300s window + 3 trailing padding spaces.
+        let plain = format_countdown_line(Theme::plain(), 299.9, 299.9, "23:55:00Z");
+        assert!(
+            plain.chars().count() + 3 < 80,
+            "plain countdown ({} + 3 padding) exceeded 79 cols: {plain:?}",
+            plain.chars().count()
+        );
+
+        let styled = format_countdown_line(Theme::styled(), 299.9, 299.9, "23:55:00Z");
+        let visible = visible_char_len(&styled);
+        assert!(
+            visible + 3 < 80,
+            "styled visible countdown ({visible} + 3 padding) exceeded 79 cols: {styled:?}"
+        );
     }
 }

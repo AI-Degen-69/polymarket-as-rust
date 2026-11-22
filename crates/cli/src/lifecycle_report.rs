@@ -538,15 +538,27 @@ impl LifecycleStreamReporter {
         // 2. Order actions or cancel-all transitions
         let has_up_action = !matches!(row.action_up, OrderAction::Hold);
         let has_dn_action = !matches!(row.action_dn, OrderAction::Hold);
-        let cancel_all_changed = match (
-            row.cancel_all_reason,
-            self.last_cancel_all_reason.as_deref(),
-        ) {
-            (Some(cur), Some(prev)) => cur != prev,
-            (Some(_), None) => true,
-            (None, _) => false,
-        };
+        let prev_cancel_all = self.last_cancel_all_reason.take();
+        let (cancel_all_changed, cleared_cancel_all) =
+            match (row.cancel_all_reason, prev_cancel_all.as_deref()) {
+                (Some(cur), Some(prev)) => (cur != prev, None),
+                (Some(_), None) => (true, None),
+                (None, Some(prev)) => (false, Some(prev.to_string())),
+                (None, None) => (false, None),
+            };
         self.last_cancel_all_reason = row.cancel_all_reason.map(str::to_string);
+
+        if let Some(prev) = cleared_cancel_all {
+            lines.push(format!(
+                "{} T-{:03}s {} {} {} | cancel-all cleared (was {})",
+                t.muted(&utc),
+                row.tau_secs,
+                t.badge(Badge::Resume),
+                t.phase_badge(row.phase),
+                t.tier_badge(row.tier),
+                t.muted(&prev),
+            ));
+        }
 
         if has_up_action || has_dn_action || cancel_all_changed {
             let up_str = format_action_styled(t, row.action_up);
@@ -573,12 +585,11 @@ impl LifecycleStreamReporter {
             lines.push(action_line);
         }
 
-        // 3. Latency budget breaches
-        let pricing_us = row.pricing_ns / 1_000;
-        let risk_us = row.risk_ns / 1_000;
+        // 3. Latency budget breaches (compare raw nanoseconds before rounding down for display)
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
-        let total_us = total_ns / 1_000;
-        if pricing_us > PRICING_BUDGET_US || risk_us > RISK_BUDGET_US || total_us > TOTAL_BUDGET_US
+        if row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000)
+            || row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000)
+            || total_ns > TOTAL_BUDGET_US.saturating_mul(1_000)
         {
             lines.push(format!(
                 "{} T-{:03}s {} pricing={} risk={} total={} {}",
@@ -1401,5 +1412,87 @@ mod tests {
         let s1 = styled_raw.format_step(&row);
         assert_eq!(s1.len(), 1);
         assert!(s1[0].contains('\x1b'));
+    }
+
+    #[test]
+    fn stream_mode_emits_cancel_all_clear_notice_and_deduplicates_repeats() {
+        let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let hold = OrderAction::Hold;
+        let base_ms = 1_795_345_200_000_u64;
+
+        // Seed initial heartbeat with cancel_all_reason = None.
+        assert_eq!(
+            rep.format_step(&sample_row(base_ms, 300, &hold, &hold))
+                .len(),
+            1
+        );
+
+        // Transition None -> Some("circuit_breaker"): emits [ORDER] with reason.
+        let mut active_row = sample_row(base_ms + 100, 300, &hold, &hold);
+        active_row.cancel_all_reason = Some("circuit_breaker");
+        let l1 = rep.format_step(&active_row);
+        assert_eq!(l1.len(), 1);
+        assert!(l1[0].contains("[ORDER]"));
+        assert!(l1[0].contains("reason=circuit_breaker"));
+
+        // Repeated Some("circuit_breaker") stays silent.
+        active_row.now_ms = base_ms + 200;
+        assert!(rep.format_step(&active_row).is_empty());
+
+        // Transition Some("circuit_breaker") -> Some("stale_feed"): emits [ORDER] with new reason.
+        active_row.now_ms = base_ms + 300;
+        active_row.cancel_all_reason = Some("stale_feed");
+        let l2 = rep.format_step(&active_row);
+        assert_eq!(l2.len(), 1);
+        assert!(l2[0].contains("reason=stale_feed"));
+
+        // Transition Some("stale_feed") -> None: emits recovery/clear notice.
+        let cleared_row = sample_row(base_ms + 400, 299, &hold, &hold);
+        let l3 = rep.format_step(&cleared_row);
+        assert_eq!(l3.len(), 1);
+        assert!(l3[0].contains("[RESUME]"));
+        assert!(l3[0].contains("cancel-all cleared (was stale_feed)"));
+
+        // Repeated None stays silent.
+        assert!(
+            rep.format_step(&sample_row(base_ms + 500, 299, &hold, &hold))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stream_mode_detects_sub_microsecond_latency_breaches() {
+        let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let hold = OrderAction::Hold;
+        let base_ms = 1_795_345_200_000_u64;
+
+        // Seed initial heartbeat.
+        assert_eq!(
+            rep.format_step(&sample_row(base_ms, 300, &hold, &hold))
+                .len(),
+            1
+        );
+
+        // Exact pricing (25us) and risk (10us) budgets stay silent.
+        let mut exact_row = sample_row(base_ms + 100, 300, &hold, &hold);
+        exact_row.pricing_ns = PRICING_BUDGET_US * 1_000;
+        exact_row.risk_ns = RISK_BUDGET_US * 1_000;
+        assert!(rep.format_step(&exact_row).is_empty());
+
+        // Pricing +1ns over budget (25_001ns) triggers [LATENCY] event.
+        let mut pricing_over = sample_row(base_ms + 200, 300, &hold, &hold);
+        pricing_over.pricing_ns = PRICING_BUDGET_US * 1_000 + 1;
+        pricing_over.risk_ns = 4_000;
+        let p_lines = rep.format_step(&pricing_over);
+        assert_eq!(p_lines.len(), 1);
+        assert!(p_lines[0].contains("[LATENCY]"));
+
+        // Risk +1ns over budget (10_001ns) triggers [LATENCY] event.
+        let mut risk_over = sample_row(base_ms + 300, 300, &hold, &hold);
+        risk_over.pricing_ns = 10_000;
+        risk_over.risk_ns = RISK_BUDGET_US * 1_000 + 1;
+        let r_lines = rep.format_step(&risk_over);
+        assert_eq!(r_lines.len(), 1);
+        assert!(r_lines[0].contains("[LATENCY]"));
     }
 }
