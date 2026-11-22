@@ -1,6 +1,6 @@
 use std::error::Error;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 
 use core_types::{
     ClockOffsetEstimator, EngineConfig, HighResTimerGuard, JsonlWriter, MarketDescriptor,
@@ -21,13 +21,33 @@ use crate::feeds_report::{
     format_poly_sample, print_header_and_market, print_sections_b_to_e, push_sample, run_replay,
     write_summary_event,
 };
+use crate::log_paths;
 
 pub(crate) struct FeedsArgs {
     pub(crate) discover: bool,
     pub(crate) duration: String,
     pub(crate) replay: Option<PathBuf>,
     pub(crate) replay_out: Option<PathBuf>,
-    pub(crate) jsonl: PathBuf,
+    pub(crate) jsonl: Option<PathBuf>,
+}
+
+enum CaptureTarget {
+    Explicit(PathBuf),
+    Auto {
+        inprogress_path: PathBuf,
+        start_stamp: String,
+    },
+}
+
+impl CaptureTarget {
+    fn write_path(&self) -> &Path {
+        match self {
+            Self::Explicit(p)
+            | Self::Auto {
+                inprogress_path: p, ..
+            } => p,
+        }
+    }
 }
 
 pub(crate) struct ActorHandles {
@@ -86,17 +106,33 @@ pub(crate) fn run(args: FeedsArgs) -> Result<(), Box<dyn Error>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_discover(duration, &args.jsonl))
+    rt.block_on(run_discover(duration, args.jsonl.as_deref()))
 }
 
-async fn run_discover(duration: Duration, jsonl_path: &Path) -> Result<(), Box<dyn Error>> {
+async fn run_discover(duration: Duration, jsonl_arg: Option<&Path>) -> Result<(), Box<dyn Error>> {
     let clock = MonotonicClock::start();
     let _timer_guard = HighResTimerGuard::acquire_1ms()?;
     let cfg = EngineConfig::from_env()?;
     feeds::install_tls_provider();
 
+    let target = match jsonl_arg {
+        Some(path) => CaptureTarget::Explicit(path.to_path_buf()),
+        None => {
+            let start_stamp = log_paths::format_utc_stamp(SystemTime::now());
+            let inprogress_path = log_paths::capture_inprogress_path(
+                Path::new(log_paths::CAPTURES_DIR),
+                &start_stamp,
+                duration,
+            );
+            CaptureTarget::Auto {
+                inprogress_path,
+                start_stamp,
+            }
+        }
+    };
+
     let (discovery, mut desc, offset_est, mut jsonl) =
-        setup_discovery_and_log(&cfg, &clock, jsonl_path).await?;
+        setup_discovery_and_log(&cfg, &clock, target.write_path()).await?;
     let (poly_prod, mut poly_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (bin_prod, mut bin_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (ora_prod, mut ora_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
@@ -123,8 +159,10 @@ async fn run_discover(duration: Duration, jsonl_path: &Path) -> Result<(), Box<d
         handles: &handles,
         current_desc: &mut desc,
         epoch: 0,
+        rollovers: 0,
         last_rollover_attempt: None,
     };
+    let capture_start = Instant::now();
     let capture_res = capture_until_deadline(
         duration,
         &clock,
@@ -134,10 +172,19 @@ async fn run_discover(duration: Duration, jsonl_path: &Path) -> Result<(), Box<d
         &mut rollover_ctx,
     )
     .await;
+    let actual_dur = capture_start.elapsed();
+    let windows_touched = 1 + rollover_ctx.rollovers;
     finish_discover_report(
         handles,
         capture_res,
-        (&cfg, &desc.slug, jsonl_path, &clock),
+        (
+            &cfg,
+            &desc.slug,
+            target,
+            actual_dur,
+            windows_touched,
+            &clock,
+        ),
         (&mut rings, &mut data),
         jsonl,
     )
@@ -147,21 +194,20 @@ async fn run_discover(duration: Duration, jsonl_path: &Path) -> Result<(), Box<d
 async fn finish_discover_report(
     handles: ActorHandles,
     capture_res: Result<(), Box<dyn Error>>,
-    (cfg, slug, jsonl_path, clock): (&EngineConfig, &str, &Path, &MonotonicClock),
+    (cfg, slug, target, actual_dur, windows_touched, clock): (
+        &EngineConfig,
+        &str,
+        CaptureTarget,
+        Duration,
+        usize,
+        &MonotonicClock,
+    ),
     (rings, data): (&mut Rings<'_>, &mut CaptureReportData),
     mut jsonl: JsonlWriter,
 ) -> Result<(), Box<dyn Error>> {
     let ((clob_stats, binance_stats, polybolt_stats), shutdown_err) =
         shutdown_actors(handles, cfg.polybolt_enabled).await;
     drain_all(clock, rings, data, &mut jsonl)?;
-    print_sections_b_to_e(
-        data,
-        &clob_stats,
-        &binance_stats,
-        &polybolt_stats,
-        cfg.polybolt_enabled,
-        jsonl_path,
-    );
     write_summary_event(
         &mut jsonl,
         clock,
@@ -172,6 +218,26 @@ async fn finish_discover_report(
         &polybolt_stats,
     )?;
     jsonl.close()?;
+    let final_path = match target {
+        CaptureTarget::Explicit(p) => p,
+        CaptureTarget::Auto {
+            inprogress_path,
+            start_stamp,
+        } => log_paths::finalize_capture_file(
+            &inprogress_path,
+            &start_stamp,
+            actual_dur,
+            windows_touched,
+        )?,
+    };
+    print_sections_b_to_e(
+        data,
+        &clob_stats,
+        &binance_stats,
+        &polybolt_stats,
+        cfg.polybolt_enabled,
+        &final_path,
+    );
     capture_res?;
     if let Some(err) = shutdown_err {
         return Err(err.into());
@@ -262,6 +328,7 @@ struct CaptureRolloverCtx<'a> {
     handles: &'a ActorHandles,
     current_desc: &'a mut MarketDescriptor,
     epoch: u64,
+    rollovers: usize,
     last_rollover_attempt: Option<tokio::time::Instant>,
 }
 
@@ -348,6 +415,7 @@ async fn maybe_rollover_capture(
     data.latest_up_book = None;
     data.latest_dn_book = None;
     rollover.epoch = new_epoch;
+    rollover.rollovers += 1;
     let post_rollover_ms = MonotonicClock::unix_now_ms()?;
     jsonl.write_event(
         post_rollover_ms,

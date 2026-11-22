@@ -18,9 +18,7 @@ use rtrb::RingBuffer;
 use tokio::sync::mpsc;
 
 use crate::feeds_cmd::{ActorHandles, shutdown_actors, spawn_actors};
-use crate::feeds_report::{
-    RawJsonlEnvelope, ReplayFixedBook, ReplayPolyEvent, canonical_target_path,
-};
+use crate::feeds_report::{RawJsonlEnvelope, ReplayFixedBook, ReplayPolyEvent};
 use crate::trace_report::{
     TraceReportStats, print_trace_header, record_and_print_tick, write_and_print_summary,
 };
@@ -132,7 +130,8 @@ pub(crate) fn run(args: TraceArgs) -> Result<(), Box<dyn Error>> {
 
     match args.source {
         TraceSourceMode::Replay => {
-            let input_path = resolve_replay_input(args.input.as_deref(), &args.jsonl)?;
+            let input_path =
+                crate::log_paths::resolve_replay_input(args.input.as_deref(), &args.jsonl)?;
             run_replay(&args, &input_path, &cfg, inventory_q)
         }
         TraceSourceMode::Live => {
@@ -145,20 +144,6 @@ pub(crate) fn run(args: TraceArgs) -> Result<(), Box<dyn Error>> {
             rt.block_on(run_live(&args, &cfg, inventory_q))
         }
     }
-}
-
-fn resolve_replay_input(input: Option<&Path>, jsonl: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let input_path = input.map_or_else(
-        || PathBuf::from("logs/phase1-feeds.jsonl"),
-        Path::to_path_buf,
-    );
-    if !input_path.exists() {
-        return Err(format!("replay input `{}` does not exist", input_path.display()).into());
-    }
-    if canonical_target_path(&input_path)? == canonical_target_path(jsonl)? {
-        return Err("refusing to overwrite `--input` replay log with `--jsonl` output".into());
-    }
-    Ok(input_path)
 }
 
 fn run_replay(
@@ -870,9 +855,9 @@ mod tests {
 
         let replay_in = temp_path("self_in");
         std::fs::write(&replay_in, "{}\n").unwrap();
-        assert!(resolve_replay_input(Some(&replay_in), &replay_in).is_err());
+        assert!(crate::log_paths::resolve_replay_input(Some(&replay_in), &replay_in).is_err());
         let missing = temp_path("missing");
-        assert!(resolve_replay_input(Some(&missing), &temp_path("out")).is_err());
+        assert!(crate::log_paths::resolve_replay_input(Some(&missing), &temp_path("out")).is_err());
         let _ = std::fs::remove_file(&replay_in);
 
         // Malformed Binance rows fail closed and transient cross clears cached snapshot.
