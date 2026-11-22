@@ -41,6 +41,14 @@ param(
 
     [string[]]$MaxEntryProbs = @("off"),
 
+    [string[]]$LeadLagThresholds = @("0.02"),
+
+    [string[]]$LeadLagWindows = @("0"),
+
+    [string[]]$LeadLagCooldowns = @("0"),
+
+    [string[]]$LeadLagDirectionals = @("false"),
+
     [uint64]$MaxCombinedBidMicro = 990000,
 
     [ValidateSet("conservative", "optimistic")]
@@ -88,8 +96,42 @@ $parsedMaxEntryProbs = @($MaxEntryProbs | ForEach-Object { $_ -split ',' } | For
 if ($parsedGammas.Count -eq 0 -or $parsedVarSpreads.Count -eq 0 -or $parsedMinTicks.Count -eq 0 -or $parsedCrossLosses.Count -eq 0 -or $parsedMaxEntryProbs.Count -eq 0) {
     throw "Gammas, VarianceSpreads, MinSpreadTicks, MaxCrossTickLossMicros, and MaxEntryProbs must each contain at least one value"
 }
+$parsedLLThresholds = @($LeadLagThresholds | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    $t = [double]::Parse($_, $inv)
+    if ([double]::IsNaN($t) -or [double]::IsInfinity($t) -or $t -le 0.0 -or $t -ge 1.0) {
+        throw "Invalid LeadLagThresholds entry '$_' (expected finite number in (0.0, 1.0))"
+    }
+    $t.ToString("R", $inv)
+})
+$parsedLLWindows = @($LeadLagWindows | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    $w = [uint64]::Parse($_, $inv)
+    if ($w -gt 6000) {
+        throw "Invalid LeadLagWindows entry '$_' (expected 0..=6000)"
+    }
+    $w
+})
+$parsedLLCooldowns = @($LeadLagCooldowns | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    $c = [uint64]::Parse($_, $inv)
+    if ($c -gt 10000) {
+        throw "Invalid LeadLagCooldowns entry '$_' (expected 0..=10000)"
+    }
+    $c
+})
+$parsedLLDirectionals = @($LeadLagDirectionals | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -ne '' })
+foreach ($d in $parsedLLDirectionals) {
+    if ($d -ne "true" -and $d -ne "false") {
+        throw "Invalid LeadLagDirectionals entry '$d' (expected 'true' or 'false')"
+    }
+}
+if ($parsedLLThresholds.Count -eq 0 -or $parsedLLWindows.Count -eq 0 -or $parsedLLCooldowns.Count -eq 0 -or $parsedLLDirectionals.Count -eq 0) {
+    throw "LeadLagThresholds, LeadLagWindows, LeadLagCooldowns, and LeadLagDirectionals must each contain at least one value"
+}
 $showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
 $showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
+$showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.02 }).Count -gt 0)
+$showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 0 }).Count -gt 0)
+$showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 0 }).Count -gt 0)
+$showLLDir = ($parsedLLDirectionals.Count -gt 1) -or (@($parsedLLDirectionals | Where-Object { $_ -ne "false" }).Count -gt 0)
 foreach ($v in $parsedVarSpreads) {
     if ($v -ne "true" -and $v -ne "false") {
         throw "Invalid VarianceSpreads entry '$v' (expected 'true' or 'false')"
@@ -218,7 +260,7 @@ try {
         }
     }
 
-    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count
+    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count * $parsedLLThresholds.Count * $parsedLLWindows.Count * $parsedLLCooldowns.Count * $parsedLLDirectionals.Count
     $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
     $sweepBase = Join-Path $repoRoot "logs/sweeps"
     if (-not (Test-Path -LiteralPath $sweepBase)) {
@@ -266,6 +308,10 @@ try {
             foreach ($minTicks in $parsedMinTicks) {
                 foreach ($crossLoss in $parsedCrossLosses) {
                     foreach ($entryProb in $parsedMaxEntryProbs) {
+                        foreach ($llThresh in $parsedLLThresholds) {
+                            foreach ($llWin in $parsedLLWindows) {
+                                foreach ($llCd in $parsedLLCooldowns) {
+                                    foreach ($llDir in $parsedLLDirectionals) {
                         $runIdx++
                         $stem = "g${gammaTag}_var-${varStr}_t${minTicks}_b${MaxCombinedBidMicro}_${QueueDecay}"
                         if ($showCrossLoss) {
@@ -275,10 +321,27 @@ try {
                             $epTag = $entryProb.Replace(".", "p")
                             $stem += "_ep-${epTag}"
                         }
+                        if ($showLLThresh) {
+                            $lltTag = $llThresh.Replace(".", "p")
+                            $stem += "_llt-${lltTag}"
+                        }
+                        if ($showLLWin) {
+                            $stem += "_llw-${llWin}"
+                        }
+                        if ($showLLCd) {
+                            $stem += "_llc-${llCd}"
+                        }
+                        if ($showLLDir) {
+                            $stem += "_lld-${llDir}"
+                        }
 
                         $extraProgress = ""
                         if ($showCrossLoss) { $extraProgress += " xtick=$crossLoss" }
                         if ($showEntryProb) { $extraProgress += " max_p=$entryProb" }
+                        if ($showLLThresh) { $extraProgress += " ll_th=$llThresh" }
+                        if ($showLLWin) { $extraProgress += " ll_win=$llWin" }
+                        if ($showLLCd) { $extraProgress += " ll_cd=$llCd" }
+                        if ($showLLDir) { $extraProgress += " ll_dir=$llDir" }
 
                         $capRuns = [System.Collections.Generic.List[PSCustomObject]]::new()
                         for ($capIdx = 0; $capIdx -lt $captures.Count; $capIdx++) {
@@ -305,6 +368,10 @@ try {
                                 "--include-variance-spread", $varStr,
                                 "--min-spread-ticks", $minTicks.ToString($inv),
                                 "--max-combined-bid-micro", $MaxCombinedBidMicro.ToString($inv),
+                                "--lead-lag-threshold", $llThresh,
+                                "--lead-lag-window-ms", $llWin.ToString($inv),
+                                "--lead-lag-cooldown-ms", $llCd.ToString($inv),
+                                "--lead-lag-directional", $llDir,
                                 "--jsonl", $outJsonl
                             )
                             if ($crossLoss -ne "off") {
@@ -316,6 +383,10 @@ try {
 
                             $prevCrossLossEnv = $env:MAX_CROSS_TICK_LOSS_MICRO
                             $prevEntryProbEnv = $env:MAX_ENTRY_PROB
+                            $prevLLThreshEnv = $env:LEAD_LAG_CANCEL_THRESHOLD
+                            $prevLLWinEnv = $env:LEAD_LAG_WINDOW_MS
+                            $prevLLCdEnv = $env:LEAD_LAG_COOLDOWN_MS
+                            $prevLLDirEnv = $env:LEAD_LAG_DIRECTIONAL
                             try {
                                 if ($crossLoss -eq "off") {
                                     $env:MAX_CROSS_TICK_LOSS_MICRO = "off"
@@ -323,6 +394,10 @@ try {
                                 if ($entryProb -eq "off") {
                                     $env:MAX_ENTRY_PROB = "off"
                                 }
+                                $env:LEAD_LAG_CANCEL_THRESHOLD = $llThresh
+                                $env:LEAD_LAG_WINDOW_MS = $llWin.ToString($inv)
+                                $env:LEAD_LAG_COOLDOWN_MS = $llCd.ToString($inv)
+                                $env:LEAD_LAG_DIRECTIONAL = $llDir
                                 & $binPath @cliArgs *> $outLog
                                 if ($LASTEXITCODE -ne 0) {
                                     $tail = if (Test-Path -LiteralPath $outLog) { (Get-Content -LiteralPath $outLog -Tail 20) -join "`n" } else { "" }
@@ -338,6 +413,26 @@ try {
                                     Remove-Item Env:MAX_ENTRY_PROB -ErrorAction SilentlyContinue
                                 } else {
                                     $env:MAX_ENTRY_PROB = $prevEntryProbEnv
+                                }
+                                if ($null -eq $prevLLThreshEnv) {
+                                    Remove-Item Env:LEAD_LAG_CANCEL_THRESHOLD -ErrorAction SilentlyContinue
+                                } else {
+                                    $env:LEAD_LAG_CANCEL_THRESHOLD = $prevLLThreshEnv
+                                }
+                                if ($null -eq $prevLLWinEnv) {
+                                    Remove-Item Env:LEAD_LAG_WINDOW_MS -ErrorAction SilentlyContinue
+                                } else {
+                                    $env:LEAD_LAG_WINDOW_MS = $prevLLWinEnv
+                                }
+                                if ($null -eq $prevLLCdEnv) {
+                                    Remove-Item Env:LEAD_LAG_COOLDOWN_MS -ErrorAction SilentlyContinue
+                                } else {
+                                    $env:LEAD_LAG_COOLDOWN_MS = $prevLLCdEnv
+                                }
+                                if ($null -eq $prevLLDirEnv) {
+                                    Remove-Item Env:LEAD_LAG_DIRECTIONAL -ErrorAction SilentlyContinue
+                                } else {
+                                    $env:LEAD_LAG_DIRECTIONAL = $prevLLDirEnv
                                 }
                             }
 
@@ -393,6 +488,10 @@ try {
                                 MinT       = $minTicks
                                 XTick      = $crossLoss
                                 MaxP       = $entryProb
+                                LLTh       = $llThresh
+                                LLWin      = $llWin
+                                LLCd       = $llCd
+                                LLDir      = $llDir
                                 Fills      = $c.Fills
                                 Merges     = $c.Merges
                                 Pairs      = $c.PairsNum.ToString("F2", $inv)
@@ -448,6 +547,10 @@ try {
                                 MinT       = $minTicks
                                 XTick      = $crossLoss
                                 MaxP       = $entryProb
+                                LLTh       = $llThresh
+                                LLWin      = $llWin
+                                LLCd       = $llCd
+                                LLDir      = $llDir
                                 Fills      = $sumFills
                                 Merges     = $sumMerges
                                 Pairs      = $sumPairs.ToString("F2", $inv)
@@ -466,6 +569,10 @@ try {
                                 CapRuns    = $capRuns
                             })
                         }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -482,6 +589,18 @@ try {
     }
     if ($showEntryProb) {
         $cols.Add(@{ Name = "MaxP"; Dash = "----"; Width = 5; Prop = "MaxP" })
+    }
+    if ($showLLThresh) {
+        $cols.Add(@{ Name = "LLTh"; Dash = "-----"; Width = 5; Prop = "LLTh" })
+    }
+    if ($showLLWin) {
+        $cols.Add(@{ Name = "LLWin"; Dash = "-----"; Width = 5; Prop = "LLWin" })
+    }
+    if ($showLLCd) {
+        $cols.Add(@{ Name = "LLCd"; Dash = "----"; Width = 4; Prop = "LLCd" })
+    }
+    if ($showLLDir) {
+        $cols.Add(@{ Name = "LLDir"; Dash = "-----"; Width = 5; Prop = "LLDir" })
     }
     $cols.Add(@{ Name = "Fills"; Dash = "-----"; Width = 5; Prop = "Fills" })
     $cols.Add(@{ Name = "Merges"; Dash = "------"; Width = 6; Prop = "Merges" })
@@ -545,6 +664,10 @@ try {
             $comboDesc = "gamma={0} var={1} min_t={2}" -f $r.Gamma, $r.VarSpr, $r.MinT
             if ($showCrossLoss) { $comboDesc += " xtick=$($r.XTick)" }
             if ($showEntryProb) { $comboDesc += " max_p=$($r.MaxP)" }
+            if ($showLLThresh) { $comboDesc += " ll_th=$($r.LLTh)" }
+            if ($showLLWin) { $comboDesc += " ll_win=$($r.LLWin)" }
+            if ($showLLCd) { $comboDesc += " ll_cd=$($r.LLCd)" }
+            if ($showLLDir) { $comboDesc += " ll_dir=$($r.LLDir)" }
             $summaryLines.Add(("[{0} | NetPnL={1} Net+Reb={2} WinCap={3}]" -f $comboDesc, $r.NetPnL, $r.NetPlusReb, $r.WinCap))
             $summaryLines.Add(($capFmt -f "Capture", "Win", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "Net+Reb", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s"))
             foreach ($cr in $r.CapRuns) {

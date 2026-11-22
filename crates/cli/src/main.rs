@@ -153,6 +153,18 @@ pub(crate) struct MathOverrides {
     /// Override extreme-probability entry guard in `(0.5, 1.0)` (`0.80` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_prob_override)]
     pub(crate) max_entry_prob: Option<MaxEntryProbOverride>,
+    /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.02` default).
+    #[arg(long)]
+    pub(crate) lead_lag_threshold: Option<f64>,
+    /// Override rolling Binance lead-lag lookback window in ms (`0..=6000`, `0` default).
+    #[arg(long)]
+    pub(crate) lead_lag_window_ms: Option<u64>,
+    /// Override per-side lead-lag cancel cooldown in ms (`0..=10000`, `0` default).
+    #[arg(long)]
+    pub(crate) lead_lag_cooldown_ms: Option<u64>,
+    /// Override whether Binance lead-lag cancels only the endangered leg (`false` default).
+    #[arg(long)]
+    pub(crate) lead_lag_directional: Option<bool>,
 }
 
 impl MathOverrides {
@@ -164,6 +176,10 @@ impl MathOverrides {
             || self.fee_spread_floor.is_some()
             || self.max_cross_tick_loss_micro.is_some()
             || self.max_entry_prob.is_some()
+            || self.lead_lag_threshold.is_some()
+            || self.lead_lag_window_ms.is_some()
+            || self.lead_lag_cooldown_ms.is_some()
+            || self.lead_lag_directional.is_some()
     }
 
     pub(crate) fn apply_to(
@@ -209,6 +225,27 @@ impl MathOverrides {
                     cfg.max_entry_prob = Some(p_max);
                 }
             }
+        }
+        if let Some(th) = self.lead_lag_threshold {
+            if !th.is_finite() || th <= 0.0 || th >= 1.0 {
+                return Err("`--lead-lag-threshold` must be finite in (0.0, 1.0)".into());
+            }
+            cfg.lead_lag_cancel_threshold = th;
+        }
+        if let Some(win) = self.lead_lag_window_ms {
+            if win > 6_000 {
+                return Err("`--lead-lag-window-ms` must be <= 6000".into());
+            }
+            cfg.lead_lag_window_ms = win;
+        }
+        if let Some(cd) = self.lead_lag_cooldown_ms {
+            if cd > 10_000 {
+                return Err("`--lead-lag-cooldown-ms` must be <= 10000".into());
+            }
+            cfg.lead_lag_cooldown_ms = cd;
+        }
+        if let Some(dir) = self.lead_lag_directional {
+            cfg.lead_lag_directional = dir;
         }
         cfg.validate()?;
         Ok(())
@@ -1295,6 +1332,63 @@ mod tests {
         assert!(
             Cli::try_parse_from(["poly-as", "lifecycle", "--max-cross-tick-loss-micro", "-5"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn cli_parses_and_validates_lead_lag_overrides() {
+        let parsed = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--lead-lag-threshold",
+            "0.015",
+            "--lead-lag-window-ms",
+            "1000",
+            "--lead-lag-cooldown-ms",
+            "500",
+            "--lead-lag-directional",
+            "true",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Lifecycle { math, .. } => {
+                assert!(math.is_any_set());
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert!((cfg.lead_lag_cancel_threshold - 0.015).abs() < 1e-12);
+                assert_eq!(cfg.lead_lag_window_ms, 1_000);
+                assert_eq!(cfg.lead_lag_cooldown_ms, 500);
+                assert!(cfg.lead_lag_directional);
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        let mut cfg = core_types::EngineConfig::default();
+        assert!(
+            MathOverrides {
+                lead_lag_threshold: Some(0.0),
+                ..Default::default()
+            }
+            .apply_to(&mut cfg)
+            .is_err()
+        );
+        assert!(
+            MathOverrides {
+                lead_lag_window_ms: Some(6_001),
+                ..Default::default()
+            }
+            .apply_to(&mut cfg)
+            .is_err()
+        );
+        assert!(
+            MathOverrides {
+                lead_lag_cooldown_ms: Some(10_001),
+                ..Default::default()
+            }
+            .apply_to(&mut cfg)
+            .is_err()
         );
     }
 }
