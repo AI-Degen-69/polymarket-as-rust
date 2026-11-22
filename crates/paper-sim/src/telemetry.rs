@@ -160,6 +160,22 @@ impl NaiveBaselineEngine {
             let _ = self.ledger.record_fill(fill);
         }
     }
+
+    /// Cancels all active naive baseline quotes and immediately halts pending fills on expiry.
+    pub fn cancel_all(&mut self, now_ms: u64) -> usize {
+        let mut cancelled = 0_usize;
+        if let Some(id) = self.active_up_id.take()
+            && self.broker.cancel(id, now_ms).is_ok()
+        {
+            cancelled = cancelled.saturating_add(1);
+        }
+        if let Some(id) = self.active_dn_id.take()
+            && self.broker.cancel(id, now_ms).is_ok()
+        {
+            cancelled = cancelled.saturating_add(1);
+        }
+        cancelled.saturating_add(self.broker.force_cancel_all())
+    }
 }
 
 /// Baseline telemetry tracker collecting RPM, trajectories, paired latency,
@@ -350,5 +366,17 @@ impl BaselineTelemetry {
     #[must_use]
     pub fn trajectories(&self) -> &[TrajectorySnapshot] {
         &self.trajectories
+    }
+
+    /// Clears pending cross-epoch markout probes and unpaired-fill timer on epoch rollover.
+    pub fn reset_epoch(&mut self) {
+        self.markout_probes.clear();
+        self.unpaired_start_ts_ms = None;
+    }
+
+    /// Returns count of pending uncompleted markout probes.
+    #[must_use]
+    pub fn pending_markout_probe_count(&self) -> usize {
+        self.markout_probes.len()
     }
 }

@@ -222,6 +222,13 @@ impl MathPipeline {
         self.pending_defensive_cancel = false;
     }
 
+    /// Computes `[expiry_ms - 60s, expiry_ms]` terminal TWAP when available,
+    /// falling back to the trailing 60s TWAP at `now_ms`.
+    #[must_use]
+    pub fn settlement_twap_usd(&mut self, now_ms: u64, expiry_ms: u64) -> Option<f64> {
+        self.st2.settlement_twap_usd(now_ms, expiry_ms)
+    }
+
     /// Fast-path Binance Spot ingress updating 60s TWAP, spot vol, and `<1ms` defensive cancel signal.
     pub fn on_binance_spot(
         &mut self,

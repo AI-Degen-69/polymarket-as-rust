@@ -10,7 +10,7 @@ use core_types::{
 };
 use feeds::{
     BinanceSpotEvent, BookMaintainer, DEFAULT_RING_CAPACITY, FeedHealthEvent, GammaDiscoveryClient,
-    PolyMarketEvent,
+    OracleTwapEvent, PolyMarketEvent,
 };
 use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 use paper_sim::{
@@ -58,7 +58,10 @@ struct PaperState {
     latest_up: Option<FixedBook<10>>,
     latest_dn: Option<FixedBook<10>>,
     spot_usd: Option<f64>,
+    twap_60s_usd: Option<f64>,
+    oracle_twap_60s_usd: Option<f64>,
     strike_usd: Option<f64>,
+    clob_epoch: u64,
     replay_time_anchor: Option<(u64, u64)>,
     max_outer_mono: u64,
     next_eval_ms: Option<u64>,
@@ -83,7 +86,10 @@ impl PaperState {
             latest_up: None,
             latest_dn: None,
             spot_usd: None,
+            twap_60s_usd: None,
+            oracle_twap_60s_usd: None,
             strike_usd: None,
+            clob_epoch: 0,
             replay_time_anchor: None,
             max_outer_mono: 0,
             next_eval_ms: None,
@@ -100,6 +106,8 @@ impl PaperState {
         } else {
             self.strike_usd = self.spot_usd;
         }
+        self.twap_60s_usd = None;
+        self.oracle_twap_60s_usd = None;
         self.book_up = BookMaintainer::new(Outcome::Up);
         self.book_dn = BookMaintainer::new(Outcome::Down);
         self.latest_up = None;
@@ -110,8 +118,13 @@ impl PaperState {
     }
 
     fn resolve_winning_outcome(&self) -> Outcome {
-        if let (Some(spot), Some(strike)) = (self.spot_usd, self.strike_usd) {
-            if spot >= strike {
+        if let (Some(ref_px), Some(strike)) = (
+            self.oracle_twap_60s_usd
+                .or(self.twap_60s_usd)
+                .or(self.spot_usd),
+            self.strike_usd,
+        ) {
+            if ref_px >= strike {
                 return Outcome::Up;
             }
             return Outcome::Down;
@@ -139,25 +152,38 @@ impl PaperState {
         broker: &mut FifoPaperBroker,
         ledger: &mut PaperLedger,
         telemetry: &mut BaselineTelemetry,
+        pipe: &mut MathPipeline,
     ) -> Option<PendingEpochSettlement> {
-        let desc = self.desc.as_ref()?;
-        if let Some(id) = self.active_up_id.take() {
-            let _ = broker.cancel(id, now_ms);
+        let (expired_slug, expiry_ts_ms) = {
+            let desc = self.desc.as_ref()?;
+            (desc.slug.clone(), desc.expiry_ts_ms)
+        };
+        if let Some(id) = self.active_up_id.take()
+            && broker.cancel(id, now_ms).is_ok()
+        {
             self.stats.orders_cancelled = self.stats.orders_cancelled.saturating_add(1);
             telemetry.record_cancel_replace(now_ms);
         }
-        if let Some(id) = self.active_dn_id.take() {
-            let _ = broker.cancel(id, now_ms);
+        if let Some(id) = self.active_dn_id.take()
+            && broker.cancel(id, now_ms).is_ok()
+        {
             self.stats.orders_cancelled = self.stats.orders_cancelled.saturating_add(1);
             telemetry.record_cancel_replace(now_ms);
+        }
+        let _ = broker.force_cancel_all();
+        let _ = telemetry.naive_engine.cancel_all(now_ms);
+
+        if let Some(twap) = pipe.settlement_twap_usd(now_ms, expiry_ts_ms) {
+            self.twap_60s_usd = Some(twap);
         }
 
         let winning_outcome = self.resolve_winning_outcome();
         let settle_delta = ledger.settle_epoch(winning_outcome);
         let _ = telemetry.naive_engine.ledger.settle_epoch(winning_outcome);
+        telemetry.reset_epoch();
 
         Some(PendingEpochSettlement {
-            expired_slug: desc.slug.clone(),
+            expired_slug,
             winning_outcome,
             settle_delta_micro: settle_delta,
             total_realized_pnl_micro: ledger.realized_pnl_micro,
@@ -170,6 +196,7 @@ impl PaperState {
     fn rollover_to_market(
         &mut self,
         next_desc: MarketDescriptor,
+        next_epoch: u64,
         broker: &mut FifoPaperBroker,
         ledger: &mut PaperLedger,
         telemetry: &mut BaselineTelemetry,
@@ -182,7 +209,9 @@ impl PaperState {
         telemetry.naive_engine.active_dn_id = None;
         telemetry.naive_engine.ledger.fee_schedule = next_desc.fee_schedule;
         ledger.fee_schedule = next_desc.fee_schedule;
+        telemetry.reset_epoch();
 
+        self.clob_epoch = next_epoch;
         self.set_market(next_desc);
         pipe.reset_epoch();
         self.stats.epoch_rollovers = self.stats.epoch_rollovers.saturating_add(1);
@@ -716,6 +745,9 @@ fn eval_sim_step(
     };
 
     let trace = pipe.evaluate(&inp)?;
+    if let Some(st2) = trace.station2 {
+        state.twap_60s_usd = st2.terminal_twap_usd.or(st2.twap_60s_usd);
+    }
     if trace.flags.sg_warming_up {
         return Ok(());
     }
@@ -955,104 +987,48 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                         }
                     };
                     state.observe_spot(spot);
-                    let ev_ts_ms = base_adj_ms.saturating_add(rx_ns.saturating_sub(base_mono_ns) / 1_000_000);
-                    let _ = pipe.on_binance_spot(ev_ts_ms, spot, state.strike_usd, desc.expiry_ts_ms);
-                }
-                while let Ok(_ev) = oracle_cons.pop() {}
-                while let Ok(ev) = poly_cons.pop() {
-                    match ev {
-                        PolyMarketEvent::BookSnapshot { outcome, book, rx_mono_ns, exch_ts_ms } => {
-                            match outcome {
-                                Outcome::Up => {
-                                    let _ = state.book_up.apply_snapshot(book.bids_slice(), book.asks_slice(), rx_mono_ns, exch_ts_ms);
-                                    state.latest_up = Some(book);
-                                }
-                                Outcome::Down => {
-                                    let _ = state.book_dn.apply_snapshot(book.bids_slice(), book.asks_slice(), rx_mono_ns, exch_ts_ms);
-                                    state.latest_dn = Some(book);
-                                }
-                            }
-                        }
-                        PolyMarketEvent::PriceChange { outcome, side, price, size, rx_mono_ns, exch_ts_ms, .. } => {
-                            match outcome {
-                                Outcome::Up => {
-                                    let _ = state.book_up.apply_price_change_delta(side, price, size, rx_mono_ns, exch_ts_ms);
-                                    if let Ok(top) = state.book_up.top_n::<10>() {
-                                        state.latest_up = Some(top);
-                                    }
-                                }
-                                Outcome::Down => {
-                                    let _ = state.book_dn.apply_price_change_delta(side, price, size, rx_mono_ns, exch_ts_ms);
-                                    if let Ok(top) = state.book_dn.top_n::<10>() {
-                                        state.latest_dn = Some(top);
-                                    }
-                                }
-                            }
-                            broker.on_book_update(outcome, price, size, exch_ts_ms);
-                        }
-                        PolyMarketEvent::LastTrade { outcome, price, size, exch_ts_ms, .. } => {
-                            pipe.on_poly_trade(outcome, size);
-
-                            let vol_ahead_before = broker
-                                .active_order(outcome, OrderSide::Buy)
-                                .map_or(SharesMicro::ZERO, |o| o.volume_ahead);
-
-                            let fills = broker.on_public_trade(outcome, price, size, exch_ts_ms);
-
-                            let vol_ahead_after = broker
-                                .active_order(outcome, OrderSide::Buy)
-                                .map_or(SharesMicro::ZERO, |o| o.volume_ahead);
-
-                            let filled_total: u64 = fills.iter().map(|f| f.filled_shares.0).sum();
-                            let reachable = size.0.saturating_sub(vol_ahead_before.0);
-
-                            if filled_total > 0 || vol_ahead_before.0 > 0 {
-                                print_trade_eval(
-                                    outcome,
-                                    price,
-                                    size,
-                                    vol_ahead_before,
-                                    vol_ahead_after,
-                                    SharesMicro(reachable),
-                                    SharesMicro(filled_total),
-                                );
-                            }
-
-                            let mid_up = state.latest_up.as_ref().and_then(fixed_book_mid).unwrap_or(price);
-                            let mid_dn = state.latest_dn.as_ref().and_then(fixed_book_mid).unwrap_or(price);
-                            let mid_at_fill = match outcome {
-                                Outcome::Up => mid_up,
-                                Outcome::Down => mid_dn,
-                            };
-
-                            for fill in &fills {
-                                state.stats.fills_count = state.stats.fills_count.saturating_add(1);
-                                print_fill_event(fill);
-                                record_fill_jsonl(&desc.slug, fill, &mut jsonl, &clock)?;
-
-                                let inv_before = ledger.net_inventory();
-                                if let Some(merge) = ledger.record_fill(fill)? {
-                                    state.stats.merges_count = state.stats.merges_count.saturating_add(1);
-                                    state.stats.total_pairs_merged.0 = state.stats.total_pairs_merged.0.saturating_add(merge.merged_pairs.0);
-                                    print_merge_event(&merge, ledger.total_pairs_merged);
-                                    record_merge_jsonl(&desc.slug, &merge, ledger.total_pairs_merged, exch_ts_ms, &mut jsonl, &clock)?;
-                                }
-                                let inv_after = ledger.net_inventory();
-                                telemetry.record_fill(fill, inv_before, inv_after, mid_at_fill);
-                            }
-
-                            telemetry.naive_engine.on_public_trade(outcome, price, size, exch_ts_ms);
-                        }
-                        PolyMarketEvent::TickSizeChange { new_tick_micro, .. } => {
-                            if let Some(d) = state.desc.as_mut() {
-                                d.tick_size_micro = new_tick_micro;
-                            }
-                        }
-                        PolyMarketEvent::BestBidAsk { .. } => {}
+                    if !epoch_settled {
+                        let ev_ts_ms = base_adj_ms.saturating_add(rx_ns.saturating_sub(base_mono_ns) / 1_000_000);
+                        let _ = pipe.on_binance_spot(ev_ts_ms, spot, state.strike_usd, desc.expiry_ts_ms);
                     }
                 }
+                while let Ok(ev) = oracle_cons.pop() {
+                    if epoch_settled {
+                        continue;
+                    }
+                    match ev {
+                        OracleTwapEvent::ChainlinkSpot { spot_e8, .. } => {
+                            if spot_e8 > 0 {
+                                state.observe_spot(spot_e8 as f64 / 100_000_000.0);
+                            }
+                        }
+                        OracleTwapEvent::ChainlinkTwap { twap_e8, spot_e8, .. } => {
+                            if twap_e8 > 0 {
+                                state.oracle_twap_60s_usd = Some(twap_e8 as f64 / 100_000_000.0);
+                            }
+                            if spot_e8 > 0 {
+                                state.observe_spot(spot_e8 as f64 / 100_000_000.0);
+                            }
+                        }
+                    }
+                }
+                while let Ok(ev) = poly_cons.pop() {
+                    if epoch_settled || ev.epoch() != state.clob_epoch {
+                        continue;
+                    }
+                    handle_live_poly_event(
+                        ev,
+                        &desc.slug,
+                        &mut state,
+                        &mut pipe,
+                        (&mut broker, &mut ledger, &mut telemetry),
+                        (&mut jsonl, &clock),
+                    )?;
+                }
                 while let Ok(h) = health_rx.try_recv() {
-                    if let FeedHealthEvent::MarketResolved { .. } = h {
+                    if !epoch_settled
+                        && let FeedHealthEvent::MarketResolved { .. } = h
+                    {
                         println!("[HEALTH] Active 5m epoch market resolved!");
                         market_resolved_flag = true;
                     }
@@ -1073,6 +1049,7 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                             &mut broker,
                             &mut ledger,
                             &mut telemetry,
+                            &mut pipe,
                         );
                         epoch_settled = true;
                     }
@@ -1094,18 +1071,21 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                                     next_desc.slug,
                                     next_desc.expiry_ts_ms.saturating_sub(now_ms) / 1000
                                 );
-                                if let Err(err) = handles
+                                let next_epoch = match handles
                                     .send_clob_rollover(
                                         next_desc.asset_id_up.clone(),
                                         next_desc.asset_id_dn.clone(),
                                     )
                                     .await
                                 {
-                                    eprintln!("[ROLLOVER] Failed to switch CLOB feed subscriptions: {err}");
-                                    break;
-                                }
+                                    Ok(ep) => ep,
+                                    Err(err) => {
+                                        eprintln!("[ROLLOVER] Failed to switch CLOB feed subscriptions: {err}");
+                                        break;
+                                    }
+                                };
 
-                                while poly_cons.pop().is_ok() {}
+                                while health_rx.try_recv().is_ok() {}
 
                                 if let Some(pending) = pending_settlement.take() {
                                     print_epoch_rollover(
@@ -1132,6 +1112,7 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
 
                                 state.rollover_to_market(
                                     next_desc.clone(),
+                                    next_epoch,
                                     &mut broker,
                                     &mut ledger,
                                     &mut telemetry,
@@ -1142,6 +1123,20 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                                 epoch_settled = false;
                                 market_resolved_flag = false;
                                 last_rollover_probe = None;
+
+                                while let Ok(ev) = poly_cons.pop() {
+                                    if ev.epoch() != state.clob_epoch {
+                                        continue;
+                                    }
+                                    handle_live_poly_event(
+                                        ev,
+                                        &desc.slug,
+                                        &mut state,
+                                        &mut pipe,
+                                        (&mut broker, &mut ledger, &mut telemetry),
+                                        (&mut jsonl, &clock),
+                                    )?;
+                                }
 
                                 print_paper_header(
                                     TraceSourceMode::Live.as_str(),
@@ -1218,12 +1213,15 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     }
 
     // Cancel all resting quotes before shutdown
-    if let Some(id) = state.active_up_id {
-        let _ = broker.cancel(id, MonotonicClock::unix_now_ms()?);
+    let shutdown_ms = MonotonicClock::unix_now_ms()?;
+    if let Some(id) = state.active_up_id.take() {
+        let _ = broker.cancel(id, shutdown_ms);
     }
-    if let Some(id) = state.active_dn_id {
-        let _ = broker.cancel(id, MonotonicClock::unix_now_ms()?);
+    if let Some(id) = state.active_dn_id.take() {
+        let _ = broker.cancel(id, shutdown_ms);
     }
+    let _ = broker.force_cancel_all();
+    let _ = telemetry.naive_engine.cancel_all(shutdown_ms);
 
     shutdown_actors(handles, cfg.polybolt_enabled).await;
 
@@ -1261,6 +1259,160 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
         jsonl,
         &clock,
     )
+}
+
+fn handle_live_poly_event(
+    ev: PolyMarketEvent,
+    slug: &str,
+    state: &mut PaperState,
+    pipe: &mut MathPipeline,
+    (broker, ledger, telemetry): SimTuple<'_>,
+    (jsonl, clock): (&mut JsonlWriter, &MonotonicClock),
+) -> Result<(), Box<dyn Error>> {
+    match ev {
+        PolyMarketEvent::BookSnapshot {
+            outcome,
+            book,
+            rx_mono_ns,
+            exch_ts_ms,
+            ..
+        } => match outcome {
+            Outcome::Up => {
+                let _ = state.book_up.apply_snapshot(
+                    book.bids_slice(),
+                    book.asks_slice(),
+                    rx_mono_ns,
+                    exch_ts_ms,
+                );
+                state.latest_up = Some(book);
+            }
+            Outcome::Down => {
+                let _ = state.book_dn.apply_snapshot(
+                    book.bids_slice(),
+                    book.asks_slice(),
+                    rx_mono_ns,
+                    exch_ts_ms,
+                );
+                state.latest_dn = Some(book);
+            }
+        },
+        PolyMarketEvent::PriceChange {
+            outcome,
+            side,
+            price,
+            size,
+            rx_mono_ns,
+            exch_ts_ms,
+            ..
+        } => {
+            match outcome {
+                Outcome::Up => {
+                    let _ = state
+                        .book_up
+                        .apply_price_change_delta(side, price, size, rx_mono_ns, exch_ts_ms);
+                    if let Ok(top) = state.book_up.top_n::<10>() {
+                        state.latest_up = Some(top);
+                    }
+                }
+                Outcome::Down => {
+                    let _ = state
+                        .book_dn
+                        .apply_price_change_delta(side, price, size, rx_mono_ns, exch_ts_ms);
+                    if let Ok(top) = state.book_dn.top_n::<10>() {
+                        state.latest_dn = Some(top);
+                    }
+                }
+            }
+            broker.on_book_update(outcome, price, size, exch_ts_ms);
+        }
+        PolyMarketEvent::LastTrade {
+            outcome,
+            price,
+            size,
+            exch_ts_ms,
+            ..
+        } => {
+            pipe.on_poly_trade(outcome, size);
+
+            let vol_ahead_before = broker
+                .active_order(outcome, OrderSide::Buy)
+                .map_or(SharesMicro::ZERO, |o| o.volume_ahead);
+
+            let fills = broker.on_public_trade(outcome, price, size, exch_ts_ms);
+
+            let vol_ahead_after = broker
+                .active_order(outcome, OrderSide::Buy)
+                .map_or(SharesMicro::ZERO, |o| o.volume_ahead);
+
+            let filled_total: u64 = fills.iter().map(|f| f.filled_shares.0).sum();
+            let reachable = size.0.saturating_sub(vol_ahead_before.0);
+
+            if filled_total > 0 || vol_ahead_before.0 > 0 {
+                print_trade_eval(
+                    outcome,
+                    price,
+                    size,
+                    vol_ahead_before,
+                    vol_ahead_after,
+                    SharesMicro(reachable),
+                    SharesMicro(filled_total),
+                );
+            }
+
+            let mid_up = state
+                .latest_up
+                .as_ref()
+                .and_then(fixed_book_mid)
+                .unwrap_or(price);
+            let mid_dn = state
+                .latest_dn
+                .as_ref()
+                .and_then(fixed_book_mid)
+                .unwrap_or(price);
+            let mid_at_fill = match outcome {
+                Outcome::Up => mid_up,
+                Outcome::Down => mid_dn,
+            };
+
+            for fill in &fills {
+                state.stats.fills_count = state.stats.fills_count.saturating_add(1);
+                print_fill_event(fill);
+                record_fill_jsonl(slug, fill, jsonl, clock)?;
+
+                let inv_before = ledger.net_inventory();
+                if let Some(merge) = ledger.record_fill(fill)? {
+                    state.stats.merges_count = state.stats.merges_count.saturating_add(1);
+                    state.stats.total_pairs_merged.0 = state
+                        .stats
+                        .total_pairs_merged
+                        .0
+                        .saturating_add(merge.merged_pairs.0);
+                    print_merge_event(&merge, ledger.total_pairs_merged);
+                    record_merge_jsonl(
+                        slug,
+                        &merge,
+                        ledger.total_pairs_merged,
+                        exch_ts_ms,
+                        jsonl,
+                        clock,
+                    )?;
+                }
+                let inv_after = ledger.net_inventory();
+                telemetry.record_fill(fill, inv_before, inv_after, mid_at_fill);
+            }
+
+            telemetry
+                .naive_engine
+                .on_public_trade(outcome, price, size, exch_ts_ms);
+        }
+        PolyMarketEvent::TickSizeChange { new_tick_micro, .. } => {
+            if let Some(d) = state.desc.as_mut() {
+                d.tick_size_micro = new_tick_micro;
+            }
+        }
+        PolyMarketEvent::BestBidAsk { .. } => {}
+    }
+    Ok(())
 }
 
 async fn discover_next_5m_market(
@@ -1380,7 +1532,13 @@ mod tests {
 
         // At expiry, settle epoch
         let pending = state
-            .settle_expired_epoch(expiry_ms, &mut broker, &mut ledger, &mut telemetry)
+            .settle_expired_epoch(
+                expiry_ms,
+                &mut broker,
+                &mut ledger,
+                &mut telemetry,
+                &mut pipe,
+            )
             .expect("should produce pending settlement");
 
         assert_eq!(pending.expired_slug, "btc-5m-epoch1");
@@ -1395,6 +1553,7 @@ mod tests {
         let market2 = test_market("btc-5m-epoch2", expiry_ms, expiry_ms + 300_000);
         state.rollover_to_market(
             market2.clone(),
+            1,
             &mut broker,
             &mut ledger,
             &mut telemetry,
@@ -1402,6 +1561,7 @@ mod tests {
         );
 
         assert_eq!(state.desc.as_ref().unwrap().slug, "btc-5m-epoch2");
+        assert_eq!(state.clob_epoch, 1);
         assert_eq!(state.stats.epoch_rollovers, 1);
         assert!(state.latest_up.is_none());
         assert!(state.latest_dn.is_none());
@@ -1414,24 +1574,36 @@ mod tests {
         let mut state = PaperState::new();
         state.set_market(test_market("btc-5m-test", 0, 300_000));
 
-        // Case 1: Spot >= Strike -> Up
+        // Case 1: Spot >= Strike -> Up (when TWAP unavailable)
         state.spot_usd = Some(95_000.0);
         state.strike_usd = Some(95_000.0);
         assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
 
-        // Case 2: Spot < Strike -> Down
+        // Case 2: Spot < Strike -> Down (when TWAP unavailable)
         state.spot_usd = Some(94_999.0);
         state.strike_usd = Some(95_000.0);
         assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
 
-        // Case 3: No strike, fallback to book mid (UP >= DN -> Up)
+        // Case 3: Local 60s TWAP takes precedence over instantaneous spot
+        state.spot_usd = Some(95_500.0);
+        state.twap_60s_usd = Some(94_900.0);
+        state.strike_usd = Some(95_000.0);
+        assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
+
+        // Case 4: Oracle 60s TWAP takes precedence over local TWAP and spot
+        state.oracle_twap_60s_usd = Some(95_050.0);
+        assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
+
+        // Case 5: No strike, fallback to book mid (UP >= DN -> Up)
         state.spot_usd = None;
+        state.twap_60s_usd = None;
+        state.oracle_twap_60s_usd = None;
         state.strike_usd = None;
         state.latest_up = Some(test_book(Outcome::Up, 550_000, 560_000));
         state.latest_dn = Some(test_book(Outcome::Down, 440_000, 450_000));
         assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
 
-        // Case 4: No strike, fallback to book mid (UP < DN -> Down)
+        // Case 6: No strike, fallback to book mid (UP < DN -> Down)
         state.latest_up = Some(test_book(Outcome::Up, 440_000, 450_000));
         state.latest_dn = Some(test_book(Outcome::Down, 550_000, 560_000));
         assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
@@ -1475,6 +1647,7 @@ mod tests {
         let market2 = test_market("btc-5m-epoch2", expiry_ms, expiry_ms + 300_000);
         state.rollover_to_market(
             market2.clone(),
+            1,
             &mut broker,
             &mut ledger,
             &mut telemetry,
@@ -1546,6 +1719,296 @@ mod tests {
             (&mut tracker, &mut jsonl, &clock),
         );
         assert!(res.is_ok());
+        let _ = std::fs::remove_file(test_jsonl);
+    }
+
+    #[test]
+    fn test_settlement_uses_terminal_60s_twap_over_last_second_spot_spike() {
+        let clock = MonotonicClock::start();
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let market = test_market("btc-5m-twap-settle", start_ms, expiry_ms);
+
+        let mut state = PaperState::new();
+        state.set_market(market.clone());
+        state.strike_usd = Some(95_000.0);
+
+        let broker_config = FifoBrokerConfig::default();
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut broker = FifoPaperBroker::new(broker_config);
+        let mut ledger = PaperLedger::new(market.fee_schedule);
+        let mut telemetry =
+            BaselineTelemetry::new(broker_config, market.fee_schedule, base_size).unwrap();
+
+        let cfg = EngineConfig::default();
+        let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
+        let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
+
+        // Feed [T-60s, T-1s] at $94,900, then spike at T-1s to $95,500.
+        // 60s TWAP = (94_900 * 59 + 95_500 * 1) / 60 = $94,910 < $95,000 strike -> Down wins!
+        let _ = pipe.on_binance_spot(expiry_ms - 60_000, 94_900.0, state.strike_usd, expiry_ms);
+        let _ = pipe.on_binance_spot(expiry_ms - 1_000, 95_500.0, state.strike_usd, expiry_ms);
+        state.observe_spot(95_500.0);
+
+        let pending = state
+            .settle_expired_epoch(
+                expiry_ms,
+                &mut broker,
+                &mut ledger,
+                &mut telemetry,
+                &mut pipe,
+            )
+            .expect("should settle using 60s TWAP");
+        assert_eq!(pending.winning_outcome, Outcome::Down);
+        assert!(state.twap_60s_usd.is_some_and(|v| v < 95_000.0));
+    }
+
+    #[test]
+    fn test_settlement_cancels_both_primary_and_naive_brokers_without_post_expiry_fills() {
+        let clock = MonotonicClock::start();
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let market = test_market("btc-5m-cancel-both", start_ms, expiry_ms);
+
+        let mut state = PaperState::new();
+        state.set_market(market.clone());
+        state.observe_spot(95_000.0);
+        state.strike_usd = Some(94_000.0);
+
+        let broker_config = FifoBrokerConfig {
+            order_latency_ms: 40,
+            cancel_latency_ms: 40,
+            ..Default::default()
+        };
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut broker = FifoPaperBroker::new(broker_config);
+        let mut ledger = PaperLedger::new(market.fee_schedule);
+        let mut telemetry =
+            BaselineTelemetry::new(broker_config, market.fee_schedule, base_size).unwrap();
+
+        let cfg = EngineConfig::default();
+        let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
+        let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
+
+        // Place active orders in primary broker (past 40ms placement latency).
+        let up_id = broker
+            .submit_new(NewOrderParams {
+                outcome: Outcome::Up,
+                side: OrderSide::Buy,
+                price: MicroUsdc(480_000),
+                size: base_size,
+                now_ms: start_ms,
+                current_best_bid: Some(MicroUsdc(490_000)),
+                current_best_ask: Some(MicroUsdc(510_000)),
+                book_depth_at_price: SharesMicro::ZERO,
+            })
+            .unwrap();
+        state.active_up_id = Some(up_id);
+
+        // Place active quotes in naive baseline engine as well.
+        telemetry.naive_engine.update_quotes(NaiveQuotesInput {
+            mid_up: Some(MicroUsdc(500_000)),
+            mid_dn: Some(MicroUsdc(500_000)),
+            best_bid_up: Some(MicroUsdc(490_000)),
+            best_ask_up: Some(MicroUsdc(510_000)),
+            best_bid_dn: Some(MicroUsdc(490_000)),
+            best_ask_dn: Some(MicroUsdc(510_000)),
+            tick: core_types::TickPrecision::Cent,
+            depth_up: SharesMicro::ZERO,
+            depth_dn: SharesMicro::ZERO,
+            now_ms: start_ms,
+        });
+        assert!(telemetry.naive_engine.active_up_id.is_some());
+        assert!(telemetry.naive_engine.active_dn_id.is_some());
+
+        // Settle at expiry: both primary and naive active orders must be cancelled and unfillable.
+        let _ = state
+            .settle_expired_epoch(
+                expiry_ms,
+                &mut broker,
+                &mut ledger,
+                &mut telemetry,
+                &mut pipe,
+            )
+            .unwrap();
+
+        assert_eq!(state.active_up_id, None);
+        assert_eq!(state.active_dn_id, None);
+        assert_eq!(telemetry.naive_engine.active_up_id, None);
+        assert_eq!(telemetry.naive_engine.active_dn_id, None);
+        assert!(broker.active_order(Outcome::Up, OrderSide::Buy).is_none());
+        assert!(
+            telemetry
+                .naive_engine
+                .broker
+                .active_order(Outcome::Up, OrderSide::Buy)
+                .is_none()
+        );
+        assert!(
+            telemetry
+                .naive_engine
+                .broker
+                .active_order(Outcome::Down, OrderSide::Buy)
+                .is_none()
+        );
+
+        // Trade prints arriving immediately after settlement (even within 40ms cancel latency)
+        // must produce zero fills on either broker.
+        let post_fills = broker.on_public_trade(
+            Outcome::Up,
+            MicroUsdc(470_000),
+            SharesMicro(50 * ONE_SHARE_MICRO),
+            expiry_ms + 10,
+        );
+        assert!(post_fills.is_empty());
+        telemetry.naive_engine.on_public_trade(
+            Outcome::Up,
+            MicroUsdc(470_000),
+            SharesMicro(50 * ONE_SHARE_MICRO),
+            expiry_ms + 10,
+        );
+        assert_eq!(telemetry.naive_engine.ledger.filled_up, SharesMicro::ZERO);
+        assert_eq!(telemetry.naive_engine.ledger.total_fills_count, 0);
+    }
+
+    #[test]
+    fn test_rollover_clears_pending_markout_probes() {
+        let clock = MonotonicClock::start();
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let market1 = test_market("btc-5m-markout-1", start_ms, expiry_ms);
+        let market2 = test_market("btc-5m-markout-2", expiry_ms, expiry_ms + 300_000);
+
+        let mut state = PaperState::new();
+        state.set_market(market1.clone());
+        state.observe_spot(95_000.0);
+
+        let broker_config = FifoBrokerConfig::default();
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut broker = FifoPaperBroker::new(broker_config);
+        let mut ledger = PaperLedger::new(market1.fee_schedule);
+        let mut telemetry =
+            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let cfg = EngineConfig::default();
+        let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
+        let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
+
+        // Fill near the end of epoch 1 when UP mid is $0.90.
+        let fill = SimFill {
+            sim_id: 1,
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(890_000),
+            filled_shares: base_size,
+            fill_ts_ms: expiry_ms - 500,
+            is_maker: true,
+        };
+        let inv_before = ledger.net_inventory();
+        let _ = ledger.record_fill(&fill).unwrap();
+        let inv_after = ledger.net_inventory();
+        telemetry.record_fill(&fill, inv_before, inv_after, MicroUsdc(900_000));
+        assert_eq!(telemetry.pending_markout_probe_count(), 1);
+
+        // Settle and rollover to epoch 2 where fresh market opens at $0.50.
+        let _ = state.settle_expired_epoch(
+            expiry_ms,
+            &mut broker,
+            &mut ledger,
+            &mut telemetry,
+            &mut pipe,
+        );
+        assert_eq!(telemetry.pending_markout_probe_count(), 0);
+
+        state.rollover_to_market(
+            market2,
+            1,
+            &mut broker,
+            &mut ledger,
+            &mut telemetry,
+            &mut pipe,
+        );
+        assert_eq!(telemetry.pending_markout_probe_count(), 0);
+
+        // Evaluating markouts in epoch 2 at $0.50 must NOT match epoch 1's $0.90 fill.
+        telemetry.update_markouts(expiry_ms + 6_000, MicroUsdc(500_000), MicroUsdc(500_000));
+        assert_eq!(telemetry.avg_markout_1s_bps(), 0.0);
+        assert_eq!(telemetry.avg_markout_5s_bps(), 0.0);
+    }
+
+    #[test]
+    fn test_stale_epoch_poly_events_are_ignored_after_rollover() {
+        let clock = MonotonicClock::start();
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let market1 = test_market("btc-5m-stale-1", start_ms, expiry_ms);
+        let market2 = test_market("btc-5m-stale-2", expiry_ms, expiry_ms + 300_000);
+
+        let mut state = PaperState::new();
+        state.set_market(market1.clone());
+
+        let broker_config = FifoBrokerConfig::default();
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut broker = FifoPaperBroker::new(broker_config);
+        let mut ledger = PaperLedger::new(market1.fee_schedule);
+        let mut telemetry =
+            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let cfg = EngineConfig::default();
+        let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
+        let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
+
+        state.rollover_to_market(
+            market2,
+            1,
+            &mut broker,
+            &mut ledger,
+            &mut telemetry,
+            &mut pipe,
+        );
+        assert_eq!(state.clob_epoch, 1);
+
+        let temp_dir = std::env::temp_dir();
+        let test_jsonl = temp_dir.join("test_stale_epoch_guard.jsonl");
+        let mut jsonl = JsonlWriter::create(&test_jsonl).unwrap();
+
+        let (mut prod, mut cons) = RingBuffer::new(16);
+        let stale_book = test_book(Outcome::Up, 110_000, 120_000);
+        let fresh_book = test_book(Outcome::Up, 490_000, 510_000);
+        prod.push(PolyMarketEvent::BookSnapshot {
+            outcome: Outcome::Up,
+            book: stale_book,
+            rx_mono_ns: 100,
+            exch_ts_ms: expiry_ms - 10,
+            epoch: 0,
+        })
+        .unwrap();
+        prod.push(PolyMarketEvent::BookSnapshot {
+            outcome: Outcome::Up,
+            book: fresh_book,
+            rx_mono_ns: 200,
+            exch_ts_ms: expiry_ms + 50,
+            epoch: 1,
+        })
+        .unwrap();
+
+        while let Ok(ev) = cons.pop() {
+            if ev.epoch() != state.clob_epoch {
+                continue;
+            }
+            handle_live_poly_event(
+                ev,
+                "btc-5m-stale-2",
+                &mut state,
+                &mut pipe,
+                (&mut broker, &mut ledger, &mut telemetry),
+                (&mut jsonl, &clock),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            state.latest_up.unwrap().best_bid().unwrap().price,
+            MicroUsdc(490_000)
+        );
         let _ = std::fs::remove_file(test_jsonl);
     }
 }

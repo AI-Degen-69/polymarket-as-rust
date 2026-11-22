@@ -740,6 +740,7 @@ fn apply_live_poly_to_state(
             book,
             rx_mono_ns,
             exch_ts_ms,
+            ..
         } => {
             apply_book_snapshot_state(
                 outcome,

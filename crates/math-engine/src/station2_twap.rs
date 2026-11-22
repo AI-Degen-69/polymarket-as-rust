@@ -385,6 +385,14 @@ impl RollingTwapAndVariance {
         })
     }
 
+    /// Computes `[expiry_ms - window_ms, expiry_ms]` terminal TWAP when available,
+    /// falling back to the trailing `window_ms` TWAP at `now_ms`.
+    #[must_use]
+    pub fn settlement_twap_usd(&mut self, now_ms: u64, expiry_ms: u64) -> Option<f64> {
+        let (_, _, terminal_twap) = self.update_terminal_tracker(now_ms, expiry_ms);
+        terminal_twap.or_else(|| self.twap_60s_fast(now_ms))
+    }
+
     /// Computes trailing 60-second ZOH TWAP in O(1) using incremental `stored_area`.
     #[must_use]
     pub fn twap_60s_fast(&mut self, now_ms: u64) -> Option<f64> {

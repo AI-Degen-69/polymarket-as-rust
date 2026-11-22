@@ -6,7 +6,7 @@ use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
@@ -69,7 +69,7 @@ impl ClobWsConfig {
 }
 
 /// Control commands sent to `ClobMarketWsActor`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ClobWsCommand {
     /// Zero-reconnect epoch rollover (`unsubscribe` old pair, `subscribe` new pair).
     Rollover {
@@ -77,6 +77,8 @@ pub enum ClobWsCommand {
         new_asset_id_up: String,
         /// Next epoch DOWN asset ID.
         new_asset_id_dn: String,
+        /// Optional acknowledgment channel notified with the new actor epoch after switching.
+        ack: Option<oneshot::Sender<u64>>,
     },
     /// Force a real socket drop and reconnect (exercises backoff + REST resync + snapshot rebuild).
     ForceReconnect,
@@ -91,6 +93,7 @@ pub struct ClobMarketWsActor {
     discovery: GammaDiscoveryClient,
     active_up: String,
     active_dn: String,
+    epoch: u64,
     book_up: BookMaintainer,
     book_dn: BookMaintainer,
     up_synced: bool,
@@ -122,6 +125,7 @@ impl ClobMarketWsActor {
             discovery,
             active_up,
             active_dn,
+            epoch: 0,
             book_up: BookMaintainer::new(Outcome::Up),
             book_dn: BookMaintainer::new(Outcome::Down),
             up_synced: false,
@@ -218,8 +222,12 @@ impl ClobMarketWsActor {
             ConnectStep::Command(Some(ClobWsCommand::Rollover {
                 new_asset_id_up,
                 new_asset_id_dn,
+                ack,
             })) => {
-                self.commit_rollover(new_asset_id_up, new_asset_id_dn);
+                let epoch = self.commit_rollover(new_asset_id_up, new_asset_id_dn);
+                if let Some(tx) = ack {
+                    let _ = tx.send(epoch);
+                }
                 Ok(Err(SessionExit::ImmediateReconnect))
             }
         }
@@ -232,12 +240,14 @@ impl ClobMarketWsActor {
         self.crossed_since = None;
     }
 
-    fn commit_rollover(&mut self, new_up: String, new_dn: String) {
+    fn commit_rollover(&mut self, new_up: String, new_dn: String) -> u64 {
         self.active_up = new_up;
         self.active_dn = new_dn;
+        self.epoch = self.epoch.saturating_add(1);
         self.book_up = BookMaintainer::new(Outcome::Up);
         self.book_dn = BookMaintainer::new(Outcome::Down);
         self.reset_sync_state();
+        self.epoch
     }
 
     async fn emit_transition(
@@ -292,8 +302,9 @@ impl ClobMarketWsActor {
         self.dn_synced = false;
         self.ready_emitted = false;
         let fetched = tokio::select! {
-            res = self.fetch_both_rest_books() => res,
+            biased;
             cmd = cmd_rx.recv() => return Ok(Some(self.handle_pending_cmd(cmd))),
+            res = self.fetch_both_rest_books() => res,
         };
         self.apply_rest_resync_pair(fetched, producer, health_tx)
             .await
@@ -371,6 +382,7 @@ impl ClobMarketWsActor {
             book,
             rx_mono_ns,
             exch_ts_ms,
+            epoch: self.epoch,
         };
         if producer.push(ev).is_err() {
             self.stats.ring_overflows = self.stats.ring_overflows.saturating_add(1);
@@ -417,6 +429,7 @@ impl ClobMarketWsActor {
         };
         loop {
             let step = tokio::select! {
+                biased;
                 cmd = io.cmd_rx.recv() => self.on_command(cmd, &mut io).await?,
                 _ = ping_tick.tick() => self.send_app_ping(&mut io).await?,
                 _ = watchdog_tick.tick() => self.on_watchdog(&mut io).await?,
@@ -445,11 +458,15 @@ impl ClobMarketWsActor {
             Some(ClobWsCommand::Rollover {
                 new_asset_id_up,
                 new_asset_id_dn,
+                ack,
             }) => {
-                if let Err(reason) = self
+                let apply_res = self
                     .apply_rollover(io.writer, new_asset_id_up, new_asset_id_dn)
-                    .await
-                {
+                    .await;
+                if let Some(tx) = ack {
+                    let _ = tx.send(self.epoch);
+                }
+                if let Err(reason) = apply_res {
                     self.emit_disconnect(io.health_tx, reason).await?;
                     return Ok(Some(SessionExit::Reconnect));
                 }
@@ -624,6 +641,9 @@ impl ClobMarketWsActor {
         cmd_rx: &mut mpsc::Receiver<ClobWsCommand>,
     ) -> Result<Option<SessionExit>, FeedError> {
         let mut scratch = std::mem::take(&mut self.scratch);
+        for ev in &mut scratch.batch.events {
+            ev.set_epoch(self.epoch);
+        }
         self.emit_scratch_events(&scratch.batch.events, producer, health_tx)?;
         for warn in scratch.batch.warnings.drain(..) {
             self.warn(warn, health_tx)?;
@@ -718,6 +738,7 @@ impl ClobMarketWsActor {
     ) -> Result<(), String> {
         let old_up = std::mem::replace(&mut self.active_up, new_up);
         let old_dn = std::mem::replace(&mut self.active_dn, new_dn);
+        self.epoch = self.epoch.saturating_add(1);
         self.book_up = BookMaintainer::new(Outcome::Up);
         self.book_dn = BookMaintainer::new(Outcome::Down);
         self.reset_sync_state();
@@ -756,8 +777,9 @@ impl ClobMarketWsActor {
     async fn wait_reconnect_cmd(&mut self, cmd_rx: &mut mpsc::Receiver<ClobWsCommand>) -> bool {
         let delay = self.next_reconnect_delay();
         tokio::select! {
-            _ = tokio::time::sleep(delay) => false,
+            biased;
             cmd = cmd_rx.recv() => self.handle_pending_cmd(cmd) == SessionExit::Shutdown,
+            _ = tokio::time::sleep(delay) => false,
         }
     }
 
@@ -768,8 +790,12 @@ impl ClobMarketWsActor {
             Some(ClobWsCommand::Rollover {
                 new_asset_id_up,
                 new_asset_id_dn,
+                ack,
             }) => {
-                self.commit_rollover(new_asset_id_up, new_asset_id_dn);
+                let epoch = self.commit_rollover(new_asset_id_up, new_asset_id_dn);
+                if let Some(tx) = ack {
+                    let _ = tx.send(epoch);
+                }
                 SessionExit::ImmediateReconnect
             }
         }
@@ -979,6 +1005,7 @@ fn decode_book_frame(
             book,
             rx_mono_ns,
             exch_ts_ms: ts_ms,
+            epoch: 0,
         }),
         Err(err) => {
             scratch.batch.warnings.push(err.to_string());
@@ -1052,6 +1079,7 @@ fn decode_price_change_item(
         best_ask,
         rx_mono_ns,
         exch_ts_ms: ts_ms,
+        epoch: 0,
     });
 }
 
@@ -1100,6 +1128,7 @@ fn decode_last_trade_frame(
         size,
         rx_mono_ns,
         exch_ts_ms,
+        epoch: 0,
     });
 }
 
@@ -1130,6 +1159,7 @@ fn decode_tick_size_frame(
         new_tick_micro,
         rx_mono_ns,
         exch_ts_ms,
+        epoch: 0,
     });
 }
 
@@ -1164,6 +1194,7 @@ fn decode_bba_frame(
         best_ask,
         rx_mono_ns,
         exch_ts_ms,
+        epoch: 0,
     });
 }
 

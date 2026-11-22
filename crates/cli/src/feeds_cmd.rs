@@ -41,19 +41,25 @@ pub(crate) struct ActorHandles {
 
 impl ActorHandles {
     /// Commands `ClobMarketWsActor` to unsubscribe from the expired token pair and
-    /// subscribe to the newly discovered 5m market tokens without tearing down the socket.
+    /// subscribe to the newly discovered 5m market tokens without tearing down the socket,
+    /// returning the new actor epoch once subscriptions have switched.
     pub(crate) async fn send_clob_rollover(
         &self,
         new_asset_id_up: String,
         new_asset_id_dn: String,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<u64, Box<dyn Error>> {
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.clob_cmd
             .send(ClobWsCommand::Rollover {
                 new_asset_id_up,
                 new_asset_id_dn,
+                ack: Some(ack_tx),
             })
             .await
-            .map_err(|e| format!("failed to send CLOB rollover command: {e}").into())
+            .map_err(|e| format!("failed to send CLOB rollover command: {e}"))?;
+        ack_rx
+            .await
+            .map_err(|e| format!("CLOB actor exited before acknowledging rollover: {e}").into())
     }
 }
 
@@ -389,6 +395,7 @@ fn record_poly_event(
             book,
             rx_mono_ns,
             exch_ts_ms,
+            ..
         } => {
             data.poly_books = data.poly_books.saturating_add(1);
             sync_report_snapshot(outcome, book, rx_mono_ns, exch_ts_ms, data);
