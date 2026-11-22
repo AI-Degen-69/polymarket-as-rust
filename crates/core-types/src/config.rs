@@ -14,6 +14,9 @@ const MAX_GAMMA: f64 = 100.0;
 const MAX_NOTIONAL_PER_LEG_MICRO: u64 = 1_000_000 * ONE_DOLLAR_MICRO;
 const MAX_HYSTERESIS_TICKS: f64 = 10.0;
 const MAX_CLOCK_DRIFT_MS: i64 = 60_000;
+const MAX_LEAD_LAG_WINDOW_MS: u64 = 6_000;
+const MIN_LEAD_LAG_WINDOW_MS: u64 = 50;
+const MAX_LEAD_LAG_COOLDOWN_MS: u64 = 10_000;
 const MAX_MIN_SPREAD_TICKS: u32 =
     ((ONE_DOLLAR_MICRO / TickPrecision::TenthMill.tick_micro().0) - 1) as u32;
 
@@ -137,6 +140,14 @@ pub struct EngineConfig {
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
+    /// Binance lead-lag fair-probability shift triggering defensive cancel (`0.02` default).
+    pub lead_lag_cancel_threshold: f64,
+    /// Rolling Binance lead-lag lookback window in ms (`1000ms` default; `0` = legacy tick-to-tick).
+    pub lead_lag_window_ms: u64,
+    /// Per-side defensive cancel suppression cooldown in ms (`1000ms` default; `0` = legacy one-shot).
+    pub lead_lag_cooldown_ms: u64,
+    /// Cancel only the endangered side on lead-lag move (`true` default; `false` = legacy symmetric cancel).
+    pub lead_lag_directional: bool,
     /// Maximum permitted local-to-exchange clock drift in milliseconds (`1000ms` default).
     pub clock_drift_max_ms: i64,
     /// Non-serializable live credentials (excluded from serde/JSONL).
@@ -170,6 +181,10 @@ struct RawEngineConfig {
     enforce_fee_floor: bool,
     max_cross_tick_loss_micro: Option<u64>,
     max_entry_prob: Option<f64>,
+    lead_lag_cancel_threshold: f64,
+    lead_lag_window_ms: u64,
+    lead_lag_cooldown_ms: u64,
+    lead_lag_directional: bool,
     clock_drift_max_ms: i64,
 }
 
@@ -200,6 +215,10 @@ impl Default for RawEngineConfig {
             enforce_fee_floor: d.enforce_fee_floor,
             max_cross_tick_loss_micro: d.max_cross_tick_loss_micro,
             max_entry_prob: d.max_entry_prob,
+            lead_lag_cancel_threshold: d.lead_lag_cancel_threshold,
+            lead_lag_window_ms: d.lead_lag_window_ms,
+            lead_lag_cooldown_ms: d.lead_lag_cooldown_ms,
+            lead_lag_directional: d.lead_lag_directional,
             clock_drift_max_ms: d.clock_drift_max_ms,
         }
     }
@@ -233,6 +252,10 @@ impl TryFrom<RawEngineConfig> for EngineConfig {
             enforce_fee_floor: raw.enforce_fee_floor,
             max_cross_tick_loss_micro: raw.max_cross_tick_loss_micro,
             max_entry_prob: raw.max_entry_prob,
+            lead_lag_cancel_threshold: raw.lead_lag_cancel_threshold,
+            lead_lag_window_ms: raw.lead_lag_window_ms,
+            lead_lag_cooldown_ms: raw.lead_lag_cooldown_ms,
+            lead_lag_directional: raw.lead_lag_directional,
             clock_drift_max_ms: raw.clock_drift_max_ms,
             credentials: LiveCredentials::default(),
         };
@@ -270,6 +293,10 @@ impl fmt::Debug for EngineConfig {
             .field("enforce_fee_floor", &self.enforce_fee_floor)
             .field("max_cross_tick_loss_micro", &self.max_cross_tick_loss_micro)
             .field("max_entry_prob", &self.max_entry_prob)
+            .field("lead_lag_cancel_threshold", &self.lead_lag_cancel_threshold)
+            .field("lead_lag_window_ms", &self.lead_lag_window_ms)
+            .field("lead_lag_cooldown_ms", &self.lead_lag_cooldown_ms)
+            .field("lead_lag_directional", &self.lead_lag_directional)
             .field("clock_drift_max_ms", &self.clock_drift_max_ms)
             .field("credentials", &self.credentials)
             .finish()
@@ -302,6 +329,10 @@ impl Default for EngineConfig {
             enforce_fee_floor: false,
             max_cross_tick_loss_micro: None,
             max_entry_prob: Some(0.80),
+            lead_lag_cancel_threshold: 0.02,
+            lead_lag_window_ms: 1_000,
+            lead_lag_cooldown_ms: 1_000,
+            lead_lag_directional: true,
             clock_drift_max_ms: 1_000,
             credentials: LiveCredentials::default(),
         }
@@ -497,6 +528,30 @@ where
             .parse::<u32>()
             .map_err(|_| invalid_val("MIN_SPREAD_TICKS", v, "expected positive integer ticks"))?;
     }
+    if let Some(v) = non_empty(lookup, "LEAD_LAG_CANCEL_THRESHOLD")? {
+        cfg.lead_lag_cancel_threshold = parse_f64("LEAD_LAG_CANCEL_THRESHOLD", &v)?;
+    }
+    if let Some(v) = non_empty(lookup, "LEAD_LAG_WINDOW_MS")? {
+        cfg.lead_lag_window_ms = v.parse::<u64>().map_err(|_| {
+            invalid_val(
+                "LEAD_LAG_WINDOW_MS",
+                v,
+                "expected non-negative integer milliseconds",
+            )
+        })?;
+    }
+    if let Some(v) = non_empty(lookup, "LEAD_LAG_COOLDOWN_MS")? {
+        cfg.lead_lag_cooldown_ms = v.parse::<u64>().map_err(|_| {
+            invalid_val(
+                "LEAD_LAG_COOLDOWN_MS",
+                v,
+                "expected non-negative integer milliseconds",
+            )
+        })?;
+    }
+    if let Some(v) = non_empty(lookup, "LEAD_LAG_DIRECTIONAL")? {
+        cfg.lead_lag_directional = parse_bool("LEAD_LAG_DIRECTIONAL", &v)?;
+    }
     if let Some(v) = non_empty(lookup, "CLOCK_DRIFT_MAX_MS")? {
         cfg.clock_drift_max_ms = v
             .parse::<i64>()
@@ -656,6 +711,33 @@ fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
             "max_entry_prob must be finite in (0.5, 1.0), got {p_max}"
         )));
     }
+    if !cfg.lead_lag_cancel_threshold.is_finite()
+        || cfg.lead_lag_cancel_threshold <= 0.0
+        || cfg.lead_lag_cancel_threshold >= 1.0
+    {
+        return Err(invariant(format!(
+            "lead_lag_cancel_threshold must be finite in (0.0, 1.0), got {}",
+            cfg.lead_lag_cancel_threshold
+        )));
+    }
+    if cfg.lead_lag_window_ms > MAX_LEAD_LAG_WINDOW_MS {
+        return Err(invariant(format!(
+            "lead_lag_window_ms ({}) must be <= {MAX_LEAD_LAG_WINDOW_MS}",
+            cfg.lead_lag_window_ms
+        )));
+    }
+    if cfg.lead_lag_window_ms > 0 && cfg.lead_lag_window_ms < MIN_LEAD_LAG_WINDOW_MS {
+        return Err(invariant(format!(
+            "lead_lag_window_ms ({}) must be 0 or >= {MIN_LEAD_LAG_WINDOW_MS}ms",
+            cfg.lead_lag_window_ms
+        )));
+    }
+    if cfg.lead_lag_cooldown_ms > MAX_LEAD_LAG_COOLDOWN_MS {
+        return Err(invariant(format!(
+            "lead_lag_cooldown_ms ({}) must be <= {MAX_LEAD_LAG_COOLDOWN_MS}",
+            cfg.lead_lag_cooldown_ms
+        )));
+    }
     if cfg.clock_drift_max_ms <= 0 || cfg.clock_drift_max_ms > MAX_CLOCK_DRIFT_MS {
         return Err(invariant(format!(
             "clock_drift_max_ms must be in (0, {MAX_CLOCK_DRIFT_MS}], got {}",
@@ -799,5 +881,68 @@ fn invalid_val(key: &'static str, value: String, reason: &str) -> ConfigError {
 fn invariant(detail: impl Into<String>) -> ConfigError {
     ConfigError::InvalidInvariant {
         detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn lookup_map<'a>(
+        map: &'a HashMap<&'static str, &'static str>,
+    ) -> impl Fn(&'static str) -> Result<Option<String>, ConfigError> + 'a {
+        move |k| Ok(map.get(k).map(|s| (*s).to_string()))
+    }
+
+    #[test]
+    fn lead_lag_config_defaults_env_and_bounds() {
+        let def = EngineConfig::from_lookup(|_| Ok(None)).unwrap();
+        assert!((def.lead_lag_cancel_threshold - 0.02).abs() < 1e-12);
+        assert_eq!(def.lead_lag_window_ms, 1_000);
+        assert_eq!(def.lead_lag_cooldown_ms, 1_000);
+        assert!(def.lead_lag_directional);
+
+        let mut env_ok = HashMap::new();
+        env_ok.insert("LEAD_LAG_CANCEL_THRESHOLD", "0.015");
+        env_ok.insert("LEAD_LAG_WINDOW_MS", "1000");
+        env_ok.insert("LEAD_LAG_COOLDOWN_MS", "500");
+        env_ok.insert("LEAD_LAG_DIRECTIONAL", "true");
+        let parsed = EngineConfig::from_lookup(lookup_map(&env_ok)).unwrap();
+        assert!((parsed.lead_lag_cancel_threshold - 0.015).abs() < 1e-12);
+        assert_eq!(parsed.lead_lag_window_ms, 1_000);
+        assert_eq!(parsed.lead_lag_cooldown_ms, 500);
+        assert!(parsed.lead_lag_directional);
+
+        // Threshold bounds: <= 0.0 or >= 1.0 or NaN rejected
+        for bad_th in ["0.0", "-0.01", "1.0", "1.5", "NaN"] {
+            let mut m = HashMap::new();
+            m.insert("LEAD_LAG_CANCEL_THRESHOLD", bad_th);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&m)).is_err(),
+                "expected error for threshold={bad_th}"
+            );
+        }
+
+        // Window > 6000 rejected
+        let mut bad_win = HashMap::new();
+        bad_win.insert("LEAD_LAG_WINDOW_MS", "6001");
+        assert!(EngineConfig::from_lookup(lookup_map(&bad_win)).is_err());
+
+        // Window in 1..49 rejected (below 50ms bucket resolution)
+        for sub_bucket in ["1", "10", "49"] {
+            let mut bad_sub = HashMap::new();
+            bad_sub.insert("LEAD_LAG_WINDOW_MS", sub_bucket);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&bad_sub)).is_err(),
+                "expected error for window={sub_bucket}"
+            );
+        }
+
+        // Cooldown > 10000 rejected
+        let mut bad_cd = HashMap::new();
+        bad_cd.insert("LEAD_LAG_COOLDOWN_MS", "10001");
+        assert!(EngineConfig::from_lookup(lookup_map(&bad_cd)).is_err());
     }
 }

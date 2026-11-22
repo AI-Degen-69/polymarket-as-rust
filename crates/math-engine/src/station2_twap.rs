@@ -4,6 +4,11 @@ use serde::Serialize;
 use crate::safe_clamp;
 
 const SPOT_RING_CAP: usize = 1024;
+const LEAD_LAG_BUCKET_MS: u64 = 50;
+const LEAD_LAG_RING_CAP: usize = 128;
+const MIN_VOL_SAMPLE_MS: u64 = 1_000;
+const MAX_LEAD_LAG_WINDOW_MS: u64 = 6_000;
+const MAX_LEAD_LAG_COOLDOWN_MS: u64 = 10_000;
 const SECONDS_PER_YEAR: f64 = 31_536_000.0;
 
 /// Single BTC spot reference observation buffered inside Station 2.
@@ -43,6 +48,12 @@ pub struct Station2Config {
     pub default_sigma_binance: f64,
     /// Fair-probability jump `|delta_p_star|` threshold triggering defensive cancel (`0.02` default).
     pub lead_lag_cancel_threshold: f64,
+    /// Rolling Binance lead-lag lookback window in ms (`0` = legacy tick-to-tick).
+    pub lead_lag_window_ms: u64,
+    /// Per-side defensive cancel cooldown duration in ms (`0` = legacy one-shot).
+    pub lead_lag_cooldown_ms: u64,
+    /// Cancel only the endangered side on lead-lag move (`false` = legacy symmetric cancel).
+    pub lead_lag_directional: bool,
 }
 
 impl Default for Station2Config {
@@ -57,6 +68,9 @@ impl Default for Station2Config {
             spot_vol_ewma_alpha: 0.10,
             default_sigma_binance: 0.60,
             lead_lag_cancel_threshold: 0.02,
+            lead_lag_window_ms: 0,
+            lead_lag_cooldown_ms: 0,
+            lead_lag_directional: false,
         }
     }
 }
@@ -79,6 +93,18 @@ impl Station2Config {
             "default_sigma_binance",
         )?;
         check_pos_finite(self.lead_lag_cancel_threshold)?;
+        if self.lead_lag_cancel_threshold >= 1.0 {
+            return Err(err_desc("station2 lead_lag_cancel_threshold must be < 1.0"));
+        }
+        if self.lead_lag_window_ms > MAX_LEAD_LAG_WINDOW_MS {
+            return Err(err_desc("station2 lead_lag_window_ms must be <= 6000"));
+        }
+        if self.lead_lag_window_ms > 0 && self.lead_lag_window_ms < LEAD_LAG_BUCKET_MS {
+            return Err(err_desc("station2 lead_lag_window_ms must be 0 or >= 50ms"));
+        }
+        if self.lead_lag_cooldown_ms > MAX_LEAD_LAG_COOLDOWN_MS {
+            return Err(err_desc("station2 lead_lag_cooldown_ms must be <= 10000"));
+        }
         Ok(())
     }
 }
@@ -88,12 +114,16 @@ impl Station2Config {
 pub struct LeadLagSignal {
     /// Black-Scholes binary risk-neutral probability `Phi(d_2)` if spot and strike exist.
     pub p_spot_star: Option<f64>,
-    /// Tick-to-tick change in `p_spot_star`.
+    /// Change in `p_spot_star` over the configured lookback window (or previous tick).
     pub delta_p_star: f64,
     /// Annualized Binance realized EWMA volatility.
     pub sigma_binance: f64,
-    /// `true` when `|delta_p_star| >= lead_lag_cancel_threshold`.
+    /// `true` when either UP or DOWN defensive cancel / cooldown is active.
     pub trigger_defensive_cancel: bool,
+    /// `true` when UP defensive cancel / cooldown is active (BTC dropped vs reference).
+    pub trigger_defensive_cancel_up: bool,
+    /// `true` when DOWN defensive cancel / cooldown is active (BTC rose vs reference).
+    pub trigger_defensive_cancel_dn: bool,
 }
 
 /// Complete output of Station 2 for one evaluation step.
@@ -130,7 +160,13 @@ pub struct RollingTwapAndVariance {
     evictions_since_resync: u32,
     last_spot_usd: Option<f64>,
     last_spot_ts_ms: Option<u64>,
+    last_vol_sample: Option<SpotSample>,
     sigma_binance: f64,
+    ll_samples: [SpotSample; LEAD_LAG_RING_CAP],
+    ll_head: usize,
+    ll_len: usize,
+    cooldown_until_up_ms: u64,
+    cooldown_until_dn_ms: u64,
     prev_p_spot_star: Option<f64>,
     last_lead_lag: LeadLagSignal,
     last_strike_usd: Option<f64>,
@@ -158,7 +194,13 @@ impl RollingTwapAndVariance {
             evictions_since_resync: 0,
             last_spot_usd: None,
             last_spot_ts_ms: None,
+            last_vol_sample: None,
             sigma_binance: default_sigma,
+            ll_samples: [SpotSample::EMPTY; LEAD_LAG_RING_CAP],
+            ll_head: 0,
+            ll_len: 0,
+            cooldown_until_up_ms: 0,
+            cooldown_until_dn_ms: 0,
             prev_p_spot_star: None,
             last_lead_lag: initial_lead_lag(default_sigma),
             last_strike_usd: None,
@@ -182,7 +224,13 @@ impl RollingTwapAndVariance {
         self.evictions_since_resync = 0;
         self.last_spot_usd = None;
         self.last_spot_ts_ms = None;
+        self.last_vol_sample = None;
         self.sigma_binance = self.config.default_sigma_binance;
+        self.ll_samples = [SpotSample::EMPTY; LEAD_LAG_RING_CAP];
+        self.ll_head = 0;
+        self.ll_len = 0;
+        self.cooldown_until_up_ms = 0;
+        self.cooldown_until_dn_ms = 0;
         self.prev_p_spot_star = None;
         self.last_lead_lag = initial_lead_lag(self.config.default_sigma_binance);
         self.last_strike_usd = None;
@@ -225,20 +273,27 @@ impl RollingTwapAndVariance {
         if self.term_valid && ts_ms <= self.term_last_ts_ms {
             self.term_valid = false;
         }
-        if let Some(last) = self.last_sample() {
-            if ts_ms == last.ts_ms {
-                self.overwrite_tail_price(price_usd);
-                self.spot_dirty = true;
-                return Ok(true);
+        if let Some(last) = self.last_sample()
+            && ts_ms == last.ts_ms
+        {
+            self.overwrite_tail_price(price_usd);
+            self.record_lead_lag_sample(ts_ms, price_usd);
+            if let Some(ref mut lv) = self.last_vol_sample
+                && lv.ts_ms == ts_ms
+            {
+                lv.price_usd = price_usd;
             }
-            self.update_spot_vol(last, ts_ms, price_usd);
+            self.spot_dirty = true;
+            return Ok(true);
         }
+        self.maybe_update_spot_vol(ts_ms, price_usd);
         let cutoff = ts_ms.saturating_sub(self.config.window_ms);
         self.evict_expired_before(cutoff);
         if self.len >= SPOT_RING_CAP {
             self.coalesce_oldest_pair();
         }
         self.append_sample(SpotSample { ts_ms, price_usd });
+        self.record_lead_lag_sample(ts_ms, price_usd);
         self.last_spot_ts_ms = Some(ts_ms);
         self.last_spot_usd = Some(price_usd);
         self.spot_dirty = true;
@@ -253,13 +308,29 @@ impl RollingTwapAndVariance {
             delta_p_star: 0.0,
             sigma_binance: self.sigma_binance,
             trigger_defensive_cancel: false,
+            trigger_defensive_cancel_up: false,
+            trigger_defensive_cancel_dn: false,
         }
+    }
+
+    /// Returns `true` when UP-leg defensive cancel cooldown is active at `now_ms`.
+    #[must_use]
+    pub const fn is_cooldown_up_active(&self, now_ms: u64) -> bool {
+        self.config.lead_lag_cooldown_ms > 0 && now_ms < self.cooldown_until_up_ms
+    }
+
+    /// Returns `true` when DOWN-leg defensive cancel cooldown is active at `now_ms`.
+    #[must_use]
+    pub const fn is_cooldown_dn_active(&self, now_ms: u64) -> bool {
+        self.config.lead_lag_cooldown_ms > 0 && now_ms < self.cooldown_until_dn_ms
     }
 
     /// Clears one-shot jump delta/cancel latch after a skipped/suppressed pipeline evaluation.
     pub const fn clear_one_shot_lead_lag(&mut self) {
         self.last_lead_lag.delta_p_star = 0.0;
         self.last_lead_lag.trigger_defensive_cancel = false;
+        self.last_lead_lag.trigger_defensive_cancel_up = false;
+        self.last_lead_lag.trigger_defensive_cancel_dn = false;
     }
 
     /// Updates empirical EWMA binary mid-price variance rate (`USD^2/s`).
@@ -315,9 +386,21 @@ impl RollingTwapAndVariance {
         }
     }
 
-    /// Computes immediate Binance lead-lag fair probability `Phi(d_2)` and jump detector.
+    /// Computes Binance lead-lag fair probability `Phi(d_2)` and jump detector using the last spot timestamp.
     pub fn compute_lead_lag(
         &mut self,
+        spot_usd: f64,
+        strike_usd: Option<f64>,
+        tau_secs: f64,
+    ) -> Result<LeadLagSignal, MathError> {
+        let ts_ms = self.last_spot_ts_ms.unwrap_or(0);
+        self.compute_lead_lag_at(ts_ms, spot_usd, strike_usd, tau_secs)
+    }
+
+    /// Computes rolling-window or tick-to-tick Binance lead-lag fair probability and directional cancels at `ts_ms`.
+    pub fn compute_lead_lag_at(
+        &mut self,
+        ts_ms: u64,
         spot_usd: f64,
         strike_usd: Option<f64>,
         tau_secs: f64,
@@ -336,13 +419,43 @@ impl RollingTwapAndVariance {
         };
         check_pos_finite(strike)?;
         let p_spot_star = binary_spot_prob(spot_usd, strike, sigma, tau_secs);
-        let delta_p_star = self.prev_p_spot_star.map_or(0.0, |p| p_spot_star - p);
+        let delta_p_star = if self.config.lead_lag_window_ms > 0 {
+            if let Some(ref_spot) = self.lead_lag_ref_spot(ts_ms, self.config.lead_lag_window_ms) {
+                let p_ref = binary_spot_prob(ref_spot, strike, sigma, tau_secs);
+                p_spot_star - p_ref
+            } else {
+                self.prev_p_spot_star.map_or(0.0, |p| p_spot_star - p)
+            }
+        } else {
+            self.prev_p_spot_star.map_or(0.0, |p| p_spot_star - p)
+        };
         self.prev_p_spot_star = Some(p_spot_star);
+
+        let thresh = self.config.lead_lag_cancel_threshold;
+        let mut raw_up = delta_p_star <= -thresh;
+        let mut raw_dn = delta_p_star >= thresh;
+        if !self.config.lead_lag_directional && (raw_up || raw_dn) {
+            raw_up = true;
+            raw_dn = true;
+        }
+        if self.config.lead_lag_cooldown_ms > 0 {
+            let until = ts_ms.saturating_add(self.config.lead_lag_cooldown_ms);
+            if raw_up {
+                self.cooldown_until_up_ms = self.cooldown_until_up_ms.max(until);
+            }
+            if raw_dn {
+                self.cooldown_until_dn_ms = self.cooldown_until_dn_ms.max(until);
+            }
+        }
+        let trigger_up = raw_up || self.is_cooldown_up_active(ts_ms);
+        let trigger_dn = raw_dn || self.is_cooldown_dn_active(ts_ms);
         let sig = LeadLagSignal {
             p_spot_star: Some(p_spot_star),
             delta_p_star,
             sigma_binance: sigma,
-            trigger_defensive_cancel: delta_p_star.abs() >= self.config.lead_lag_cancel_threshold,
+            trigger_defensive_cancel: trigger_up || trigger_dn,
+            trigger_defensive_cancel_up: trigger_up,
+            trigger_defensive_cancel_dn: trigger_dn,
         };
         self.last_lead_lag = sig;
         self.last_strike_usd = Some(strike);
@@ -370,7 +483,7 @@ impl RollingTwapAndVariance {
         let (terminal_window_active, terminal_lock_fraction, terminal_twap_usd) =
             self.update_terminal_tracker(now_ms, expiry_ms);
         let twap_60s_usd = self.twap_60s_fast(now_ms);
-        let lead_lag = self.resolve_lead_lag(strike_usd, tau_secs)?;
+        let lead_lag = self.resolve_lead_lag(now_ms, strike_usd, tau_secs)?;
 
         Ok(Station2Output {
             twap_60s_usd,
@@ -425,20 +538,83 @@ impl RollingTwapAndVariance {
 
     fn resolve_lead_lag(
         &mut self,
+        now_ms: u64,
         strike_usd: Option<f64>,
         tau_secs: f64,
     ) -> Result<LeadLagSignal, MathError> {
         if let Some(spot) = self.last_spot_usd
-            && (self.spot_dirty || self.last_strike_usd != strike_usd)
+            && (self.spot_dirty
+                || self.last_strike_usd != strike_usd
+                || (self.config.lead_lag_window_ms > 0 && strike_usd.is_some()))
         {
-            let sig = self.compute_lead_lag(spot, strike_usd, tau_secs)?;
+            let sig = self.compute_lead_lag_at(now_ms, spot, strike_usd, tau_secs)?;
             self.clear_one_shot_lead_lag();
             return Ok(sig);
         }
         let mut sig = self.last_lead_lag;
         sig.sigma_binance = self.sigma_binance;
+        sig.trigger_defensive_cancel_up |= self.is_cooldown_up_active(now_ms);
+        sig.trigger_defensive_cancel_dn |= self.is_cooldown_dn_active(now_ms);
+        sig.trigger_defensive_cancel =
+            sig.trigger_defensive_cancel_up || sig.trigger_defensive_cancel_dn;
         self.clear_one_shot_lead_lag();
         Ok(sig)
+    }
+
+    fn ll_slot_idx(&self, logical: usize) -> usize {
+        (self.ll_head + logical) % LEAD_LAG_RING_CAP
+    }
+
+    fn ll_sample_at(&self, logical: usize) -> Option<SpotSample> {
+        if logical >= self.ll_len {
+            return None;
+        }
+        self.ll_samples.get(self.ll_slot_idx(logical)).copied()
+    }
+
+    fn ll_sample_mut(&mut self, logical: usize) -> Option<&mut SpotSample> {
+        if logical >= self.ll_len {
+            return None;
+        }
+        let idx = self.ll_slot_idx(logical);
+        self.ll_samples.get_mut(idx)
+    }
+
+    fn record_lead_lag_sample(&mut self, ts_ms: u64, price_usd: f64) {
+        if let Some(last_idx) = self.ll_len.checked_sub(1)
+            && let Some(tail) = self.ll_sample_mut(last_idx)
+            && (tail.ts_ms / LEAD_LAG_BUCKET_MS == ts_ms / LEAD_LAG_BUCKET_MS
+                || ts_ms <= tail.ts_ms)
+        {
+            tail.ts_ms = tail.ts_ms.max(ts_ms);
+            tail.price_usd = price_usd;
+            return;
+        }
+        if self.ll_len == LEAD_LAG_RING_CAP {
+            self.ll_head = (self.ll_head + 1) % LEAD_LAG_RING_CAP;
+            self.ll_len = self.ll_len.saturating_sub(1);
+        }
+        let idx = self.ll_slot_idx(self.ll_len);
+        if let Some(slot) = self.ll_samples.get_mut(idx) {
+            *slot = SpotSample { ts_ms, price_usd };
+            self.ll_len = self.ll_len.saturating_add(1);
+        }
+    }
+
+    fn lead_lag_ref_spot(&self, now_ms: u64, window_ms: u64) -> Option<f64> {
+        if self.ll_len == 0 {
+            return None;
+        }
+        let ref_ts = now_ms.saturating_sub(window_ms);
+        for rev in 0..self.ll_len {
+            let idx = self.ll_len - 1 - rev;
+            if let Some(s) = self.ll_sample_at(idx)
+                && s.ts_ms <= ref_ts
+            {
+                return Some(s.price_usd);
+            }
+        }
+        self.ll_sample_at(0).map(|s| s.price_usd)
     }
 
     fn compute_variance(&self, tau_secs: f64, p_mid: f64) -> Result<(f64, f64), MathError> {
@@ -598,6 +774,17 @@ impl RollingTwapAndVariance {
         self.last_spot_usd = Some(price_usd);
     }
 
+    fn maybe_update_spot_vol(&mut self, ts_ms: u64, price_usd: f64) {
+        let Some(prev_vol) = self.last_vol_sample else {
+            self.last_vol_sample = Some(SpotSample { ts_ms, price_usd });
+            return;
+        };
+        if ts_ms >= prev_vol.ts_ms.saturating_add(MIN_VOL_SAMPLE_MS) {
+            self.update_spot_vol(prev_vol, ts_ms, price_usd);
+            self.last_vol_sample = Some(SpotSample { ts_ms, price_usd });
+        }
+    }
+
     fn update_spot_vol(&mut self, prev: SpotSample, ts_ms: u64, price_usd: f64) {
         let dt_secs = (ts_ms - prev.ts_ms) as f64 / 1000.0;
         if dt_secs <= 0.0 || prev.price_usd <= 0.0 {
@@ -733,6 +920,8 @@ const fn initial_lead_lag(sigma: f64) -> LeadLagSignal {
         delta_p_star: 0.0,
         sigma_binance: sigma,
         trigger_defensive_cancel: false,
+        trigger_defensive_cancel_up: false,
+        trigger_defensive_cancel_dn: false,
     }
 }
 
@@ -907,5 +1096,139 @@ mod tests {
         locked.push_spot(330_000, 95_000.0).unwrap();
         let after_exp = locked.evaluate(330_100, 300_000, 0.50, None).unwrap();
         assert_close(after_exp.terminal_twap_usd.unwrap(), 90_100.0, 1e-9);
+    }
+
+    #[test]
+    fn subsecond_bookticker_spam_preserves_1s_sigma_binance() {
+        let mut st2 = RollingTwapAndVariance::new(Station2Config::default()).unwrap();
+        let t0 = 10_000_u64;
+        // 199 duplicate BookTicker ticks within 995ms must leave initial 0.60 untouched.
+        for i in 0..200_u64 {
+            st2.push_spot(t0 + i * 5, 90_000.0).unwrap();
+        }
+        assert_close(st2.peek_lead_lag().sigma_binance, 0.60, 1e-12);
+
+        // Interleave realistic 1s spot changes (+/- $25/s) with 5ms zero-change spam.
+        let mut spot = 90_000.0;
+        for sec in 1..=10_u64 {
+            spot += if sec % 2 == 1 { 25.0 } else { -25.0 };
+            for sub in 0..200_u64 {
+                st2.push_spot(t0 + sec * 1_000 + sub * 5, spot).unwrap();
+            }
+        }
+        let sig = st2.peek_lead_lag().sigma_binance;
+        assert!(
+            sig > 0.25,
+            "expected realistic >0.25 1s sigma despite 5ms flat spam, got {sig}"
+        );
+    }
+
+    #[test]
+    fn rolling_directional_lead_lag_drop_rally_theta_and_symmetric() {
+        let dir_cfg = Station2Config {
+            lead_lag_cancel_threshold: 0.02,
+            lead_lag_window_ms: 1_000,
+            lead_lag_cooldown_ms: 500,
+            lead_lag_directional: true,
+            ..Station2Config::default()
+        };
+        let mut st2 = RollingTwapAndVariance::new(dir_cfg).unwrap();
+        let strike = Some(90_000.0);
+        let exp = 300_000_u64;
+
+        // Baseline at t=10_000..11_000
+        for step in 0..=10_u64 {
+            st2.push_spot(10_000 + step * 100, 90_000.0).unwrap();
+        }
+        let calm = st2.evaluate(11_000, exp, 0.50, strike).unwrap();
+        assert!(!calm.lead_lag.trigger_defensive_cancel);
+
+        // Multi-tick gradual drop (-$18 every 100ms = -$180 over 1s): no single tick >= 2c, rolling is.
+        for step in 1..=10_u64 {
+            let t = 11_000 + step * 100;
+            let px = 90_000.0 - (step as f64) * 18.0;
+            st2.push_spot(t, px).unwrap();
+        }
+        let ev_drop = st2.evaluate(12_000, exp, 0.50, strike).unwrap();
+        assert!(ev_drop.lead_lag.delta_p_star <= -0.02);
+        assert!(ev_drop.lead_lag.trigger_defensive_cancel);
+        assert!(ev_drop.lead_lag.trigger_defensive_cancel_up);
+        assert!(!ev_drop.lead_lag.trigger_defensive_cancel_dn);
+
+        // Silent tick 400ms later still holds UP cancel via window/cooldown, DOWN stays clear.
+        let ev_hold = st2.evaluate(12_400, exp, 0.50, strike).unwrap();
+        assert!(ev_hold.lead_lag.trigger_defensive_cancel_up);
+        assert!(!ev_hold.lead_lag.trigger_defensive_cancel_dn);
+
+        // Once 1000ms window rolls past drop and cooldown expires (t=13_600), both clear.
+        let ev_clear = st2.evaluate(13_600, exp, 0.50, strike).unwrap();
+        assert!(!ev_clear.lead_lag.trigger_defensive_cancel);
+        assert!(!ev_clear.lead_lag.trigger_defensive_cancel_up);
+        assert!(!ev_clear.lead_lag.trigger_defensive_cancel_dn);
+
+        // Pure theta decay at constant off-strike spot gives zero delta_p_star in rolling mode.
+        let mut theta = RollingTwapAndVariance::new(dir_cfg).unwrap();
+        theta.push_spot(10_000, 90_150.0).unwrap();
+        let _ = theta.evaluate(10_000, exp, 0.60, strike).unwrap();
+        let ev_theta = theta.evaluate(270_000, exp, 0.70, strike).unwrap();
+        assert_close(ev_theta.lead_lag.delta_p_star, 0.0, 1e-12);
+        assert!(!ev_theta.lead_lag.trigger_defensive_cancel);
+
+        // Multi-tick rally triggers ONLY DOWN side in directional mode.
+        let mut rally = RollingTwapAndVariance::new(dir_cfg).unwrap();
+        for step in 0..=10_u64 {
+            rally.push_spot(10_000 + step * 100, 90_000.0).unwrap();
+        }
+        let _ = rally.evaluate(11_000, exp, 0.50, strike).unwrap();
+        for step in 1..=10_u64 {
+            rally
+                .push_spot(11_000 + step * 100, 90_000.0 + (step as f64) * 18.0)
+                .unwrap();
+        }
+        let ev_rally = rally.evaluate(12_000, exp, 0.50, strike).unwrap();
+        assert!(ev_rally.lead_lag.delta_p_star >= 0.02);
+        assert!(!ev_rally.lead_lag.trigger_defensive_cancel_up);
+        assert!(ev_rally.lead_lag.trigger_defensive_cancel_dn);
+
+        // Symmetric mode cancels both sides.
+        let sym_cfg = Station2Config {
+            lead_lag_directional: false,
+            ..dir_cfg
+        };
+        let mut sym = RollingTwapAndVariance::new(sym_cfg).unwrap();
+        sym.push_spot(10_000, 90_000.0).unwrap();
+        let _ = sym.evaluate(10_500, exp, 0.50, strike).unwrap();
+        sym.push_spot(10_800, 89_800.0).unwrap();
+        let ev_sym = sym.evaluate(10_900, exp, 0.50, strike).unwrap();
+        assert!(ev_sym.lead_lag.trigger_defensive_cancel_up);
+        assert!(ev_sym.lead_lag.trigger_defensive_cancel_dn);
+    }
+
+    #[test]
+    fn high_rate_burst_preserves_rolling_lead_lag_reference_window() {
+        let cfg = Station2Config {
+            lead_lag_cancel_threshold: 0.02,
+            lead_lag_window_ms: 1_500,
+            lead_lag_cooldown_ms: 0,
+            lead_lag_directional: true,
+            ..Station2Config::default()
+        };
+        let mut st2 = RollingTwapAndVariance::new(cfg).unwrap();
+        // Push 2,000 samples over 2,000ms (1 sample/ms > 128 raw capacity):
+        // first 500ms at 90_000, next 1,500ms ramping down to 89_750.
+        for ms in 0..=2_000_u64 {
+            let px = if ms <= 500 {
+                90_000.0
+            } else {
+                90_000.0 - ((ms - 500) as f64) * (250.0 / 1_500.0)
+            };
+            st2.push_spot(10_000 + ms, px).unwrap();
+        }
+        // Lookup 1,500ms before 12_000 => ts <= 10_500 => ~90_000.0 (preserved by 50ms bucketing).
+        let ref_px = st2.lead_lag_ref_spot(12_000, 1_500).unwrap();
+        assert_close(ref_px, 90_000.0, 1e-9);
+        let ev = st2.evaluate(12_000, 300_000, 0.50, Some(90_000.0)).unwrap();
+        assert!(ev.lead_lag.trigger_defensive_cancel_up);
+        assert!(!ev.lead_lag.trigger_defensive_cancel_dn);
     }
 }
