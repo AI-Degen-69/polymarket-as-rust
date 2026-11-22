@@ -18,6 +18,7 @@ mod feeds_cmd;
 mod feeds_report;
 mod lifecycle_cmd;
 mod lifecycle_report;
+mod log_paths;
 mod paper_cmd;
 mod paper_report;
 mod sandbox_cmd;
@@ -179,8 +180,8 @@ enum SandboxCommands {
         #[arg(long, default_value_t = false)]
         require_allowlisted_egress: bool,
         /// Output path for structured JSONL telemetry.
-        #[arg(long, default_value = "logs/sandbox-health.jsonl")]
-        jsonl: PathBuf,
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// List sandbox markets through Gamma preprod edge credentials (NEX CLOB fallback).
     Markets {
@@ -188,8 +189,8 @@ enum SandboxCommands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Output path for structured JSONL telemetry.
-        #[arg(long, default_value = "logs/sandbox-markets.jsonl")]
-        jsonl: PathBuf,
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Read `GET /book?token_id=...` for one sandbox outcome.
     Book {
@@ -197,8 +198,8 @@ enum SandboxCommands {
         #[arg(long)]
         asset_id: String,
         /// Output path for structured JSONL telemetry.
-        #[arg(long, default_value = "logs/sandbox-book.jsonl")]
-        jsonl: PathBuf,
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Place, read back, and cancel the minimum-size post-only limit buy at one tick.
     Validate {
@@ -209,8 +210,8 @@ enum SandboxCommands {
         #[arg(long, default_value_t = false)]
         confirm_sandbox_trade: bool,
         /// Output path for structured JSONL telemetry.
-        #[arg(long, default_value = "logs/sandbox-validate.jsonl")]
-        jsonl: PathBuf,
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Stream the NEX market and authenticated user feeds with heartbeats and snapshot rebuilds.
     Feeds {
@@ -230,8 +231,8 @@ enum SandboxCommands {
         #[arg(long)]
         reconnect_after_secs: Option<u64>,
         /// Output path for structured JSONL telemetry.
-        #[arg(long, default_value = "logs/sandbox-feeds.jsonl")]
-        jsonl: PathBuf,
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
 }
 
@@ -250,9 +251,9 @@ struct Cli {
 enum Commands {
     /// Phase 0 diagnostic: verify Windows clock resolution, fixed-point wire math, config redaction, and JSONL telemetry.
     Doctor {
-        /// Output path for structured JSONL telemetry log.
-        #[arg(long, default_value = "logs/phase0-doctor.jsonl")]
-        jsonl: PathBuf,
+        /// Output path for structured JSONL telemetry log (defaults to `logs/doctor/<DD-MM_HH-MM-SSZ>.jsonl`).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Phase 1 feed verifier: live Gamma/CLOB discovery, Binance Spot & Polymarket WS streams, or offline replay.
     Feeds {
@@ -268,16 +269,16 @@ enum Commands {
         /// Optional separate output JSONL report path for `--replay` (never overwrites `--replay`).
         #[arg(long)]
         replay_out: Option<PathBuf>,
-        /// Output path for structured JSONL telemetry log during `--discover`.
-        #[arg(long, default_value = "logs/phase1-feeds.jsonl")]
-        jsonl: PathBuf,
+        /// Output path for structured JSONL telemetry log during `--discover` (defaults to `logs/captures/<stamp>_<dur>.inprogress.jsonl` renamed on close).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Phase 2 math engine tracer: stream live or replayed ticks through Stations 1–6.
     Trace {
         /// Feed source (`live` WebSockets or `replay` JSONL log).
         #[arg(long, value_enum, default_value_t = CliTraceSource::Live)]
         source: CliTraceSource,
-        /// Input JSONL path used when `--source replay` (defaults to `logs/phase1-feeds.jsonl`).
+        /// Input JSONL path used when `--source replay` (defaults to newest capture in `logs/captures/`).
         #[arg(long)]
         input: Option<PathBuf>,
         /// Station 1 Savitzky-Golay filter mode (`causal` default or `symmetric`).
@@ -297,9 +298,9 @@ enum Commands {
         inventory: i64,
         #[command(flatten)]
         math: MathOverrides,
-        /// Output path for structured JSONL telemetry log.
-        #[arg(long, default_value = "logs/phase2-trace.jsonl")]
-        jsonl: PathBuf,
+        /// Output path for structured JSONL telemetry log (defaults to `logs/trace/<DD-MM_HH-MM-SSZ>.jsonl`).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Phase 3 paper simulator: run FIFO queue-aware paper trading against live WebSockets or replayed JSONL logs.
     #[command(alias = "sim")]
@@ -307,7 +308,7 @@ enum Commands {
         /// Feed source (`live` WebSockets or `replay` JSONL log).
         #[arg(long, value_enum, default_value_t = CliTraceSource::Live)]
         source: CliTraceSource,
-        /// Input JSONL path used when `--source replay` (defaults to `logs/phase1-feeds.jsonl`).
+        /// Input JSONL path used when `--source replay` (defaults to newest capture in `logs/captures/`).
         #[arg(long)]
         input: Option<PathBuf>,
         /// Simulation duration (`60s`, `300s`, `5m`).
@@ -327,16 +328,16 @@ enum Commands {
         queue_decay: CliQueueDecay,
         #[command(flatten)]
         math: MathOverrides,
-        /// Output path for structured JSONL telemetry log.
-        #[arg(long, default_value = "logs/phase3-paper.jsonl")]
-        jsonl: PathBuf,
+        /// Output path for structured JSONL telemetry log (defaults to `logs/paper/<DD-MM_HH-MM-SSZ>.jsonl`).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// Phase 4 risk & lifecycle actor pipeline: run deterministic 300s epoch, live feeds, or offline replay with 4-tier risk limits.
     Lifecycle {
         /// Source mode (`live` WebSockets, `sim-epoch` simulated 300s epoch, or `replay` JSONL log).
         #[arg(long, value_enum, default_value_t = CliLifecycleSource::SimEpoch)]
         source: CliLifecycleSource,
-        /// Input JSONL path used when `--source replay` (defaults to `logs/phase1-feeds.jsonl`).
+        /// Input JSONL path used when `--source replay` (defaults to newest capture in `logs/captures/`).
         #[arg(long)]
         input: Option<PathBuf>,
         /// Live run duration (`60s`, `90s`, `300s`).
@@ -365,9 +366,9 @@ enum Commands {
         /// Pin the live Risk actor OS thread to a zero-based logical CPU core.
         #[arg(long)]
         pin_risk_core: Option<usize>,
-        /// Output path for structured JSONL telemetry log.
-        #[arg(long, default_value = "logs/phase4-lifecycle.jsonl")]
-        jsonl: PathBuf,
+        /// Output path for structured JSONL telemetry log (defaults to `logs/lifecycle/<DD-MM_HH-MM-SSZ>.jsonl`).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
     /// NEX sandbox (Amoy 80002) health gate, market discovery, validation order, and feeds.
     Sandbox {
@@ -389,15 +390,18 @@ enum Commands {
         /// Dry-run trace duration (`60s` default).
         #[arg(long, default_value = "60s")]
         duration: String,
-        /// Output path for structured JSONL telemetry log.
-        #[arg(long, default_value = "logs/phase5-exec-dry.jsonl")]
-        jsonl: PathBuf,
+        /// Output path for structured JSONL telemetry log (defaults to `logs/exec/<DD-MM_HH-MM-SSZ>.jsonl`).
+        #[arg(long)]
+        jsonl: Option<PathBuf>,
     },
 }
 
 fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
-        Commands::Doctor { jsonl } => doctor::run(&jsonl),
+        Commands::Doctor { jsonl } => {
+            let path = jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("doctor"));
+            doctor::run(&path)
+        }
         Commands::Feeds {
             discover,
             duration,
@@ -442,7 +446,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             ticks,
             inventory,
             math,
-            jsonl,
+            jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("trace")),
         }),
         Commands::Paper {
             source,
@@ -466,7 +470,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             latency_ms,
             queue_decay: queue_decay.into(),
             math,
-            jsonl,
+            jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("paper")),
         }),
         Commands::Lifecycle {
             source,
@@ -505,30 +509,32 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 pricing_core: pin_pricing_core,
                 risk_core: pin_risk_core,
             },
-            jsonl,
+            jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("lifecycle")),
         }),
         Commands::Sandbox { action } => match action {
             SandboxCommands::Health {
                 require_allowlisted_egress,
                 jsonl,
             } => sandbox_cmd::run(
-                jsonl,
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("health")),
                 sandbox_cmd::SandboxAction::Health {
                     require_allowlisted_egress,
                 },
             ),
-            SandboxCommands::Markets { limit, jsonl } => {
-                sandbox_cmd::run(jsonl, sandbox_cmd::SandboxAction::Markets { limit })
-            }
-            SandboxCommands::Book { asset_id, jsonl } => {
-                sandbox_cmd::run(jsonl, sandbox_cmd::SandboxAction::Book { asset_id })
-            }
+            SandboxCommands::Markets { limit, jsonl } => sandbox_cmd::run(
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("markets")),
+                sandbox_cmd::SandboxAction::Markets { limit },
+            ),
+            SandboxCommands::Book { asset_id, jsonl } => sandbox_cmd::run(
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("book")),
+                sandbox_cmd::SandboxAction::Book { asset_id },
+            ),
             SandboxCommands::Validate {
                 asset_id,
                 confirm_sandbox_trade,
                 jsonl,
             } => sandbox_cmd::run(
-                jsonl,
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("validate")),
                 sandbox_cmd::SandboxAction::Validate {
                     asset_id,
                     confirm_sandbox_trade,
@@ -542,7 +548,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 reconnect_after_secs,
                 jsonl,
             } => sandbox_cmd::run(
-                jsonl,
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("feeds")),
                 sandbox_cmd::SandboxAction::Feeds {
                     up_asset_id,
                     dn_asset_id,
@@ -569,7 +575,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             confirm_live_capital,
             canary_max_usd,
             duration,
-            jsonl,
+            jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("exec")),
         }),
     }
 }
@@ -598,7 +604,7 @@ mod tests {
         let default_cli = Cli::try_parse_from(["poly-as", "doctor"]).unwrap();
         match default_cli.command {
             Commands::Doctor { jsonl } => {
-                assert_eq!(jsonl, PathBuf::from("logs/phase0-doctor.jsonl"));
+                assert!(jsonl.is_none());
             }
             _ => panic!("expected Doctor"),
         }
@@ -607,7 +613,7 @@ mod tests {
             Cli::try_parse_from(["poly-as", "doctor", "--jsonl", "out/custom.jsonl"]).unwrap();
         match custom_cli.command {
             Commands::Doctor { jsonl } => {
-                assert_eq!(jsonl, PathBuf::from("out/custom.jsonl"));
+                assert_eq!(jsonl, Some(PathBuf::from("out/custom.jsonl")));
             }
             _ => panic!("expected Doctor"),
         }
@@ -637,7 +643,19 @@ mod tests {
                 assert_eq!(duration, "20s");
                 assert!(replay.is_none());
                 assert!(replay_out.is_none());
-                assert_eq!(jsonl, PathBuf::from("logs/phase1-feeds.jsonl"));
+                assert_eq!(jsonl, Some(PathBuf::from("logs/phase1-feeds.jsonl")));
+            }
+            _ => panic!("expected Feeds"),
+        }
+
+        let auto_discover =
+            Cli::try_parse_from(["poly-as", "feeds", "--discover", "--duration", "20s"]).unwrap();
+        match auto_discover.command {
+            Commands::Feeds {
+                discover, jsonl, ..
+            } => {
+                assert!(discover);
+                assert!(jsonl.is_none());
             }
             _ => panic!("expected Feeds"),
         }
@@ -740,7 +758,7 @@ mod tests {
                     },
             } => {
                 assert!(!require_allowlisted_egress);
-                assert_eq!(jsonl, PathBuf::from("logs/sandbox-health.jsonl"));
+                assert!(jsonl.is_none());
             }
             _ => panic!("expected sandbox health"),
         }
@@ -817,7 +835,7 @@ mod tests {
                 assert_eq!(v_max, 100);
                 assert_eq!(base_size, 25);
                 assert_eq!(latency_ms, 50);
-                assert_eq!(jsonl, PathBuf::from("logs/phase3-paper.jsonl"));
+                assert_eq!(jsonl, Some(PathBuf::from("logs/phase3-paper.jsonl")));
             }
             _ => panic!("expected Paper"),
         }

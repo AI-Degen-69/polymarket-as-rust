@@ -1107,6 +1107,7 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "arc-swap",
+ "chrono",
  "clap",
  "core-types",
  "execution",

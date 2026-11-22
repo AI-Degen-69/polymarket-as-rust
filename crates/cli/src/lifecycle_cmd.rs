@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -33,7 +33,7 @@ use rtrb::RingBuffer;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
-use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent, canonical_target_path};
+use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent};
 use crate::lifecycle_report::{
     CancelAllRecord, LifecycleReportStats, LifecycleStepRow, OrderActionTelemetry,
     print_breaker_trip, print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten,
@@ -304,20 +304,6 @@ fn risk_actor_loop(
     }
 }
 
-fn resolve_replay_input(input: Option<&Path>, jsonl: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let input_path = input.map_or_else(
-        || PathBuf::from("logs/phase1-feeds.jsonl"),
-        Path::to_path_buf,
-    );
-    if !input_path.exists() {
-        return Err(format!("replay input `{}` does not exist", input_path.display()).into());
-    }
-    if canonical_target_path(&input_path)? == canonical_target_path(jsonl)? {
-        return Err("refusing to overwrite `--input` replay log with `--jsonl` output".into());
-    }
-    Ok(input_path)
-}
-
 pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
     let mut check_cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut check_cfg)?;
@@ -350,7 +336,10 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
                     .into(),
             );
         }
-        Some(resolve_replay_input(args.input.as_deref(), &args.jsonl)?)
+        Some(crate::log_paths::resolve_replay_input(
+            args.input.as_deref(),
+            &args.jsonl,
+        )?)
     } else {
         None
     };
@@ -2957,6 +2946,7 @@ impl FlattenOutcomeExt for FlattenAction {
 mod tests {
     use super::*;
     use core_types::{BookLevel, ProtocolVersion};
+    use std::path::Path;
 
     fn test_market(slug: &str, start_ts_ms: u64, expiry_ts_ms: u64) -> MarketDescriptor {
         MarketDescriptor {

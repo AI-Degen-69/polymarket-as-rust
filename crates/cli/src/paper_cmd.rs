@@ -21,7 +21,7 @@ use rtrb::RingBuffer;
 use tokio::sync::mpsc;
 
 use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
-use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent, canonical_target_path};
+use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent};
 use crate::lifecycle_report::{print_epoch_rollover, record_epoch_rollover_jsonl};
 use crate::paper_report::{
     PaperReportStats, PaperSummaryDisplay, print_fill_event, print_merge_event, print_order_event,
@@ -259,7 +259,8 @@ pub(crate) fn run(args: PaperArgs) -> Result<(), Box<dyn Error>> {
 
     match args.source {
         TraceSourceMode::Replay => {
-            let input_path = resolve_replay_input(args.input.as_deref(), &args.jsonl)?;
+            let input_path =
+                crate::log_paths::resolve_replay_input(args.input.as_deref(), &args.jsonl)?;
             run_replay(&args, &input_path, &cfg)
         }
         TraceSourceMode::Live => {
@@ -272,20 +273,6 @@ pub(crate) fn run(args: PaperArgs) -> Result<(), Box<dyn Error>> {
             rt.block_on(run_live(&args, &cfg))
         }
     }
-}
-
-fn resolve_replay_input(input: Option<&Path>, jsonl: &Path) -> Result<PathBuf, Box<dyn Error>> {
-    let input_path = input.map_or_else(
-        || PathBuf::from("logs/phase1-feeds.jsonl"),
-        Path::to_path_buf,
-    );
-    if !input_path.exists() {
-        return Err(format!("replay input `{}` does not exist", input_path.display()).into());
-    }
-    if canonical_target_path(&input_path)? == canonical_target_path(jsonl)? {
-        return Err("refusing to overwrite `--input` replay log with `--jsonl` output".into());
-    }
-    Ok(input_path)
 }
 
 fn run_replay(

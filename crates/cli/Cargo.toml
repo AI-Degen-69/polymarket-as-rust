@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 alloy.workspace = true
 arc-swap.workspace = true
+chrono.workspace = true
 clap.workspace = true
 core-types = { path = "../core-types" }
 execution = { path = "../execution" }
