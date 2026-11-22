@@ -13,6 +13,8 @@ use feeds::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::theme::{self, Badge};
+
 pub(crate) struct CaptureReportData {
     pub(crate) poly_books: u64,
     pub(crate) poly_price_changes: u64,
@@ -100,61 +102,106 @@ pub(crate) fn print_header_and_market(
     sync: &ClockSyncReport,
     polybolt_enabled: bool,
 ) {
-    println!("==================================================================");
-    println!(" POLY-AS PHASE 1 FEEDS :: DISCOVERY, L2 BOOK & WS INGESTION TRACE");
-    println!("==================================================================");
-    println!("\n(a) DISCOVERED 5M BTC MARKET & CLOCK SYNC");
+    let t = theme::current();
+    println!();
     println!(
-        "  Market               : {} (version={:?}, neg_risk={})",
-        desc.slug, desc.version, desc.neg_risk
+        "{}",
+        t.banner(
+            "POLY-AS PHASE 1 FEEDS :: DISCOVERY, L2 BOOK & WS INGESTION TRACE",
+            None
+        )
     );
-    println!("  Condition ID         : {}", desc.condition_id);
+    println!("{}", t.section("(a) DISCOVERED 5M BTC MARKET & CLOCK SYNC"));
     println!(
-        "  Asset Up / Down      : {} / {}",
-        desc.asset_id_up, desc.asset_id_dn
+        "{}",
+        t.kv(
+            "Market:",
+            &format!(
+                "{} (version={:?}, neg_risk={})",
+                t.cyan(&desc.slug),
+                desc.version,
+                desc.neg_risk
+            )
+        )
+    );
+    println!("{}", t.kv("Condition ID:", &desc.condition_id));
+    println!(
+        "{}",
+        t.kv(
+            "Asset Up / Down:",
+            &format!("{} / {}", desc.asset_id_up, desc.asset_id_dn)
+        )
     );
     println!(
-        "  Params & Fees        : tick=${} | min_size={} | feeRate={:.4} | taker_delay={}ms",
-        desc.tick_size_micro,
-        desc.min_order_size_micro,
-        (desc.fee_schedule.fee_rate_e6 as f64) / 1_000_000.0,
-        desc.taker_delay_ms
+        "{}",
+        t.kv(
+            "Params & Fees:",
+            &format!(
+                "tick=${} | min_size={} | feeRate={:.4} | taker_delay={}ms",
+                desc.tick_size_micro,
+                desc.min_order_size_micro,
+                (desc.fee_schedule.fee_rate_e6 as f64) / 1_000_000.0,
+                desc.taker_delay_ms
+            )
+        )
     );
     println!(
-        "  Epoch Window         : start={}ms -> expiry={}ms (span={}s)",
-        desc.start_ts_ms,
-        desc.expiry_ts_ms,
-        desc.expiry_ts_ms.saturating_sub(desc.start_ts_ms) / 1_000
+        "{}",
+        t.kv(
+            "Epoch Window:",
+            &format!(
+                "start={}ms -> expiry={}ms (span={}s)",
+                desc.start_ts_ms,
+                desc.expiry_ts_ms,
+                desc.expiry_ts_ms.saturating_sub(desc.start_ts_ms) / 1_000
+            )
+        )
     );
     print_clock_sync_banner(sync, polybolt_enabled);
 }
 
 fn print_clock_sync_banner(sync: &ClockSyncReport, polybolt_enabled: bool) {
+    let t = theme::current();
     println!(
-        "  Clock Offset         : {}ms (source={}, clob={:?}ms, binance={:?}ms, drift_tripped={})",
-        sync.offset_ms,
-        sync.source,
-        sync.clob_offset_ms,
-        sync.binance_offset_ms,
-        sync.drift_exceeded
+        "{}",
+        t.kv(
+            "Clock Offset:",
+            &format!(
+                "{}ms (source={}, clob={:?}ms, binance={:?}ms, drift_tripped={})",
+                sync.offset_ms,
+                sync.source,
+                sync.clob_offset_ms,
+                sync.binance_offset_ms,
+                sync.drift_exceeded
+            )
+        )
     );
     if sync.drift_exceeded {
         println!(
-            "  [CLOCK WARNING]      : host drift {}ms exceeds limit; run `w32tm /resync` before live trading",
+            "  {} CLOCK WARNING: host drift {}ms exceeds limit; run `w32tm /resync` before live trading",
+            t.badge(Badge::Warn),
             sync.offset_ms
         );
     }
     if let Some(err) = &sync.binance_error {
-        println!("  [SYNC WARNING]       : Binance /time failed (fallback used): {err}");
+        println!(
+            "  {} SYNC WARNING: Binance /time failed (fallback used): {err}",
+            t.badge(Badge::Warn)
+        );
     }
     println!(
-        "  PolyBolt Oracle      : enabled={} ({})",
-        polybolt_enabled,
-        if polybolt_enabled {
-            "connecting"
-        } else {
-            "disabled; local Binance 60s TWAP fallback"
-        }
+        "{}",
+        t.kv(
+            "PolyBolt Oracle:",
+            &format!(
+                "enabled={polybolt_enabled} ({})",
+                if polybolt_enabled {
+                    "connecting"
+                } else {
+                    "disabled; local Binance 60s TWAP fallback"
+                }
+            )
+        )
     );
 }
 
@@ -321,37 +368,63 @@ pub(crate) fn print_sections_b_to_e(
 }
 
 fn print_section_b(data: &CaptureReportData) {
-    println!("\n(b) LIVE RAW -> PARSED FRAMES & EVENT TOTALS");
+    let t = theme::current();
+    println!();
     println!(
-        "  Binance Totals       : bookTicker={} | aggTrade={}",
-        data.binance_tickers, data.binance_trades
+        "{}",
+        t.section("(b) LIVE RAW -> PARSED FRAMES & EVENT TOTALS")
     );
     println!(
-        "  Polymarket Totals    : book={} | price_change={} | trade={} | tick_size={} | bba={}",
-        data.poly_books,
-        data.poly_price_changes,
-        data.poly_trades,
-        data.poly_tick_changes,
-        data.poly_bba
+        "{}",
+        t.kv(
+            "Binance Totals:",
+            &format!(
+                "bookTicker={} | aggTrade={}",
+                data.binance_tickers, data.binance_trades
+            )
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Polymarket Totals:",
+            &format!(
+                "book={} | price_change={} | trade={} | tick_size={} | bba={}",
+                data.poly_books,
+                data.poly_price_changes,
+                data.poly_trades,
+                data.poly_tick_changes,
+                data.poly_bba
+            )
+        )
     );
     for s in &data.samples_binance {
-        println!("  [BINANCE SAMPLE]     : {s}");
+        println!("{}", t.kv("[BINANCE SAMPLE]:", s));
     }
     for s in &data.samples_poly {
-        println!("  [POLY SAMPLE]        : {s}");
+        println!("{}", t.kv("[POLY SAMPLE]:", s));
     }
 }
 
 fn print_section_c(data: &CaptureReportData) {
-    println!("\n(c) MAINTAINED L2 TOP-5 DEPTH & UP+DOWN PARITY");
+    let t = theme::current();
+    println!();
+    println!(
+        "{}",
+        t.section("(c) MAINTAINED L2 TOP-5 DEPTH & UP+DOWN PARITY")
+    );
     print_book_side("UP", data.latest_up_book.as_ref());
     print_book_side("DOWN", data.latest_dn_book.as_ref());
     print_parity_check(data.latest_up_book.as_ref(), data.latest_dn_book.as_ref());
 }
 
 fn print_book_side(label: &str, book: Option<&FixedBook<10>>) {
+    let t = theme::current();
     let Some(b) = book else {
-        println!("  {label} Top-5            : <no snapshot received>");
+        println!(
+            "{}",
+            t.kv(&format!("{label} Top-5:"), "<no snapshot received>")
+        );
         return;
     };
     let bids: String = b
@@ -368,31 +441,63 @@ fn print_book_side(label: &str, book: Option<&FixedBook<10>>) {
         .map(|l| format!("${}x{}", l.price, l.size))
         .collect::<Vec<_>>()
         .join(", ");
-    println!("  {label} Bids (Top 5)     : [{bids}]");
-    println!("  {label} Asks (Top 5)     : [{asks}]");
+    println!(
+        "{}",
+        t.kv(&format!("{label} Bids (Top 5):"), &format!("[{bids}]"))
+    );
+    println!(
+        "{}",
+        t.kv(&format!("{label} Asks (Top 5):"), &format!("[{asks}]"))
+    );
 }
 
 fn print_parity_check(up: Option<&FixedBook<10>>, dn: Option<&FixedBook<10>>) {
+    let t = theme::current();
     let (Some(u), Some(d)) = (up, dn) else {
-        println!("  UP+DOWN Parity       : pending both outcome snapshots");
+        println!(
+            "{}",
+            t.kv("UP+DOWN Parity:", "pending both outcome snapshots")
+        );
         return;
     };
     let (Some(ub), Some(ua), Some(db), Some(da)) =
         (u.best_bid(), u.best_ask(), d.best_bid(), d.best_ask())
     else {
-        println!("  UP+DOWN Parity       : one-sided book (missing BBO on a leg)");
+        println!(
+            "{}",
+            t.kv("UP+DOWN Parity:", "one-sided book (missing BBO on a leg)")
+        );
         return;
     };
     let implied_ask_up = MicroUsdc(ONE_DOLLAR_MICRO.saturating_sub(db.price.0));
     let combined_ask = ua.price.0.saturating_add(da.price.0);
     let combined_bid = ub.price.0.saturating_add(db.price.0);
     println!(
-        "  UP+DOWN Parity       : ask_up=${} vs (1-bid_dn)=${} | sum_bid=${} | sum_ask=${}",
-        ua.price,
-        implied_ask_up,
-        MicroUsdc(combined_bid),
-        MicroUsdc(combined_ask),
+        "{}",
+        t.kv(
+            "UP+DOWN Parity:",
+            &format!(
+                "ask_up=${} vs (1-bid_dn)=${} | sum_bid=${} | sum_ask=${}",
+                ua.price,
+                implied_ask_up,
+                MicroUsdc(combined_bid),
+                MicroUsdc(combined_ask),
+            )
+        )
     );
+}
+
+fn style_health_state(state: &str) -> String {
+    let t = theme::current();
+    if state.eq_ignore_ascii_case("ready") || state.eq_ignore_ascii_case("active") {
+        t.green(state)
+    } else if state.eq_ignore_ascii_case("disabled") {
+        t.muted(state)
+    } else if state.contains("Stale") || state.contains("Disconnect") || state.contains("Error") {
+        t.red(state)
+    } else {
+        t.yellow(state)
+    }
 }
 
 fn print_section_d(
@@ -401,6 +506,7 @@ fn print_section_d(
     binance: &FeedStats,
     polybolt: &FeedStats,
 ) {
+    let t = theme::current();
     let total_overflows = clob.ring_overflows + binance.ring_overflows + polybolt.ring_overflows;
     let total_warnings = clob.parse_warnings + binance.parse_warnings + polybolt.parse_warnings;
     let total_reconnects = clob.reconnects + binance.reconnects + polybolt.reconnects;
@@ -408,25 +514,44 @@ fn print_section_d(
     let total_pings = clob.pings_replied + binance.pings_replied + polybolt.pings_replied;
     let health_drops =
         clob.health_events_dropped + binance.health_events_dropped + polybolt.health_events_dropped;
-    println!("\n(d) FEED HEALTH & RINGBUFFER UTILIZATION");
+    println!();
+    println!("{}", t.section("(d) FEED HEALTH & RINGBUFFER UTILIZATION"));
     println!(
-        "  Health States        : CLOB={} | Binance={} | PolyBolt={}",
-        data.health_counts.clob_state,
-        data.health_counts.binance_state,
-        data.health_counts.polybolt_state
+        "{}",
+        t.kv(
+            "Health States:",
+            &format!(
+                "CLOB={} | Binance={} | PolyBolt={}",
+                style_health_state(&data.health_counts.clob_state),
+                style_health_state(&data.health_counts.binance_state),
+                style_health_state(&data.health_counts.polybolt_state),
+            )
+        )
     );
     println!(
-        "  Ring Utilization     : poly_peak={}/{} | binance_peak={}/{} | oracle_peak={}/{}",
-        data.peak_poly_slots,
-        DEFAULT_RING_CAPACITY,
-        data.peak_binance_slots,
-        DEFAULT_RING_CAPACITY,
-        data.peak_oracle_slots,
-        DEFAULT_RING_CAPACITY,
+        "{}",
+        t.kv(
+            "Ring Utilization:",
+            &format!(
+                "poly_peak={}/{} | binance_peak={}/{} | oracle_peak={}/{}",
+                data.peak_poly_slots,
+                DEFAULT_RING_CAPACITY,
+                data.peak_binance_slots,
+                DEFAULT_RING_CAPACITY,
+                data.peak_oracle_slots,
+                DEFAULT_RING_CAPACITY,
+            )
+        )
     );
     println!(
-        "  Counters             : overflows={total_overflows} (clob={}, bin={}) | stale={} | warnings={total_warnings} | reconnects={total_reconnects} | pongs={total_pongs}/pings={total_pings} | health_drops={health_drops}",
-        clob.ring_overflows, binance.ring_overflows, data.health_counts.stale_timeouts,
+        "{}",
+        t.kv(
+            "Counters:",
+            &format!(
+                "overflows={total_overflows} (clob={}, bin={}) | stale={} | warnings={total_warnings} | reconnects={total_reconnects} | pongs={total_pongs}/pings={total_pings} | health_drops={health_drops}",
+                clob.ring_overflows, binance.ring_overflows, data.health_counts.stale_timeouts,
+            )
+        )
     );
 }
 
@@ -437,33 +562,45 @@ fn print_section_e(
     polybolt_enabled: bool,
     jsonl_path: &Path,
 ) {
-    println!("\n(e) INGRESS PARSE LATENCY (HDR HISTOGRAM)");
-    print_latency_line("Polymarket CLOB", clob);
-    print_latency_line("Binance Spot   ", binance);
+    let t = theme::current();
+    println!();
+    println!("{}", t.section("(e) INGRESS PARSE LATENCY (HDR HISTOGRAM)"));
+    print_latency_line("Polymarket CLOB:", clob);
+    print_latency_line("Binance Spot:", binance);
     if polybolt_enabled || polybolt.latency.is_some() {
-        print_latency_line("PolyBolt Oracle", polybolt);
+        print_latency_line("PolyBolt Oracle:", polybolt);
     }
     println!(
-        "  JSONL Telemetry      : written and closed at {}",
-        jsonl_path.display()
+        "{}",
+        t.kv(
+            "JSONL Telemetry:",
+            &format!("written and closed at {}", jsonl_path.display())
+        )
     );
-    println!("==================================================================");
+    println!("{}", t.divider());
 }
 
 fn print_latency_line(label: &str, stats: &FeedStats) {
+    let t = theme::current();
     let Some(l) = stats.latency else {
-        println!("  {label}      : 0 parsed frames");
+        println!("{}", t.kv(label, "0 parsed frames"));
         return;
     };
     println!(
-        "  {label}      : n={} (0ns={}) | P50={:.3} us | P95={:.3} us | P99={:.3} us | P99.9={:.3} us | max={:.3} us",
-        l.count,
-        l.zero_ns_samples,
-        l.p50_ns as f64 / 1_000.0,
-        l.p95_ns as f64 / 1_000.0,
-        l.p99_ns as f64 / 1_000.0,
-        l.p999_ns as f64 / 1_000.0,
-        l.max_ns as f64 / 1_000.0,
+        "{}",
+        t.kv(
+            label,
+            &format!(
+                "n={} (0ns={}) | P50={:.3} us | P95={:.3} us | P99={:.3} us | P99.9={:.3} us | max={:.3} us",
+                l.count,
+                l.zero_ns_samples,
+                l.p50_ns as f64 / 1_000.0,
+                l.p95_ns as f64 / 1_000.0,
+                l.p99_ns as f64 / 1_000.0,
+                l.p999_ns as f64 / 1_000.0,
+                l.max_ns as f64 / 1_000.0,
+            )
+        )
     );
 }
 
@@ -584,7 +721,8 @@ pub(crate) fn run_replay(
         write_replay_report(replay_path, out_path, &tally)?;
     }
     println!(
-        "REPLAY VERIFIED: {} -> lines={} binance={} poly={} oracle={} non_monotonic={}",
+        "  {} REPLAY VERIFIED: {} -> lines={} binance={} poly={} oracle={} non_monotonic={}",
+        theme::current().badge(Badge::Pass),
         replay_path.display(),
         tally.total_lines,
         tally.binance_count,

@@ -173,17 +173,41 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     };
     let domain = MarketDomain::for_market(&market);
 
-    println!("  (a) Market discovery ({discovery_mode}, zero capital at risk)");
-    println!("      slug:             {}", market.slug);
+    let t = crate::theme::current();
     println!(
-        "      version:          {:?} (domain v{})",
-        market.version, domain.domain_version
+        "{}",
+        t.section(&format!(
+            "(a) MARKET DISCOVERY ({discovery_mode}, zero capital at risk)"
+        ))
     );
-    println!("      verifying:        {:?}", domain.exchange_address);
-    println!("      wallet_mode:      DepositWallet1271 (sig 3, ERC-7739 TypedDataSign)");
+    println!("{}", t.kv("Slug:", &t.cyan(&market.slug)));
     println!(
-        "      tick:             0.01  min_size: 5 shares  takerDelay: {}ms  feeRate: dynamic~0.05",
-        market.taker_delay_ms
+        "{}",
+        t.kv(
+            "Version:",
+            &format!("{:?} (domain v{})", market.version, domain.domain_version)
+        )
+    );
+    println!(
+        "{}",
+        t.kv("Verifying:", &format!("{:?}", domain.exchange_address))
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Wallet Mode:",
+            "DepositWallet1271 (sig 3, ERC-7739 TypedDataSign)"
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Market Params:",
+            &format!(
+                "tick=0.01  min_size=5 shares  takerDelay={}ms  feeRate=dynamic~0.05",
+                market.taker_delay_ms
+            )
+        )
     );
 
     // Fresh-eyes review: no hardcoded keys/secrets. Both signers are ephemeral
@@ -215,8 +239,13 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     )?;
     warm_and_measure_signing(&order_signer, &domain, &mut sign_lat, &probe_order)?;
     println!(
-        "      signing probe:      {DRY_RUN_SIGN_WARMUP} warmup (excluded) + {DRY_RUN_SIGN_SAMPLES} measured synthetic sigs"
+        "{}",
+        t.kv(
+            "Signing Probe:",
+            &format!("{DRY_RUN_SIGN_WARMUP} warmup (excluded) + {DRY_RUN_SIGN_SAMPLES} measured synthetic sigs")
+        )
     );
+    println!("{}", t.section("(b) DRY-RUN EVALUATION & SIGNING TRACE"));
 
     let mut pipeline = MathPipeline::new(MathPipelineConfig::try_default()?, clock)?;
     let display_ticks = (duration_secs.clamp(1, 60) as usize).clamp(6, 12);
@@ -264,10 +293,11 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
         let v_rem = trace.station2.map(|s| s.v_rem).unwrap_or(0.0);
         let kappa = trace.kappa.map(|k| k.kappa).unwrap_or(50.0);
         println!(
-            "  tick {tick:02}: s_i={s_i:.4} V_rem={v_rem:.5} kappa={kappa:.1} quote=({},{}) tau2={}us",
+            "  {} s_i={s_i:.4} V_rem={v_rem:.5} kappa={kappa:.1} quote=({},{}) tau2={}",
+            t.muted(&format!("tick {tick:02}:")),
             bid_up_opt.map(|p| p.0).unwrap_or(0),
             bid_dn_opt.map(|p| p.0).unwrap_or(0),
-            tau2 / 1000
+            t.fmt_latency_us(tau2, 25),
         );
 
         let (tau3, tau4) = if tick + 1 == display_ticks
@@ -322,11 +352,18 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
         ProtocolVersion::PolyV2 => "Router.merge",
         ProtocolVersion::CtfV1 => "CTF.mergePositions",
     };
+    println!("{}", t.section("(d) SETTLEMENT PREVIEW"));
     println!(
-        "  (d) Settlement preview: {target_label} pairable={} decision={} ",
-        decision.amount_micro, decision.reason
+        "{}",
+        t.kv(
+            "Target / Decision:",
+            &format!(
+                "{target_label} pairable={} decision={}",
+                decision.amount_micro, decision.reason
+            )
+        )
     );
-    println!("      calldata: {calldata}");
+    println!("{}", t.kv("Calldata:", &calldata));
     record_settlement_preview(
         &mut jsonl,
         unix_ms_now(),
@@ -341,11 +378,18 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
     let compute_summary = compute_lat.summary();
     print_exec_summary(&stats, &sign_summary, &calldata);
     println!(
-        "      compute P50: {}us P99: {}us | signing samples: {}",
-        compute_summary.p50_ns / 1000,
-        compute_summary.p99_ns / 1000,
-        sign_summary.count
+        "{}",
+        t.kv(
+            "Compute Latency:",
+            &format!(
+                "P50: {}us P99: {} | signing samples: {}",
+                compute_summary.p50_ns / 1000,
+                t.fmt_latency_us(compute_summary.p99_ns, 25),
+                sign_summary.count
+            )
+        )
     );
+    println!("{}", t.divider());
     record_summary_jsonl(
         &mut jsonl,
         unix_ms_now(),
@@ -425,12 +469,18 @@ fn sign_and_record(
         stats.signed_orders += 1;
         let l2 = l2_signer.sign_request_now("POST", "/order", Some("{\"dry\":true}"))?;
         println!(
-            "  (b) {leg} bid={} maker={} taker={} sig={}.. recover={} L2key={}",
+            "  {} {} bid={} maker={} taker={} sig={}.. recover={} L2key={}",
+            crate::theme::current().badge(crate::theme::Badge::Order),
+            leg,
             price.0,
             wire.maker_amount,
             wire.taker_amount,
             sig.get(..18).unwrap_or(&sig),
-            if recovered_match { "ok" } else { "MISMATCH" },
+            if recovered_match {
+                crate::theme::current().green("ok")
+            } else {
+                crate::theme::current().bold_red("MISMATCH")
+            },
             l2.poly_api_key,
         );
         record_signed_order(

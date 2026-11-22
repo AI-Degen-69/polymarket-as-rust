@@ -23,6 +23,7 @@ mod paper_cmd;
 mod paper_report;
 mod sandbox_cmd;
 mod sandbox_report;
+mod theme;
 mod trace_cmd;
 mod trace_report;
 mod window_gate;
@@ -49,6 +50,12 @@ enum CliLifecycleSource {
     Live,
     SimEpoch,
     Replay,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliLifecycleDisplay {
+    Stream,
+    Raw,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -244,6 +251,9 @@ enum SandboxCommands {
     about = "Polymarket 5-Minute BTC Avellaneda-Stoikov HFT Bot (Terminal CLI)"
 )]
 struct Cli {
+    /// Control ANSI terminal color output (`auto`, `always`, `never`).
+    #[arg(long, global = true, value_enum, default_value_t = theme::ColorChoice::Auto)]
+    color: theme::ColorChoice,
     #[command(subcommand)]
     command: Commands,
 }
@@ -347,6 +357,9 @@ enum Commands {
         /// Source mode (`live` WebSockets, `sim-epoch` simulated 300s epoch, or `replay` JSONL log).
         #[arg(long, value_enum, default_value_t = CliLifecycleSource::SimEpoch)]
         source: CliLifecycleSource,
+        /// Terminal display mode (`stream` events + 5s/1s heartbeats, or `raw` 10 Hz tick lines).
+        #[arg(long, value_enum, default_value_t = CliLifecycleDisplay::Stream)]
+        display: CliLifecycleDisplay,
         /// Input JSONL path used when `--source replay` (defaults to newest capture in `logs/captures/`).
         #[arg(long)]
         input: Option<PathBuf>,
@@ -410,6 +423,7 @@ enum Commands {
 }
 
 fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    theme::init(cli.color);
     match cli.command {
         Commands::Doctor { jsonl } => {
             let path = jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("doctor"));
@@ -493,6 +507,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }),
         Commands::Lifecycle {
             source,
+            display,
             input,
             duration,
             allow_mid_window,
@@ -510,6 +525,10 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 CliLifecycleSource::Live => LifecycleSourceMode::Live,
                 CliLifecycleSource::SimEpoch => LifecycleSourceMode::SimEpoch,
                 CliLifecycleSource::Replay => LifecycleSourceMode::Replay,
+            },
+            display: match display {
+                CliLifecycleDisplay::Stream => lifecycle_report::LifecycleDisplayMode::Stream,
+                CliLifecycleDisplay::Raw => lifecycle_report::LifecycleDisplayMode::Raw,
             },
             input,
             duration,
@@ -602,13 +621,16 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
-    match dispatch_cli(Cli::parse()) {
+    let cli = Cli::parse();
+    theme::init(cli.color);
+    match dispatch_cli(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ERROR: {err}");
+            let t = theme::current();
+            eprintln!("{} {err}", t.bold_red("ERROR:"));
             let mut cause = err.source();
             while let Some(inner) = cause {
-                eprintln!("  caused by: {inner}");
+                eprintln!("  {} {inner}", t.muted("caused by:"));
                 cause = inner.source();
             }
             ExitCode::FAILURE
@@ -1106,6 +1128,32 @@ mod tests {
                 assert!(allow_mid_window);
             }
             _ => panic!("expected Lifecycle live"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_global_color_flag_before_and_after_subcommand() {
+        let default_cli = Cli::try_parse_from(["poly-as", "doctor"]).unwrap();
+        assert_eq!(default_cli.color, theme::ColorChoice::Auto);
+
+        let before = Cli::try_parse_from(["poly-as", "--color", "always", "doctor"]).unwrap();
+        assert_eq!(before.color, theme::ColorChoice::Always);
+
+        let after = Cli::try_parse_from(["poly-as", "lifecycle", "--color", "never"]).unwrap();
+        assert_eq!(after.color, theme::ColorChoice::Never);
+        match after.command {
+            Commands::Lifecycle { display, .. } => {
+                assert_eq!(display, CliLifecycleDisplay::Stream);
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        let raw_disp = Cli::try_parse_from(["poly-as", "lifecycle", "--display", "raw"]).unwrap();
+        match raw_disp.command {
+            Commands::Lifecycle { display, .. } => {
+                assert_eq!(display, CliLifecycleDisplay::Raw);
+            }
+            _ => panic!("expected Lifecycle"),
         }
     }
 }

@@ -977,16 +977,28 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     let mut epoch_settled = false;
     let mut pending_settlement: Option<PendingEpochSettlement> = None;
 
-    println!("Streaming live market feeds for paper simulation... (Press Ctrl+C to stop)");
+    let t = crate::theme::current();
+    println!(
+        "  {} Streaming live market feeds for paper simulation... {}",
+        t.badge(crate::theme::Badge::Info),
+        t.muted("(Press Ctrl+C to stop)")
+    );
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
-                println!("\nReceived Ctrl+C, shutting down paper simulator...");
+                println!(
+                    "\n  {} Received Ctrl+C, shutting down paper simulator...",
+                    t.badge(crate::theme::Badge::Signal)
+                );
                 break;
             }
             _ = tokio::time::sleep_until(deadline) => {
-                println!("\nReached target duration {}, shutting down...", args.duration);
+                println!(
+                    "\n  {} Reached target duration {}, shutting down...",
+                    t.badge(crate::theme::Badge::Info),
+                    args.duration
+                );
                 break;
             }
             _ = interval.tick() => {
@@ -1045,7 +1057,10 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                     if !epoch_settled
                         && let FeedHealthEvent::MarketResolved { .. } = h
                     {
-                        println!("[HEALTH] Active 5m epoch market resolved!");
+                        println!(
+                            "  {} Active 5m epoch market resolved!",
+                            t.badge(crate::theme::Badge::Ready)
+                        );
                         market_resolved_flag = true;
                     }
                 }
@@ -1083,8 +1098,9 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                         {
                             Ok(next_desc) => {
                                 println!(
-                                    "\n[ROLLOVER] Discovered next 5m market: {} (expires in {}s)",
-                                    next_desc.slug,
+                                    "\n  {} Discovered next 5m market: {} (expires in {}s)",
+                                    t.badge(crate::theme::Badge::Epoch),
+                                    t.cyan(&next_desc.slug),
                                     next_desc.expiry_ts_ms.saturating_sub(now_ms) / 1000
                                 );
                                 let next_epoch = match handles
@@ -1096,7 +1112,10 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                                 {
                                     Ok(ep) => ep,
                                     Err(err) => {
-                                        eprintln!("[ROLLOVER] Failed to switch CLOB feed subscriptions: {err}");
+                                        eprintln!(
+                                            "  {} Failed to switch CLOB feed subscriptions: {err}",
+                                            t.badge(crate::theme::Badge::Fail)
+                                        );
                                         break;
                                     }
                                 };
@@ -1166,7 +1185,8 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                             }
                             Err(err) => {
                                 eprintln!(
-                                    "  [ROLLOVER] Awaiting next 5m BTC market after {}: {err}",
+                                    "  {} Awaiting next 5m BTC market after {}: {err}",
+                                    t.badge(crate::theme::Badge::Epoch),
                                     desc.slug
                                 );
                             }

@@ -364,7 +364,10 @@ async fn capture_until_deadline(
         tokio::select! {
             _ = &mut deadline => break,
             _ = &mut ctrl_c => {
-                println!("  [SIGNAL]             : Ctrl-C received, shutting down feeds cleanly...");
+                println!(
+                    "  {} Ctrl-C received, shutting down feeds cleanly...",
+                    crate::theme::current().badge(crate::theme::Badge::Signal)
+                );
                 break;
             }
             _ = poll_tick.tick() => {
@@ -410,7 +413,8 @@ async fn maybe_rollover_capture(
         Ok(desc) => desc,
         Err(err) => {
             eprintln!(
-                "WARN: rollover market discovery failed after {}: {err}",
+                "  {} rollover market discovery failed after {}: {err}",
+                crate::theme::current().badge(crate::theme::Badge::Warn),
                 rollover.current_desc.slug
             );
             return Ok(());
@@ -444,8 +448,11 @@ async fn maybe_rollover_capture(
         &next_desc,
     )?;
     println!(
-        "  [ROLLOVER]           : {} -> {} (epoch={})",
-        rollover.current_desc.slug, next_desc.slug, rollover.epoch
+        "  {} {} -> {} (epoch={})",
+        crate::theme::current().badge(crate::theme::Badge::Epoch),
+        rollover.current_desc.slug,
+        crate::theme::current().cyan(&next_desc.slug),
+        rollover.epoch
     );
     *rollover.current_desc = next_desc;
     rollover.last_rollover_attempt = None;

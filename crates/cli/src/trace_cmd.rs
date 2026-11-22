@@ -602,23 +602,39 @@ fn drain_live_rings(
 }
 
 fn log_live_health(ev: &FeedHealthEvent) {
+    let t = crate::theme::current();
     match ev {
         FeedHealthEvent::StaleTimeout {
             feed, silent_ms, ..
-        } => eprintln!("WARN: feed `{feed:?}` stale timeout ({silent_ms}ms)"),
+        } => eprintln!(
+            "  {} feed `{feed:?}` stale timeout ({silent_ms}ms)",
+            t.badge(crate::theme::Badge::Warn)
+        ),
         FeedHealthEvent::RingOverflow {
             feed,
             dropped_count,
             ..
-        } => eprintln!("WARN: feed `{feed:?}` ring overflow (dropped={dropped_count})"),
+        } => eprintln!(
+            "  {} feed `{feed:?}` ring overflow (dropped={dropped_count})",
+            t.badge(crate::theme::Badge::Warn)
+        ),
         FeedHealthEvent::ParseWarning { feed, reason, .. } => {
-            eprintln!("WARN: feed `{feed:?}` parse warning: {reason}");
+            eprintln!(
+                "  {} feed `{feed:?}` parse warning: {reason}",
+                t.badge(crate::theme::Badge::Warn)
+            );
         }
         FeedHealthEvent::Disconnected { feed, reason, .. } => {
-            eprintln!("WARN: feed `{feed:?}` disconnected: {reason}");
+            eprintln!(
+                "  {} feed `{feed:?}` disconnected: {reason}",
+                t.badge(crate::theme::Badge::Warn)
+            );
         }
         FeedHealthEvent::MarketResolved { feed, .. } => {
-            eprintln!("INFO: market_resolved reported by feed `{feed:?}`");
+            eprintln!(
+                "  {} market_resolved reported by feed `{feed:?}`",
+                t.badge(crate::theme::Badge::Info)
+            );
         }
         FeedHealthEvent::Connected { .. }
         | FeedHealthEvent::ResyncingRest { .. }

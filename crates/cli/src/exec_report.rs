@@ -1,6 +1,9 @@
+use std::path::Path;
+
 use core_types::{JsonlWriter, LatencySummary};
 use serde::Serialize;
-use std::path::Path;
+
+use crate::theme;
 
 #[derive(Debug, Default)]
 pub(crate) struct ExecReportStats {
@@ -48,17 +51,23 @@ struct SummaryEvent {
 }
 
 pub(crate) fn print_exec_header(mode: &str, jsonl: &Path, canary_max_usd: u64) {
+    let t = theme::current();
     println!();
-    println!("================================================================================");
-    println!("  POLYMARKET 5-MINUTE BTC HFT BOT -- PHASE 5 LIVE EXECUTION (DRY-RUN TRACE)");
-    println!("================================================================================");
-    println!("  Mode:               {mode}");
-    println!("  Canary Cap:         ${canary_max_usd}");
-    println!("  JSONL Telemetry:    {}", jsonl.display());
     println!(
-        "  Safety Latch:       Dry-run never touches CLOB; canary needs --confirm-live-capital"
+        "{}",
+        t.banner("POLY-AS PHASE 5 :: LIVE EXECUTION (DRY-RUN TRACE)", None)
     );
-    println!("--------------------------------------------------------------------------------");
+    println!("{}", t.kv("Mode:", mode));
+    println!("{}", t.kv("Canary Cap:", &format!("${canary_max_usd}")));
+    println!("{}", t.kv("JSONL Telemetry:", &jsonl.display().to_string()));
+    println!(
+        "{}",
+        t.kv(
+            "Safety Latch:",
+            "Dry-run never touches CLOB; canary needs --confirm-live-capital"
+        )
+    );
+    println!("{}", t.divider());
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -150,18 +159,38 @@ pub(crate) fn print_exec_summary(
     sign_summary: &LatencySummary,
     settlement_calldata: &str,
 ) {
-    println!("--------------------------------------------------------------------------------");
+    let t = theme::current();
+    println!();
+    println!("{}", t.section("PHASE 5 EXECUTION SUMMARY"));
     println!(
-        "  Ticks: {}  Active quotes: {}  Signed orders: {}",
-        stats.ticks, stats.active_quotes, stats.signed_orders
+        "{}",
+        t.kv(
+            "Execution Counts:",
+            &format!(
+                "Ticks: {}  Active quotes: {}  Signed orders: {}",
+                stats.ticks, stats.active_quotes, stats.signed_orders
+            )
+        )
     );
     println!(
-        "  tau_3 signing P50: {}us  P99: {}us  (budget < 80us release, < 10ms debug)",
-        sign_summary.p50_ns / 1000,
-        sign_summary.p99_ns / 1000
+        "{}",
+        t.kv(
+            "tau_3 Signing:",
+            &format!(
+                "P50: {}us  P99: {}  (budget < 80us release, < 10ms debug)",
+                sign_summary.p50_ns / 1000,
+                t.fmt_latency_us(sign_summary.p99_ns, 80)
+            )
+        )
     );
-    println!("  Settlement preview: {settlement_calldata}");
-    println!("  Secrets: no full secrets written (signature prefixes only, ephemeral keys)");
+    println!("{}", t.kv("Settlement Preview:", settlement_calldata));
+    println!(
+        "{}",
+        t.kv(
+            "Secrets Hygiene:",
+            "no full secrets written (signature prefixes only, ephemeral keys)"
+        )
+    );
 }
 
 pub(crate) fn record_summary_jsonl(

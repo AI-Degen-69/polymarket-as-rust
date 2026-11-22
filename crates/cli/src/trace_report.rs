@@ -8,6 +8,8 @@ use core_types::{
 use math_engine::{PipelineTrace, QuoteOutput};
 use serde::Serialize;
 
+use crate::theme::{self, Badge};
+
 #[derive(Default)]
 pub(crate) struct TraceReportStats {
     pub(crate) warmup_ticks: u64,
@@ -55,26 +57,49 @@ pub(crate) fn print_trace_header(
     strike_source: &str,
     jsonl_path: &Path,
 ) {
-    println!("=== POLY-AS PHASE 2 MATH ENGINE TRACE ({source}) ===");
-    println!(
-        "  (a) Market           : {} | ver={:?} | tick=${} | min_size={} | fee_rate={}",
-        desc.slug,
-        desc.version,
-        desc.tick_size_micro,
-        desc.min_order_size_micro,
-        desc.fee_schedule.fee_rate_e6 as f64 / 1_000_000.0
-    );
-    println!(
-        "  (a) Modes & Strike   : sg={:?} | kappa={:?} | var={:?} | gamma={} | strike={} ({})",
-        cfg.sg_mode,
-        cfg.kappa_mode,
-        cfg.variance_mode,
-        cfg.gamma,
-        opt_usd(strike_usd),
-        strike_source
-    );
-    println!("  (a) Telemetry JSONL  : {}", jsonl_path.display());
+    let t = theme::current();
     println!();
+    println!(
+        "{}",
+        t.banner(
+            &format!("POLY-AS PHASE 2 :: MATH ENGINE TRACE ({source})"),
+            None
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Market:",
+            &format!(
+                "{} | ver={:?} | tick=${} | min_size={} | fee_rate={}",
+                t.cyan(&desc.slug),
+                desc.version,
+                desc.tick_size_micro,
+                desc.min_order_size_micro,
+                desc.fee_schedule.fee_rate_e6 as f64 / 1_000_000.0
+            )
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Modes & Strike:",
+            &format!(
+                "sg={:?} | kappa={:?} | var={:?} | gamma={} | strike={} ({})",
+                cfg.sg_mode,
+                cfg.kappa_mode,
+                cfg.variance_mode,
+                cfg.gamma,
+                opt_usd(strike_usd),
+                strike_source
+            )
+        )
+    );
+    println!(
+        "{}",
+        t.kv("Telemetry JSONL:", &jsonl_path.display().to_string())
+    );
+    println!("{}", t.divider());
 }
 
 pub(crate) fn record_and_print_tick(
@@ -133,36 +158,61 @@ pub(crate) fn print_tick_trace(
     ),
     tr: &PipelineTrace,
 ) {
-    println!("--- Tick #{idx:02} ({source}) now_ms={} ---", tr.now_ms);
+    let t = theme::current();
+    println!();
     println!(
-        "  (a) BBO & Spot       : UP={}/{} | DN={}/{} | btc_spot={}",
-        opt_micro(tr.best_bid_up),
-        opt_micro(tr.best_ask_up),
-        opt_micro(tr.best_bid_dn),
-        opt_micro(tr.best_ask_dn),
-        opt_usd(tr.spot_usd),
+        "{}",
+        t.section(&format!("TICK #{idx:02} ({source}) now_ms={}", tr.now_ms))
+    );
+    println!(
+        "{}",
+        t.kv(
+            "BBO & Spot:",
+            &format!(
+                "UP={}/{} | DN={}/{} | btc_spot={}",
+                opt_micro(tr.best_bid_up),
+                opt_micro(tr.best_ask_up),
+                opt_micro(tr.best_bid_dn),
+                opt_micro(tr.best_ask_dn),
+                opt_usd(tr.spot_usd),
+            )
+        )
     );
     let (Some(sg), Some(s2), Some(kap), Some(pr)) = (tr.sg, tr.station2, tr.kappa, tr.pricer)
     else {
         println!(
-            "  (c-d) Suppressed     : {:?} | total={}ns",
-            tr.quote, tr.total_compute_ns
+            "{}",
+            t.kv(
+                "Suppressed:",
+                &format!(
+                    "{} {:?} | total={}ns",
+                    t.badge(Badge::Suppr),
+                    tr.quote,
+                    tr.total_compute_ns
+                )
+            )
         );
         return;
     };
     println!(
-        "  (b) Inputs           : raw_mid={:.6} q={:.2} gamma={} tau={:.1}s tick=${} fee={} v_bar={:.1} depth_up={}/{} dn={}/{}",
-        sg.raw_mid,
-        tr.inventory_q.to_shares_f64(),
-        cfg.gamma,
-        s2.tau_secs,
-        desc.tick_size_micro,
-        desc.fee_schedule.fee_rate_e6 as f64 / 1_000_000.0,
-        kap.v_bar,
-        up_book.bid_len().min(5),
-        up_book.ask_len().min(5),
-        dn_book.bid_len().min(5),
-        dn_book.ask_len().min(5),
+        "{}",
+        t.kv(
+            "Inputs:",
+            &format!(
+                "raw_mid={:.6} q={:.2} gamma={} tau={:.1}s tick=${} fee={} v_bar={:.1} depth_up={}/{} dn={}/{}",
+                sg.raw_mid,
+                tr.inventory_q.to_shares_f64(),
+                cfg.gamma,
+                s2.tau_secs,
+                desc.tick_size_micro,
+                desc.fee_schedule.fee_rate_e6 as f64 / 1_000_000.0,
+                kap.v_bar,
+                up_book.bid_len().min(5),
+                up_book.ask_len().min(5),
+                dn_book.bid_len().min(5),
+                dn_book.ask_len().min(5),
+            )
+        )
     );
     print_tick_stations(&sg, &s2, &kap, &pr);
     print_tick_outputs_and_timing(tr, s2.lead_lag.trigger_defensive_cancel);
@@ -174,33 +224,47 @@ fn print_tick_stations(
     kap: &math_engine::KappaOutput,
     pr: &math_engine::PricerTrace,
 ) {
+    let t = theme::current();
     println!(
-        "  (c) S1 SG -> S2 -> S3: s_i={:.6}(clamp={}) | twap60={} v_rem={:.6} p*={} | kappa={:.2}(raw={},fb={},lvl={})",
-        sg.s_i,
-        sg.clamped_to_bbo,
-        opt_usd(s2.twap_60s_usd),
-        s2.v_rem,
-        opt_prob(s2.lead_lag.p_spot_star),
-        kap.kappa,
-        opt_prob(kap.raw_kappa),
-        kap.fallback_used,
-        kap.levels_used,
+        "{}",
+        t.kv(
+            "S1 SG -> S2 -> S3:",
+            &format!(
+                "s_i={:.6}(clamp={}) | twap60={} v_rem={:.6} p*={} | kappa={:.2}(raw={},fb={},lvl={})",
+                sg.s_i,
+                sg.clamped_to_bbo,
+                opt_usd(s2.twap_60s_usd),
+                s2.v_rem,
+                opt_prob(s2.lead_lag.p_spot_star),
+                kap.kappa,
+                opt_prob(kap.raw_kappa),
+                kap.fallback_used,
+                kap.levels_used,
+            )
+        )
     );
     println!(
-        "  (c) S4 -> S5 -> S6   : s*={:.6}(min={:.4}) | r_i={:.6} | raw={:.4}/{:.4} floor={}/{} po_clamp={}/{}",
-        pr.s_star,
-        pr.s_min,
-        pr.r_i,
-        pr.bid_up_raw,
-        pr.bid_dn_raw,
-        opt_micro(pr.bid_up_floored),
-        opt_micro(pr.bid_dn_floored),
-        pr.post_only_clamped_up,
-        pr.post_only_clamped_dn,
+        "{}",
+        t.kv(
+            "S4 -> S5 -> S6:",
+            &format!(
+                "s*={:.6}(min={:.4}) | r_i={:.6} | raw={:.4}/{:.4} floor={}/{} po_clamp={}/{}",
+                pr.s_star,
+                pr.s_min,
+                pr.r_i,
+                pr.bid_up_raw,
+                pr.bid_dn_raw,
+                opt_micro(pr.bid_up_floored),
+                opt_micro(pr.bid_dn_floored),
+                pr.post_only_clamped_up,
+                pr.post_only_clamped_dn,
+            )
+        )
     );
 }
 
 fn print_tick_outputs_and_timing(tr: &PipelineTrace, lead_cancel: bool) {
+    let t = theme::current();
     match tr.quote {
         QuoteOutput::Active {
             bid_up,
@@ -208,29 +272,50 @@ fn print_tick_outputs_and_timing(tr: &PipelineTrace, lead_cancel: bool) {
             pair_cost_micro,
             gross_margin_bps,
         } => println!(
-            "  (d) Quote Output     : bid_up=${} bid_dn=${} pair_cost=${} margin={}bps defensive_cancel={}",
-            opt_micro(bid_up),
-            opt_micro(bid_dn),
-            opt_micro(pair_cost_micro),
-            gross_margin_bps.map_or_else(|| "none".to_string(), |b| b.to_string()),
-            tr.flags.defensive_cancel || lead_cancel,
+            "{}",
+            t.kv(
+                "Quote Output:",
+                &format!(
+                    "{} bid_up=${} bid_dn=${} pair_cost=${} margin={}bps defensive_cancel={}",
+                    t.bold_green("ACTIVE"),
+                    opt_micro(bid_up),
+                    opt_micro(bid_dn),
+                    opt_micro(pair_cost_micro),
+                    gross_margin_bps.map_or_else(|| "none".to_string(), |b| b.to_string()),
+                    tr.flags.defensive_cancel || lead_cancel,
+                )
+            )
         ),
         QuoteOutput::Suppressed(reason) => println!(
-            "  (d) Quote Output     : SUPPRESSED({reason:?}) defensive_cancel={}",
-            tr.flags.defensive_cancel || lead_cancel
+            "{}",
+            t.kv(
+                "Quote Output:",
+                &format!(
+                    "{} {:?} defensive_cancel={}",
+                    t.badge(Badge::Suppr),
+                    reason,
+                    tr.flags.defensive_cancel || lead_cancel
+                )
+            )
         ),
     }
     let tm = tr.timings;
     println!(
-        "  (e) Latency (ns)     : s1={} s2={} s3={} s4={} s5={} s6={} | total={}ns ({:.3}us)",
-        tm.s1_ns,
-        tm.s2_ns,
-        tm.s3_ns,
-        tm.s4_ns,
-        tm.s5_ns,
-        tm.s6_ns,
-        tr.total_compute_ns,
-        tr.total_compute_ns as f64 / 1000.0
+        "{}",
+        t.kv(
+            "Latency (ns):",
+            &format!(
+                "s1={} s2={} s3={} s4={} s5={} s6={} | total={}ns ({:.3}us)",
+                tm.s1_ns,
+                tm.s2_ns,
+                tm.s3_ns,
+                tm.s4_ns,
+                tm.s5_ns,
+                tm.s6_ns,
+                tr.total_compute_ns,
+                tr.total_compute_ns as f64 / 1000.0
+            )
+        )
     );
 }
 
@@ -270,29 +355,46 @@ fn print_summary_stdout(
     summary: LatencySummary,
     jsonl_path: &Path,
 ) {
+    let t = theme::current();
     println!();
-    println!("=== PHASE 2 TRACE SUMMARY ===");
+    println!("{}", t.banner("PHASE 2 TRACE SUMMARY", None));
     println!(
-        "  Ticks                : evaluated={} warmup={} suppressed={} kappa_fb={} def_cancel={}",
-        stats.evaluated_ticks,
-        stats.warmup_ticks,
-        stats.suppressed_ticks,
-        stats.kappa_fallbacks,
-        stats.defensive_cancels
+        "{}",
+        t.kv(
+            "Ticks:",
+            &format!(
+                "evaluated={} warmup={} suppressed={} kappa_fb={} def_cancel={}",
+                stats.evaluated_ticks,
+                stats.warmup_ticks,
+                stats.suppressed_ticks,
+                stats.kappa_fallbacks,
+                stats.defensive_cancels
+            )
+        )
     );
     println!(
-        "  HDR Compute Latency  : count={} min={}ns P50={:.3}us P95={:.3}us P99={:.3}us max={:.3}us",
-        summary.count,
-        summary.min_ns,
-        summary.p50_ns as f64 / 1000.0,
-        summary.p95_ns as f64 / 1000.0,
-        summary.p99_ns as f64 / 1000.0,
-        summary.max_ns as f64 / 1000.0
+        "{}",
+        t.kv(
+            "HDR Compute Latency:",
+            &format!(
+                "count={} min={}ns P50={:.3}us P95={:.3}us P99={:.3}us max={:.3}us",
+                summary.count,
+                summary.min_ns,
+                summary.p50_ns as f64 / 1000.0,
+                summary.p95_ns as f64 / 1000.0,
+                summary.p99_ns as f64 / 1000.0,
+                summary.max_ns as f64 / 1000.0
+            )
+        )
     );
     println!(
-        "  Strike Source        : {strike_source} | JSONL={}",
-        jsonl_path.display()
+        "{}",
+        t.kv(
+            "Strike / JSONL:",
+            &format!("{strike_source} | {}", jsonl_path.display())
+        )
     );
+    println!("{}", t.divider());
 }
 
 fn opt_micro(val: Option<MicroUsdc>) -> String {

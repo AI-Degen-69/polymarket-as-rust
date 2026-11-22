@@ -50,5 +50,5 @@ sha2 = "0.10"
 thiserror = "2.0"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "signal"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
-windows-sys = { version = "0.59", features = ["Win32_Media", "Win32_System_Performance"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Console", "Win32_System_Performance"] }
 wiremock = "0.6"

@@ -162,7 +162,8 @@ async fn run_health(
     }
     report.require_healthy()?;
     println!(
-        "GATE: PASS  /health=200 from egress {}",
+        "  {} GATE: /health=200 from egress {}",
+        crate::theme::current().badge(crate::theme::Badge::Pass),
         report.egress_ip.as_deref().unwrap_or("<unknown>")
     );
     Ok(())
@@ -247,7 +248,8 @@ async fn run_validate(
     write_sandbox_event(&mut jsonl, "sandbox_validation_order", &result)?;
     jsonl.close()?;
     println!(
-        "VALIDATION: order {} placed (post-only), read-back={}, cancel/reconcile={}",
+        "  {} VALIDATION: order {} placed (post-only), read-back={}, cancel/reconcile={}",
+        crate::theme::current().badge(crate::theme::Badge::Pass),
         result.placement.order_id,
         if result.readback.is_some() {
             "yes"
@@ -407,23 +409,27 @@ async fn run_feeds(
             "blocked: NEX_API_KEY / NEX_API_SECRET / NEX_API_PASSPHRASE not configured".to_string();
     }
 
-    println!("(e) LIVE FEEDS");
+    let t = crate::theme::current();
+    println!("{}", t.section("(e) LIVE FEEDS"));
     println!(
-        "    Market path:            {}",
-        profile.market_ws_url(ws_version)
+        "{}",
+        t.kv("Market Path:", &profile.market_ws_url(ws_version))
     );
+    println!("{}", t.kv("User Path:", &profile.user_ws_url(ws_version)));
+    println!("{}", t.kv("User Feed:", &user_status));
     println!(
-        "    User path:              {}",
-        profile.user_ws_url(ws_version)
-    );
-    println!("    User feed:              {user_status}");
-    println!(
-        "    Socket budget (subs-v2): local {:?} shared_nat={} caps market={} user_ip={} user_key={}",
-        budget.usage(),
-        profile.shared_nat_sockets,
-        core_types::NEX_V2_MARKET_CAP_PER_IP,
-        core_types::NEX_V2_USER_CAP_PER_IP,
-        core_types::NEX_V2_USER_CAP_PER_KEY
+        "{}",
+        t.kv(
+            "Socket Budget:",
+            &format!(
+                "local {:?} shared_nat={} caps market={} user_ip={} user_key={}",
+                budget.usage(),
+                profile.shared_nat_sockets,
+                core_types::NEX_V2_MARKET_CAP_PER_IP,
+                core_types::NEX_V2_USER_CAP_PER_IP,
+                core_types::NEX_V2_USER_CAP_PER_KEY
+            )
+        )
     );
 
     let mut state = FeedSessionState::new();
@@ -442,7 +448,10 @@ async fn run_feeds(
             && started.elapsed() >= Duration::from_secs(after)
         {
             reconnect_sent = true;
-            println!("    [probe] forcing a real socket reconnect to exercise snapshot rebuild");
+            println!(
+                "    {} forcing a real socket reconnect to exercise snapshot rebuild",
+                t.badge(crate::theme::Badge::Info)
+            );
             let _ = cmd_tx.send(ClobWsCommand::ForceReconnect).await;
         }
 
@@ -453,31 +462,44 @@ async fn run_feeds(
                     state.snapshot_seen = false;
                     state.reset_books();
                     println!(
-                        "    [health] market session {} connected (snapshot required)",
+                        "    {} market session {} connected (snapshot required)",
+                        t.badge(crate::theme::Badge::Info),
                         state.connected_sessions
                     );
                 }
                 FeedHealthEvent::Ready { .. } => {
                     state.ready_events = state.ready_events.saturating_add(1);
-                    println!("    [health] market READY after snapshot/REST resync");
+                    println!(
+                        "    {} market READY after snapshot/REST resync",
+                        t.badge(crate::theme::Badge::Ready)
+                    );
                 }
                 FeedHealthEvent::ResyncingRest { .. } => {
                     state.snapshot_seen = false;
                     state.reset_books();
-                    println!("    [health] market reconnecting: REST snapshot resync");
+                    println!(
+                        "    {} market reconnecting: REST snapshot resync",
+                        t.badge(crate::theme::Badge::Warn)
+                    );
                 }
                 FeedHealthEvent::Disconnected { reason, .. } => {
                     state.snapshot_seen = false;
                     state.reset_books();
-                    println!("    [health] market disconnected: {reason}");
+                    println!(
+                        "    {} market disconnected: {reason}",
+                        t.badge(crate::theme::Badge::Fail)
+                    );
                 }
                 FeedHealthEvent::StaleTimeout { silent_ms, .. } => {
                     state.stale_events = state.stale_events.saturating_add(1);
                     state.snapshot_seen = false;
                     state.reset_books();
-                    println!("    [health] STALE FEED ({silent_ms}ms silent): quoting blocked");
+                    println!(
+                        "    {} STALE FEED ({silent_ms}ms silent): quoting blocked",
+                        t.badge(crate::theme::Badge::Fail)
+                    );
                 }
-                other => println!("    [health] {other:?}"),
+                other => println!("    {} {other:?}", t.badge(crate::theme::Badge::Info)),
             }
             write_sandbox_event(&mut jsonl, "sandbox_feed_health", &health)?;
         }
@@ -505,7 +527,8 @@ async fn run_feeds(
                         exch_ts_ms,
                         ..
                     } => println!(
-                        "    [market] snapshot {:?} bids={} asks={} exch_ms={}",
+                        "    {} snapshot {:?} bids={} asks={} exch_ms={}",
+                        t.cyan("[market]"),
                         outcome,
                         book.bid_len(),
                         book.ask_len(),
@@ -516,14 +539,26 @@ async fn run_feeds(
                         price,
                         size,
                         ..
-                    } => println!("    [market] delta {:?} {} x {}", outcome, price.0, size.0),
+                    } => println!(
+                        "    {} delta {:?} {} x {}",
+                        t.cyan("[market]"),
+                        outcome,
+                        price.0,
+                        size.0
+                    ),
                     PolyMarketEvent::LastTrade {
                         outcome,
                         price,
                         size,
                         ..
-                    } => println!("    [market] trade {:?} {} x {}", outcome, price.0, size.0),
-                    _ => println!("    [market] {event:?}"),
+                    } => println!(
+                        "    {} trade {:?} {} x {}",
+                        t.cyan("[market]"),
+                        outcome,
+                        price.0,
+                        size.0
+                    ),
+                    _ => println!("    {} {event:?}", t.cyan("[market]")),
                 }
                 printed_market_events += 1;
             }
@@ -542,7 +577,7 @@ async fn run_feeds(
                 snap.anomalies
             );
             if state_key != last_user_state {
-                println!("    [user] {state_key}");
+                println!("    {} {state_key}", t.cyan("[user]"));
                 last_user_state = state_key;
                 write_sandbox_event(&mut jsonl, "sandbox_user_snapshot", &*snap)?;
             }
@@ -554,8 +589,10 @@ async fn run_feeds(
 
         let readiness = state.readiness(execution::NEX_STALE_AFTER_MS);
         if last_readiness != Some(readiness.quoting_allowed()) {
+            let gate_badge = t.pass_fail(readiness.quoting_allowed());
             println!(
-                "    [gate] quoting_allowed={} (snapshot={} liquidity={} fresh={} user_ready={})",
+                "    {} quoting_allowed={} (snapshot={} liquidity={} fresh={} user_ready={})",
+                gate_badge,
                 readiness.quoting_allowed(),
                 readiness.snapshot_seen,
                 readiness.book_has_liquidity,
@@ -576,15 +613,24 @@ async fn run_feeds(
     let market_stats = match tokio::time::timeout(Duration::from_secs(5), market_task).await {
         Ok(Ok(Ok(stats))) => Some(stats),
         Ok(Ok(Err(err))) => {
-            println!("    market actor error: {err}");
+            println!(
+                "    {} market actor error: {err}",
+                t.badge(crate::theme::Badge::Fail)
+            );
             None
         }
         Ok(Err(join_err)) => {
-            println!("    market actor join error: {join_err}");
+            println!(
+                "    {} market actor join error: {join_err}",
+                t.badge(crate::theme::Badge::Fail)
+            );
             None
         }
         Err(_) => {
-            println!("    market actor did not stop within 5s");
+            println!(
+                "    {} market actor did not stop within 5s",
+                t.badge(crate::theme::Badge::Warn)
+            );
             None
         }
     };
@@ -634,25 +680,37 @@ async fn run_feeds(
         user_feed: &user_status,
         user_reconciled: state.user_reconcile_seen,
     };
-    println!("--------------------------------------------------------------------------------");
-    println!("(f) FEED SUMMARY");
+    println!("{}", t.section("(f) FEED SUMMARY"));
     println!(
-        "    frames={} pongs={} sessions={} snapshots={} ready={} reconnects={} stale={}",
-        summary.frames_received,
-        summary.pongs_received,
-        summary.connected_sessions,
-        summary.snapshots_seen,
-        summary.ready_events,
-        summary.reconnects,
-        summary.stale_timeouts
+        "{}",
+        t.kv(
+            "Counters:",
+            &format!(
+                "frames={} pongs={} sessions={} snapshots={} ready={} reconnects={} stale={}",
+                summary.frames_received,
+                summary.pongs_received,
+                summary.connected_sessions,
+                summary.snapshots_seen,
+                summary.ready_events,
+                summary.reconnects,
+                summary.stale_timeouts
+            )
+        )
     );
     println!(
-        "    snapshot_rebuild_ok={} book_has_liquidity={} quoting_allowed={} user_reconciled={}",
-        summary.snapshot_rebuild_ok,
-        summary.book_has_liquidity,
-        summary.quoting_allowed,
-        summary.user_reconciled
+        "{}",
+        t.kv(
+            "Readiness Gates:",
+            &format!(
+                "snapshot_rebuild_ok={} book_has_liquidity={} quoting_allowed={} user_reconciled={}",
+                summary.snapshot_rebuild_ok,
+                summary.book_has_liquidity,
+                summary.quoting_allowed,
+                summary.user_reconciled
+            )
+        )
     );
+    println!("{}", t.divider());
     write_sandbox_event(&mut jsonl, "sandbox_feeds_summary", &summary)?;
     jsonl.close()?;
     Ok(())

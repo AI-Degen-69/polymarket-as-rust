@@ -9,6 +9,8 @@ use core_types::{
 };
 use serde::Serialize;
 
+use crate::theme::{self, Badge};
+
 #[derive(Serialize)]
 struct DoctorEnvRecord<'a> {
     execution_mode: &'a str,
@@ -61,14 +63,20 @@ struct ClockSelfTest {
 }
 
 pub fn run(jsonl_path: &Path) -> Result<(), Box<dyn Error>> {
+    let t = theme::current();
     let clock = MonotonicClock::start();
     let timer_guard = HighResTimerGuard::acquire_1ms()?;
     let cfg = EngineConfig::from_env()?;
     let mut jsonl = JsonlWriter::create(jsonl_path)?;
 
-    println!("==================================================================");
-    println!(" POLY-AS PHASE 0 DOCTOR :: ENVIRONMENT, CLOCK & FIXED-POINT AUDIT");
-    println!("==================================================================");
+    println!();
+    println!(
+        "{}",
+        t.banner(
+            "POLY-AS PHASE 0 DOCTOR :: ENVIRONMENT, CLOCK & FIXED-POINT AUDIT",
+            None
+        )
+    );
 
     print_and_log_env(&clock, &timer_guard, &cfg, &mut jsonl)?;
     print_input_vectors();
@@ -79,10 +87,17 @@ pub fn run(jsonl_path: &Path) -> Result<(), Box<dyn Error>> {
 
     jsonl.close()?;
     println!(
-        "  JSONL Telemetry      : written, flushed, and closed cleanly at {}",
-        jsonl_path.display()
+        "{}",
+        t.kv(
+            "JSONL Telemetry:",
+            &format!(
+                "{} written, flushed, and closed cleanly at {}",
+                t.badge(Badge::Pass),
+                jsonl_path.display()
+            )
+        )
     );
-    println!("==================================================================");
+    println!("{}", t.divider());
     Ok(())
 }
 
@@ -92,61 +107,106 @@ fn print_and_log_env(
     cfg: &EngineConfig,
     jsonl: &mut JsonlWriter,
 ) -> Result<(), Box<dyn Error>> {
+    let t = theme::current();
     let (qpc_hz, qpc_res_ns) = MonotonicClock::qpc_resolution()?;
     let now_ms = MonotonicClock::unix_now_ms()?;
     let mono_ns = clock.now_ns()?;
     let self_test = run_clock_self_test(now_ms, cfg.clock_drift_max_ms)?;
 
-    println!("\n(a) DATA SOURCE, CONFIG & WINDOWS CLOCK STATUS");
+    println!();
     println!(
-        "  OS Timer Guard       : active={} period={}ms (Win32 timeBeginPeriod)",
-        timer_guard.is_active(),
-        timer_guard.period_ms()
+        "{}",
+        t.section("(a) DATA SOURCE, CONFIG & WINDOWS CLOCK STATUS")
     );
     println!(
-        "  QPC Clock            : freq={} Hz | resolution={:.2} ns/tick",
-        qpc_hz, qpc_res_ns
+        "{}",
+        t.kv(
+            "OS Timer Guard:",
+            &format!(
+                "active={} period={}ms (Win32 timeBeginPeriod)",
+                timer_guard.is_active(),
+                timer_guard.period_ms()
+            )
+        )
     );
     println!(
-        "  Clock Self-Test      : unsynced_latched={} | loopback_offset={}ms tripped={} | synthetic(+{}ms)_tripped={} (max={}ms)",
-        self_test.unsynced_trip,
-        self_test.loopback_offset,
-        self_test.loopback_trip,
-        self_test.synthetic_drift,
-        self_test.overdrift_trip,
-        cfg.clock_drift_max_ms
+        "{}",
+        t.kv(
+            "QPC Clock:",
+            &format!("freq={qpc_hz} Hz | resolution={qpc_res_ns:.2} ns/tick")
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Clock Self-Test:",
+            &format!(
+                "unsynced_latched={} | loopback_offset={}ms tripped={} | synthetic(+{}ms)_tripped={} (max={}ms)",
+                self_test.unsynced_trip,
+                self_test.loopback_offset,
+                self_test.loopback_trip,
+                self_test.synthetic_drift,
+                self_test.overdrift_trip,
+                cfg.clock_drift_max_ms
+            )
+        )
     );
     print_config_summary(cfg);
     write_doctor_env_event(now_ms, mono_ns, qpc_hz, qpc_res_ns, timer_guard, cfg, jsonl)
 }
 
 fn print_config_summary(cfg: &EngineConfig) {
+    let t = theme::current();
     println!(
-        "  Execution Mode       : {:?} (dry_run={})",
-        cfg.execution_mode, cfg.dry_run
+        "{}",
+        t.kv(
+            "Execution Mode:",
+            &format!("{:?} (dry_run={})", cfg.execution_mode, cfg.dry_run)
+        )
     );
     println!(
-        "  Wallet Signature     : {:?} (signatureType={})",
-        cfg.wallet_mode,
-        cfg.wallet_mode.as_u8()
+        "{}",
+        t.kv(
+            "Wallet Signature:",
+            &format!(
+                "{:?} (signatureType={})",
+                cfg.wallet_mode,
+                cfg.wallet_mode.as_u8()
+            )
+        )
     );
     println!(
-        "  Locked Math/Risk     : gamma={:.2} | V_max=${:.2} | base_size={} shares | min_spread=${:.2} | max_pair_bid=${:.2}",
-        cfg.gamma,
-        cfg.max_notional_per_leg_micro.to_usd_f64(),
-        cfg.base_order_size_shares.to_shares_f64(),
-        cfg.min_combined_spread_micro.to_usd_f64(),
-        cfg.max_combined_bid_micro.to_usd_f64(),
+        "{}",
+        t.kv(
+            "Locked Math/Risk:",
+            &format!(
+                "gamma={:.2} | V_max=${:.2} | base_size={} shares | min_spread=${:.2} | max_pair_bid=${:.2}",
+                cfg.gamma,
+                cfg.max_notional_per_leg_micro.to_usd_f64(),
+                cfg.base_order_size_shares.to_shares_f64(),
+                cfg.min_combined_spread_micro.to_usd_f64(),
+                cfg.max_combined_bid_micro.to_usd_f64(),
+            )
+        )
     );
     println!(
-        "  Pipeline Toggles     : variance={:?} | kappa={:?} | sg={:?} | include_var={} | polybolt={}",
-        cfg.variance_mode,
-        cfg.kappa_mode,
-        cfg.sg_mode,
-        cfg.include_variance_spread,
-        cfg.polybolt_enabled,
+        "{}",
+        t.kv(
+            "Pipeline Toggles:",
+            &format!(
+                "variance={:?} | kappa={:?} | sg={:?} | include_var={} | polybolt={}",
+                cfg.variance_mode,
+                cfg.kappa_mode,
+                cfg.sg_mode,
+                cfg.include_variance_spread,
+                cfg.polybolt_enabled,
+            )
+        )
     );
-    println!("  Redacted Credentials : {:?}", cfg.credentials);
+    println!(
+        "{}",
+        t.kv("Redacted Credentials:", &format!("{:?}", cfg.credentials))
+    );
 }
 
 fn write_doctor_env_event(
@@ -219,19 +279,44 @@ fn run_clock_self_test(now_ms: u64, max_drift_ms: i64) -> Result<ClockSelfTest, 
 }
 
 fn print_input_vectors() {
-    println!("\n(b) EXACT INPUT VECTORS");
-    println!("  Wire Sample 1        : BUY/SELL 10.00 shares @ $0.52 (tick=0.01)");
-    println!("  Wire Sample 2        : BUY 10.00 shares @ $0.29 (IEEE-754 float trap check)");
+    let t = theme::current();
+    println!();
+    println!("{}", t.section("(b) EXACT INPUT VECTORS"));
     println!(
-        "  Fee Schedule Curves  : 100 shares @ feeRate=0.05 (current) and feeRate=0.07 (legacy)"
+        "{}",
+        t.kv(
+            "Wire Sample 1:",
+            "BUY/SELL 10.00 shares @ $0.52 (tick=0.01)"
+        )
     );
-    println!("  Tick & Diff Inputs   : floor_to_tick(0.4999, 0.01) | abs_diff($0.52, $0.51)");
+    println!(
+        "{}",
+        t.kv(
+            "Wire Sample 2:",
+            "BUY 10.00 shares @ $0.29 (IEEE-754 float trap check)"
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Fee Schedule Curves:",
+            "100 shares @ feeRate=0.05 (current) and feeRate=0.07 (legacy)"
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Tick & Diff Inputs:",
+            "floor_to_tick(0.4999, 0.01) | abs_diff($0.52, $0.51)"
+        )
+    );
 }
 
 fn print_and_log_wire_checks(
     clock: &MonotonicClock,
     jsonl: &mut JsonlWriter,
 ) -> Result<WireSamples, Box<dyn Error>> {
+    let t = theme::current();
     let p_52 = MicroUsdc::from_usd_str("0.52")?;
     let p_29 = MicroUsdc::from_usd_str("0.29")?;
     let s_10 = SharesMicro::from_shares_str("10.00")?;
@@ -241,9 +326,14 @@ fn print_and_log_wire_checks(
         buy_29: encode_buy_amounts(p_29, s_10, TickPrecision::Cent)?,
     };
 
-    println!("\n(c) STEP-BY-STEP WIRE ENCODING & DYNAMIC FEE CURVE");
+    println!();
     println!(
-        "  [1] parse(\"0.52\")={} micro | parse(\"10.00\")={} micro -> notional=({}*{} )/1e6 = {}",
+        "{}",
+        t.section("(c) STEP-BY-STEP WIRE ENCODING & DYNAMIC FEE CURVE")
+    );
+    println!(
+        "  {} parse(\"0.52\")={} micro | parse(\"10.00\")={} micro -> notional=({}*{} )/1e6 = {}",
+        t.muted("[1]"),
         p_52.as_u64(),
         s_10.as_u64(),
         p_52.as_u64(),
@@ -251,15 +341,20 @@ fn print_and_log_wire_checks(
         wire.buy_52.maker_amount
     );
     println!(
-        "  [2] BUY  10 @ $0.52  -> makerAmount=\"{}\" (USD)    | takerAmount=\"{}\" (shares)",
-        wire.buy_52.maker_amount, wire.buy_52.taker_amount
+        "  {} BUY  10 @ $0.52  -> makerAmount=\"{}\" (USD)    | takerAmount=\"{}\" (shares)",
+        t.muted("[2]"),
+        wire.buy_52.maker_amount,
+        wire.buy_52.taker_amount
     );
     println!(
-        "  [3] SELL 10 @ $0.52  -> makerAmount=\"{}\" (shares) | takerAmount=\"{}\" (USD)",
-        wire.sell_52.maker_amount, wire.sell_52.taker_amount
+        "  {} SELL 10 @ $0.52  -> makerAmount=\"{}\" (shares) | takerAmount=\"{}\" (USD)",
+        t.muted("[3]"),
+        wire.sell_52.maker_amount,
+        wire.sell_52.taker_amount
     );
     println!(
-        "  [4] BUY  10 @ $0.29  -> makerAmount=\"{}\" (exact; avoids 2899999 float drift)",
+        "  {} BUY  10 @ $0.29  -> makerAmount=\"{}\" (exact; avoids 2899999 float drift)",
+        t.muted("[4]"),
         wire.buy_29.maker_amount
     );
     log_wire_events(clock, &wire, jsonl)?;
@@ -377,28 +472,66 @@ fn verify_and_print_decisions(wire: &WireSamples) -> Result<(), Box<dyn Error>> 
         diff_52_51,
     )?;
 
-    println!("\n(d) EXACT OUTPUTS & INVARIANT DECISIONS");
+    let t = theme::current();
+    println!();
+    println!("{}", t.section("(d) EXACT OUTPUTS & INVARIANT DECISIONS"));
     println!(
-        "  BUY 10 @ $0.52       : makerAmount=\"{}\" takerAmount=\"{}\" [OK]",
-        wire.buy_52.maker_amount, wire.buy_52.taker_amount
+        "{}",
+        t.kv(
+            "BUY 10 @ $0.52:",
+            &format!(
+                "makerAmount=\"{}\" takerAmount=\"{}\" {}",
+                wire.buy_52.maker_amount,
+                wire.buy_52.taker_amount,
+                t.badge(Badge::Pass)
+            )
+        )
     );
     println!(
-        "  SELL 10 @ $0.52      : makerAmount=\"{}\" takerAmount=\"{}\" [OK]",
-        wire.sell_52.maker_amount, wire.sell_52.taker_amount
+        "{}",
+        t.kv(
+            "SELL 10 @ $0.52:",
+            &format!(
+                "makerAmount=\"{}\" takerAmount=\"{}\" {}",
+                wire.sell_52.maker_amount,
+                wire.sell_52.taker_amount,
+                t.badge(Badge::Pass)
+            )
+        )
     );
     println!(
-        "  BUY 10 @ $0.29       : makerAmount=\"{}\" takerAmount=\"{}\" [OK]",
-        wire.buy_29.maker_amount, wire.buy_29.taker_amount
+        "{}",
+        t.kv(
+            "BUY 10 @ $0.29:",
+            &format!(
+                "makerAmount=\"{}\" takerAmount=\"{}\" {}",
+                wire.buy_29.maker_amount,
+                wire.buy_29.taker_amount,
+                t.badge(Badge::Pass)
+            )
+        )
     );
     println!(
-        "  Fee 100 @ $0.50      : fee(0.05)=${} | fee(0.07)=${} | maker=${} [OK]",
-        fee_05_50, fee_07_50, fee_maker_50
+        "{}",
+        t.kv(
+            "Fee 100 @ $0.50:",
+            &format!(
+                "fee(0.05)=${fee_05_50} | fee(0.07)=${fee_07_50} | maker=${fee_maker_50} {}",
+                t.badge(Badge::Pass)
+            )
+        )
     );
     println!(
-        "  Tick & Diff Guards   : floor(0.4999)=${} ({}) | abs_diff($0.52,$0.51)={} >= 10000 [OK]",
-        floored_4999,
-        floored_4999.as_u64(),
-        diff_52_51.as_u64()
+        "{}",
+        t.kv(
+            "Tick & Diff Guards:",
+            &format!(
+                "floor(0.4999)=${floored_4999} ({}) | abs_diff($0.52,$0.51)={} >= 10000 {}",
+                floored_4999.as_u64(),
+                diff_52_51.as_u64(),
+                t.badge(Badge::Pass)
+            )
+        )
     );
     Ok(())
 }
@@ -440,27 +573,44 @@ fn run_latency_benchmark(
     clock: &MonotonicClock,
     jsonl: &mut JsonlWriter,
 ) -> Result<(), Box<dyn Error>> {
-    println!("\n(e) COMPUTE LATENCY BENCHMARK (1,000 FIXED-POINT + FEE + TICK CYCLES)");
+    let t = theme::current();
+    println!();
+    println!(
+        "{}",
+        t.section("(e) COMPUTE LATENCY BENCHMARK (1,000 FIXED-POINT + FEE + TICK CYCLES)")
+    );
     let summary = measure_latency_cycles(clock)?;
     println!(
-        "  Samples              : {} (0ns_clamped={}) | min={} ns ({:.3} us)",
-        summary.count,
-        summary.zero_ns_samples,
-        summary.min_ns,
-        summary.min_ns as f64 / 1_000.0
+        "{}",
+        t.kv(
+            "Samples:",
+            &format!(
+                "{} (0ns_clamped={}) | min={} ns ({:.3} us)",
+                summary.count,
+                summary.zero_ns_samples,
+                summary.min_ns,
+                summary.min_ns as f64 / 1_000.0
+            )
+        )
     );
     println!(
-        "  Percentiles          : P50={} ns ({:.3} us) | P95={} ns ({:.3} us) | P99={} ns ({:.3} us) | P99.9={} ns ({:.3} us) | max={} ns ({:.3} us)",
-        summary.p50_ns,
-        summary.p50_ns as f64 / 1_000.0,
-        summary.p95_ns,
-        summary.p95_ns as f64 / 1_000.0,
-        summary.p99_ns,
-        summary.p99_ns as f64 / 1_000.0,
-        summary.p999_ns,
-        summary.p999_ns as f64 / 1_000.0,
-        summary.max_ns,
-        summary.max_ns as f64 / 1_000.0
+        "{}",
+        t.kv(
+            "Percentiles:",
+            &format!(
+                "P50={} ns ({:.3} us) | P95={} ns ({:.3} us) | P99={} ns ({:.3} us) | P99.9={} ns ({:.3} us) | max={} ns ({:.3} us)",
+                summary.p50_ns,
+                summary.p50_ns as f64 / 1_000.0,
+                summary.p95_ns,
+                summary.p95_ns as f64 / 1_000.0,
+                summary.p99_ns,
+                summary.p99_ns as f64 / 1_000.0,
+                summary.p999_ns,
+                summary.p999_ns as f64 / 1_000.0,
+                summary.max_ns,
+                summary.max_ns as f64 / 1_000.0
+            )
+        )
     );
     jsonl.write_event(
         MonotonicClock::unix_now_ms()?,
