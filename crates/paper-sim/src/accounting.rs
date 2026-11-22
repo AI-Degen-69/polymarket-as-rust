@@ -363,6 +363,18 @@ impl PaperLedger {
         }
     }
 
+    /// Returns the active VWAP acquisition cost of unmerged UP shares (`None` when flat UP).
+    #[must_use]
+    pub fn avg_cost_up(&self) -> Option<MicroUsdc> {
+        self.vwap_up()
+    }
+
+    /// Returns the active VWAP acquisition cost of unmerged DOWN shares (`None` when flat DOWN).
+    #[must_use]
+    pub fn avg_cost_dn(&self) -> Option<MicroUsdc> {
+        self.vwap_dn()
+    }
+
     /// Returns signed net inventory `q = q_UP - q_DOWN`.
     #[must_use]
     pub fn net_inventory(&self) -> SignedSharesMicro {
