@@ -24,14 +24,21 @@ const TIER_BADGE_WIDTH: usize = 4;
 /// Fixed value width keeps `Pricing` / `Risk` / `Total` labels aligned across latency rows.
 const LATENCY_VALUE_WIDTH: usize = 10;
 
-/// Builds the canonical prefix shared by every stream row: `HH:MM:SSZ T-NNNs [EVENT] [PHASE] [TIER] `.
+/// Content of the middle badge column: epoch phase, or any other badge such as `[MAKER]`.
+#[derive(Debug, Clone, Copy)]
+enum MidColumn {
+    Phase(EpochPhase),
+    Badge(Badge),
+}
+
+/// Builds the canonical prefix shared by every stream row: `HH:MM:SSZ T-NNNs [EVENT] [MID] [TIER] `.
 /// Missing badges leave their column blank so positions never shift.
 fn row_prefix(
     t: Theme,
     utc: &str,
     tau_secs: u64,
     event: Option<Badge>,
-    phase: Option<EpochPhase>,
+    mid: Option<MidColumn>,
     tier: Option<RiskTier>,
 ) -> String {
     let event = event.map_or_else(
@@ -41,12 +48,18 @@ fn row_prefix(
             format!("{}{}", t.badge(kind), " ".repeat(pad))
         },
     );
-    let phase = phase.map_or_else(
+    let mid = mid.map_or_else(
         || " ".repeat(PHASE_BADGE_WIDTH),
-        |phase| t.phase_badge(phase),
+        |mid| match mid {
+            MidColumn::Phase(phase) => t.phase_badge(phase),
+            MidColumn::Badge(kind) => {
+                let pad = PHASE_BADGE_WIDTH.saturating_sub(kind.label().chars().count());
+                format!("{}{}", t.badge(kind), " ".repeat(pad))
+            }
+        },
     );
     let tier = tier.map_or_else(|| " ".repeat(TIER_BADGE_WIDTH), |tier| t.tier_badge(tier));
-    format!("{} T-{:03}s {event}{phase} {tier} ", t.muted(utc), tau_secs)
+    format!("{} T-{:03}s {event}{mid} {tier} ", t.muted(utc), tau_secs)
 }
 
 /// Terminal output mode for `poly-as lifecycle`.
@@ -550,7 +563,7 @@ impl LifecycleStreamReporter {
                             &utc,
                             row.tau_secs,
                             Some(Badge::Suppr),
-                            Some(row.phase),
+                            Some(MidColumn::Phase(row.phase)),
                             None
                         ),
                         t.yellow(&detail),
@@ -567,7 +580,7 @@ impl LifecycleStreamReporter {
                             &utc,
                             row.tau_secs,
                             Some(Badge::Resume),
-                            Some(row.phase),
+                            Some(MidColumn::Phase(row.phase)),
                             None
                         ),
                     ));
@@ -596,7 +609,7 @@ impl LifecycleStreamReporter {
                     &utc,
                     row.tau_secs,
                     Some(Badge::Resume),
-                    Some(row.phase),
+                    Some(MidColumn::Phase(row.phase)),
                     Some(row.tier)
                 ),
                 t.muted(&prev),
@@ -613,7 +626,7 @@ impl LifecycleStreamReporter {
                     &utc,
                     row.tau_secs,
                     Some(Badge::Order),
-                    Some(row.phase),
+                    Some(MidColumn::Phase(row.phase)),
                     Some(row.tier)
                 ),
                 up_str,
@@ -688,7 +701,7 @@ impl LifecycleStreamReporter {
                 utc,
                 row.tau_secs,
                 Some(Badge::Heartbeat),
-                Some(row.phase),
+                Some(MidColumn::Phase(row.phase)),
                 Some(row.tier)
             ),
             u_pct,
@@ -705,11 +718,17 @@ impl LifecycleStreamReporter {
 fn format_action_styled(t: Theme, action: &OrderAction) -> String {
     match action {
         OrderAction::Hold => t.muted("Hold"),
-        OrderAction::SubmitNew { price, size, .. } => t.green(&format!(
-            "Submit {}@{}",
-            size.as_u64() / 1_000_000,
-            Theme::fmt_price_compact(Some(*price))
-        )),
+        OrderAction::SubmitNew {
+            outcome,
+            price,
+            size,
+        } => {
+            let leg = match outcome {
+                Outcome::Up => t.bold_green("UP"),
+                Outcome::Down => t.bold_red("DN"),
+            };
+            format!("{} {} @ {}", fmt_shares_3dp(*size), leg, fmt_cents(*price))
+        }
         OrderAction::Cancel { reason, .. } => t.yellow(&format!("Cancel({reason:?})")),
         OrderAction::CancelAndReplace {
             new_price,
@@ -721,6 +740,36 @@ fn format_action_styled(t: Theme, action: &OrderAction) -> String {
             new_size.as_u64() / 1_000_000,
             Theme::fmt_price_compact(Some(*new_price))
         )),
+    }
+}
+
+/// Formats micro-shares with up to 3 decimals, trimming trailing zeros (`5`, `0.01`, `2.5`).
+fn fmt_shares_3dp(shares: SharesMicro) -> String {
+    let raw = shares.as_u64();
+    let whole = raw / 1_000_000;
+    let mut digits = format!("{:06}", raw % 1_000_000);
+    digits.truncate(3);
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        whole.to_string()
+    } else {
+        format!("{whole}.{digits}")
+    }
+}
+
+/// Formats a dollar price as cents (`50c`), keeping up to 2 decimals for sub-cent prices.
+fn fmt_cents(price: MicroUsdc) -> String {
+    let cents = price.0 / 10_000;
+    let mut digits = format!("{:02}", (price.0 % 10_000) / 100);
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        format!("{cents}c")
+    } else {
+        format!("{cents}.{digits}c")
     }
 }
 
@@ -763,28 +812,37 @@ pub(crate) fn print_breaker_trip(status: BreakerStatus) {
     );
 }
 
-pub(crate) fn print_lifecycle_fill(
-    now_ms: u64,
-    tau_secs: u64,
-    phase: Option<EpochPhase>,
-    tier: RiskTier,
-    fill: &SimFill,
-) {
+pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, fill: &SimFill) {
     let t = theme::current();
     let utc = format_utc_hms(now_ms);
     let leg = match fill.outcome {
         Outcome::Up => t.bold_green("UP"),
-        Outcome::Down => t.bold_cyan("DN"),
+        Outcome::Down => t.bold_red("DN"),
+    };
+    let side = match fill.side {
+        OrderSide::Buy => t.bold_green("BUY"),
+        OrderSide::Sell => t.bold_red("SELL"),
+    };
+    let liquidity = if fill.is_maker {
+        Badge::Maker
+    } else {
+        Badge::Taker
     };
     println!(
-        "{}#{} {} {} {} @ {} (maker={})",
-        row_prefix(t, &utc, tau_secs, Some(Badge::Fill), phase, Some(tier)),
+        "{}#{} {} {} {:>9} @ {}",
+        row_prefix(
+            t,
+            &utc,
+            tau_secs,
+            Some(Badge::Fill),
+            Some(MidColumn::Badge(liquidity)),
+            Some(tier)
+        ),
         fill.sim_id,
         leg,
-        fill.side.as_str(),
-        fill.filled_shares,
-        Theme::fmt_price_compact(Some(fill.price)),
-        fill.is_maker
+        side,
+        fmt_shares_3dp(fill.filled_shares),
+        fmt_cents(fill.price),
     );
 }
 
@@ -800,7 +858,14 @@ pub(crate) fn print_lifecycle_merge(
     let utc = format_utc_hms(now_ms);
     println!(
         "{}pairs: {} | pair_cost={} (UP={}, DN={}) -> PnL={} (total={})",
-        row_prefix(t, &utc, tau_secs, Some(Badge::Merge), phase, Some(tier)),
+        row_prefix(
+            t,
+            &utc,
+            tau_secs,
+            Some(Badge::Merge),
+            phase.map(MidColumn::Phase),
+            Some(tier),
+        ),
         merge.merged_pairs,
         Theme::fmt_price_compact(Some(merge.pair_cost)),
         Theme::fmt_price_compact(Some(merge.avg_cost_up)),
@@ -1346,6 +1411,17 @@ mod tests {
     }
 
     #[test]
+    fn stream_helpers_format_sizes_and_cents() {
+        assert_eq!(fmt_shares_3dp(SharesMicro::from_raw(5_000_000)), "5");
+        assert_eq!(fmt_shares_3dp(SharesMicro::from_raw(10_000)), "0.01");
+        assert_eq!(fmt_shares_3dp(SharesMicro::from_raw(2_500_000)), "2.5");
+        assert_eq!(fmt_shares_3dp(SharesMicro::from_raw(1_234_560)), "1.234");
+        assert_eq!(fmt_cents(MicroUsdc(500_000)), "50c");
+        assert_eq!(fmt_cents(MicroUsdc(550_000)), "55c");
+        assert_eq!(fmt_cents(MicroUsdc(555_000)), "55.5c");
+    }
+
+    #[test]
     fn stream_rows_share_canonical_badge_columns() {
         let t = Theme::plain();
         let order = row_prefix(
@@ -1353,7 +1429,7 @@ mod tests {
             "00:00:00Z",
             300,
             Some(Badge::Order),
-            Some(EpochPhase::ActiveQuoting),
+            Some(MidColumn::Phase(EpochPhase::ActiveQuoting)),
             Some(RiskTier::Tier1Normal),
         );
         let latency = row_prefix(t, "00:00:00Z", 300, Some(Badge::Latency), None, None);
@@ -1362,7 +1438,7 @@ mod tests {
             "00:00:00Z",
             300,
             Some(Badge::Heartbeat),
-            Some(EpochPhase::ActiveQuoting),
+            Some(MidColumn::Phase(EpochPhase::ActiveQuoting)),
             Some(RiskTier::Tier1Normal),
         );
         assert_eq!(order.chars().count(), latency.chars().count());
@@ -1475,7 +1551,7 @@ mod tests {
         let act_lines = rep.format_step(&sample_row(base_ms + 600, 299, &submit, &cancel));
         assert_eq!(act_lines.len(), 1);
         assert!(act_lines[0].contains("[ORDER]"));
-        assert!(act_lines[0].contains("Submit 20@.50"));
+        assert!(act_lines[0].contains("20 UP @ 50c"));
         assert!(act_lines[0].contains("Cancel(RiskSuppressed)"));
 
         // Latency breach emits immediately.

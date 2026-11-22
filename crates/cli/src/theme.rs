@@ -48,6 +48,8 @@ pub(crate) enum Badge {
     Tier,
     Info,
     Heartbeat,
+    Maker,
+    Taker,
 }
 
 impl Badge {
@@ -74,6 +76,8 @@ impl Badge {
             Self::Tier => "[TIER]",
             Self::Info => "[INFO]",
             Self::Heartbeat => "♥ [HB]",
+            Self::Maker => "[MAKER]",
+            Self::Taker => "[TAKER]",
         }
     }
 }
@@ -310,6 +314,8 @@ impl Theme {
             Badge::Tier => self.bold_yellow("[TIER]"),
             Badge::Info => self.cyan("[INFO]"),
             Badge::Heartbeat => self.bold_red("♥ [HB]"),
+            Badge::Maker => self.bold_green("[MAKER]"),
+            Badge::Taker => self.bold_yellow("[TAKER]"),
         }
     }
 
@@ -418,8 +424,8 @@ impl Theme {
         self.fmt_latency_us_width(ns, budget_us, 0)
     }
 
-    /// Pads a latency measurement to a fixed-width cell, outside the ANSI style. Left-aligned,
-    /// so the detail starts on the same column as other rows.
+    /// Pads a latency measurement to a fixed-width cell, outside the ANSI style. Right-aligned,
+    /// so each value sits one space before its label while the labels stay aligned.
     pub(crate) fn fmt_latency_us_width(self, ns: u64, budget_us: u64, width: usize) -> String {
         let raw = latency_us_raw(ns);
         let styled = if ns > budget_us.saturating_mul(1_000) {
@@ -428,7 +434,7 @@ impl Theme {
             self.green(&raw)
         };
         let pad = " ".repeat(width.saturating_sub(raw.chars().count()));
-        format!("{styled}{pad}")
+        format!("{pad}{styled}")
     }
 
     /// Formats a pass/fail boolean status badge.
