@@ -83,6 +83,77 @@ enum CliExecMode {
     CanaryLive,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliQueueDecay {
+    Conservative,
+    Optimistic,
+}
+
+impl From<CliQueueDecay> for paper_sim::QueueDecayPolicy {
+    fn from(policy: CliQueueDecay) -> Self {
+        match policy {
+            CliQueueDecay::Conservative => Self::Conservative,
+            CliQueueDecay::Optimistic => Self::Optimistic,
+        }
+    }
+}
+
+/// Optional Stations 4–6 math competitiveness overrides for live/replay A/B testing.
+#[derive(Debug, Clone, Copy, Default, clap::Args)]
+pub(crate) struct MathOverrides {
+    /// Override CARA risk aversion parameter `gamma` (`0.15` default).
+    #[arg(long)]
+    pub(crate) gamma: Option<f64>,
+    /// Override maximum combined UP+DOWN bid in micro-USDC (`<= 990000`, `980000` default).
+    #[arg(long)]
+    pub(crate) max_combined_bid_micro: Option<u64>,
+    /// Override whether Station 4 adds `gamma * V_rem` variance spread (`true` default).
+    #[arg(long)]
+    pub(crate) include_variance_spread: Option<bool>,
+    /// Override minimum spread floor in ticks (`2` default; `1` allows 1-cent BBO joining).
+    #[arg(long)]
+    pub(crate) min_spread_ticks: Option<u32>,
+    /// Override whether Station 4 enforces taker-fee spread floor (`true` default; auto-disabled at 1 tick unless set).
+    #[arg(long)]
+    pub(crate) fee_spread_floor: Option<bool>,
+}
+
+impl MathOverrides {
+    pub(crate) fn apply_to(
+        self,
+        cfg: &mut core_types::EngineConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(gamma) = self.gamma {
+            cfg.gamma = gamma;
+        }
+        if let Some(include_var) = self.include_variance_spread {
+            cfg.include_variance_spread = include_var;
+        }
+        if let Some(ticks) = self.min_spread_ticks {
+            if ticks == 0 {
+                return Err("`--min-spread-ticks` must be >= 1".into());
+            }
+            cfg.min_spread_ticks = ticks;
+            cfg.min_combined_spread_micro =
+                core_types::MicroUsdc(u64::from(ticks).saturating_mul(core_types::ONE_CENT_MICRO));
+            if ticks == 1 && self.fee_spread_floor.is_none() {
+                cfg.enforce_fee_floor = false;
+            }
+        }
+        if let Some(fee_floor) = self.fee_spread_floor {
+            cfg.enforce_fee_floor = fee_floor;
+        }
+        if let Some(max_bid) = self.max_combined_bid_micro {
+            if max_bid == 0 || max_bid > 990_000 {
+                return Err("`--max-combined-bid-micro` must be in 1..=990000".into());
+            }
+            cfg.max_combined_bid_micro = core_types::MicroUsdc(max_bid);
+        }
+        cfg.validate()?;
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliWsVersion {
     #[value(name = "original")]
@@ -215,6 +286,8 @@ enum Commands {
         /// Simulated net UP-DOWN share inventory `q` (integer shares).
         #[arg(long, default_value_t = 0)]
         inventory: i64,
+        #[command(flatten)]
+        math: MathOverrides,
         /// Output path for structured JSONL telemetry log.
         #[arg(long, default_value = "logs/phase2-trace.jsonl")]
         jsonl: PathBuf,
@@ -240,6 +313,11 @@ enum Commands {
         /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
         #[arg(long, default_value_t = 40)]
         latency_ms: u64,
+        /// FIFO queue decay policy (`conservative` default or `optimistic`).
+        #[arg(long, value_enum, default_value_t = CliQueueDecay::Conservative)]
+        queue_decay: CliQueueDecay,
+        #[command(flatten)]
+        math: MathOverrides,
         /// Output path for structured JSONL telemetry log.
         #[arg(long, default_value = "logs/phase3-paper.jsonl")]
         jsonl: PathBuf,
@@ -264,6 +342,11 @@ enum Commands {
         /// Base order size in whole shares (`20` default).
         #[arg(long, default_value_t = 20)]
         base_size: u64,
+        /// FIFO queue decay policy (`conservative` default or `optimistic`).
+        #[arg(long, value_enum, default_value_t = CliQueueDecay::Conservative)]
+        queue_decay: CliQueueDecay,
+        #[command(flatten)]
+        math: MathOverrides,
         /// Pin the live Pricing actor OS thread to a zero-based logical CPU core.
         #[arg(long)]
         pin_pricing_core: Option<usize>,
@@ -324,6 +407,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             variance_mode,
             ticks,
             inventory,
+            math,
             jsonl,
         } => trace_cmd::run(TraceArgs {
             source: match source {
@@ -345,6 +429,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             ticks,
             inventory,
+            math,
             jsonl,
         }),
         Commands::Paper {
@@ -354,6 +439,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             v_max,
             base_size,
             latency_ms,
+            queue_decay,
+            math,
             jsonl,
         } => paper_cmd::run(paper_cmd::PaperArgs {
             source: match source {
@@ -365,6 +452,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             v_max,
             base_size,
             latency_ms,
+            queue_decay: queue_decay.into(),
+            math,
             jsonl,
         }),
         Commands::Lifecycle {
@@ -374,6 +463,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             inject_fault,
             v_max,
             base_size,
+            queue_decay,
+            math,
             pin_pricing_core,
             pin_risk_core,
             jsonl,
@@ -393,6 +484,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             v_max,
             base_size,
+            queue_decay: queue_decay.into(),
+            math,
             pinning: risk_lifecycle::CorePinning {
                 pricing_core: pin_pricing_core,
                 risk_core: pin_risk_core,
@@ -740,5 +833,117 @@ mod tests {
             }
             _ => panic!("expected Paper"),
         }
+    }
+
+    #[test]
+    fn cli_parses_math_competitiveness_and_queue_decay_overrides() {
+        let lc = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "live",
+            "--duration",
+            "60s",
+            "--gamma",
+            "0.02",
+            "--include-variance-spread",
+            "false",
+            "--min-spread-ticks",
+            "1",
+            "--max-combined-bid-micro",
+            "990000",
+            "--queue-decay",
+            "optimistic",
+            "--jsonl",
+            "logs/bbo-verify.jsonl",
+        ])
+        .unwrap();
+        match lc.command {
+            Commands::Lifecycle {
+                queue_decay, math, ..
+            } => {
+                assert_eq!(queue_decay, CliQueueDecay::Optimistic);
+                assert_eq!(math.gamma, Some(0.02));
+                assert_eq!(math.include_variance_spread, Some(false));
+                assert_eq!(math.min_spread_ticks, Some(1));
+                assert_eq!(math.max_combined_bid_micro, Some(990_000));
+                assert_eq!(math.fee_spread_floor, None);
+
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.gamma, 0.02);
+                assert!(!cfg.include_variance_spread);
+                assert_eq!(cfg.min_spread_ticks, 1);
+                assert_eq!(cfg.min_combined_spread_micro, core_types::MicroUsdc(10_000));
+                assert_eq!(cfg.max_combined_bid_micro, core_types::MicroUsdc(990_000));
+                assert!(!cfg.enforce_fee_floor);
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        let paper_default = Cli::try_parse_from(["poly-as", "paper"]).unwrap();
+        match paper_default.command {
+            Commands::Paper {
+                queue_decay, math, ..
+            } => {
+                assert_eq!(queue_decay, CliQueueDecay::Conservative);
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.gamma, 0.15);
+                assert!(cfg.include_variance_spread);
+                assert_eq!(cfg.min_spread_ticks, 2);
+                assert_eq!(cfg.min_combined_spread_micro, core_types::MicroUsdc(20_000));
+                assert_eq!(cfg.max_combined_bid_micro, core_types::MicroUsdc(980_000));
+                assert!(cfg.enforce_fee_floor);
+            }
+            _ => panic!("expected Paper"),
+        }
+
+        let trace_override = Cli::try_parse_from([
+            "poly-as",
+            "trace",
+            "--gamma",
+            "0.05",
+            "--include-variance-spread",
+            "false",
+            "--min-spread-ticks",
+            "1",
+            "--fee-spread-floor",
+            "true",
+            "--max-combined-bid-micro",
+            "990000",
+        ])
+        .unwrap();
+        match trace_override.command {
+            Commands::Trace { math, .. } => {
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.gamma, 0.05);
+                assert!(!cfg.include_variance_spread);
+                assert_eq!(cfg.min_spread_ticks, 1);
+                assert!(cfg.enforce_fee_floor);
+                assert_eq!(cfg.max_combined_bid_micro, core_types::MicroUsdc(990_000));
+            }
+            _ => panic!("expected Trace"),
+        }
+
+        let mut bad_bid_cfg = core_types::EngineConfig::default();
+        assert!(
+            MathOverrides {
+                max_combined_bid_micro: Some(995_000),
+                ..Default::default()
+            }
+            .apply_to(&mut bad_bid_cfg)
+            .is_err()
+        );
+        let mut zero_ticks_cfg = core_types::EngineConfig::default();
+        assert!(
+            MathOverrides {
+                min_spread_ticks: Some(0),
+                ..Default::default()
+            }
+            .apply_to(&mut zero_ticks_cfg)
+            .is_err()
+        );
     }
 }

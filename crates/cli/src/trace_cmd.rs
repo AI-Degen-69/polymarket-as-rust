@@ -48,6 +48,7 @@ pub(crate) struct TraceArgs {
     pub(crate) variance_mode: VarianceMode,
     pub(crate) ticks: usize,
     pub(crate) inventory: i64,
+    pub(crate) math: crate::MathOverrides,
     pub(crate) jsonl: PathBuf,
 }
 
@@ -127,6 +128,7 @@ pub(crate) fn run(args: TraceArgs) -> Result<(), Box<dyn Error>> {
     cfg.sg_mode = args.sg_mode;
     cfg.kappa_mode = args.kappa_mode;
     cfg.variance_mode = args.variance_mode;
+    args.math.apply_to(&mut cfg)?;
 
     match args.source {
         TraceSourceMode::Replay => {
@@ -848,6 +850,7 @@ mod tests {
             variance_mode: VarianceMode::BinaryCara,
             ticks: 0,
             inventory: 0,
+            math: crate::MathOverrides::default(),
             jsonl: temp_path("zero"),
         };
         assert!(run(zero_ticks).is_err());
@@ -860,6 +863,7 @@ mod tests {
             variance_mode: VarianceMode::BinaryCara,
             ticks: 5,
             inventory: 0,
+            math: crate::MathOverrides::default(),
             jsonl: temp_path("live"),
         };
         assert!(run(live_with_input).is_err());

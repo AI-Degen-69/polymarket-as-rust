@@ -48,6 +48,8 @@ pub(crate) struct PaperArgs {
     pub(crate) v_max: u64,
     pub(crate) base_size: u64,
     pub(crate) latency_ms: u64,
+    pub(crate) queue_decay: paper_sim::QueueDecayPolicy,
+    pub(crate) math: crate::MathOverrides,
     pub(crate) jsonl: PathBuf,
 }
 
@@ -252,7 +254,8 @@ fn fixed_book_depth_at(book: &FixedBook<10>, price: MicroUsdc) -> SharesMicro {
 
 pub(crate) fn run(args: PaperArgs) -> Result<(), Box<dyn Error>> {
     let _duration = parse_duration_arg(&args.duration)?;
-    let cfg = EngineConfig::from_env()?;
+    let mut cfg = EngineConfig::from_env()?;
+    args.math.apply_to(&mut cfg)?;
 
     match args.source {
         TraceSourceMode::Replay => {
@@ -301,7 +304,7 @@ fn run_replay(
     let broker_config = FifoBrokerConfig {
         order_latency_ms: args.latency_ms,
         cancel_latency_ms: args.latency_ms,
-        ..Default::default()
+        queue_decay_policy: args.queue_decay,
     };
     let base_size = SharesMicro(args.base_size * ONE_SHARE_MICRO);
     let mut broker = FifoPaperBroker::new(broker_config);
@@ -866,6 +869,10 @@ fn eval_sim_step(
     let mid_dn = fixed_book_mid(dn_book);
     let tick_prec = core_types::TickPrecision::from_micro(desc.tick_size_micro)
         .unwrap_or(core_types::TickPrecision::Cent);
+    let naive_up_px =
+        paper_sim::NaiveBaselineEngine::target_bid_price(mid_up, best_ask_up, tick_prec);
+    let naive_dn_px =
+        paper_sim::NaiveBaselineEngine::target_bid_price(mid_dn, best_ask_dn, tick_prec);
     telemetry.naive_engine.update_quotes(NaiveQuotesInput {
         mid_up,
         mid_dn,
@@ -874,8 +881,8 @@ fn eval_sim_step(
         best_bid_dn,
         best_ask_dn,
         tick: tick_prec,
-        depth_up: fixed_book_depth_at(up_book, mid_up.unwrap_or(MicroUsdc(500_000))),
-        depth_dn: fixed_book_depth_at(dn_book, mid_dn.unwrap_or(MicroUsdc(500_000))),
+        depth_up: naive_up_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(up_book, px)),
+        depth_dn: naive_dn_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(dn_book, px)),
         now_ms,
     });
 
@@ -937,7 +944,7 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     let broker_config = FifoBrokerConfig {
         order_latency_ms: args.latency_ms,
         cancel_latency_ms: args.latency_ms,
-        ..Default::default()
+        queue_decay_policy: args.queue_decay,
     };
     let base_size = SharesMicro(args.base_size * ONE_SHARE_MICRO);
     let mut broker = FifoPaperBroker::new(broker_config);
@@ -1646,6 +1653,8 @@ mod tests {
             v_max: 50,
             base_size: 20,
             latency_ms: 0,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
             jsonl: test_jsonl.clone(),
         };
 
