@@ -651,27 +651,42 @@ mod tests {
         let json_val = serde_json::to_value(active).unwrap();
         assert!(json_val["total_compute_ns"].is_u64());
 
-        // Fast-path Binance jump sets defensive_cancel once and clears on subsequent silent evaluate().
+        // Fast-path Binance jump sets directional defensive cancel.
         let sig = pipe
             .on_binance_spot(100_450, 90_300.0, Some(90_000.0), 300_000)
             .unwrap();
         assert!(sig.trigger_defensive_cancel);
+        assert!(sig.trigger_defensive_cancel_dn);
+        assert!(!sig.trigger_defensive_cancel_up);
         let jump_in = PipelineInput {
+            now_ms: 100_450,
             spot_usd: Some(90_300.0),
             ..active_in
         };
         let after_jump = pipe.evaluate(&jump_in).unwrap();
         assert!(after_jump.flags.defensive_cancel);
-        let second_silent = pipe.evaluate(&jump_in).unwrap();
-        assert!(!second_silent.flags.defensive_cancel);
-        assert_eq!(second_silent.station2.unwrap().lead_lag.delta_p_star, 0.0);
-        assert!(
-            !second_silent
-                .station2
-                .unwrap()
-                .lead_lag
-                .trigger_defensive_cancel
-        );
+        assert!(after_jump.flags.defensive_cancel_dn);
+        assert!(!after_jump.flags.defensive_cancel_up);
+
+        // Cooldown remains active for 1,000ms.
+        let during_cd = PipelineInput {
+            now_ms: 101_000,
+            spot_usd: Some(90_300.0),
+            ..active_in
+        };
+        let cd_eval = pipe.evaluate(&during_cd).unwrap();
+        assert!(cd_eval.flags.defensive_cancel);
+
+        // After lookback window (1,000ms) and cooldown (1,000ms) elapse, cancellation clears.
+        let after_cd = PipelineInput {
+            now_ms: 102_500,
+            spot_usd: Some(90_300.0),
+            ..active_in
+        };
+        let cleared = pipe.evaluate(&after_cd).unwrap();
+        assert!(!cleared.flags.defensive_cancel);
+        assert_eq!(cleared.station2.unwrap().lead_lag.delta_p_star, 0.0);
+        assert!(!cleared.station2.unwrap().lead_lag.trigger_defensive_cancel);
 
         // Out-of-order past spot timestamp is rejected cleanly without mutating delta_p_star.
         let ooo = pipe

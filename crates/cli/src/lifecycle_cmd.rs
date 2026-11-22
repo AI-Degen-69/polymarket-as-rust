@@ -3981,10 +3981,12 @@ mod tests {
             t_jump,
         );
         ctx.step(start_ms + 800).await;
-        assert_eq!(ctx.sim.stats.orders_canceled, 2);
+        // Directional defensive cancel cancels only the endangered leg (DN).
+        assert_eq!(ctx.sim.stats.orders_canceled, 1);
 
-        // Step forward so resting UP + DN quotes re-place cleanly.
-        for i in 9..12_u64 {
+        // Step forward past the 1,000ms lead-lag cooldown so resting UP + DN quotes re-place cleanly.
+        // Step forward past the lead-lag window + cooldown so resting UP + DN quotes re-place cleanly.
+        for i in 9..32_u64 {
             ctx.step(start_ms + i * 100).await;
         }
         let dn_order = ctx
@@ -3995,7 +3997,7 @@ mod tests {
             .clone();
 
         // Fill 19 shares on DN so Q = (0, 19) (net = -19), while UP and DN orders remain open.
-        let t_fill_dn = start_ms + 1_150;
+        let t_fill_dn = start_ms + 3_250;
         ctx.sim
             .on_poly_event(
                 PolyMarketEvent::LastTrade {
@@ -4080,7 +4082,8 @@ mod tests {
             summary["flattens_executed"].as_u64().unwrap() as usize,
             jsonl_flatten_count
         );
-        assert!(jsonl_cancel_count >= 4);
+        // 1 directional DefensiveCancel on DN + remaining resting orders canceled at MandatoryFlatten.
+        assert!(jsonl_cancel_count >= 3);
         assert!(jsonl_cancel_all_events >= 1);
         assert!(saw_mandatory_flatten_telemetry);
     }

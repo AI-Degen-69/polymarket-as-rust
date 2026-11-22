@@ -43,11 +43,11 @@ param(
 
     [string[]]$LeadLagThresholds = @("0.02"),
 
-    [string[]]$LeadLagWindows = @("0"),
+    [string[]]$LeadLagWindows = @("1000"),
 
-    [string[]]$LeadLagCooldowns = @("0"),
+    [string[]]$LeadLagCooldowns = @("1000"),
 
-    [string[]]$LeadLagDirectionals = @("false"),
+    [string[]]$LeadLagDirectionals = @("true"),
 
     [uint64]$MaxCombinedBidMicro = 990000,
 
@@ -129,9 +129,9 @@ if ($parsedLLThresholds.Count -eq 0 -or $parsedLLWindows.Count -eq 0 -or $parsed
 $showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
 $showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
 $showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.02 }).Count -gt 0)
-$showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 0 }).Count -gt 0)
-$showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 0 }).Count -gt 0)
-$showLLDir = ($parsedLLDirectionals.Count -gt 1) -or (@($parsedLLDirectionals | Where-Object { $_ -ne "false" }).Count -gt 0)
+$showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 1000 }).Count -gt 0)
+$showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 1000 }).Count -gt 0)
+$showLLDir = ($parsedLLDirectionals.Count -gt 1) -or (@($parsedLLDirectionals | Where-Object { $_ -ne "true" }).Count -gt 0)
 foreach ($v in $parsedVarSpreads) {
     if ($v -ne "true" -and $v -ne "false") {
         throw "Invalid VarianceSpreads entry '$v' (expected 'true' or 'false')"

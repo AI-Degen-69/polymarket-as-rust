@@ -156,13 +156,13 @@ pub(crate) struct MathOverrides {
     /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.02` default).
     #[arg(long)]
     pub(crate) lead_lag_threshold: Option<f64>,
-    /// Override rolling Binance lead-lag lookback window in ms (`0..=6000`, `0` default).
+    /// Override rolling Binance lead-lag lookback window in ms (`0..=6000`, `1000` default).
     #[arg(long)]
     pub(crate) lead_lag_window_ms: Option<u64>,
-    /// Override per-side lead-lag cancel cooldown in ms (`0..=10000`, `0` default).
+    /// Override per-side lead-lag cancel cooldown in ms (`0..=10000`, `1000` default).
     #[arg(long)]
     pub(crate) lead_lag_cooldown_ms: Option<u64>,
-    /// Override whether Binance lead-lag cancels only the endangered leg (`false` default).
+    /// Override whether Binance lead-lag cancels only the endangered leg (`true` default).
     #[arg(long)]
     pub(crate) lead_lag_directional: Option<bool>,
 }
