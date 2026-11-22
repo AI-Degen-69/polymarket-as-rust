@@ -115,9 +115,9 @@ pub struct EngineConfig {
     pub max_notional_per_leg_micro: MicroUsdc,
     /// Baseline order size in outcome shares (`20` shares default).
     pub base_order_size_shares: SharesMicro,
-    /// Minimum combined spread floor (`$0.02` default, covering `1.25%` max taker drag).
+    /// Minimum combined spread floor (`$0.01` default, calibrated 1-tick BBO floor).
     pub min_combined_spread_micro: MicroUsdc,
-    /// Minimum combined spread floor in integer ticks (`2` default).
+    /// Minimum combined spread floor in integer ticks (`1` default).
     pub min_spread_ticks: u32,
     /// Maximum combined dual-bid cost (`$0.98` default).
     pub max_combined_bid_micro: MicroUsdc,
@@ -131,11 +131,11 @@ pub struct EngineConfig {
     pub sg_mode: SgMode,
     /// Whether Station 4 includes `gamma * V_rem` term (`true` default).
     pub include_variance_spread: bool,
-    /// Whether Station 4 enforces taker-fee profitability floor (`true` default).
+    /// Whether Station 4 enforces taker-fee profitability floor (`false` default).
     pub enforce_fee_floor: bool,
     /// Optional cross-tick pair-cost loss budget in micro-USDC (`None` disables cross-tick cap).
     pub max_cross_tick_loss_micro: Option<u64>,
-    /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`None` disables entry guard).
+    /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
     /// Maximum permitted local-to-exchange clock drift in milliseconds (`1000ms` default).
     pub clock_drift_max_ms: i64,
@@ -291,17 +291,17 @@ impl Default for EngineConfig {
             gamma: 0.15,
             max_notional_per_leg_micro: MicroUsdc(50_000_000),
             base_order_size_shares: SharesMicro(20_000_000),
-            min_combined_spread_micro: MicroUsdc(20_000),
-            min_spread_ticks: 2,
+            min_combined_spread_micro: MicroUsdc(10_000),
+            min_spread_ticks: 1,
             max_combined_bid_micro: MicroUsdc(980_000),
             hysteresis_tick_buffer: 0.25,
             variance_mode: VarianceMode::BinaryCara,
             kappa_mode: KappaMode::TradeNormalizedDepth,
             sg_mode: SgMode::Causal,
             include_variance_spread: true,
-            enforce_fee_floor: true,
+            enforce_fee_floor: false,
             max_cross_tick_loss_micro: None,
-            max_entry_prob: None,
+            max_entry_prob: Some(0.80),
             clock_drift_max_ms: 1_000,
             credentials: LiveCredentials::default(),
         }
