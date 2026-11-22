@@ -45,6 +45,7 @@ pub(crate) struct PaperArgs {
     pub(crate) source: TraceSourceMode,
     pub(crate) input: Option<PathBuf>,
     pub(crate) duration: String,
+    pub(crate) allow_mid_window: bool,
     pub(crate) v_max: u64,
     pub(crate) base_size: u64,
     pub(crate) latency_ms: u64,
@@ -908,11 +909,28 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     let _timer_guard = HighResTimerGuard::acquire_1ms()?;
     feeds::install_tls_provider();
 
+    let target_duration = parse_duration_arg(&args.duration)?;
+    let fresh = match crate::window_gate::wait_and_discover_fresh_5m_market(
+        cfg,
+        args.allow_mid_window,
+        15_000,
+    )
+    .await?
+    {
+        crate::window_gate::GateOutcome::Ready(fresh) => fresh,
+        crate::window_gate::GateOutcome::Cancelled => return Ok(()),
+    };
+    let crate::window_gate::FreshWindowDiscovery {
+        discovery,
+        offset_est,
+        mut desc,
+        ..
+    } = fresh;
+
     let pipe_cfg = MathPipelineConfig::from_engine_config(cfg)?;
     let mut pipe = MathPipeline::new(pipe_cfg, clock)?;
     let mut tracker = LatencyTracker::new()?;
     let mut jsonl = JsonlWriter::create(&args.jsonl)?;
-    let (discovery, offset_est, mut desc) = discover_live_market(cfg).await?;
     let base_adj_ms = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
     let base_mono_ns = clock.now_ns()?;
 
@@ -952,7 +970,6 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
         health_tx,
     )?;
 
-    let target_duration = parse_duration_arg(&args.duration)?;
     let deadline = tokio::time::Instant::now() + target_duration;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     let mut last_rollover_probe: Option<tokio::time::Instant> = None;
@@ -1429,17 +1446,6 @@ async fn discover_next_5m_market(
     Ok(next_desc)
 }
 
-async fn discover_live_market(
-    cfg: &EngineConfig,
-) -> Result<(GammaDiscoveryClient, ClockOffsetEstimator, MarketDescriptor), Box<dyn Error>> {
-    let discovery = GammaDiscoveryClient::new()?;
-    let offset_est = ClockOffsetEstimator::new(cfg.clock_drift_max_ms);
-    let _sync = discovery.sync_clock(&offset_est).await?;
-    let adj_now = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
-    let desc = discovery.discover_active_5m_btc(adj_now, 15_000).await?;
-    Ok((discovery, offset_est, desc))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1637,6 +1643,7 @@ mod tests {
             source: TraceSourceMode::Live,
             input: None,
             duration: "300s".to_string(),
+            allow_mid_window: false,
             v_max: 50,
             base_size: 20,
             latency_ms: 0,
