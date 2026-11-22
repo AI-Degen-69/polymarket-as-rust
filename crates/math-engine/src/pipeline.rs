@@ -50,6 +50,7 @@ impl MathPipelineConfig {
             max_combined_bid_micro: cfg.max_combined_bid_micro,
             max_cross_tick_loss_micro: cfg.max_cross_tick_loss_micro,
             max_entry_prob: cfg.max_entry_prob,
+            hedge_skew_mult: cfg.hedge_skew_mult,
         };
         let station2 = Station2Config {
             variance_mode: cfg.variance_mode,

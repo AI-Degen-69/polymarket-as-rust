@@ -25,6 +25,8 @@ pub struct PricerConfig {
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
+    /// Asymmetric reducing-leg skew multiplier in `[0.0, 1.0]` (`1.0` default).
+    pub hedge_skew_mult: f64,
 }
 
 impl PricerConfig {
@@ -40,6 +42,7 @@ impl PricerConfig {
             max_combined_bid_micro: MicroUsdc(980_000),
             max_cross_tick_loss_micro: None,
             max_entry_prob: Some(0.80),
+            hedge_skew_mult: 1.0,
         }
     }
 
@@ -71,6 +74,9 @@ impl PricerConfig {
             && (!p_max.is_finite() || p_max <= 0.5 || p_max >= 1.0)
         {
             return Err(err_desc("max_entry_prob must be finite in (0.5, 1.0)"));
+        }
+        if !self.hedge_skew_mult.is_finite() || !(0.0..=1.0).contains(&self.hedge_skew_mult) {
+            return Err(err_desc("hedge_skew_mult must be finite in [0.0, 1.0]"));
         }
         Ok(())
     }
@@ -329,8 +335,23 @@ fn compute_station6(
     let tick_micro = input.tick_size_micro;
     let tick_usd = tick_micro.to_usd_f64();
     let half = s_star / 2.0;
-    let bid_up_raw = r_i - half;
-    let bid_dn_raw = 1.0 - (r_i + half);
+    let effective_hedge_mult = if input.cost_context.allow_cross_tick_override {
+        1.0
+    } else {
+        cfg.hedge_skew_mult
+    };
+    let r_i_hedge = if effective_hedge_mult < 1.0 && input.inventory_q.0 != 0 {
+        compute_station5(cfg.gamma.get() * effective_hedge_mult, input, tick_usd)?.1
+    } else {
+        r_i
+    };
+    let (bid_up_raw, bid_dn_raw) = if input.inventory_q.0 > 0 {
+        (r_i - half, 1.0 - (r_i_hedge + half))
+    } else if input.inventory_q.0 < 0 {
+        (r_i_hedge - half, 1.0 - (r_i + half))
+    } else {
+        (r_i - half, 1.0 - (r_i + half))
+    };
     let bid_up_floored = quantize_bid_leg(bid_up_raw, tick_micro, tick_usd)?;
     let bid_dn_floored = quantize_bid_leg(bid_dn_raw, tick_micro, tick_usd)?;
 
@@ -867,6 +888,7 @@ mod tests {
             max_combined_bid_micro: MicroUsdc(990_000),
             max_cross_tick_loss_micro: None,
             max_entry_prob: None,
+            hedge_skew_mult: 1.0,
         };
         let pricer = DualBidPricer::new(cfg).unwrap();
         let bounds = PostOnlyBounds {
@@ -1137,6 +1159,86 @@ mod tests {
         for bad in [0.5, 0.49, 1.0, 1.01, f64::NAN, f64::INFINITY] {
             let mut bad_cfg = cfg;
             bad_cfg.max_entry_prob = Some(bad);
+            assert!(DualBidPricer::new(bad_cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn asymmetric_hedge_skew_mult_damps_reducing_leg_and_restores_on_override() {
+        let clock = MonotonicClock::start();
+        let mut base_cfg = PricerConfig::try_default().unwrap();
+        base_cfg.include_variance_spread = false;
+        let base_pricer = DualBidPricer::new(base_cfg).unwrap();
+
+        let mut cfg_one = base_cfg;
+        cfg_one.hedge_skew_mult = 1.0;
+        let pricer_one = DualBidPricer::new(cfg_one).unwrap();
+
+        let mut cfg_zero = base_cfg;
+        cfg_zero.hedge_skew_mult = 0.0;
+        let pricer_zero = DualBidPricer::new(cfg_zero).unwrap();
+
+        let mut cfg_quarter = base_cfg;
+        cfg_quarter.hedge_skew_mult = 0.25;
+        let pricer_quarter = DualBidPricer::new(cfg_quarter).unwrap();
+
+        // q = +20, s_i = 0.50, v_rem = 0.03, gamma = 0.15 => full skew = 0.09, s* ~ 0.03994
+        let inp_pos = make_input(20, 10_000, base_bounds());
+        let tr_base = base_pricer.price(&inp_pos, &clock).unwrap();
+        let tr_one = pricer_one.price(&inp_pos, &clock).unwrap();
+        assert_eq!(tr_one.quote, tr_base.quote);
+        assert_close(tr_one.bid_up_raw, tr_base.bid_up_raw, 1e-12);
+        assert_close(tr_one.bid_dn_raw, tr_base.bid_dn_raw, 1e-12);
+
+        // hedge_skew_mult = 0.0: accumulating UP keeps full backoff (r_i = 0.41),
+        // reducing DN quotes passively around s_i = 0.50 -> 1.0 - (0.50 + s*/2) ~ 0.48003
+        let tr_zero_pos = pricer_zero.price(&inp_pos, &clock).unwrap();
+        assert_close(tr_zero_pos.r_i, 0.41, 1e-9);
+        assert_close(tr_zero_pos.bid_up_raw, tr_base.bid_up_raw, 1e-12);
+        assert_close(
+            tr_zero_pos.bid_dn_raw,
+            1.0 - (0.50 + tr_zero_pos.s_star / 2.0),
+            1e-12,
+        );
+        assert!(
+            tr_zero_pos.bid_up_raw + tr_zero_pos.bid_dn_raw <= 1.0 - tr_zero_pos.s_star + 1e-12
+        );
+
+        // Symmetric q = -20: accumulating DN keeps full backoff, reducing UP quotes passively
+        let inp_neg = make_input(-20, 10_000, base_bounds());
+        let tr_base_neg = base_pricer.price(&inp_neg, &clock).unwrap();
+        let tr_zero_neg = pricer_zero.price(&inp_neg, &clock).unwrap();
+        assert_close(tr_zero_neg.r_i, 0.59, 1e-9);
+        assert_close(tr_zero_neg.bid_dn_raw, tr_base_neg.bid_dn_raw, 1e-12);
+        assert_close(
+            tr_zero_neg.bid_up_raw,
+            0.50 - tr_zero_neg.s_star / 2.0,
+            1e-12,
+        );
+
+        // hedge_skew_mult = 0.25: damps only reducing leg while keeping bid_up_raw + bid_dn_raw <= 1 - s*
+        let tr_q = pricer_quarter.price(&inp_pos, &clock).unwrap();
+        let r_expected_hedge = 0.50 - 20.0 * (0.15 * 0.25) * 0.03;
+        assert_close(tr_q.bid_up_raw, tr_base.bid_up_raw, 1e-12);
+        assert_close(
+            tr_q.bid_dn_raw,
+            1.0 - (r_expected_hedge + tr_q.s_star / 2.0),
+            1e-12,
+        );
+        assert!(tr_q.bid_up_raw + tr_q.bid_dn_raw <= 1.0 - tr_q.s_star + 1e-12);
+
+        // allow_cross_tick_override = true restores 1.0x urgency on the hedge leg
+        let mut inp_override = inp_pos;
+        inp_override.cost_context.allow_cross_tick_override = true;
+        let tr_override = pricer_zero.price(&inp_override, &clock).unwrap();
+        assert_close(tr_override.bid_up_raw, tr_base.bid_up_raw, 1e-12);
+        assert_close(tr_override.bid_dn_raw, tr_base.bid_dn_raw, 1e-12);
+        assert_eq!(tr_override.quote, tr_base.quote);
+
+        // Invalid hedge_skew_mult rejected cleanly
+        for bad in [-0.01, 1.01, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut bad_cfg = base_cfg;
+            bad_cfg.hedge_skew_mult = bad;
             assert!(DualBidPricer::new(bad_cfg).is_err());
         }
     }
