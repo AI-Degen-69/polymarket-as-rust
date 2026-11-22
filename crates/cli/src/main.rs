@@ -25,6 +25,7 @@ mod sandbox_cmd;
 mod sandbox_report;
 mod trace_cmd;
 mod trace_report;
+mod window_gate;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
