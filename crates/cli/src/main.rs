@@ -52,6 +52,12 @@ enum CliLifecycleSource {
     Replay,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CliLifecycleDisplay {
+    Stream,
+    Raw,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum CliFaultModeArg {
     None,
@@ -351,6 +357,9 @@ enum Commands {
         /// Source mode (`live` WebSockets, `sim-epoch` simulated 300s epoch, or `replay` JSONL log).
         #[arg(long, value_enum, default_value_t = CliLifecycleSource::SimEpoch)]
         source: CliLifecycleSource,
+        /// Terminal display mode (`stream` events + 5s/1s heartbeats, or `raw` 10 Hz tick lines).
+        #[arg(long, value_enum, default_value_t = CliLifecycleDisplay::Stream)]
+        display: CliLifecycleDisplay,
         /// Input JSONL path used when `--source replay` (defaults to newest capture in `logs/captures/`).
         #[arg(long)]
         input: Option<PathBuf>,
@@ -498,6 +507,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }),
         Commands::Lifecycle {
             source,
+            display,
             input,
             duration,
             allow_mid_window,
@@ -515,6 +525,10 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 CliLifecycleSource::Live => LifecycleSourceMode::Live,
                 CliLifecycleSource::SimEpoch => LifecycleSourceMode::SimEpoch,
                 CliLifecycleSource::Replay => LifecycleSourceMode::Replay,
+            },
+            display: match display {
+                CliLifecycleDisplay::Stream => lifecycle_report::LifecycleDisplayMode::Stream,
+                CliLifecycleDisplay::Raw => lifecycle_report::LifecycleDisplayMode::Raw,
             },
             input,
             duration,
@@ -1127,5 +1141,19 @@ mod tests {
 
         let after = Cli::try_parse_from(["poly-as", "lifecycle", "--color", "never"]).unwrap();
         assert_eq!(after.color, theme::ColorChoice::Never);
+        match after.command {
+            Commands::Lifecycle { display, .. } => {
+                assert_eq!(display, CliLifecycleDisplay::Stream);
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        let raw_disp = Cli::try_parse_from(["poly-as", "lifecycle", "--display", "raw"]).unwrap();
+        match raw_disp.command {
+            Commands::Lifecycle { display, .. } => {
+                assert_eq!(display, CliLifecycleDisplay::Raw);
+            }
+            _ => panic!("expected Lifecycle"),
+        }
     }
 }

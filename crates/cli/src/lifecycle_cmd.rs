@@ -35,14 +35,16 @@ use tokio::sync::{mpsc, oneshot};
 use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
 use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent};
 use crate::lifecycle_report::{
-    CancelAllRecord, LifecycleReportStats, LifecycleStepRow, OrderActionTelemetry,
-    print_breaker_trip, print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten,
-    print_lifecycle_header, print_lifecycle_merge, print_lifecycle_step, print_lifecycle_summary,
-    print_phase_transition, print_tier_transition, record_breaker_jsonl, record_cancel_all_jsonl,
-    record_epoch_rollover_jsonl, record_lifecycle_fill_jsonl, record_lifecycle_flatten_jsonl,
-    record_lifecycle_merge_jsonl, record_lifecycle_summary_jsonl, record_order_action_jsonl,
-    record_phase_transition_jsonl, record_risk_tier_jsonl,
+    CancelAllRecord, LifecycleDisplayMode, LifecycleReportStats, LifecycleStepRow,
+    LifecycleStreamReporter, OrderActionTelemetry, print_breaker_trip, print_epoch_banner,
+    print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten, print_lifecycle_header,
+    print_lifecycle_merge, print_lifecycle_summary, print_phase_transition, print_tier_transition,
+    record_breaker_jsonl, record_cancel_all_jsonl, record_epoch_rollover_jsonl,
+    record_lifecycle_fill_jsonl, record_lifecycle_flatten_jsonl, record_lifecycle_merge_jsonl,
+    record_lifecycle_summary_jsonl, record_order_action_jsonl, record_phase_transition_jsonl,
+    record_risk_tier_jsonl,
 };
+use crate::theme::{self, Badge};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleSourceMode {
@@ -74,6 +76,7 @@ impl From<CliFaultMode> for FaultInjection {
 
 pub(crate) struct LifecycleArgs {
     pub(crate) source: LifecycleSourceMode,
+    pub(crate) display: LifecycleDisplayMode,
     pub(crate) input: Option<PathBuf>,
     pub(crate) duration: String,
     pub(crate) allow_mid_window: bool,
@@ -354,6 +357,7 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
             LifecycleSourceMode::SimEpoch => "Simulated 5m Epoch (SimEpoch)",
             LifecycleSourceMode::Replay => "Offline Replay (JSONL)",
         },
+        args.display,
         args.v_max,
         args.base_size,
         args.fast_forward,
@@ -436,6 +440,10 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
     // Simulated 5m epoch time range: 300 seconds down to 0 seconds.
     let start_ms = 1_700_000_000_000u64;
     let expiry_ms = start_ms + 300_000; // 300s horizon
+    print_epoch_banner(1, "sim-epoch", None, start_ms, expiry_ms);
+    let mut reporter = LifecycleStreamReporter::new(args.display, theme::current());
+    let mut resting_bid_up: Option<MicroUsdc> = None;
+    let mut resting_bid_dn: Option<MicroUsdc> = None;
 
     let mut current_phase: Option<EpochPhase> = None;
     let mut current_tier = RiskTier::Tier1Normal;
@@ -465,17 +473,18 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
         let bid_dn_val = (((1.0 - mid_up) - 0.02).clamp(0.05, 0.95) * 1_000_000.0).round() as u64;
 
         let pricing_start = clock.now_ns()?;
+        let step_quote = QuoteOutput::Active {
+            bid_up: Some(MicroUsdc(bid_up_val)),
+            bid_dn: Some(MicroUsdc(bid_dn_val)),
+            pair_cost_micro: Some(MicroUsdc(bid_up_val + bid_dn_val)),
+            gross_margin_bps: Some(400),
+        };
         let proposal = QuoteProposal {
             seq: step_idx + 1,
             now_ms,
             expiry_ms,
             tick_size_micro: MicroUsdc(10_000),
-            quote: QuoteOutput::Active {
-                bid_up: Some(MicroUsdc(bid_up_val)),
-                bid_dn: Some(MicroUsdc(bid_dn_val)),
-                pair_cost_micro: Some(MicroUsdc(bid_up_val + bid_dn_val)),
-                gross_margin_bps: Some(400),
-            },
+            quote: step_quote,
             bid_up_raw: mid_up - 0.02,
             bid_dn_raw: (1.0 - mid_up) - 0.02,
             best_bid_up: Some(MicroUsdc(bid_up_val.saturating_sub(10_000))),
@@ -570,6 +579,8 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
             while let Ok(cmd) = priority_rx.try_recv() {
                 match cmd {
                     risk_lifecycle::ExecutionCommand::CancelAll { reason } => {
+                        resting_bid_up = None;
+                        resting_bid_dn = None;
                         let _ = cancel_active_sim_slots_and_record(
                             &mut risk_actor,
                             &mut stats,
@@ -585,6 +596,8 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                         size,
                         reason,
                     } => {
+                        resting_bid_up = None;
+                        resting_bid_dn = None;
                         let _ = cancel_active_sim_slots_and_record(
                             &mut risk_actor,
                             &mut stats,
@@ -675,6 +688,10 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                             OrderSlotState::Idle
                         ) =>
                     {
+                        match outcome {
+                            Outcome::Up => resting_bid_up = None,
+                            Outcome::Down => resting_bid_dn = None,
+                        }
                         stats.orders_canceled += 1;
                         let _ = risk_actor.hysteresis_mut().on_cancel_ack(outcome);
                     }
@@ -690,6 +707,10 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                         price,
                         size,
                     } => {
+                        match outcome {
+                            Outcome::Up => resting_bid_up = Some(price),
+                            Outcome::Down => resting_bid_dn = Some(price),
+                        }
                         stats.orders_submitted += 1;
                         risk_actor.hysteresis_mut().on_place_ack(
                             outcome,
@@ -704,6 +725,10 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                         new_size,
                         ..
                     } => {
+                        match outcome {
+                            Outcome::Up => resting_bid_up = Some(new_price),
+                            Outcome::Down => resting_bid_dn = Some(new_price),
+                        }
                         stats.orders_replaced += 1;
                         let _ = risk_actor.hysteresis_mut().on_cancel_ack(outcome);
                         risk_actor.hysteresis_mut().on_place_ack(
@@ -719,6 +744,10 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                             OrderSlotState::Idle
                         ) =>
                     {
+                        match outcome {
+                            Outcome::Up => resting_bid_up = None,
+                            Outcome::Down => resting_bid_dn = None,
+                        }
                         stats.orders_canceled += 1;
                         let _ = risk_actor.hysteresis_mut().on_cancel_ack(outcome);
                     }
@@ -728,7 +757,8 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
 
             let net_delta = (sim_q_up.as_u64() as i64) - (sim_q_dn.as_u64() as i64);
 
-            print_lifecycle_step(&LifecycleStepRow {
+            reporter.on_step(&LifecycleStepRow {
+                now_ms,
                 tau_secs,
                 phase: trace.phase,
                 tier: trace.tier,
@@ -736,6 +766,12 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                 q_up: sim_q_up,
                 q_dn: sim_q_dn,
                 net_delta: net_delta / 1_000_000,
+                quote: step_quote,
+                spot_usd: None,
+                strike_usd: None,
+                resting_bid_up,
+                resting_bid_dn,
+                net_pnl_micro: 0,
                 action_up: &trace.action_up,
                 action_dn: &trace.action_dn,
                 cancel_all_reason: trace.cancel_all_reason.as_deref(),
@@ -960,15 +996,19 @@ struct LivePaperSimulator {
     market_resolved_flag: bool,
     epoch_settled: bool,
     pending_settlement: Option<PendingEpochSettlement>,
+    epoch_num: usize,
+    reporter: LifecycleStreamReporter,
     stats: LifecycleReportStats,
 }
 
 impl LivePaperSimulator {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         desc: MarketDescriptor,
         broker_config: FifoBrokerConfig,
         v_max_micro: MicroUsdc,
         base_size_shares: u64,
+        display: LifecycleDisplayMode,
         harness: ActorPipelineHarness,
         priority_rx: mpsc::Receiver<ExecutionCommand>,
         routine_rx: mpsc::Receiver<ExecutionCommand>,
@@ -1011,6 +1051,8 @@ impl LivePaperSimulator {
             market_resolved_flag: false,
             epoch_settled: false,
             pending_settlement: None,
+            epoch_num: 1,
+            reporter: LifecycleStreamReporter::new(display, theme::current()),
             stats: LifecycleReportStats::default(),
         };
         let _ = sim.publish_registry_snapshot();
@@ -1900,8 +1942,20 @@ impl LivePaperSimulator {
                 record_breaker_jsonl(jsonl, now_ms, now_ns, r_trace.breaker, clock_offset_ms)?;
             }
 
+            let resting_bid_up = self
+                .broker
+                .active_order(Outcome::Up, OrderSide::Buy)
+                .map(|o| o.price);
+            let resting_bid_dn = self
+                .broker
+                .active_order(Outcome::Down, OrderSide::Buy)
+                .map(|o| o.price);
+            let m_up = mid_up.unwrap_or(MicroUsdc(500_000));
+            let m_dn = mid_dn.unwrap_or(MicroUsdc(500_000));
+            let net_pnl_micro = self.ledger.net_pnl_micro(m_up, m_dn);
             let net_delta = self.ledger.net_inventory().as_i64() / ONE_SHARE_MICRO as i64;
-            print_lifecycle_step(&LifecycleStepRow {
+            self.reporter.on_step(&LifecycleStepRow {
+                now_ms,
                 tau_secs,
                 phase: r_trace.phase,
                 tier: r_trace.tier,
@@ -1909,6 +1963,12 @@ impl LivePaperSimulator {
                 q_up: self.ledger.filled_up,
                 q_dn: self.ledger.filled_dn,
                 net_delta,
+                quote: pricing_ack.quote,
+                spot_usd: self.latest_spot,
+                strike_usd: self.strike_usd,
+                resting_bid_up,
+                resting_bid_dn,
+                net_pnl_micro,
                 action_up: &r_trace.action_up,
                 action_dn: &r_trace.action_dn,
                 cancel_all_reason: r_trace.cancel_all_reason.as_deref(),
@@ -2082,6 +2142,15 @@ impl LivePaperSimulator {
             now_ns,
         });
         self.desc = next_desc;
+        self.epoch_num = self.epoch_num.saturating_add(1);
+        self.reporter.reset_epoch();
+        print_epoch_banner(
+            self.epoch_num,
+            &self.desc.slug,
+            self.strike_usd,
+            self.desc.start_ts_ms,
+            self.desc.expiry_ts_ms,
+        );
         let _ = self.publish_registry_snapshot();
         Ok(())
     }
@@ -2246,6 +2315,7 @@ fn spawn_managed_session(
         broker_cfg,
         v_max_micro,
         args.base_size,
+        args.display,
         harness.clone(),
         priority_rx,
         routine_rx,
@@ -2316,7 +2386,11 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
 
     let duration_limit = parse_duration_arg(&args.duration)?;
 
-    println!("  [1/4] Discovering active Polymarket 5-minute BTC market...");
+    let t = theme::current();
+    println!(
+        "  {} Discovering active Polymarket 5-minute BTC market...",
+        t.badge(Badge::Info)
+    );
     let fresh = match crate::window_gate::wait_and_discover_fresh_5m_market(
         &cfg,
         args.allow_mid_window,
@@ -2342,8 +2416,9 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     let base_adj_ms = offset_est.adjusted_unix_ms(base_raw_ms)?;
     let base_mono_ns = clock.now_ns()?;
     println!(
-        "  Discovered: {} (expires in {}s)",
-        desc.slug,
+        "  {} Discovered: {} (expires in {}s)",
+        t.badge(Badge::Ready),
+        t.cyan(&desc.slug),
         desc.expiry_ts_ms.saturating_sub(base_adj_ms) / 1000
     );
 
@@ -2364,10 +2439,18 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     let mut sess = spawn_managed_session(desc, &cfg, &args, base_mono_ns, clock)?;
 
     println!(
-        "  Actors: {} | local 8-station FIFO paper simulator armed (V_max=${}, base={}sh, 40ms wire latency)",
+        "  {} Actors: {} | local 8-station FIFO paper simulator armed (V_max=${}, base={}sh, 40ms wire latency)",
+        t.badge(Badge::Info),
         args.pinning.summary(),
         args.v_max,
         args.base_size
+    );
+    print_epoch_banner(
+        sess.sim.epoch_num,
+        &sess.sim.desc.slug,
+        sess.sim.strike_usd,
+        sess.sim.desc.start_ts_ms,
+        sess.sim.desc.expiry_ts_ms,
     );
 
     let deadline = tokio::time::Instant::now() + duration_limit;
@@ -2382,11 +2465,18 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     loop {
         tokio::select! {
             _ = &mut ctrl_c => {
-                println!("\n  [SIGNAL] Ctrl+C received, shutting down live 8-station simulator...");
+                println!(
+                    "\n  {} Ctrl+C received, shutting down live 8-station simulator...",
+                    t.badge(Badge::Signal)
+                );
                 break;
             }
             _ = &mut sleep_deadline => {
-                println!("\n  Reached target duration {}, shutting down...", args.duration);
+                println!(
+                    "\n  {} Reached target duration {}, shutting down...",
+                    t.badge(Badge::Info),
+                    args.duration
+                );
                 break;
             }
             _ = interval.tick() => {
@@ -2473,7 +2563,8 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                             }
                             Err(err) => {
                                 eprintln!(
-                                    "  [ROLLOVER] Awaiting next 5m BTC market after {}: {err}",
+                                    "  {} Awaiting next 5m BTC market after {}: {err}",
+                                    t.badge(Badge::Epoch),
                                     sess.sim.desc.slug
                                 );
                             }
@@ -2693,6 +2784,13 @@ async fn run_replay_epoch(
                     }
                 } else {
                     let sess = spawn_managed_session(desc, &cfg, &args, cur_sim_ns, clock)?;
+                    print_epoch_banner(
+                        sess.sim.epoch_num,
+                        &sess.sim.desc.slug,
+                        sess.sim.strike_usd,
+                        sess.sim.desc.start_ts_ms,
+                        sess.sim.desc.expiry_ts_ms,
+                    );
                     next_eval_ms = Some(
                         cur_sim_ms
                             .checked_add(100)
@@ -2774,7 +2872,8 @@ async fn step_replay_eval_grid(
         && cur_sim_ms.saturating_sub(target) > MAX_REPLAY_GAP_CATCHUP_MS
     {
         eprintln!(
-            "WARN: replay timestamp gap of {}ms exceeds {MAX_REPLAY_GAP_CATCHUP_MS}ms; fast-forwarding evaluation grid",
+            "  {} replay timestamp gap of {}ms exceeds {MAX_REPLAY_GAP_CATCHUP_MS}ms; fast-forwarding evaluation grid",
+            theme::current().badge(Badge::Warn),
             cur_sim_ms.saturating_sub(target)
         );
         *next_eval_ms = Some(cur_sim_ms);
@@ -3059,6 +3158,7 @@ mod tests {
             broker_cfg,
             v_max_micro,
             base_size,
+            LifecycleDisplayMode::Stream,
             harness.clone(),
             priority_rx,
             routine_rx,
@@ -3917,6 +4017,7 @@ mod tests {
     fn sim_epoch_rejects_math_override_flags_explicitly() {
         let err = run(LifecycleArgs {
             source: LifecycleSourceMode::SimEpoch,
+            display: LifecycleDisplayMode::Stream,
             input: None,
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4131,6 +4232,7 @@ mod tests {
         // `--input` rejected with `--source live`.
         let err_live = run(LifecycleArgs {
             source: LifecycleSourceMode::Live,
+            display: LifecycleDisplayMode::Stream,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4149,6 +4251,7 @@ mod tests {
         // `--input == --jsonl` rejected with `--source replay`.
         let err_overwrite = run(LifecycleArgs {
             source: LifecycleSourceMode::Replay,
+            display: LifecycleDisplayMode::Stream,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4170,6 +4273,7 @@ mod tests {
         // Math overrides + queue-decay accepted with `--source replay`.
         let ok_res = run(LifecycleArgs {
             source: LifecycleSourceMode::Replay,
+            display: LifecycleDisplayMode::Stream,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4203,6 +4307,7 @@ mod tests {
 
         let make_args = |jsonl: PathBuf| LifecycleArgs {
             source: LifecycleSourceMode::Replay,
+            display: LifecycleDisplayMode::Stream,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4256,6 +4361,7 @@ mod tests {
 
         run(LifecycleArgs {
             source: LifecycleSourceMode::Replay,
+            display: LifecycleDisplayMode::Stream,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
