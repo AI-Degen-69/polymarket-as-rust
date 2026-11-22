@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>עדכון #16: משווים הגדרות מסחר על הקלטה, בלי לחכות לשוק החי</title>
+  <style>
+    :root {
+      --bg: #faf7f0;
+      --card: #ffffff;
+      --ink: #253127;
+      --ink-dim: #5f6f61;
+      --line: #e3dcc9;
+      --accent: #047857;
+      --accent-soft: #e3f2e9;
+      --gold: #b45309;
+      --gold-soft: #fdf0dc;
+      --radius: 14px;
+      --font: system-ui, -apple-system, "Segoe UI", Roboto, "Heebo", Arial, sans-serif;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      * { animation: none !important; transition: none !important; }
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font-family: var(--font);
+      line-height: 1.65;
+      padding: 2rem 1.25rem 4rem;
+      max-width: 960px;
+      margin: 0 auto;
+    }
+    .meta-bar { display: flex; flex-wrap: wrap; gap: 0.6rem; margin-bottom: 1.25rem; }
+    .meta-bar a {
+      display: inline-block;
+      padding: 0.3rem 0.9rem;
+      border-radius: 9999px;
+      font-size: 0.85rem;
+      font-weight: 700;
+      text-decoration: none;
+      border: 1.5px solid var(--accent);
+      color: var(--accent);
+      background: #fff;
+    }
+    .meta-bar a.live { background: var(--accent); color: #fff; }
+    h1 { font-size: 1.9rem; font-weight: 800; margin-bottom: 0.5rem; }
+    .lead { font-size: 1.1rem; color: var(--ink-dim); max-width: 720px; margin-bottom: 2rem; }
+    .story { display: grid; gap: 0.9rem; margin-bottom: 2.25rem; }
+    .story section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-right: 5px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+    }
+    .story h2 { font-size: 1.02rem; margin-bottom: 0.25rem; }
+    .story p { font-size: 0.95rem; color: var(--ink-dim); }
+    .story p strong { color: var(--ink); }
+    .demo {
+      background: var(--card);
+      border: 2px solid var(--accent);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+      margin-bottom: 2.25rem;
+    }
+    .demo h2 { font-size: 1.2rem; margin-bottom: 0.25rem; }
+    .demo .hint { font-size: 0.88rem; color: var(--ink-dim); margin-bottom: 1.1rem; }
+    .rank-row {
+      width: 100%;
+      text-align: right;
+      font-family: inherit;
+      background: var(--bg);
+      border: 1.5px solid var(--line);
+      border-radius: var(--radius);
+      padding: 0.8rem 1rem;
+      margin-bottom: 0.7rem;
+      cursor: pointer;
+    }
+    .rank-row[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+    .rank-top { display: flex; align-items: baseline; gap: 0.75rem; }
+    .medal {
+      display: inline-block;
+      min-width: 2rem;
+      text-align: center;
+      font-weight: 800;
+      border-radius: 8px;
+      padding: 0.1rem 0.4rem;
+      background: var(--gold-soft);
+      color: var(--gold);
+    }
+    .rank-row:first-child .medal { background: var(--gold); color: #fff; }
+    .gamma { font-weight: 800; font-size: 1.05rem; }
+    .net { margin-right: auto; font-weight: 800; font-size: 1.15rem; color: var(--accent); }
+    .bar { height: 10px; border-radius: 9999px; background: var(--line); margin-top: 0.6rem; overflow: hidden; }
+    .bar i { display: block; height: 100%; border-radius: 9999px; background: var(--accent); width: 0; transition: width 0.8s ease; }
+    .rank-row:first-child .bar i { background: var(--gold); }
+    .detail {
+      background: var(--bg);
+      border: 1px dashed var(--accent);
+      border-radius: var(--radius);
+      padding: 1rem 1.25rem;
+      margin-top: 0.25rem;
+      font-size: 0.92rem;
+    }
+    .detail h3 { font-size: 1rem; margin-bottom: 0.5rem; }
+    .detail dl { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 0.35rem 1rem; }
+    .detail dt { color: var(--ink-dim); font-size: 0.82rem; }
+    .detail dd { font-weight: 700; }
+    code, .ltr { font-family: Consolas, monospace; }
+    .runway {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      padding: 1.5rem;
+    }
+    .runway h2 { font-size: 1.2rem; margin-bottom: 0.75rem; }
+    .runway ol { padding-right: 1.25rem; display: grid; gap: 0.9rem; font-size: 0.95rem; }
+    .runway li::marker { font-weight: 800; color: var(--accent); }
+    .runway code {
+      display: inline-block;
+      direction: ltr;
+      background: var(--bg);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 0.15rem 0.5rem;
+      font-size: 0.85rem;
+    }
+    footer { margin-top: 2rem; font-size: 0.82rem; color: var(--ink-dim); }
+  </style>
+</head>
+<body>
+
+  <nav class="meta-bar">
+    <a class="live" href="https://github.com/AI-Degen-69/polymarket-as-rust/pull/16">עדכון #16 — מוכן ומוטמע</a>
+    <a href="https://github.com/AI-Degen-69/polymarket-as-rust/pull/16/files">מה השתנה</a>
+  </nav>
+
+  <h1>משווים הגדרות מסחר על הקלטה — בלי לחכות לשוק החי</h1>
+  <p class="lead">לפני: כל בדיקת הגדרה דרשה חיבור חי לשוק והמתנה. עכשיו: מריצים הקלטה שמורה, מקבלים טבלת דירוג מסודרת, ויודעים איזו הגדרה ניצחה — עם אותה תוצאה בכל הרצה.</p>
+
+  <div class="story">
+    <section>
+      <h2>הבעיה</h2>
+      <p>לבדוק רעיון מסחר היה אומר <strong>להתחבר לשוק החי ולחכות</strong>. אי אפשר היה להשוות שתי הגדרות באותם תנאים, כי השוק כבר זז בינתיים.</p>
+    </section>
+    <section>
+      <h2>מה השתנה</h2>
+      <p>נוספה <strong>הרצה חוזרת מהקלטה</strong>: לוקחים קובץ הקלטה שמור, מריצים עליו כל הגדרה, ומקבלים <strong>טבלת דירוג לפי רווח</strong> — הכול מהמחשב, בלי רשת.</p>
+    </section>
+    <section>
+      <h2>המציאות החדשה</h2>
+      <p>מריצים פקודה אחת ורואים מיד מי ניצח. אותה הקלטה נותנת <strong>אותה תוצאה בכל הרצה</strong>, וכל הרצה שומרת את הקבצים שלה בתיקייה משלה עם חותמת זמן.</p>
+    </section>
+  </div>
+
+  <div class="demo">
+    <h2>התוצאה האמיתית מההרצה — לחצו על שורה לפירוט</h2>
+    <p class="hint">שלוש הגדרות של <span class="ltr">Gamma</span> על אותה הקלטה (<span class="ltr">logs/feeds.jsonl</span>). מדד הדירוג: <span class="ltr">NetPnL</span> — הרווח הנקי בדולרים.</p>
+    <div id="ranks"></div>
+    <div class="detail" id="detail"></div>
+  </div>
+
+  <div class="runway">
+    <h2>בודקים בעצמכם במוצר האמיתי</h2>
+    <ol>
+      <li>פתחו מסוף בתיקיית הפרויקט → הריצו <code>pwsh -File scripts/sweep-params.ps1 -InputPath logs/feeds.jsonl -Gammas 0.02,0.08,0.15 -VarianceSpreads false</code> → מחכים לבנייה ולשלוש ההרצות.</li>
+      <li>מחפשים את הכותרת <code>=== OFFLINE PARAMETER SWEEP RESULTS (sorted by NetPnL desc) ===</code> → רואים טבלה עם העמודות <code>Gamma</code> ו־<code>NetPnL</code>, והשורה הראשונה היא <code>0.08</code> עם <code>+0.2084</code>.</li>
+      <li>מעתיקים את הנתיב שמופיע בשורת <code>Outputs:</code> → פותחים אותו ורואים 3 קבצי <code>.jsonl</code> ו־3 קבצי <code>.log</code> — אחד לכל הגדרה.</li>
+      <li>מריצים את אותה פקודה פעם שנייה → אותם מספרי <code>NetPnL</code> בדיוק — ההרצה צפויה וחוזרת על עצמה.</li>
+    </ol>
+  </div>
+
+  <footer>עדכון #16 מוטמע בענף הראשי. שלב הסגירה (צינור VI) טרם בוצע.</footer>
+
+  <script>
+    var RUNS = [
+      { gamma: "0.08", net: 0.2084, fills: 4, merges: 3, pairs: "4.32", realized: "+0.1299", unreal: "+0.0785", rebate: "0.0606", base: "-0.2343", alpha: "+0.4426", rpm: 53, mo1: "+283.3", mo5: "+500.0" },
+      { gamma: "0.15", net: 0.2084, fills: 4, merges: 3, pairs: "4.32", realized: "+0.1299", unreal: "+0.0785", rebate: "0.0606", base: "-0.2343", alpha: "+0.4426", rpm: 55, mo1: "+283.3", mo5: "+500.0" },
+      { gamma: "0.02", net: 0.1615, fills: 5, merges: 3, pairs: "13.69", realized: "+0.1299", unreal: "+0.0316", rebate: "0.0840", base: "-0.2343", alpha: "+0.3958", rpm: 56, mo1: "+200.0", mo5: "+266.7" }
+    ];
+    var MEDALS = ["1", "2", "3"];
+    var ranksEl = document.getElementById("ranks");
+    var detailEl = document.getElementById("detail");
+    var reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+    function fmtNet(v) { return (v >= 0 ? "+" : "") + v.toFixed(4); }
+
+    function renderDetail(i) {
+      var r = RUNS[i];
+      detailEl.innerHTML =
+        "<h3>פירוט מלא — <span dir=\"ltr\">Gamma " + r.gamma + "</span></h3>" +
+        "<dl>" +
+        "<div><dt><span dir=\"ltr\">NetPnL</span> (רווח נקי)</dt><dd>" + fmtNet(r.net) + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">Fills</span> (עסקאות)</dt><dd>" + r.fills + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">Merges</span> (מיזוגים)</dt><dd>" + r.merges + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">Pairs</span> (זוגות)</dt><dd>" + r.pairs + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">Realized</span> (ממומש)</dt><dd>" + r.realized + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">Unrealized</span> (לא ממומש)</dt><dd>" + r.unreal + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">Rebate</span> (החזר)</dt><dd>" + r.rebate + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">BasePnL</span> (בסיס להשוואה)</dt><dd>" + r.base + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">AlphaEdge</span> (יתרון מעל הבסיס)</dt><dd>" + r.alpha + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">RPM</span> (ציטוטים לדקה)</dt><dd>" + r.rpm + "</dd></div>" +
+        "<div><dt><span dir=\"ltr\">MO1s / MO5s</span> (איכות סימון)</dt><dd>" + r.mo1 + " / " + r.mo5 + "</dd></div>" +
+        "</dl>";
+    }
+
+    RUNS.forEach(function (r, i) {
+      var btn = document.createElement("button");
+      btn.className = "rank-row";
+      btn.setAttribute("aria-pressed", i === 0 ? "true" : "false");
+      var pct = Math.max(4, (r.net / 0.22) * 100);
+      btn.innerHTML =
+        "<span class=\"rank-top\">" +
+        "<span class=\"medal\">" + MEDALS[i] + "</span>" +
+        "<span class=\"gamma\" dir=\"ltr\">Gamma " + r.gamma + "</span>" +
+        "<span class=\"net\" dir=\"ltr\">" + fmtNet(r.net) + "</span>" +
+        "</span>" +
+        "<span class=\"bar\"><i data-w=\"" + pct.toFixed(1) + "\"></i></span>";
+      btn.addEventListener("click", function () {
+        var rows = ranksEl.querySelectorAll(".rank-row");
+        for (var k = 0; k < rows.length; k++) rows[k].setAttribute("aria-pressed", "false");
+        btn.setAttribute("aria-pressed", "true");
+        renderDetail(i);
+      });
+      ranksEl.appendChild(btn);
+    });
+    renderDetail(0);
+
+    function animateBars() {
+      var bars = ranksEl.querySelectorAll(".bar i");
+      for (var k = 0; k < bars.length; k++) bars[k].style.width = bars[k].getAttribute("data-w") + "%";
+    }
+    if (reduceMotion) {
+      animateBars();
+    } else {
+      window.addEventListener("load", function () { window.setTimeout(animateBars, 150); });
+      window.setTimeout(animateBars, 800);
+    }
+  </script>
+</body>
+</html>
