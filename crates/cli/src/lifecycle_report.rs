@@ -585,23 +585,23 @@ impl LifecycleStreamReporter {
             lines.push(action_line);
         }
 
-        // 3. Latency budget breaches (compare raw nanoseconds before rounding down for display)
+        // 3. Latency breaches (compare raw nanoseconds; detail aligns with action rows)
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
         if row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000)
             || row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000)
             || total_ns > TOTAL_BUDGET_US.saturating_mul(1_000)
         {
+            // `[LATENCY]` is 9 visible chars, `[ORDER]` is 7; 15 spaces put the detail
+            // at the same column as the action rows' `UP`/`DN` text.
             lines.push(format!(
-                "{} T-{:03}s {} pricing={} risk={} total={} {}",
+                "{} T-{:03}s {}{} {} Pricing + {} Risk = {} Total | (Ideal: Total < {TOTAL_BUDGET_US}us | Pricing < {PRICING_BUDGET_US}us AND Risk < {RISK_BUDGET_US}us)",
                 t.muted(&utc),
                 row.tau_secs,
                 t.badge(Badge::Latency),
+                " ".repeat(15),
                 t.fmt_latency_us(row.pricing_ns, PRICING_BUDGET_US),
                 t.fmt_latency_us(row.risk_ns, RISK_BUDGET_US),
                 t.fmt_latency_us(total_ns, TOTAL_BUDGET_US),
-                t.muted(&format!(
-                    "(budget {PRICING_BUDGET_US}/{RISK_BUDGET_US}/{TOTAL_BUDGET_US}us)"
-                )),
             ));
         }
 
@@ -1391,7 +1391,7 @@ mod tests {
         let lat_lines = rep.format_step(&lat_row);
         assert_eq!(lat_lines.len(), 1);
         assert!(lat_lines[0].contains("[LATENCY]"));
-        assert!(lat_lines[0].contains("pricing=31us"));
+        assert!(lat_lines[0].contains("31us Pricing"));
     }
 
     #[test]
@@ -1486,6 +1486,7 @@ mod tests {
         let p_lines = rep.format_step(&pricing_over);
         assert_eq!(p_lines.len(), 1);
         assert!(p_lines[0].contains("[LATENCY]"));
+        assert!(p_lines[0].contains("25.001us Pricing"));
 
         // Risk +1ns over budget (10_001ns) triggers [LATENCY] event.
         let mut risk_over = sample_row(base_ms + 300, 300, &hold, &hold);
@@ -1494,5 +1495,6 @@ mod tests {
         let r_lines = rep.format_step(&risk_over);
         assert_eq!(r_lines.len(), 1);
         assert!(r_lines[0].contains("[LATENCY]"));
+        assert!(r_lines[0].contains("10.001us Risk"));
     }
 }
