@@ -2,8 +2,6 @@
 //!
 //! Zero external dependencies: uses `std::io::IsTerminal` + `NO_COLOR` + global `--color`.
 
-#![allow(dead_code)]
-
 use std::io::IsTerminal;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -100,10 +98,6 @@ impl Theme {
         self.color
     }
 
-    pub(crate) const fn is_unicode(self) -> bool {
-        self.unicode
-    }
-
     fn wrap(self, code: &str, text: &str) -> String {
         if self.color {
             format!("\x1b[{code}m{text}\x1b[0m")
@@ -150,10 +144,6 @@ impl Theme {
 
     pub(crate) fn bold_red(self, text: &str) -> String {
         self.wrap("1;31", text)
-    }
-
-    pub(crate) fn magenta(self, text: &str) -> String {
-        self.wrap("35", text)
     }
 
     pub(crate) fn bold_magenta(self, text: &str) -> String {

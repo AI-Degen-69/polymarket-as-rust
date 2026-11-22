@@ -8,6 +8,8 @@ use core_types::{
 use paper_sim::{MergeEvent, SimFill, SimOrder, TrajectorySnapshot};
 use serde::Serialize;
 
+use crate::theme::{self, Badge, Theme};
+
 #[derive(Debug, Clone)]
 pub(crate) struct PaperReportStats {
     pub(crate) total_ticks: usize,
@@ -113,36 +115,68 @@ pub(crate) fn print_paper_header(
     duration: &str,
     jsonl_path: &Path,
 ) {
-    println!("=== POLY-AS PHASE 3 FIFO PAPER SIMULATOR ({source}) ===");
-    println!(
-        "  (a) Market & Epoch   : {} | ver={:?} | tick=${} | min_size={}",
-        desc.slug, desc.version, desc.tick_size_micro, desc.min_order_size_micro
-    );
-    println!(
-        "  (a) Capital & Sizing : V_max=${} | base_size={} shares | duration={}",
-        v_max, base_size, duration
-    );
-    println!(
-        "  (a) Wire Latency     : {}ms placement / {}ms cancel (FIFO queue-aware)",
-        latency_ms, latency_ms
-    );
-    println!("  (a) Telemetry JSONL  : {}", jsonl_path.display());
+    let t = theme::current();
     println!();
+    println!(
+        "{}",
+        t.banner(
+            &format!("POLY-AS PHASE 3 :: FIFO PAPER SIMULATOR ({source})"),
+            None
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Market & Epoch:",
+            &format!(
+                "{} | ver={:?} | tick=${} | min_size={}",
+                t.cyan(&desc.slug),
+                desc.version,
+                desc.tick_size_micro,
+                desc.min_order_size_micro
+            )
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Capital & Sizing:",
+            &format!("V_max=${v_max} | base_size={base_size} shares | duration={duration}")
+        )
+    );
+    println!(
+        "{}",
+        t.kv(
+            "Wire Latency:",
+            &format!("{latency_ms}ms placement / {latency_ms}ms cancel (FIFO queue-aware)")
+        )
+    );
+    println!(
+        "{}",
+        t.kv("Telemetry JSONL:", &jsonl_path.display().to_string())
+    );
+    println!("{}", t.divider());
 }
 
 pub(crate) fn print_order_event(action: &str, order: &SimOrder) {
+    let t = theme::current();
     let outcome_str = match order.outcome {
-        core_types::Outcome::Up => "UP",
-        core_types::Outcome::Down => "DN",
+        core_types::Outcome::Up => t.bold_green("UP"),
+        core_types::Outcome::Down => t.bold_cyan("DN"),
+    };
+    let action_styled = match action {
+        "CANCEL" | "CANCELLED" => t.yellow(&format!("{action:<7}")),
+        _ => t.cyan(&format!("{action:<7}")),
     };
     let side_str = order.side.as_str();
     println!(
-        "  [ORDER] #{:<4} {:<7} | {:<2} {:<4} @ ${:<8} | sz={:<6} | vol_ahead={:<7} | status={}",
+        "  {} #{:<4} {} | {} {:<4} @ {} | sz={:<6} | vol_ahead={:<7} | status={}",
+        t.badge(Badge::Order),
         order.sim_id,
-        action,
+        action_styled,
         outcome_str,
         side_str,
-        order.price,
+        Theme::fmt_price_compact(Some(order.price)),
         order.original_size,
         order.volume_ahead,
         order.status.as_str()
@@ -158,40 +192,52 @@ pub(crate) fn print_trade_eval(
     reachable: SharesMicro,
     filled: SharesMicro,
 ) {
+    let t = theme::current();
     let outcome_str = match outcome {
         core_types::Outcome::Up => "UP",
         core_types::Outcome::Down => "DN",
     };
     println!(
-        "  [TRADE] {:<2} | px=${:<8} | sz={:<6} | vol_ahead: {:<6} -> {:<6} | reachable: {:<6} | filled: {:<6}",
-        outcome_str, price, size, vol_ahead_before, vol_ahead_after, reachable, filled
+        "  {} {:<2} | px={} | sz={:<6} | vol_ahead: {:<6} -> {:<6} | reachable: {:<6} | filled: {:<6}",
+        t.badge(Badge::Trade),
+        outcome_str,
+        Theme::fmt_price_compact(Some(price)),
+        size,
+        vol_ahead_before,
+        vol_ahead_after,
+        reachable,
+        filled
     );
 }
 
 pub(crate) fn print_fill_event(fill: &SimFill) {
+    let t = theme::current();
     let outcome_str = match fill.outcome {
-        core_types::Outcome::Up => "UP",
-        core_types::Outcome::Down => "DN",
+        core_types::Outcome::Up => t.bold_green("UP"),
+        core_types::Outcome::Down => t.bold_cyan("DN"),
     };
     println!(
-        "  >>> [FILL] #{:<4} {:<2} {:<4} | {:<7} @ ${:<8} (maker={})",
+        "  {} #{:<4} {} {:<4} | {:<7} @ {} (maker={})",
+        t.badge(Badge::Fill),
         fill.sim_id,
         outcome_str,
         fill.side.as_str(),
         fill.filled_shares,
-        fill.price,
+        Theme::fmt_price_compact(Some(fill.price)),
         fill.is_maker
     );
 }
 
 pub(crate) fn print_merge_event(merge: &MergeEvent, total_merged: SharesMicro) {
+    let t = theme::current();
     println!(
-        "  *** [MERGE] {:<6} pairs | pair_cost=${:<6} (UP=${}, DN=${}) -> PnL={:+} (total_merged={})",
+        "  {} {:<6} pairs | pair_cost={} (UP={}, DN={}) -> PnL={} (total_merged={})",
+        t.badge(Badge::Merge),
         merge.merged_pairs,
-        merge.pair_cost,
-        merge.avg_cost_up,
-        merge.avg_cost_dn,
-        fmt_pnl(merge.realized_gain_micro),
+        Theme::fmt_price_compact(Some(merge.pair_cost)),
+        Theme::fmt_price_compact(Some(merge.avg_cost_up)),
+        Theme::fmt_price_compact(Some(merge.avg_cost_dn)),
+        t.fmt_pnl(merge.realized_gain_micro),
         total_merged
     );
 }
@@ -214,48 +260,80 @@ pub(crate) struct PaperSummaryDisplay<'a> {
 }
 
 pub(crate) fn print_summary_table(disp: &PaperSummaryDisplay<'_>) {
+    let t = theme::current();
     let net_pnl = disp.realized_pnl + disp.unrealized_pnl;
     let edge_pnl = net_pnl - disp.baseline_pnl;
 
     println!();
     println!(
-        "+--------------------------------------------------------------------------------------------------------------------------------------+"
+        "{}",
+        t.banner("PHASE 3 PAPER SIMULATOR ROLLING SUMMARY", None)
+    );
+    println!("{}", t.section("INVENTORY & PNL"));
+    println!(
+        "{}",
+        t.kv(
+            "Inventory:",
+            &format!(
+                "UP={} | DN={} | Delta_q={:+.6} | Merged={}",
+                disp.q_up,
+                disp.q_dn,
+                disp.net_q.to_shares_f64(),
+                disp.pairs_merged
+            )
+        )
     );
     println!(
-        "|                                              PHASE 3 PAPER SIMULATOR ROLLING SUMMARY                                                 |"
+        "{}",
+        t.kv(
+            "PnL (Real / Unreal):",
+            &format!(
+                "{} / {} | Net={}",
+                t.fmt_pnl(disp.realized_pnl),
+                t.fmt_pnl(disp.unrealized_pnl),
+                t.fmt_pnl(net_pnl)
+            )
+        )
+    );
+    println!("{}", t.section("METRICS & LATENCY"));
+    println!(
+        "{}",
+        t.kv(
+            "Execution Metrics:",
+            &format!(
+                "RPM={} | FillRatio={:.2}% | Markout 1s={:+.1}bps | Markout 5s={:+.1}bps",
+                disp.rpm_60s,
+                disp.fill_ratio * 100.0,
+                disp.markout_1s_bps,
+                disp.markout_5s_bps,
+            )
+        )
     );
     println!(
-        "+--------------------------------------------------------------------------------------------------------------------------------------+"
+        "{}",
+        t.kv(
+            "Fees & Alpha Edge:",
+            &format!(
+                "FeesPaid=${} | BaselinePnL={} | A-S Alpha Edge={}",
+                MicroUsdc(disp.fees_paid),
+                t.fmt_pnl(disp.baseline_pnl),
+                t.fmt_pnl(edge_pnl)
+            )
+        )
     );
     println!(
-        "| Inventory : UP={:<7} | DN={:<7} | Delta_q={:<+7} | Merged={:<7} | Realized={:<11} | Unrealized={:<11} | Net={:<11} |",
-        disp.q_up,
-        disp.q_dn,
-        disp.net_q.to_shares_f64(),
-        disp.pairs_merged,
-        fmt_pnl(disp.realized_pnl),
-        fmt_pnl(disp.unrealized_pnl),
-        fmt_pnl(net_pnl)
+        "{}",
+        t.kv(
+            "Compute Latency:",
+            &format!(
+                "P50={:.1}us | P99={:.1}us (samples={})",
+                disp.latency.p50_ns as f64 / 1_000.0,
+                disp.latency.p99_ns as f64 / 1_000.0,
+                disp.latency.count,
+            )
+        )
     );
-    println!(
-        "| Metrics   : RPM={:<3} | FillRatio={:.2}% | Markout 1s={:+.1}bps | Markout 5s={:+.1}bps | FeesPaid=${:<7} | BaselinePnL={:<11} |",
-        disp.rpm_60s,
-        disp.fill_ratio * 100.0,
-        disp.markout_1s_bps,
-        disp.markout_5s_bps,
-        MicroUsdc(disp.fees_paid),
-        fmt_pnl(disp.baseline_pnl)
-    );
-    println!(
-        "| Latency   : Compute P50={:.1}us | P99={:.1}us (samples={}) | A-S Alpha Edge={:<+11}                                               |",
-        disp.latency.p50_ns as f64 / 1_000.0,
-        disp.latency.p99_ns as f64 / 1_000.0,
-        disp.latency.count,
-        fmt_pnl(edge_pnl)
-    );
-    println!(
-        "+--------------------------------------------------------------------------------------------------------------------------------------+"
-    );
+    println!("{}", t.divider());
     println!();
 }
 
@@ -385,12 +463,4 @@ pub(crate) fn record_tick_jsonl(
     };
     jsonl.write_event(now_ms, clock.now_ns()?, "tick", &rec)?;
     Ok(())
-}
-
-fn fmt_pnl(micro: i64) -> String {
-    let sign = if micro < 0 { "-" } else { "+" };
-    let abs = micro.unsigned_abs();
-    let dollars = abs / core_types::MICRO_SCALE;
-    let rem = abs % core_types::MICRO_SCALE;
-    format!("{sign}${dollars}.{rem:06}")
 }
