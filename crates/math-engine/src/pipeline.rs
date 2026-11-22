@@ -44,8 +44,9 @@ impl MathPipelineConfig {
         let pricer = PricerConfig {
             gamma,
             include_variance_spread: cfg.include_variance_spread,
-            enforce_fee_floor: true,
+            enforce_fee_floor: cfg.enforce_fee_floor,
             min_combined_spread_micro: cfg.min_combined_spread_micro,
+            min_spread_ticks: cfg.min_spread_ticks,
             max_combined_bid_micro: cfg.max_combined_bid_micro,
         };
         let station2 = Station2Config {

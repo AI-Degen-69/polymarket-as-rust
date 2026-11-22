@@ -17,6 +17,8 @@ pub struct PricerConfig {
     pub enforce_fee_floor: bool,
     /// Minimum combined spread floor in micro-USDC (`20_000` = `$0.02` default).
     pub min_combined_spread_micro: MicroUsdc,
+    /// Minimum combined spread floor in integer ticks (`2` default).
+    pub min_spread_ticks: u32,
     /// Maximum allowed sum `bid_up + bid_dn` in micro-USDC (`980_000` = `$0.98` default).
     pub max_combined_bid_micro: MicroUsdc,
 }
@@ -30,6 +32,7 @@ impl PricerConfig {
             include_variance_spread: true,
             enforce_fee_floor: true,
             min_combined_spread_micro: MicroUsdc(20_000),
+            min_spread_ticks: 2,
             max_combined_bid_micro: MicroUsdc(980_000),
         }
     }
@@ -43,6 +46,9 @@ impl PricerConfig {
     /// Validates spread floor and maximum combined bid invariants.
     pub fn validate(&self) -> Result<(), MathError> {
         let _ = FinitePosF64::try_new(self.gamma.get())?;
+        if self.min_spread_ticks == 0 {
+            return Err(err_desc("min_spread_ticks must be >= 1"));
+        }
         if self.min_combined_spread_micro.0 == 0
             || self.min_combined_spread_micro.0 >= ONE_DOLLAR_MICRO
         {
@@ -259,7 +265,7 @@ fn compute_station4(
         return Err(MathError::NonFiniteInput { value: s_star_raw });
     }
     let cfg_min = cfg.min_combined_spread_micro.to_usd_f64();
-    let base_min = (2.0 * tick_usd).max(cfg_min);
+    let base_min = (f64::from(cfg.min_spread_ticks) * tick_usd).max(cfg_min);
     let s_min = if cfg.enforce_fee_floor {
         let fee_rate = input.fee_schedule.fee_rate_e6 as f64 / 1_000_000.0;
         let fee_floor = fee_rate * input.s_i * (1.0 - input.s_i) + tick_usd;
@@ -689,5 +695,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn bbo_join_at_99_cent_pair_cost_is_post_only_safe() {
+        let clock = MonotonicClock::start();
+        let cfg = PricerConfig {
+            gamma: FinitePosF64::try_new(0.02).unwrap(),
+            include_variance_spread: false,
+            enforce_fee_floor: false,
+            min_combined_spread_micro: MicroUsdc(10_000),
+            min_spread_ticks: 1,
+            max_combined_bid_micro: MicroUsdc(990_000),
+        };
+        let pricer = DualBidPricer::new(cfg).unwrap();
+        let bounds = PostOnlyBounds {
+            best_bid_up: Some(MicroUsdc(340_000)),
+            best_ask_up: Some(MicroUsdc(350_000)),
+            best_bid_dn: Some(MicroUsdc(650_000)),
+            best_ask_dn: Some(MicroUsdc(660_000)),
+            active_bid_up: None,
+            active_bid_dn: None,
+        };
+        let input = PricerInput {
+            s_i: 0.345,
+            v_rem: 0.03,
+            kappa: FinitePosF64::try_new(200.0).unwrap(),
+            inventory_q: SignedSharesMicro::ZERO,
+            tick_size_micro: MicroUsdc(10_000),
+            fee_schedule: FeeSchedule::btc_5m_default(),
+            bounds,
+        };
+        let t = pricer.price(&input, &clock).unwrap();
+        assert_close(t.s_min, 0.01, 1e-12);
+        assert!(!t.post_only_clamped_up);
+        assert!(!t.post_only_clamped_dn);
+        assert!(!t.pair_cost_adjusted);
+        assert_eq!(
+            t.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(340_000)),
+                bid_dn: Some(MicroUsdc(650_000)),
+                pair_cost_micro: Some(MicroUsdc(990_000)),
+                gross_margin_bps: Some(100),
+            }
+        );
+
+        let mut self_input = input;
+        self_input.bounds.active_bid_up = Some(MicroUsdc(340_000));
+        self_input.bounds.active_bid_dn = Some(MicroUsdc(650_000));
+        let t_self = pricer.price(&self_input, &clock).unwrap();
+        assert!(!t_self.post_only_clamped_up);
+        assert!(!t_self.post_only_clamped_dn);
+        assert_eq!(t_self.quote, t.quote);
     }
 }
