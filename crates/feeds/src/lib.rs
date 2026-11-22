@@ -942,4 +942,113 @@ mod tests {
             })
         ));
     }
+
+    #[tokio::test]
+    async fn clob_rollover_acknowledges_and_stamps_new_epoch_events() {
+        let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let http_addr = http_listener.local_addr().unwrap();
+        let ws_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_addr = ws_listener.local_addr().unwrap();
+
+        let http_srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = http_listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0_u8; 2048];
+                    let _ = sock.read(&mut buf).await;
+                    let body = r#"{"timestamp":"1782753360000","bids":[{"price":"0.48","size":"15"}],"asks":[{"price":"0.52","size":"15"}]}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let ws_srv = tokio::spawn(async move {
+            let (sock, _) = ws_listener.accept().await.unwrap();
+            let mut ws = accept_async(sock).await.unwrap();
+            let _ = ws.next().await; // initial subscribe UP1/DN1
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"event_type":"book","asset_id":"UP1","timestamp":"1782753357000","bids":[{"price":"0.40","size":"10"}],"asks":[{"price":"0.42","size":"10"}]}"#.into(),
+                ))
+                .await;
+            let _ = ws.next().await; // rollover unsubscribe UP1/DN1
+            let _ = ws.next().await; // rollover subscribe UP2/DN2
+            let _ = ws
+                .send(Message::Text(
+                    r#"{"event_type":"book","asset_id":"UP2","timestamp":"1782753361000","bids":[{"price":"0.49","size":"10"}],"asks":[{"price":"0.51","size":"10"}]}"#.into(),
+                ))
+                .await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        });
+
+        let http_base = format!("http://{http_addr}");
+        let disc =
+            GammaDiscoveryClient::with_base_urls(&http_base, &http_base, &http_base).unwrap();
+        let mut cfg = ClobWsConfig::new("UP1", "DN1");
+        cfg.ws_url = format!("ws://{ws_addr}");
+        cfg.ping_interval = Duration::from_secs(30);
+        cfg.stale_timeout = Duration::from_secs(10);
+
+        let (prod, mut cons) = RingBuffer::new(64);
+        let (htx, _hrx) = mpsc::channel(32);
+        let (ctx, crx) = mpsc::channel(8);
+        let actor = ClobMarketWsActor::new(cfg, disc).unwrap();
+        let handle = tokio::spawn(actor.run(prod, htx, crx));
+
+        // Wait for epoch-0 event from UP1.
+        let mut saw_epoch0 = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(2) {
+            if let Ok(ev) = cons.pop() {
+                assert_eq!(ev.epoch(), 0);
+                saw_epoch0 = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_epoch0, "expected epoch 0 snapshot before rollover");
+
+        // Trigger Rollover and await ack with new epoch = 1.
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        ctx.send(ClobWsCommand::Rollover {
+            new_asset_id_up: "UP2".to_string(),
+            new_asset_id_dn: "DN2".to_string(),
+            ack: Some(ack_tx),
+        })
+        .await
+        .unwrap();
+        let new_epoch = tokio::time::timeout(Duration::from_secs(2), ack_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(new_epoch, 1);
+
+        // Wait for epoch-1 events from UP2/DN2 (REST resync + WS frame).
+        let mut saw_epoch1 = false;
+        let t1 = Instant::now();
+        while t1.elapsed() < Duration::from_secs(2) {
+            while let Ok(ev) = cons.pop() {
+                if ev.epoch() == 1 {
+                    saw_epoch1 = true;
+                }
+            }
+            if saw_epoch1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_epoch1, "expected epoch 1 event after rollover");
+
+        let _ = ctx.send(ClobWsCommand::Shutdown).await;
+        let _ = handle.await;
+        ws_srv.abort();
+        http_srv.abort();
+    }
 }

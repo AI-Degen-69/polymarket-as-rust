@@ -304,6 +304,19 @@ impl FifoPaperBroker {
         }
     }
 
+    /// Immediately cancels every active or pending-cancel order (used at epoch settlement
+    /// so expired-epoch orders cannot receive post-settlement fills).
+    pub fn force_cancel_all(&mut self) -> usize {
+        let mut cancelled = 0_usize;
+        for order in self.orders.values_mut() {
+            if order.status.is_active() {
+                order.status = SimOrderStatus::Cancelled;
+                cancelled = cancelled.saturating_add(1);
+            }
+        }
+        cancelled
+    }
+
     /// Evaluates a public trade event against fillable resting orders on the book.
     ///
     /// Follows strict FIFO queue priority:

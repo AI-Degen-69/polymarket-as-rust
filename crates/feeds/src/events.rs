@@ -44,6 +44,8 @@ pub enum PolyMarketEvent {
         rx_mono_ns: u64,
         /// Exchange timestamp in Unix milliseconds.
         exch_ts_ms: u64,
+        /// Monotonic CLOB subscription epoch ID incremented on rollover.
+        epoch: u64,
     },
     /// Single-level L2 book delta with exchange top-of-book hint.
     PriceChange {
@@ -63,6 +65,8 @@ pub enum PolyMarketEvent {
         rx_mono_ns: u64,
         /// Exchange timestamp in Unix milliseconds.
         exch_ts_ms: u64,
+        /// Monotonic CLOB subscription epoch ID incremented on rollover.
+        epoch: u64,
     },
     /// Public trade print on an outcome book.
     LastTrade {
@@ -78,6 +82,8 @@ pub enum PolyMarketEvent {
         rx_mono_ns: u64,
         /// Exchange timestamp in Unix milliseconds.
         exch_ts_ms: u64,
+        /// Monotonic CLOB subscription epoch ID incremented on rollover.
+        epoch: u64,
     },
     /// Minimum tick size transition notification.
     TickSizeChange {
@@ -89,6 +95,8 @@ pub enum PolyMarketEvent {
         rx_mono_ns: u64,
         /// Exchange timestamp in Unix milliseconds.
         exch_ts_ms: u64,
+        /// Monotonic CLOB subscription epoch ID incremented on rollover.
+        epoch: u64,
     },
     /// Best bid/ask summary update (`custom_feature_enabled: true`).
     BestBidAsk {
@@ -102,7 +110,34 @@ pub enum PolyMarketEvent {
         rx_mono_ns: u64,
         /// Exchange timestamp in Unix milliseconds.
         exch_ts_ms: u64,
+        /// Monotonic CLOB subscription epoch ID incremented on rollover.
+        epoch: u64,
     },
+}
+
+impl PolyMarketEvent {
+    /// Returns the CLOB subscription epoch ID stamped on this event.
+    #[must_use]
+    pub const fn epoch(&self) -> u64 {
+        match *self {
+            Self::BookSnapshot { epoch, .. }
+            | Self::PriceChange { epoch, .. }
+            | Self::LastTrade { epoch, .. }
+            | Self::TickSizeChange { epoch, .. }
+            | Self::BestBidAsk { epoch, .. } => epoch,
+        }
+    }
+
+    /// Stamps the CLOB subscription epoch ID on this event.
+    pub const fn set_epoch(&mut self, new_epoch: u64) {
+        match self {
+            Self::BookSnapshot { epoch, .. }
+            | Self::PriceChange { epoch, .. }
+            | Self::LastTrade { epoch, .. }
+            | Self::TickSizeChange { epoch, .. }
+            | Self::BestBidAsk { epoch, .. } => *epoch = new_epoch,
+        }
+    }
 }
 
 /// Zero-allocation `Copy` hot-path event emitted by `BinanceSpotWsActor`.

@@ -192,6 +192,8 @@ pub(crate) async fn connect_ws_bounded<C>(
     let connect_fut =
         tokio::time::timeout(connect_timeout, connect_async_with_config(url, None, true));
     tokio::select! {
+        biased;
+        cmd = cmd_rx.recv() => ConnectStep::Command(cmd),
         res = connect_fut => match res {
             Ok(Ok((ws, _))) => ConnectStep::Connected(Box::new(ws)),
             Ok(Err(err)) => ConnectStep::Failed(format!("connect to {} failed: {err}", sanitize_ws_url(url))),
@@ -201,7 +203,6 @@ pub(crate) async fn connect_ws_bounded<C>(
                 sanitize_ws_url(url)
             )),
         },
-        cmd = cmd_rx.recv() => ConnectStep::Command(cmd),
     }
 }
 
