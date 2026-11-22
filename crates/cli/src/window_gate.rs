@@ -1,7 +1,5 @@
 //! Shared fresh 5-minute window alignment gate for live capture and trading commands.
 
-#![allow(dead_code)]
-
 use std::error::Error;
 use std::time::Duration;
 
@@ -96,7 +94,15 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
     let adjusted_now_ms = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
 
     match plan_fresh_window_gate(adjusted_now_ms, allow_mid_window) {
-        WindowGatePlan::ProceedImmediately { .. } => {
+        WindowGatePlan::ProceedImmediately {
+            current_window_start_ms,
+        } => {
+            if !allow_mid_window {
+                println!(
+                    "  [WAIT] Fresh 5m window active ({} UTC); proceeding immediately...",
+                    format_utc_hms(current_window_start_ms)
+                );
+            }
             let desc = discovery
                 .discover_active_5m_btc(adjusted_now_ms, min_remaining_ms)
                 .await?;

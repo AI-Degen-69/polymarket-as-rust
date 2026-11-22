@@ -22,10 +22,13 @@ use crate::feeds_report::{
     write_summary_event,
 };
 use crate::log_paths;
+use crate::window_gate::{self, FreshWindowDiscovery, GateOutcome};
 
 pub(crate) struct FeedsArgs {
     pub(crate) discover: bool,
-    pub(crate) duration: String,
+    pub(crate) duration: Option<String>,
+    pub(crate) windows: Option<u32>,
+    pub(crate) allow_mid_window: bool,
     pub(crate) replay: Option<PathBuf>,
     pub(crate) replay_out: Option<PathBuf>,
     pub(crate) jsonl: Option<PathBuf>,
@@ -95,6 +98,9 @@ pub(crate) fn run(args: FeedsArgs) -> Result<(), Box<dyn Error>> {
         if args.discover {
             return Err("cannot pass both --discover and --replay together".into());
         }
+        if args.windows.is_some() {
+            return Err("`--windows` is only valid with `--discover`".into());
+        }
         return run_replay(replay_path, args.replay_out.as_deref());
     }
     if !args.discover {
@@ -102,18 +108,42 @@ pub(crate) fn run(args: FeedsArgs) -> Result<(), Box<dyn Error>> {
             "specify `--discover` for live feeds or `--replay <file>` for offline replay".into(),
         );
     }
-    let duration = parse_duration_arg(&args.duration)?;
+    let duration = resolve_capture_duration(args.duration.as_deref(), args.windows)?;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    rt.block_on(run_discover(duration, args.jsonl.as_deref()))
+    rt.block_on(run_discover(
+        duration,
+        args.windows,
+        args.allow_mid_window,
+        args.jsonl.as_deref(),
+    ))
 }
 
-async fn run_discover(duration: Duration, jsonl_arg: Option<&Path>) -> Result<(), Box<dyn Error>> {
+async fn run_discover(
+    duration: Duration,
+    target_windows: Option<u32>,
+    allow_mid_window: bool,
+    jsonl_arg: Option<&Path>,
+) -> Result<(), Box<dyn Error>> {
     let clock = MonotonicClock::start();
     let _timer_guard = HighResTimerGuard::acquire_1ms()?;
     let cfg = EngineConfig::from_env()?;
     feeds::install_tls_provider();
+
+    // Wait for a fresh 5-minute boundary BEFORE reserving `.inprogress.jsonl` or starting timers.
+    let fresh = match window_gate::wait_and_discover_fresh_5m_market(&cfg, allow_mid_window, 10_000)
+        .await?
+    {
+        GateOutcome::Ready(fresh) => fresh,
+        GateOutcome::Cancelled => return Ok(()),
+    };
+    let FreshWindowDiscovery {
+        discovery,
+        offset_est,
+        sync_report,
+        mut desc,
+    } = fresh;
 
     let target = match jsonl_arg {
         Some(path) => CaptureTarget::Explicit(path.to_path_buf()),
@@ -131,8 +161,13 @@ async fn run_discover(duration: Duration, jsonl_arg: Option<&Path>) -> Result<()
         }
     };
 
-    let (discovery, mut desc, offset_est, mut jsonl) =
-        setup_discovery_and_log(&cfg, &clock, target.write_path()).await?;
+    let raw_now_ms = MonotonicClock::unix_now_ms()?;
+    let adj_now_ms = offset_est.adjusted_unix_ms(raw_now_ms)?;
+    print_header_and_market(&desc, &sync_report, cfg.polybolt_enabled);
+    let mut jsonl = JsonlWriter::create(target.write_path())?;
+    jsonl.write_event(raw_now_ms, clock.now_ns()?, "market_discovered", &desc)?;
+    jsonl.write_event(raw_now_ms, clock.now_ns()?, "clock_sync", &sync_report)?;
+
     let (poly_prod, mut poly_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (bin_prod, mut bin_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (ora_prod, mut ora_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
@@ -153,6 +188,8 @@ async fn run_discover(duration: Duration, jsonl_arg: Option<&Path>) -> Result<()
         oracle_cons: &mut ora_cons,
         health_rx: &mut health_rx,
     };
+    let max_rollovers =
+        target_windows.map(|n| usize::try_from(n.saturating_sub(1)).unwrap_or(usize::MAX));
     let mut rollover_ctx = CaptureRolloverCtx {
         discovery: &discovery,
         offset_est: &offset_est,
@@ -160,11 +197,16 @@ async fn run_discover(duration: Duration, jsonl_arg: Option<&Path>) -> Result<()
         current_desc: &mut desc,
         epoch: 0,
         rollovers: 0,
+        max_rollovers,
         last_rollover_attempt: None,
+    };
+    let effective_duration = match target_windows {
+        Some(n) => window_capture_duration(rollover_ctx.current_desc.start_ts_ms, adj_now_ms, n),
+        None => duration,
     };
     let capture_start = Instant::now();
     let capture_res = capture_until_deadline(
-        duration,
+        effective_duration,
         &clock,
         &mut rings,
         &mut data,
@@ -245,35 +287,6 @@ async fn finish_discover_report(
     Ok(())
 }
 
-async fn setup_discovery_and_log(
-    cfg: &EngineConfig,
-    clock: &MonotonicClock,
-    jsonl_path: &Path,
-) -> Result<
-    (
-        GammaDiscoveryClient,
-        MarketDescriptor,
-        ClockOffsetEstimator,
-        JsonlWriter,
-    ),
-    Box<dyn Error>,
-> {
-    let discovery = GammaDiscoveryClient::new()?;
-    let offset_est = ClockOffsetEstimator::new(cfg.clock_drift_max_ms);
-    let sync = discovery.sync_clock(&offset_est).await?;
-    let raw_now_ms = MonotonicClock::unix_now_ms()?;
-    let adjusted_now_ms = offset_est.adjusted_unix_ms(raw_now_ms)?;
-    let desc = discovery
-        .discover_active_5m_btc(adjusted_now_ms, 10_000)
-        .await?;
-
-    print_header_and_market(&desc, &sync, cfg.polybolt_enabled);
-    let mut jsonl = JsonlWriter::create(jsonl_path)?;
-    jsonl.write_event(raw_now_ms, clock.now_ns()?, "market_discovered", &desc)?;
-    jsonl.write_event(raw_now_ms, clock.now_ns()?, "clock_sync", &sync)?;
-    Ok((discovery, desc, offset_est, jsonl))
-}
-
 fn init_capture_data(polybolt_enabled: bool) -> CaptureReportData {
     let pb_state = if polybolt_enabled {
         "Connecting".to_string()
@@ -329,6 +342,7 @@ struct CaptureRolloverCtx<'a> {
     current_desc: &'a mut MarketDescriptor,
     epoch: u64,
     rollovers: usize,
+    max_rollovers: Option<usize>,
     last_rollover_attempt: Option<tokio::time::Instant>,
 }
 
@@ -372,6 +386,12 @@ async fn maybe_rollover_capture(
     let raw_now_ms = MonotonicClock::unix_now_ms()?;
     let adjusted_now_ms = rollover.offset_est.adjusted_unix_ms(raw_now_ms)?;
     if adjusted_now_ms < rollover.current_desc.expiry_ts_ms {
+        return Ok(());
+    }
+    if rollover
+        .max_rollovers
+        .is_some_and(|limit| rollover.rollovers >= limit)
+    {
         return Ok(());
     }
     let probe_due = rollover
@@ -706,6 +726,37 @@ fn record_binance_event(
     Ok(())
 }
 
+/// Resolves either `--windows <N>` (`N * 300s`, `N >= 1`) or `--duration` (default `20s`).
+pub(crate) fn resolve_capture_duration(
+    duration: Option<&str>,
+    windows: Option<u32>,
+) -> Result<Duration, Box<dyn Error>> {
+    if duration.is_some() && windows.is_some() {
+        return Err("cannot pass both --duration and --windows together".into());
+    }
+    if let Some(count) = windows {
+        if count == 0 {
+            return Err("`--windows` must be >= 1".into());
+        }
+        let secs = u64::from(count)
+            .checked_mul(300)
+            .ok_or("`--windows` duration overflow")?;
+        return Ok(Duration::from_secs(secs));
+    }
+    parse_duration_arg(duration.unwrap_or("20s"))
+}
+
+/// Computes remaining capture duration to align stop time with the end of window `N`.
+pub(crate) fn window_capture_duration(
+    desc_start_ts_ms: u64,
+    adj_now_ms: u64,
+    target_windows: u32,
+) -> Duration {
+    let total_ms = u64::from(target_windows).saturating_mul(window_gate::WINDOW_MS);
+    let target_end_ms = desc_start_ts_ms.saturating_add(total_ms);
+    Duration::from_millis(target_end_ms.saturating_sub(adj_now_ms))
+}
+
 /// Parses human duration suffixes (`20s`, `500ms`, `1m`) into `std::time::Duration`.
 pub(crate) fn parse_duration_arg(raw: &str) -> Result<Duration, Box<dyn Error>> {
     let trimmed = raw.trim();
@@ -743,5 +794,41 @@ mod tests {
         assert_eq!(parse_duration_arg("2m").unwrap(), Duration::from_secs(120));
         assert!(parse_duration_arg("0s").is_err());
         assert!(parse_duration_arg("20h").is_err());
+    }
+
+    #[test]
+    fn resolve_capture_duration_handles_windows_and_conflicts() {
+        assert_eq!(
+            resolve_capture_duration(None, None).unwrap(),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            resolve_capture_duration(Some("45s"), None).unwrap(),
+            Duration::from_secs(45)
+        );
+        assert_eq!(
+            resolve_capture_duration(None, Some(1)).unwrap(),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            resolve_capture_duration(None, Some(3)).unwrap(),
+            Duration::from_secs(900)
+        );
+        assert!(resolve_capture_duration(None, Some(0)).is_err());
+        assert!(resolve_capture_duration(Some("20s"), Some(1)).is_err());
+        assert!(resolve_capture_duration(None, Some(u32::MAX)).is_ok());
+    }
+
+    #[test]
+    fn window_capture_duration_aligns_stop_to_window_end() {
+        let start_ms = 1_795_345_200_000_u64;
+        assert_eq!(
+            window_capture_duration(start_ms, start_ms + 500, 1),
+            Duration::from_millis(299_500)
+        );
+        assert_eq!(
+            window_capture_duration(start_ms, start_ms + 1_200, 2),
+            Duration::from_millis(598_800)
+        );
     }
 }

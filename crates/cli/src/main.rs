@@ -261,9 +261,15 @@ enum Commands {
         /// Discover active 5-minute BTC market and stream live feeds.
         #[arg(long)]
         discover: bool,
-        /// Live capture duration (`20s`, `500ms`, `1m`).
-        #[arg(long, default_value = "20s")]
-        duration: String,
+        /// Live capture duration (`20s`, `500ms`, `1m`; defaults to `20s` when `--windows` is omitted).
+        #[arg(long, conflicts_with = "windows")]
+        duration: Option<String>,
+        /// Capture `N` full 5-minute windows (`N >= 1`) and stop cleanly at the end of window `N`.
+        #[arg(long, conflicts_with = "duration")]
+        windows: Option<u32>,
+        /// Allow starting mid-window instead of waiting idle for the next fresh 5-minute boundary.
+        #[arg(long, default_value_t = false)]
+        allow_mid_window: bool,
         /// Replay recorded JSONL feed log offline.
         #[arg(long)]
         replay: Option<PathBuf>,
@@ -406,12 +412,16 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Feeds {
             discover,
             duration,
+            windows,
+            allow_mid_window,
             replay,
             replay_out,
             jsonl,
         } => feeds_cmd::run(FeedsArgs {
             discover,
             duration,
+            windows,
+            allow_mid_window,
             replay,
             replay_out,
             jsonl,
@@ -636,12 +646,16 @@ mod tests {
             Commands::Feeds {
                 discover,
                 duration,
+                windows,
+                allow_mid_window,
                 replay,
                 replay_out,
                 jsonl,
             } => {
                 assert!(discover);
-                assert_eq!(duration, "20s");
+                assert_eq!(duration.as_deref(), Some("20s"));
+                assert!(windows.is_none());
+                assert!(!allow_mid_window);
                 assert!(replay.is_none());
                 assert!(replay_out.is_none());
                 assert_eq!(jsonl, Some(PathBuf::from("logs/phase1-feeds.jsonl")));
@@ -660,6 +674,44 @@ mod tests {
             }
             _ => panic!("expected Feeds"),
         }
+
+        let windowed = Cli::try_parse_from([
+            "poly-as",
+            "feeds",
+            "--discover",
+            "--windows",
+            "3",
+            "--allow-mid-window",
+        ])
+        .unwrap();
+        match windowed.command {
+            Commands::Feeds {
+                discover,
+                duration,
+                windows,
+                allow_mid_window,
+                ..
+            } => {
+                assert!(discover);
+                assert!(duration.is_none());
+                assert_eq!(windows, Some(3));
+                assert!(allow_mid_window);
+            }
+            _ => panic!("expected Feeds"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "poly-as",
+                "feeds",
+                "--discover",
+                "--duration",
+                "60s",
+                "--windows",
+                "2",
+            ])
+            .is_err()
+        );
 
         let replay =
             Cli::try_parse_from(["poly-as", "feeds", "--replay", "logs/rec.jsonl"]).unwrap();
