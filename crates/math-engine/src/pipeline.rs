@@ -8,8 +8,8 @@ use crate::station1_sg::{SavitzkyGolayFilter, SgOutput};
 use crate::station2_twap::{LeadLagSignal, RollingTwapAndVariance, Station2Config, Station2Output};
 use crate::station3_kappa::{KappaConfig, KappaEstimator, KappaOutput};
 use crate::station4_6_pricer::{
-    DualBidPricer, PostOnlyBounds, PricerConfig, PricerInput, PricerTrace, QuoteOutput,
-    SuppressionReason,
+    CostContext, DualBidPricer, PostOnlyBounds, PricerConfig, PricerInput, PricerTrace,
+    QuoteOutput, SuppressionReason,
 };
 
 /// Unified configuration for the zero-allocation Stations 1–6 math pipeline.
@@ -48,6 +48,8 @@ impl MathPipelineConfig {
             min_combined_spread_micro: cfg.min_combined_spread_micro,
             min_spread_ticks: cfg.min_spread_ticks,
             max_combined_bid_micro: cfg.max_combined_bid_micro,
+            max_cross_tick_loss_micro: cfg.max_cross_tick_loss_micro,
+            max_entry_prob: cfg.max_entry_prob,
         };
         let station2 = Station2Config {
             variance_mode: cfg.variance_mode,
@@ -101,6 +103,8 @@ pub struct PipelineInput<'a> {
     pub active_bid_up: Option<MicroUsdc>,
     /// Currently active resting DOWN bid price if any (3-way self-cross guard).
     pub active_bid_dn: Option<MicroUsdc>,
+    /// Active unmerged inventory cost basis and escalation override context for Station 6.
+    pub cost_context: CostContext,
 }
 
 /// Per-station and total nanosecond compute latencies for one evaluation tick.
@@ -450,6 +454,7 @@ fn build_pricer_input(
             active_bid_up: input.active_bid_up,
             active_bid_dn: input.active_bid_dn,
         },
+        cost_context: input.cost_context,
     }
 }
 
@@ -560,6 +565,7 @@ mod tests {
             strike_usd: Some(90_000.0),
             active_bid_up: None,
             active_bid_dn: None,
+            cost_context: CostContext::default(),
         };
         let cr = pipe.evaluate(&crossed_in).unwrap();
         assert!(cr.flags.crossed_book);
@@ -582,6 +588,7 @@ mod tests {
                 strike_usd: Some(90_000.0),
                 active_bid_up: None,
                 active_bid_dn: None,
+                cost_context: CostContext::default(),
             };
             let tr = pipe.evaluate(&inp).unwrap();
             assert!(tr.flags.sg_warming_up);
@@ -604,6 +611,7 @@ mod tests {
             strike_usd: Some(90_000.0),
             active_bid_up: None,
             active_bid_dn: None,
+            cost_context: CostContext::default(),
         };
         let active = pipe.evaluate(&active_in).unwrap();
         assert!(!active.flags.sg_warming_up);
@@ -651,5 +659,76 @@ mod tests {
         pipe.reset_epoch();
         let after_reset = pipe.evaluate(&active_in).unwrap();
         assert!(after_reset.flags.sg_warming_up);
+    }
+
+    #[test]
+    fn station6_guards_preserve_stations_1_to_5_identically() {
+        let clock = MonotonicClock::start();
+        let base_ec = EngineConfig::default();
+        let guarded_ec = EngineConfig {
+            max_cross_tick_loss_micro: Some(0),
+            max_entry_prob: Some(0.85),
+            ..EngineConfig::default()
+        };
+
+        let mut base_pipe = MathPipeline::new(
+            MathPipelineConfig::from_engine_config(&base_ec).unwrap(),
+            clock,
+        )
+        .unwrap();
+        let mut guarded_pipe = MathPipeline::new(
+            MathPipelineConfig::from_engine_config(&guarded_ec).unwrap(),
+            clock,
+        )
+        .unwrap();
+
+        let high_up = FixedBook::<10>::try_from_slices(
+            Outcome::Up,
+            &[lvl(92, 100), lvl(91, 200)],
+            &[lvl(94, 100), lvl(95, 200)],
+            1,
+            1,
+        )
+        .unwrap();
+        let low_dn = FixedBook::<10>::try_from_slices(
+            Outcome::Down,
+            &[lvl(6, 100), lvl(5, 200)],
+            &[lvl(8, 100), lvl(9, 200)],
+            1,
+            1,
+        )
+        .unwrap();
+
+        for tick in 0..5_u64 {
+            let inp = PipelineInput {
+                now_ms: 100_000 + tick * 100,
+                expiry_ms: 300_000,
+                tick_size_micro: MicroUsdc(10_000),
+                fee_schedule: FeeSchedule::btc_5m_default(),
+                inventory_q: SignedSharesMicro(20 * ONE_SHARE_MICRO as i64),
+                book_up: &high_up,
+                book_dn: &low_dn,
+                spot_usd: Some(91_000.0),
+                strike_usd: Some(90_000.0),
+                active_bid_up: None,
+                active_bid_dn: None,
+                cost_context: CostContext {
+                    avg_cost_up: Some(MicroUsdc(910_000)),
+                    avg_cost_dn: None,
+                    allow_cross_tick_override: false,
+                },
+            };
+            let b = base_pipe.evaluate(&inp).unwrap();
+            let g = guarded_pipe.evaluate(&inp).unwrap();
+            assert_eq!(b.sg, g.sg);
+            assert_eq!(b.station2.map(|s| s.v_rem), g.station2.map(|s| s.v_rem));
+            assert_eq!(
+                b.station2.map(|s| s.lead_lag.p_spot_star),
+                g.station2.map(|s| s.lead_lag.p_spot_star)
+            );
+            assert_eq!(b.kappa.map(|k| k.kappa), g.kappa.map(|k| k.kappa));
+            assert_eq!(b.pricer.map(|p| p.s_star), g.pricer.map(|p| p.s_star));
+            assert_eq!(b.pricer.map(|p| p.r_i), g.pricer.map(|p| p.r_i));
+        }
     }
 }

@@ -16,7 +16,7 @@ use feeds::{
     GammaDiscoveryClient, OracleTwapEvent, PolyMarketEvent,
 };
 use math_engine::{
-    MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
+    CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
 };
 use paper_sim::{
     BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, MergeEvent, NaiveQuotesInput,
@@ -104,6 +104,7 @@ struct PricingJob {
     strike_usd: Option<f64>,
     active_bid_up: Option<MicroUsdc>,
     active_bid_dn: Option<MicroUsdc>,
+    cost_context: CostContext,
     spot_ticks: Vec<(u64, f64)>,
     up_trade_sizes: Vec<SharesMicro>,
     reset_epoch: bool,
@@ -191,6 +192,7 @@ fn pricing_actor_loop(
             strike_usd: job.strike_usd,
             active_bid_up: job.active_bid_up,
             active_bid_dn: job.active_bid_dn,
+            cost_context: job.cost_context,
         };
 
         let reply = match pipeline.evaluate(&input) {
@@ -199,6 +201,33 @@ fn pricing_actor_loop(
                 let r_i = trace.pricer.map_or(0.50, |p| p.r_i);
                 let bid_up_raw = trace.pricer.map_or(0.0, |p| p.bid_up_raw);
                 let bid_dn_raw = trace.pricer.map_or(0.0, |p| p.bid_dn_raw);
+                let (bid_up_auth, bid_dn_auth) = match trace.quote {
+                    QuoteOutput::Active { bid_up, bid_dn, .. } => (bid_up, bid_dn),
+                    QuoteOutput::Suppressed(_) => (None, None),
+                };
+                let price_capped_up = trace.pricer.is_some_and(|p| {
+                    p.cross_tick_clamped_up || p.post_only_clamped_up || p.pair_cost_adjusted
+                });
+                let price_capped_dn = trace.pricer.is_some_and(|p| {
+                    p.cross_tick_clamped_dn || p.post_only_clamped_dn || p.pair_cost_adjusted
+                });
+                let proposal_bid_up_raw = if price_capped_up {
+                    bid_up_auth.map_or(bid_up_raw, |p| bid_up_raw.min(p.to_usd_f64()))
+                } else {
+                    bid_up_raw
+                };
+                let proposal_bid_dn_raw = if price_capped_dn {
+                    bid_dn_auth.map_or(bid_dn_raw, |p| bid_dn_raw.min(p.to_usd_f64()))
+                } else {
+                    bid_dn_raw
+                };
+                let max_entry_prob = pipeline.config().pricer.max_entry_prob;
+                let hedge_only_up = max_entry_prob.is_some_and(|p_max| {
+                    bid_up_auth.is_some_and(|p| math_engine::exceeds_entry_prob_bounds(p, p_max))
+                });
+                let hedge_only_dn = max_entry_prob.is_some_and(|p_max| {
+                    bid_dn_auth.is_some_and(|p| math_engine::exceeds_entry_prob_bounds(p, p_max))
+                });
                 let twap_60s = trace.station2.and_then(|s| s.twap_60s_usd);
                 harness.publish_quote(QuoteProposal {
                     seq: job.seq,
@@ -206,8 +235,12 @@ fn pricing_actor_loop(
                     expiry_ms: job.expiry_ms,
                     tick_size_micro: job.tick_size_micro,
                     quote: trace.quote,
-                    bid_up_raw,
-                    bid_dn_raw,
+                    bid_up_raw: proposal_bid_up_raw,
+                    bid_dn_raw: proposal_bid_dn_raw,
+                    price_capped_up,
+                    price_capped_dn,
+                    hedge_only_up,
+                    hedge_only_dn,
                     best_bid_up: trace.best_bid_up,
                     best_bid_dn: trace.best_bid_dn,
                     best_ask_up: trace.best_ask_up,
@@ -487,6 +520,10 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
             quote: step_quote,
             bid_up_raw: mid_up - 0.02,
             bid_dn_raw: (1.0 - mid_up) - 0.02,
+            price_capped_up: false,
+            price_capped_dn: false,
+            hedge_only_up: false,
+            hedge_only_dn: false,
             best_bid_up: Some(MicroUsdc(bid_up_val.saturating_sub(10_000))),
             best_bid_dn: Some(MicroUsdc(bid_dn_val.saturating_sub(10_000))),
             best_ask_up: Some(MicroUsdc(bid_up_val.saturating_add(20_000))),
@@ -989,6 +1026,7 @@ struct LivePaperSimulator {
     pending_feedback: Vec<RiskFeedback>,
     v_max_micro: MicroUsdc,
     base_size_shares: u64,
+    max_entry_prob: Option<f64>,
     cumulative_merged_cost_micro: u64,
     step_count: u64,
     current_phase: Option<EpochPhase>,
@@ -1008,6 +1046,7 @@ impl LivePaperSimulator {
         broker_config: FifoBrokerConfig,
         v_max_micro: MicroUsdc,
         base_size_shares: u64,
+        max_entry_prob: Option<f64>,
         display: LifecycleDisplayMode,
         harness: ActorPipelineHarness,
         priority_rx: mpsc::Receiver<ExecutionCommand>,
@@ -1044,6 +1083,7 @@ impl LivePaperSimulator {
             pending_feedback: Vec::with_capacity(16),
             v_max_micro,
             base_size_shares,
+            max_entry_prob,
             cumulative_merged_cost_micro: 0,
             step_count: 0,
             current_phase: None,
@@ -1378,10 +1418,20 @@ impl LivePaperSimulator {
         let remaining_q_cap =
             SharesMicro::from_raw(q_max.as_u64().saturating_sub(unhedged_leg.as_u64()));
 
+        let hedge_only_cap = if self
+            .max_entry_prob
+            .is_some_and(|p_max| math_engine::exceeds_entry_prob_bounds(price, p_max))
+        {
+            SharesMicro::from_raw(unhedged_opp.as_u64().saturating_sub(unhedged_leg.as_u64()))
+        } else {
+            requested
+        };
+
         let capped = requested
             .min(max_base)
             .min(max_by_v_max)
-            .min(remaining_q_cap);
+            .min(remaining_q_cap)
+            .min(hedge_only_cap);
         if capped < self.desc.min_order_size_micro {
             None
         } else {
@@ -1786,6 +1836,14 @@ impl LivePaperSimulator {
             strike_usd: self.strike_usd,
             active_bid_up,
             active_bid_dn,
+            cost_context: CostContext {
+                avg_cost_up: self.ledger.avg_cost_up(),
+                avg_cost_dn: self.ledger.avg_cost_dn(),
+                allow_cross_tick_override: risk_lifecycle::allows_cross_tick_override(
+                    self.current_tier,
+                    self.current_phase,
+                ),
+            },
             spot_ticks: std::mem::take(&mut self.pending_spot_ticks),
             up_trade_sizes: std::mem::take(&mut self.pending_up_trades),
             reset_epoch: std::mem::take(&mut self.pending_reset_epoch),
@@ -2315,6 +2373,7 @@ fn spawn_managed_session(
         broker_cfg,
         v_max_micro,
         args.base_size,
+        cfg.max_entry_prob,
         args.display,
         harness.clone(),
         priority_rx,
@@ -3158,6 +3217,7 @@ mod tests {
             broker_cfg,
             v_max_micro,
             base_size,
+            cfg.max_entry_prob,
             LifecycleDisplayMode::Stream,
             harness.clone(),
             priority_rx,
@@ -4288,6 +4348,7 @@ mod tests {
                 min_spread_ticks: Some(1),
                 max_combined_bid_micro: Some(990_000),
                 fee_spread_floor: Some(false),
+                ..Default::default()
             },
             pinning: CorePinning::default(),
             jsonl: out.clone(),
@@ -4322,6 +4383,7 @@ mod tests {
                 min_spread_ticks: Some(1),
                 max_combined_bid_micro: Some(990_000),
                 fee_spread_floor: Some(false),
+                ..Default::default()
             },
             pinning: CorePinning::default(),
             jsonl,

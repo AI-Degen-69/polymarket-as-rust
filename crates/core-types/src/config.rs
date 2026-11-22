@@ -133,6 +133,10 @@ pub struct EngineConfig {
     pub include_variance_spread: bool,
     /// Whether Station 4 enforces taker-fee profitability floor (`true` default).
     pub enforce_fee_floor: bool,
+    /// Optional cross-tick pair-cost loss budget in micro-USDC (`None` disables cross-tick cap).
+    pub max_cross_tick_loss_micro: Option<u64>,
+    /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`None` disables entry guard).
+    pub max_entry_prob: Option<f64>,
     /// Maximum permitted local-to-exchange clock drift in milliseconds (`1000ms` default).
     pub clock_drift_max_ms: i64,
     /// Non-serializable live credentials (excluded from serde/JSONL).
@@ -164,6 +168,8 @@ struct RawEngineConfig {
     sg_mode: SgMode,
     include_variance_spread: bool,
     enforce_fee_floor: bool,
+    max_cross_tick_loss_micro: Option<u64>,
+    max_entry_prob: Option<f64>,
     clock_drift_max_ms: i64,
 }
 
@@ -192,6 +198,8 @@ impl Default for RawEngineConfig {
             sg_mode: d.sg_mode,
             include_variance_spread: d.include_variance_spread,
             enforce_fee_floor: d.enforce_fee_floor,
+            max_cross_tick_loss_micro: d.max_cross_tick_loss_micro,
+            max_entry_prob: d.max_entry_prob,
             clock_drift_max_ms: d.clock_drift_max_ms,
         }
     }
@@ -223,6 +231,8 @@ impl TryFrom<RawEngineConfig> for EngineConfig {
             sg_mode: raw.sg_mode,
             include_variance_spread: raw.include_variance_spread,
             enforce_fee_floor: raw.enforce_fee_floor,
+            max_cross_tick_loss_micro: raw.max_cross_tick_loss_micro,
+            max_entry_prob: raw.max_entry_prob,
             clock_drift_max_ms: raw.clock_drift_max_ms,
             credentials: LiveCredentials::default(),
         };
@@ -258,6 +268,8 @@ impl fmt::Debug for EngineConfig {
             .field("sg_mode", &self.sg_mode)
             .field("include_variance_spread", &self.include_variance_spread)
             .field("enforce_fee_floor", &self.enforce_fee_floor)
+            .field("max_cross_tick_loss_micro", &self.max_cross_tick_loss_micro)
+            .field("max_entry_prob", &self.max_entry_prob)
             .field("clock_drift_max_ms", &self.clock_drift_max_ms)
             .field("credentials", &self.credentials)
             .finish()
@@ -288,6 +300,8 @@ impl Default for EngineConfig {
             sg_mode: SgMode::Causal,
             include_variance_spread: true,
             enforce_fee_floor: true,
+            max_cross_tick_loss_micro: None,
+            max_entry_prob: None,
             clock_drift_max_ms: 1_000,
             credentials: LiveCredentials::default(),
         }
@@ -411,6 +425,26 @@ where
     }
     if let Some(v) = non_empty(lookup, "HYSTERESIS_TICK_BUFFER")? {
         cfg.hysteresis_tick_buffer = parse_f64("HYSTERESIS_TICK_BUFFER", &v)?;
+    }
+    if let Some(v) = non_empty(lookup, "MAX_CROSS_TICK_LOSS_MICRO")? {
+        if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            cfg.max_cross_tick_loss_micro = None;
+        } else {
+            cfg.max_cross_tick_loss_micro = Some(v.parse::<u64>().map_err(|_| {
+                invalid_val(
+                    "MAX_CROSS_TICK_LOSS_MICRO",
+                    v,
+                    "expected non-negative integer micro-USDC or 'off'",
+                )
+            })?);
+        }
+    }
+    if let Some(v) = non_empty(lookup, "MAX_ENTRY_PROB")? {
+        if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            cfg.max_entry_prob = None;
+        } else {
+            cfg.max_entry_prob = Some(parse_f64("MAX_ENTRY_PROB", &v)?);
+        }
     }
     Ok(())
 }
@@ -613,6 +647,13 @@ fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
         return Err(invariant(format!(
             "hysteresis_tick_buffer must be in [0, {MAX_HYSTERESIS_TICKS}], got {}",
             cfg.hysteresis_tick_buffer
+        )));
+    }
+    if let Some(p_max) = cfg.max_entry_prob
+        && (!p_max.is_finite() || p_max <= 0.5 || p_max >= 1.0)
+    {
+        return Err(invariant(format!(
+            "max_entry_prob must be finite in (0.5, 1.0), got {p_max}"
         )));
     }
     if cfg.clock_drift_max_ms <= 0 || cfg.clock_drift_max_ms > MAX_CLOCK_DRIFT_MS {

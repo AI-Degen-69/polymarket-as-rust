@@ -30,6 +30,10 @@ param(
 
     [string[]]$MinSpreadTicks = @("1"),
 
+    [string[]]$MaxCrossTickLossMicros = @("off"),
+
+    [string[]]$MaxEntryProbs = @("off"),
+
     [uint64]$MaxCombinedBidMicro = 990000,
 
     [ValidateSet("conservative", "optimistic")]
@@ -55,10 +59,30 @@ $parsedVarSpreads = @($VarianceSpreads | ForEach-Object { $_ -split ',' } | ForE
 $parsedMinTicks = @($MinSpreadTicks | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
     [int]::Parse($_, $inv)
 })
+$parsedCrossLosses = @($MaxCrossTickLossMicros | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    if ($_.Equals("off", [System.StringComparison]::OrdinalIgnoreCase)) {
+        "off"
+    } else {
+        ([uint64]::Parse($_, $inv)).ToString($inv)
+    }
+})
+$parsedMaxEntryProbs = @($MaxEntryProbs | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    if ($_.Equals("off", [System.StringComparison]::OrdinalIgnoreCase)) {
+        "off"
+    } else {
+        $p = [double]::Parse($_, $inv)
+        if ([double]::IsNaN($p) -or [double]::IsInfinity($p) -or $p -le 0.5 -or $p -ge 1.0) {
+            throw "Invalid MaxEntryProbs entry '$_' (expected 'off' or finite number in (0.5, 1.0))"
+        }
+        $p.ToString("R", $inv)
+    }
+})
 
-if ($parsedGammas.Count -eq 0 -or $parsedVarSpreads.Count -eq 0 -or $parsedMinTicks.Count -eq 0) {
-    throw "Gammas, VarianceSpreads, and MinSpreadTicks must each contain at least one value"
+if ($parsedGammas.Count -eq 0 -or $parsedVarSpreads.Count -eq 0 -or $parsedMinTicks.Count -eq 0 -or $parsedCrossLosses.Count -eq 0 -or $parsedMaxEntryProbs.Count -eq 0) {
+    throw "Gammas, VarianceSpreads, MinSpreadTicks, MaxCrossTickLossMicros, and MaxEntryProbs must each contain at least one value"
 }
+$showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
+$showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
 foreach ($v in $parsedVarSpreads) {
     if ($v -ne "true" -and $v -ne "false") {
         throw "Invalid VarianceSpreads entry '$v' (expected 'true' or 'false')"
@@ -123,7 +147,7 @@ try {
         }
     }
 
-    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count
+    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count
     $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
     $captureStem = [System.IO.Path]::GetFileNameWithoutExtension($resolvedInput)
     $sweepBase = Join-Path $repoRoot "logs/sweeps"
@@ -160,83 +184,154 @@ try {
 
         foreach ($varStr in $parsedVarSpreads) {
             foreach ($minTicks in $parsedMinTicks) {
-                $runIdx++
-                $stem = "g${gammaTag}_var-${varStr}_t${minTicks}_b${MaxCombinedBidMicro}_${QueueDecay}"
-                $outJsonl = Join-Path $sweepDir "$stem.jsonl"
-                $outLog = Join-Path $sweepDir "$stem.log"
+                foreach ($crossLoss in $parsedCrossLosses) {
+                    foreach ($entryProb in $parsedMaxEntryProbs) {
+                        $runIdx++
+                        $stem = "g${gammaTag}_var-${varStr}_t${minTicks}_b${MaxCombinedBidMicro}_${QueueDecay}"
+                        if ($showCrossLoss) {
+                            $stem += "_xt-${crossLoss}"
+                        }
+                        if ($showEntryProb) {
+                            $epTag = $entryProb.Replace(".", "p")
+                            $stem += "_ep-${epTag}"
+                        }
+                        $outJsonl = Join-Path $sweepDir "$stem.jsonl"
+                        $outLog = Join-Path $sweepDir "$stem.log"
 
-                Write-Host ("[{0}/{1}] Replaying gamma={2} var_spread={3} min_ticks={4}..." -f $runIdx, $totalRuns, $gammaStr, $varStr, $minTicks)
+                        $extraProgress = ""
+                        if ($showCrossLoss) { $extraProgress += " xtick=$crossLoss" }
+                        if ($showEntryProb) { $extraProgress += " max_p=$entryProb" }
+                        Write-Host ("[{0}/{1}] Replaying gamma={2} var_spread={3} min_ticks={4}{5}..." -f $runIdx, $totalRuns, $gammaStr, $varStr, $minTicks, $extraProgress)
 
-                $cliArgs = @(
-                    "lifecycle",
-                    "--source", "replay",
-                    "--input", $resolvedInput,
-                    "--v-max", $VMax.ToString($inv),
-                    "--base-size", $BaseSize.ToString($inv),
-                    "--queue-decay", $QueueDecay,
-                    "--gamma", $gammaStr,
-                    "--include-variance-spread", $varStr,
-                    "--min-spread-ticks", $minTicks.ToString($inv),
-                    "--max-combined-bid-micro", $MaxCombinedBidMicro.ToString($inv),
-                    "--jsonl", $outJsonl
-                )
+                        $cliArgs = @(
+                            "lifecycle",
+                            "--source", "replay",
+                            "--input", $resolvedInput,
+                            "--v-max", $VMax.ToString($inv),
+                            "--base-size", $BaseSize.ToString($inv),
+                            "--queue-decay", $QueueDecay,
+                            "--gamma", $gammaStr,
+                            "--include-variance-spread", $varStr,
+                            "--min-spread-ticks", $minTicks.ToString($inv),
+                            "--max-combined-bid-micro", $MaxCombinedBidMicro.ToString($inv),
+                            "--jsonl", $outJsonl
+                        )
+                        if ($crossLoss -ne "off") {
+                            $cliArgs += @("--max-cross-tick-loss-micro", $crossLoss)
+                        }
+                        if ($entryProb -ne "off") {
+                            $cliArgs += @("--max-entry-prob", $entryProb)
+                        }
 
-                & $binPath @cliArgs *> $outLog
-                if ($LASTEXITCODE -ne 0) {
-                    $tail = if (Test-Path -LiteralPath $outLog) { (Get-Content -LiteralPath $outLog -Tail 20) -join "`n" } else { "" }
-                    throw "Sweep run failed (exit=$LASTEXITCODE) for $stem.`n$tail"
+                        $prevCrossLossEnv = $env:MAX_CROSS_TICK_LOSS_MICRO
+                        $prevEntryProbEnv = $env:MAX_ENTRY_PROB
+                        try {
+                            if ($crossLoss -eq "off") {
+                                $env:MAX_CROSS_TICK_LOSS_MICRO = "off"
+                            }
+                            if ($entryProb -eq "off") {
+                                $env:MAX_ENTRY_PROB = "off"
+                            }
+                            & $binPath @cliArgs *> $outLog
+                            if ($LASTEXITCODE -ne 0) {
+                                $tail = if (Test-Path -LiteralPath $outLog) { (Get-Content -LiteralPath $outLog -Tail 20) -join "`n" } else { "" }
+                                throw "Sweep run failed (exit=$LASTEXITCODE) for $stem.`n$tail"
+                            }
+                        } finally {
+                            if ($null -eq $prevCrossLossEnv) {
+                                Remove-Item Env:MAX_CROSS_TICK_LOSS_MICRO -ErrorAction SilentlyContinue
+                            } else {
+                                $env:MAX_CROSS_TICK_LOSS_MICRO = $prevCrossLossEnv
+                            }
+                            if ($null -eq $prevEntryProbEnv) {
+                                Remove-Item Env:MAX_ENTRY_PROB -ErrorAction SilentlyContinue
+                            } else {
+                                $env:MAX_ENTRY_PROB = $prevEntryProbEnv
+                            }
+                        }
+
+                        $summaryLine = Get-Content -LiteralPath $outJsonl -Tail 1
+                        if (-not $summaryLine) {
+                            throw "No summary event emitted in $outJsonl"
+                        }
+                        $summaryObj = $summaryLine | ConvertFrom-Json
+                        if ($summaryObj.event -ne "summary") {
+                            throw "Final JSONL row is not a summary event in $outJsonl (found '$($summaryObj.event)')"
+                        }
+
+                        $payload = $summaryObj.payload
+                        $realized = [double]$payload.realized_pnl_micro / 1e6
+                        $unreal = [double]$payload.unrealized_pnl_micro / 1e6
+                        $netPnl = [double]$payload.net_pnl_micro / 1e6
+                        $rebate = [double]$payload.estimated_rebate_micro / 1e6
+                        $basePnl = [double]$payload.baseline_pnl_micro / 1e6
+                        $alphaEdge = $netPnl - $basePnl
+                        $pairs = [double]$payload.total_pairs_merged_micro / 1e6
+
+                        $results.Add([PSCustomObject]@{
+                            Gamma      = $gammaStr
+                            VarSpr     = $varStr
+                            MinT       = $minTicks
+                            XTick      = $crossLoss
+                            MaxP       = $entryProb
+                            Fills      = [int]$payload.fills_count
+                            Merges     = [int]$payload.merges_count
+                            Pairs      = $pairs.ToString("F2", $inv)
+                            Realized   = $realized.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                            Unreal     = $unreal.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                            NetPnL     = $netPnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                            Rebate     = $rebate.ToString("0.0000", $inv)
+                            BasePnL    = $basePnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                            AlphaEdge  = $alphaEdge.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                            RPM        = [int]$payload.rpm_60s
+                            MO1s       = ([double]$payload.markout_1s_bps).ToString("+0.0;-0.0;+0.0", $inv)
+                            MO5s       = ([double]$payload.markout_5s_bps).ToString("+0.0;-0.0;+0.0", $inv)
+                            NetPnLNum  = $netPnl
+                        })
+                    }
                 }
-
-                $summaryLine = Get-Content -LiteralPath $outJsonl -Tail 1
-                if (-not $summaryLine) {
-                    throw "No summary event emitted in $outJsonl"
-                }
-                $summaryObj = $summaryLine | ConvertFrom-Json
-                if ($summaryObj.event -ne "summary") {
-                    throw "Final JSONL row is not a summary event in $outJsonl (found '$($summaryObj.event)')"
-                }
-
-                $payload = $summaryObj.payload
-                $realized = [double]$payload.realized_pnl_micro / 1e6
-                $unreal = [double]$payload.unrealized_pnl_micro / 1e6
-                $netPnl = [double]$payload.net_pnl_micro / 1e6
-                $rebate = [double]$payload.estimated_rebate_micro / 1e6
-                $basePnl = [double]$payload.baseline_pnl_micro / 1e6
-                $alphaEdge = $netPnl - $basePnl
-                $pairs = [double]$payload.total_pairs_merged_micro / 1e6
-
-                $results.Add([PSCustomObject]@{
-                    Gamma      = $gammaStr
-                    VarSpr     = $varStr
-                    MinT       = $minTicks
-                    Fills      = [int]$payload.fills_count
-                    Merges     = [int]$payload.merges_count
-                    Pairs      = $pairs.ToString("F2", $inv)
-                    Realized   = $realized.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                    Unreal     = $unreal.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                    NetPnL     = $netPnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                    Rebate     = $rebate.ToString("0.0000", $inv)
-                    BasePnL    = $basePnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                    AlphaEdge  = $alphaEdge.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                    RPM        = [int]$payload.rpm_60s
-                    MO1s       = ([double]$payload.markout_1s_bps).ToString("+0.0;-0.0;+0.0", $inv)
-                    MO5s       = ([double]$payload.markout_5s_bps).ToString("+0.0;-0.0;+0.0", $inv)
-                    NetPnLNum  = $netPnl
-                })
             }
         }
     }
 
     $sorted = $results | Sort-Object -Property NetPnLNum -Descending
-    $fmt = "{0,-6} {1,-6} {2,4} {3,5} {4,6} {5,7} {6,9} {7,9} {8,9} {9,7} {10,9} {11,9} {12,4} {13,6} {14,6}"
+    $cols = [System.Collections.Generic.List[hashtable]]::new()
+    $cols.Add(@{ Name = "Gamma"; Dash = "-----"; Width = -6; Prop = "Gamma" })
+    $cols.Add(@{ Name = "VarSpr"; Dash = "------"; Width = -6; Prop = "VarSpr" })
+    $cols.Add(@{ Name = "MinT"; Dash = "----"; Width = 4; Prop = "MinT" })
+    if ($showCrossLoss) {
+        $cols.Add(@{ Name = "XTick"; Dash = "-----"; Width = 7; Prop = "XTick" })
+    }
+    if ($showEntryProb) {
+        $cols.Add(@{ Name = "MaxP"; Dash = "----"; Width = 5; Prop = "MaxP" })
+    }
+    $cols.Add(@{ Name = "Fills"; Dash = "-----"; Width = 5; Prop = "Fills" })
+    $cols.Add(@{ Name = "Merges"; Dash = "------"; Width = 6; Prop = "Merges" })
+    $cols.Add(@{ Name = "Pairs"; Dash = "-------"; Width = 7; Prop = "Pairs" })
+    $cols.Add(@{ Name = "Realized"; Dash = "--------"; Width = 9; Prop = "Realized" })
+    $cols.Add(@{ Name = "Unreal"; Dash = "--------"; Width = 9; Prop = "Unreal" })
+    $cols.Add(@{ Name = "NetPnL"; Dash = "--------"; Width = 9; Prop = "NetPnL" })
+    $cols.Add(@{ Name = "Rebate"; Dash = "------"; Width = 7; Prop = "Rebate" })
+    $cols.Add(@{ Name = "BasePnL"; Dash = "--------"; Width = 9; Prop = "BasePnL" })
+    $cols.Add(@{ Name = "AlphaEdge"; Dash = "---------"; Width = 9; Prop = "AlphaEdge" })
+    $cols.Add(@{ Name = "RPM"; Dash = "---"; Width = 4; Prop = "RPM" })
+    $cols.Add(@{ Name = "MO1s"; Dash = "-----"; Width = 6; Prop = "MO1s" })
+    $cols.Add(@{ Name = "MO5s"; Dash = "-----"; Width = 6; Prop = "MO5s" })
+
+    $fmtParts = for ($ci = 0; $ci -lt $cols.Count; $ci++) { "{$ci,$($cols[$ci].Width)}" }
+    $fmt = $fmtParts -join " "
+    $headers = @($cols | ForEach-Object { $_.Name })
+    $dashes = @($cols | ForEach-Object { $_.Dash })
+
     $summaryLines = [System.Collections.Generic.List[string]]::new()
     $summaryLines.Add("=== OFFLINE PARAMETER SWEEP RESULTS (sorted by NetPnL desc) ===")
     $summaryLines.Add(('Input: {0} | V_max=${1} | Base={2}sh | MaxPair=${3} | Decay={4}' -f $resolvedInput, $VMax, $BaseSize, ($MaxCombinedBidMicro / 1e6).ToString("0.00", $inv), $QueueDecay))
     $summaryLines.Add(("Outputs: {0}" -f $sweepDir))
-    $summaryLines.Add(($fmt -f "Gamma", "VarSpr", "MinT", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s"))
-    $summaryLines.Add(($fmt -f "-----", "------", "----", "-----", "------", "-------", "--------", "--------", "--------", "------", "--------", "---------", "---", "-----", "-----"))
+    $summaryLines.Add(($fmt -f $headers))
+    $summaryLines.Add(($fmt -f $dashes))
     foreach ($r in $sorted) {
-        $summaryLines.Add(($fmt -f $r.Gamma, $r.VarSpr, $r.MinT, $r.Fills, $r.Merges, $r.Pairs, $r.Realized, $r.Unreal, $r.NetPnL, $r.Rebate, $r.BasePnL, $r.AlphaEdge, $r.RPM, $r.MO1s, $r.MO5s))
+        $vals = @($cols | ForEach-Object { $r.($_.Prop) })
+        $summaryLines.Add(($fmt -f $vals))
     }
 
     $summaryPath = Join-Path $sweepDir "summary.txt"

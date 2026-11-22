@@ -233,6 +233,8 @@ mod tests {
         assert_eq!(cfg.sg_mode, SgMode::Causal);
         assert!(!cfg.polybolt_enabled);
         assert!(cfg.include_variance_spread);
+        assert_eq!(cfg.max_cross_tick_loss_micro, None);
+        assert_eq!(cfg.max_entry_prob, None);
 
         let json = serde_json::to_string(&cfg).unwrap();
         let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();
@@ -652,5 +654,40 @@ mod tests {
                 .min_spread_ticks,
             9_999
         );
+    }
+
+    #[test]
+    fn config_validates_cross_tick_loss_and_max_entry_prob() {
+        let mut valid_map = HashMap::new();
+        valid_map.insert("MAX_CROSS_TICK_LOSS_MICRO", "20000");
+        valid_map.insert("MAX_ENTRY_PROB", "0.85");
+        let cfg = EngineConfig::from_lookup(lookup_map(&valid_map)).unwrap();
+        assert_eq!(cfg.max_cross_tick_loss_micro, Some(20_000));
+        assert_eq!(cfg.max_entry_prob, Some(0.85));
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.max_cross_tick_loss_micro, Some(20_000));
+        assert_eq!(roundtrip.max_entry_prob, Some(0.85));
+
+        for bad_prob in ["0.5", "0.49", "1.0", "1.05", "NaN", "inf"] {
+            let mut m = HashMap::new();
+            m.insert("MAX_ENTRY_PROB", bad_prob);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&m)).is_err(),
+                "expected error for MAX_ENTRY_PROB={bad_prob}"
+            );
+        }
+
+        let mut bad_loss = HashMap::new();
+        bad_loss.insert("MAX_CROSS_TICK_LOSS_MICRO", "-1");
+        assert!(EngineConfig::from_lookup(lookup_map(&bad_loss)).is_err());
+
+        let mut off_map = HashMap::new();
+        off_map.insert("MAX_CROSS_TICK_LOSS_MICRO", "off");
+        off_map.insert("MAX_ENTRY_PROB", "OFF");
+        let off_cfg = EngineConfig::from_lookup(lookup_map(&off_map)).unwrap();
+        assert_eq!(off_cfg.max_cross_tick_loss_micro, None);
+        assert_eq!(off_cfg.max_entry_prob, None);
     }
 }

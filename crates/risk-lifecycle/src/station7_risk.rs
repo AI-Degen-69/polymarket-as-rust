@@ -2,6 +2,7 @@ use core_types::{MicroUsdc, ONE_SHARE_MICRO, Outcome, SharesMicro};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RiskLifecycleError;
+use crate::lifecycle::EpochPhase;
 
 /// Multi-tier inventory and dollar-notional risk classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -14,6 +15,18 @@ pub enum RiskTier {
     Tier3OneSided,
     /// Utilization `u > 0.90`: hard emergency stop, drop quotes, fire taker flatten FAK.
     Tier4HardStop,
+}
+
+/// Returns `true` when Station 6 cross-tick pair-cost capping may be bypassed
+/// to allow tail-risk reduction during Tier 3/4 escalation or end-of-epoch
+/// passive offload / mandatory flatten phases.
+#[must_use]
+pub const fn allows_cross_tick_override(tier: RiskTier, phase: Option<EpochPhase>) -> bool {
+    matches!(tier, RiskTier::Tier3OneSided | RiskTier::Tier4HardStop)
+        || matches!(
+            phase,
+            Some(EpochPhase::PreExpiryLockout | EpochPhase::MandatoryFlatten)
+        )
 }
 
 /// Point-in-time snapshot of the execution order registry and position ledger.
@@ -196,6 +209,12 @@ impl DollarNotionalRiskEngine {
     pub fn new(config: RiskConfig) -> Result<Self, RiskLifecycleError> {
         config.validate()?;
         Ok(Self { config })
+    }
+
+    /// Returns the active risk configuration.
+    #[must_use]
+    pub const fn config(&self) -> RiskConfig {
+        self.config
     }
 
     /// Evaluates Station 7 risk limits for proposed UP and DOWN bid prices.
@@ -627,5 +646,39 @@ mod tests {
             decision.size_dn,
             Some(SharesMicro::from_raw(15 * ONE_SHARE_MICRO))
         );
+    }
+
+    #[test]
+    fn cross_tick_override_requires_tier_3_4_or_flatten_phase() {
+        assert!(!allows_cross_tick_override(RiskTier::Tier1Normal, None));
+        assert!(!allows_cross_tick_override(
+            RiskTier::Tier1Normal,
+            Some(EpochPhase::ActiveQuoting)
+        ));
+        assert!(!allows_cross_tick_override(
+            RiskTier::Tier2ModerateSkew,
+            Some(EpochPhase::ActiveQuoting)
+        ));
+        assert!(!allows_cross_tick_override(
+            RiskTier::Tier1Normal,
+            Some(EpochPhase::TerminalLockout)
+        ));
+
+        assert!(allows_cross_tick_override(
+            RiskTier::Tier3OneSided,
+            Some(EpochPhase::ActiveQuoting)
+        ));
+        assert!(allows_cross_tick_override(
+            RiskTier::Tier4HardStop,
+            Some(EpochPhase::ActiveQuoting)
+        ));
+        assert!(allows_cross_tick_override(
+            RiskTier::Tier1Normal,
+            Some(EpochPhase::PreExpiryLockout)
+        ));
+        assert!(allows_cross_tick_override(
+            RiskTier::Tier2ModerateSkew,
+            Some(EpochPhase::MandatoryFlatten)
+        ));
     }
 }

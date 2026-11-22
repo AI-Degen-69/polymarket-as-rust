@@ -35,6 +35,18 @@ pub struct QuoteProposal {
     pub bid_up_raw: f64,
     /// Raw unrounded DOWN target bid price in USD.
     pub bid_dn_raw: f64,
+    /// `true` when Station 6 capped UP bid below its raw target.
+    #[serde(default)]
+    pub price_capped_up: bool,
+    /// `true` when Station 6 capped DOWN bid below its raw target.
+    #[serde(default)]
+    pub price_capped_dn: bool,
+    /// `true` when UP bid lies outside `max_entry_prob` and is authorized only to offset held DOWN shares.
+    #[serde(default)]
+    pub hedge_only_up: bool,
+    /// `true` when DOWN bid lies outside `max_entry_prob` and is authorized only to offset held UP shares.
+    #[serde(default)]
+    pub hedge_only_dn: bool,
     /// Orderbook best bid for UP outcome.
     pub best_bid_up: Option<MicroUsdc>,
     /// Orderbook best bid for DOWN outcome.
@@ -59,6 +71,10 @@ impl Default for QuoteProposal {
             quote: QuoteOutput::Suppressed(math_engine::SuppressionReason::WarmingUp),
             bid_up_raw: 0.0,
             bid_dn_raw: 0.0,
+            price_capped_up: false,
+            price_capped_dn: false,
+            hedge_only_up: false,
+            hedge_only_dn: false,
             best_bid_up: None,
             best_bid_dn: None,
             best_ask_up: None,
@@ -843,7 +859,7 @@ impl RiskActor {
                 }
 
                 // If accumulation prohibited in PreExpiryLockout, zero out the accumulating leg:
-                let (auth_size_up, auth_size_dn) = if prohibit_accumulation {
+                let (mut auth_size_up, mut auth_size_dn) = if prohibit_accumulation {
                     if snapshot.unhedged_up > snapshot.unhedged_dn {
                         (None, risk_decision.size_dn)
                     } else if snapshot.unhedged_dn > snapshot.unhedged_up {
@@ -855,12 +871,38 @@ impl RiskActor {
                     (risk_decision.size_up, risk_decision.size_dn)
                 };
 
+                // Extreme-probability hedge exemption: cap reducing leg strictly to offsetting delta.
+                let min_order_micro = self
+                    .risk_engine
+                    .config()
+                    .min_order_size_shares
+                    .saturating_mul(core_types::ONE_SHARE_MICRO);
+                if proposal.hedge_only_up {
+                    let offset_up = snapshot
+                        .unhedged_dn
+                        .as_u64()
+                        .saturating_sub(snapshot.unhedged_up.as_u64());
+                    auth_size_up = auth_size_up
+                        .map(|s| s.min(SharesMicro::from_raw(offset_up)))
+                        .filter(|s| s.as_u64() >= min_order_micro);
+                }
+                if proposal.hedge_only_dn {
+                    let offset_dn = snapshot
+                        .unhedged_up
+                        .as_u64()
+                        .saturating_sub(snapshot.unhedged_dn.as_u64());
+                    auth_size_dn = auth_size_dn
+                        .map(|s| s.min(SharesMicro::from_raw(offset_dn)))
+                        .filter(|s| s.as_u64() >= min_order_micro);
+                }
+
                 // 5. Station 8 Continuous Hysteresis Gate for UP leg:
                 let quote_up = match (target_bid_up, auth_size_up) {
                     (Some(p), Some(s)) => Some(SizedQuote {
                         price: p,
                         size: s,
                         price_raw_usd: proposal.bid_up_raw,
+                        price_capped: proposal.price_capped_up,
                     }),
                     _ => None,
                 };
@@ -883,6 +925,7 @@ impl RiskActor {
                         price: p,
                         size: s,
                         price_raw_usd: proposal.bid_dn_raw,
+                        price_capped: proposal.price_capped_dn,
                     }),
                     _ => None,
                 };
@@ -1097,6 +1140,7 @@ mod tests {
                 best_ask_dn: Some(MicroUsdc(520_000)),
                 defensive_cancel: false,
                 total_compute_ns: 12_000,
+                ..Default::default()
             };
             harness.publish_quote(proposal);
         }
@@ -1172,6 +1216,7 @@ mod tests {
             best_ask_dn: Some(MicroUsdc(520_000)),
             defensive_cancel: true,
             total_compute_ns: 5_000,
+            ..Default::default()
         };
         harness.publish_quote(proposal);
 
@@ -1272,6 +1317,7 @@ mod tests {
             best_ask_dn: Some(MicroUsdc(520_000)),
             defensive_cancel: false,
             total_compute_ns: 10_000,
+            ..Default::default()
         };
         harness.publish_quote(proposal);
 
@@ -1426,6 +1472,7 @@ mod tests {
             best_ask_dn: Some(MicroUsdc(490_000)),
             defensive_cancel: false,
             total_compute_ns: 5_000,
+            ..Default::default()
         };
         harness.publish_quote(proposal);
 
@@ -1516,6 +1563,7 @@ mod tests {
             best_ask_dn: Some(MicroUsdc(490_000)),
             defensive_cancel: false,
             total_compute_ns: 5_000,
+            ..Default::default()
         };
         harness.publish_quote(base_proposal);
 
@@ -1572,6 +1620,146 @@ mod tests {
         assert!(matches!(
             priority_rx.try_recv().unwrap(),
             ExecutionCommand::ExecuteFlattenFak { .. }
+        ));
+    }
+
+    #[test]
+    fn test_hedge_only_caps_order_size_to_offsetting_inventory_in_tier1() {
+        let (harness, _priority_rx, mut routine_rx) = ActorPipelineHarness::new(16, 16);
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+
+        // Hold 5 UP shares at $0.10 ($0.50 total => u = 0.01 Tier1Normal).
+        // Without hedge_only_dn, Tier 1 would quote ~19-20 shares DN!
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(5 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(500_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+
+        harness.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: 100_000,
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: None,
+                bid_dn: Some(MicroUsdc(900_000)),
+                pair_cost_micro: None,
+                gross_margin_bps: None,
+            },
+            bid_dn_raw: 0.90,
+            hedge_only_dn: true,
+            best_bid_up: Some(MicroUsdc(90_000)),
+            best_ask_up: Some(MicroUsdc(110_000)),
+            best_bid_dn: Some(MicroUsdc(890_000)),
+            best_ask_dn: Some(MicroUsdc(910_000)),
+            ..Default::default()
+        });
+
+        let trace = risk_actor.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(trace.tier, RiskTier::Tier1Normal);
+        assert_eq!(
+            trace.action_dn,
+            OrderAction::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(900_000),
+                size: SharesMicro::from_raw(5 * core_types::ONE_SHARE_MICRO),
+            }
+        );
+        assert_eq!(
+            routine_rx.try_recv().unwrap(),
+            ExecutionCommand::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(900_000),
+                size: SharesMicro::from_raw(5 * core_types::ONE_SHARE_MICRO),
+            }
+        );
+    }
+
+    #[test]
+    fn test_price_capped_forces_cancel_and_replace_even_inside_deadband() {
+        let (harness, _priority_rx, mut routine_rx) = ActorPipelineHarness::new(16, 16);
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let mut hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let active_size = SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO);
+        hysteresis.set_state(
+            Outcome::Down,
+            crate::station8_hysteresis::OrderSlotState::Live {
+                order_id: "dn_live_1".to_string(),
+                price: MicroUsdc(500_000),
+                original_size: active_size,
+                remaining_size: active_size,
+            },
+        );
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+
+        // Capped DN target is $0.49 (1 tick below resting $0.50, inside 1.25-tick deadband),
+        // with price_capped_dn = true and bid_dn_raw clamped to 0.49.
+        harness.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: 100_000,
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: None,
+                bid_dn: Some(MicroUsdc(490_000)),
+                pair_cost_micro: None,
+                gross_margin_bps: None,
+            },
+            bid_dn_raw: 0.49,
+            price_capped_dn: true,
+            best_bid_up: Some(MicroUsdc(480_000)),
+            best_ask_up: Some(MicroUsdc(510_000)),
+            best_bid_dn: Some(MicroUsdc(480_000)),
+            best_ask_dn: Some(MicroUsdc(520_000)),
+            ..Default::default()
+        });
+
+        let trace = risk_actor.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(
+            trace.action_dn,
+            OrderAction::CancelAndReplace {
+                outcome: Outcome::Down,
+                old_order_id: "dn_live_1".to_string(),
+                new_price: MicroUsdc(490_000),
+                new_size: active_size,
+                reason: CancelReason::DeadbandDrift,
+            }
+        );
+        assert!(matches!(
+            routine_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAndReplace {
+                outcome: Outcome::Down,
+                new_price: MicroUsdc(490_000),
+                ..
+            }
         ));
     }
 }

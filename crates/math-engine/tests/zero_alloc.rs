@@ -15,7 +15,7 @@ use core_types::{
     BookLevel, FeeSchedule, FixedBook, LatencyTracker, MicroUsdc, MonotonicClock, ONE_SHARE_MICRO,
     Outcome, SharesMicro, SignedSharesMicro,
 };
-use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
+use math_engine::{CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 
 struct CountingAlloc;
 
@@ -124,6 +124,7 @@ fn make_inp<'a>(
         strike_usd: Some(90_000.0),
         active_bid_up: active.map(|(u, _)| MicroUsdc(u)),
         active_bid_dn: active.map(|(_, d)| MicroUsdc(d)),
+        cost_context: CostContext::default(),
     }
 }
 
