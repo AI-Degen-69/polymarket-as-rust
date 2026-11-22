@@ -161,6 +161,27 @@ impl NaiveBaselineEngine {
         }
     }
 
+    /// Evaluates directional public trade against naive resting orders.
+    pub fn on_public_trade_with_side(
+        &mut self,
+        outcome: Outcome,
+        trade_side: OrderSide,
+        trade_price: MicroUsdc,
+        trade_size: SharesMicro,
+        now_ms: u64,
+    ) {
+        let fills = self.broker.on_public_trade_with_side(
+            outcome,
+            trade_side,
+            trade_price,
+            trade_size,
+            now_ms,
+        );
+        for fill in &fills {
+            let _ = self.ledger.record_fill(fill);
+        }
+    }
+
     /// Cancels all active naive baseline quotes and immediately halts pending fills on expiry.
     pub fn cancel_all(&mut self, now_ms: u64) -> usize {
         let mut cancelled = 0_usize;

@@ -37,6 +37,22 @@ pub(crate) struct LifecycleReportStats {
     pub(crate) baseline_pnl_micro: i64,
 }
 
+impl LifecycleReportStats {
+    pub(crate) fn set_final_inventory(&mut self, q_up: SharesMicro, q_dn: SharesMicro) {
+        self.final_q_up = q_up;
+        self.final_q_dn = q_dn;
+        self.final_net_delta_micro = (q_up.as_u64() as i64) - (q_dn.as_u64() as i64);
+    }
+
+    fn resolved_net_delta_micro(&self) -> i64 {
+        if self.final_net_delta_micro != 0 || self.final_q_up == self.final_q_dn {
+            self.final_net_delta_micro
+        } else {
+            (self.final_q_up.as_u64() as i64) - (self.final_q_dn.as_u64() as i64)
+        }
+    }
+}
+
 impl Default for LifecycleReportStats {
     fn default() -> Self {
         Self {
@@ -516,7 +532,7 @@ pub(crate) fn print_lifecycle_summary(
         "  Final Inventory:         UP={} | DN={} | Net={:+.6} sh",
         stats.final_q_up,
         stats.final_q_dn,
-        stats.final_net_delta_micro as f64 / MICRO_SCALE as f64
+        stats.resolved_net_delta_micro() as f64 / MICRO_SCALE as f64
     );
     println!(
         "  PnL (Realized / Unreal): {} / {} | Net={}",
@@ -833,7 +849,7 @@ pub(crate) fn record_lifecycle_summary_jsonl(
             total_pairs_merged_micro: stats.total_pairs_merged.0,
             q_up_micro: stats.final_q_up.0,
             q_dn_micro: stats.final_q_dn.0,
-            net_delta_micro: stats.final_net_delta_micro,
+            net_delta_micro: stats.resolved_net_delta_micro(),
             realized_pnl_micro: stats.realized_pnl_micro,
             unrealized_pnl_micro: stats.unrealized_pnl_micro,
             net_pnl_micro,

@@ -305,4 +305,99 @@ fn test_vector_6_maker_rebate_accrual_and_epoch_settlement() {
     assert_eq!(ledger.filled_dn, SharesMicro::ZERO);
     assert_eq!(ledger.cost_basis_up_micro, 0);
     assert_eq!(ledger.cost_basis_dn_micro, 0);
+
+    // Changing fee schedule to 0% in the next epoch must NOT erase prior $0.25 accrued rebate (#14):
+    let mut zero_fee = FeeSchedule::btc_5m_default();
+    zero_fee.fee_rate_e6 = 0;
+    ledger.set_fee_schedule(zero_fee);
+    let fill_epoch2 = SimFill {
+        sim_id: 2,
+        outcome: Outcome::Down,
+        side: OrderSide::Buy,
+        price: MicroUsdc(500_000),
+        filled_shares: SharesMicro(40_000_000),
+        fill_ts_ms: 400_000,
+        is_maker: true,
+    };
+    assert!(ledger.record_fill(&fill_epoch2).unwrap().is_none());
+    assert_eq!(
+        ledger.estimated_rebate_micro, 250_000,
+        "zero-fee epoch must preserve previously accrued $0.25 maker rebate"
+    );
+}
+
+#[test]
+fn test_vector_7_pending_cancel_reservation_and_directional_trades() {
+    // Verify PendingCancel reserves cash/shares until cancel takes effect (#15),
+    // and only sell trades consume resting buy orders (#2).
+    let mut broker = FifoPaperBroker::new(FifoBrokerConfig {
+        order_latency_ms: 0,
+        cancel_latency_ms: 40,
+        ..Default::default()
+    });
+
+    let sim_id = broker
+        .submit_new(NewOrderParams {
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(490_000),
+            size: SharesMicro(20_000_000),
+            now_ms: 1_000,
+            current_best_bid: Some(MicroUsdc(490_000)),
+            current_best_ask: Some(MicroUsdc(510_000)),
+            book_depth_at_price: SharesMicro::ZERO,
+        })
+        .unwrap();
+
+    // Buyer-aggressor trade at $0.48 must NOT fill resting $0.49 buy order (#2):
+    let buy_fills = broker.on_public_trade_with_side(
+        Outcome::Up,
+        OrderSide::Buy,
+        MicroUsdc(480_000),
+        SharesMicro(10_000_000),
+        1_005,
+    );
+    assert!(buy_fills.is_empty());
+
+    // Request cancel at t=1_010 (cancel arrives at t=1_050):
+    broker.cancel(sim_id, 1_010).unwrap();
+    // While PendingCancel is in flight, shares and notional must stay reserved (#15):
+    assert_eq!(broker.open_bid_shares(Outcome::Up), SharesMicro(20_000_000));
+    assert_eq!(broker.open_bid_notional(Outcome::Up), 9_800_000);
+    assert!(broker.active_order(Outcome::Up, OrderSide::Buy).is_none());
+
+    // Once cancel deadline passes at t=1_050, reservation drops to zero:
+    broker.update_time(1_050);
+    assert_eq!(broker.open_bid_shares(Outcome::Up), SharesMicro::ZERO);
+    assert_eq!(broker.open_bid_notional(Outcome::Up), 0);
+}
+
+#[test]
+fn test_vector_8_taker_flatten_with_merge_returns_merge_event() {
+    let mut ledger = PaperLedger::new(FeeSchedule::btc_5m_default());
+    let fill_up = SimFill {
+        sim_id: 1,
+        outcome: Outcome::Up,
+        side: OrderSide::Buy,
+        price: MicroUsdc(480_000),
+        filled_shares: SharesMicro(10_000_000),
+        fill_ts_ms: 100,
+        is_maker: true,
+    };
+    assert!(ledger.record_fill(&fill_up).unwrap().is_none());
+
+    let (fee, merge_opt) = ledger
+        .record_taker_flatten_with_merge(
+            Outcome::Down,
+            OrderSide::Buy,
+            MicroUsdc(490_000),
+            SharesMicro(10_000_000),
+        )
+        .unwrap();
+    assert!(fee.0 > 0);
+    let merge = merge_opt.expect("buy-side flatten pairing opposite shares must emit MergeEvent");
+    assert_eq!(merge.merged_pairs, SharesMicro(10_000_000));
+    assert_eq!(merge.pair_cost, MicroUsdc(970_000));
+    assert_eq!(ledger.filled_up, SharesMicro::ZERO);
+    assert_eq!(ledger.filled_dn, SharesMicro::ZERO);
 }
