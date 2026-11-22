@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>מושגון — polymarket-as-rust</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Heebo:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css">
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/contrib/auto-render.min.js"></script>
+<style>
+:root {
+  --bg: #080b10;
+  --panel: #0e131b;
+  --panel-hover: #141b26;
+  --panel-header: #121824;
+  --section-bg: #111827;
+  --line: #1e2636;
+  --line-strong: #2d384d;
+  --txt: #edf1f7;
+  --txt-secondary: #c5cedd;
+  --mut: #8492a6;
+  --ac: #38bdf8;
+  --ac-dim: rgba(56, 189, 248, 0.1);
+  --ac-border: rgba(56, 189, 248, 0.25);
+  --tag-bg: #172030;
+  --shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f4f6fa;
+    --panel: #ffffff;
+    --panel-hover: #f8fafd;
+    --panel-header: #eef2f8;
+    --section-bg: #e2e8f0;
+    --line: #dfe5f0;
+    --line-strong: #cbd5e1;
+    --txt: #0f172a;
+    --txt-secondary: #334155;
+    --mut: #64748b;
+    --ac: #0284c7;
+    --ac-dim: rgba(2, 132, 199, 0.08);
+    --ac-border: rgba(2, 132, 199, 0.25);
+    --tag-bg: #e2e8f0;
+    --shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: 'Heebo', 'Inter', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--txt);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+
+.wrap {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 2.5rem 1.5rem 4rem;
+}
+
+header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+  margin-bottom: 1.75rem;
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 1.5rem;
+}
+
+.title-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+h1 {
+  font-size: 1.75rem;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: center;
+  gap: 0.65rem;
+}
+
+.repo-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--ac);
+  background: var(--ac-dim);
+  border: 1px solid var(--ac-border);
+  padding: 0.2rem 0.65rem;
+  border-radius: 6px;
+  direction: ltr;
+}
+
+.sub {
+  margin: 0;
+  font-size: 0.92rem;
+  color: var(--mut);
+  max-width: 65rem;
+}
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 1.25rem;
+}
+
+.search-box {
+  position: relative;
+  flex: 1 1 300px;
+  max-width: 420px;
+}
+
+.search-box input {
+  width: 100%;
+  background: var(--panel);
+  border: 1px solid var(--line-strong);
+  color: var(--txt);
+  padding: 0.6rem 0.9rem 0.6rem 2.2rem;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 0.9rem;
+  outline: none;
+  transition: border-color 0.15s, box-shadow 0.15s;
+}
+
+.search-box input:focus {
+  border-color: var(--ac);
+  box-shadow: 0 0 0 3px var(--ac-dim);
+}
+
+.search-box svg {
+  position: absolute;
+  left: 0.75rem;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  color: var(--mut);
+  pointer-events: none;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.filter-btn {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  color: var(--mut);
+  padding: 0.42rem 0.85rem;
+  border-radius: 7px;
+  font-family: inherit;
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.filter-btn:hover {
+  border-color: var(--line-strong);
+  color: var(--txt);
+}
+
+.filter-btn.active {
+  background: var(--ac-dim);
+  border-color: var(--ac);
+  color: var(--ac);
+  font-weight: 600;
+}
+
+.table-container {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+th {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.72rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--mut);
+  padding: 0.85rem 1rem;
+  border-bottom: 1px solid var(--line-strong);
+  background: var(--panel-header);
+  white-space: nowrap;
+}
+
+td {
+  font-size: 0.9rem;
+  padding: 1rem;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+  transition: background 0.12s ease;
+}
+
+tbody tr.data-row:last-child td { border-bottom: none; }
+tbody tr.data-row:hover td { background: var(--panel-hover); }
+
+tr.section-row td {
+  background: var(--section-bg);
+  padding: 0.55rem 1rem;
+  border-top: 1px solid var(--line-strong);
+  border-bottom: 1px solid var(--line-strong);
+}
+
+.section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--ac);
+  letter-spacing: 0.02em;
+}
+
+.section-en {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.75rem;
+  color: var(--mut);
+  direction: ltr;
+}
+
+.c-term {
+  direction: ltr;
+  text-align: left;
+  width: 16%;
+  min-width: 160px;
+}
+
+.c-def {
+  direction: ltr;
+  text-align: left;
+  font-family: 'Inter', system-ui, sans-serif;
+  color: var(--txt-secondary);
+  width: 34%;
+  min-width: 260px;
+}
+
+.c-he {
+  direction: rtl;
+  text-align: right;
+  color: var(--txt);
+  width: 30%;
+  min-width: 240px;
+}
+
+.c-ex {
+  direction: rtl;
+  text-align: right;
+  color: var(--mut);
+  font-size: 0.86rem;
+  width: 20%;
+  min-width: 190px;
+}
+
+.term-title {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--ac);
+  display: block;
+  margin-bottom: 0.35rem;
+}
+
+.cat-tag {
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--mut);
+  background: var(--tag-bg);
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+}
+
+.en {
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: inline-block;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.82em;
+  color: var(--txt);
+  background: rgba(132, 146, 166, 0.12);
+  padding: 0.05rem 0.32rem;
+  border-radius: 4px;
+}
+
+.katex {
+  font-size: 1em !important;
+  color: var(--ac);
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+.math-inline {
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: inline-block;
+  padding: 0 0.12rem;
+}
+
+.math-block {
+  display: block;
+  margin: 0.45rem 0;
+  padding: 0.5rem 0.7rem;
+  background: rgba(15, 23, 42, 0.45);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow-x: auto;
+  direction: ltr;
+  text-align: left;
+}
+
+.math-block .katex-display {
+  margin: 0.15rem 0;
+}
+
+@media (prefers-color-scheme: light) {
+  .math-block {
+    background: #f8fafc;
+  }
+}
+
+.note {
+  margin: 1.25rem 0 0;
+  font-size: 0.82rem;
+  color: var(--mut);
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.empty-state {
+  text-align: center;
+  padding: 3rem 1rem;
+  color: var(--mut);
+  display: none;
+}
+
+@media (max-width: 960px) {
+  .wrap { padding: 1.25rem 0.75rem; }
+  th, td { padding: 0.75rem 0.65rem; font-size: 0.84rem; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="title-row">
+      <h1>מושגון פרויקט <span class="repo-badge">polymarket-as-rust</span></h1>
+      <span id="row-count" class="cat-tag" style="font-size: 0.78rem; padding: 0.25rem 0.6rem;">22 מונחים</span>
+    </div>
+    <p class="sub">מסודר לפי סדר זרימת הנתונים במנוע: הגדרות קלט ושונות ← חישוב מרווח ומחיר ייחוס ← ביצוע, הגנות ומיזוגים ← מדידת ביצועים ורווחיות.</p>
+  </header>
+
+  <div class="controls">
+    <div class="search-box">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+      <input type="text" id="searchInput" placeholder="חיפוש מונח, נוסחה או הגדרה...">
+    </div>
+    <div class="filters" id="filterGroup">
+      <button class="filter-btn active" data-cat="all">הכל (לפי סדר זרימה)</button>
+      <button class="filter-btn" data-cat="inputs">1. קלטים ושונות</button>
+      <button class="filter-btn" data-cat="pricing">2. תמחור וציטוט</button>
+      <button class="filter-btn" data-cat="execution">3. ביצוע והגנות</button>
+      <button class="filter-btn" data-cat="metrics">4. מדדים ו-PnL</button>
+    </div>
+  </div>
+
+  <div class="table-container">
+    <table id="glossaryTable">
+      <thead>
+        <tr>
+          <th class="c-term">Term</th>
+          <th class="c-def">Definition</th>
+          <th class="c-he">In Hebrew</th>
+          <th class="c-ex">Example</th>
+        </tr>
+      </thead>
+      <tbody>
+        <!-- SECTION 1: INPUTS & VARIANCE -->
+        <tr class="section-row" data-sec="inputs">
+          <td colspan="4">
+            <div class="section-header">
+              <span>שלב 1 — פרמטרים, שונות נותרת ורצפות מרווח</span>
+              <span class="section-en">01 // MODEL INPUTS &amp; VARIANCE</span>
+            </div>
+          </td>
+        </tr>
+        <tr class="data-row" data-cat="inputs">
+          <td class="c-term"><span class="term-title">Gamma ($\gamma$)</span><span class="cat-tag">01 · Input</span></td>
+          <td class="c-def">CARA risk-aversion parameter in $\mathrm{USD}^{-1}$. It sets the variance term in $s^*$ and the inventory penalty in $r_i$; must be finite and positive ($\gamma \in (0, 100]$).</td>
+          <td class="c-he">פרמטר סלידה מסיכון של מודל CARA, ביחידות <span class="math-inline">$\mathrm{USD}^{-1}$</span>. הוא קובע את איבר הווריאנס במרווח ואת עונש המלאי במחיר הייחוס. הערך חייב להיות חיובי וסופי, עד <span class="math-inline">$100$</span>.</td>
+          <td class="c-ex">העלאה של <span class="en">Gamma</span> מ-<span class="en">0.15</span> ל-<span class="en">0.5</span> הרחיבה את המרווח והקטינה את חשיפת המלאי.</td>
+        </tr>
+        <tr class="data-row" data-cat="inputs">
+          <td class="c-term"><span class="term-title">Variance Mode</span><span class="cat-tag">01 · Config</span></td>
+          <td class="c-def">Selects the remaining variance formula:
+            <span class="math-block">$$\begin{aligned} \text{BinaryCara:} &\quad V_{\mathrm{rem}} = \max\!\left\{p(1-p)\max\!\left(\frac{\tau}{T},\,\tau_{\mathrm{floor}}\right),\;\hat{\sigma}^2\tau\right\} \\ \text{LibraryStrict:} &\quad \sigma_{\mathrm{eff}}^2 = \sigma_0^2\left(\frac{T-t}{T}\right)^2 \end{aligned}$$</span>
+          </td>
+          <td class="c-he">בוחר את נוסחת הווריאנס הנותר. במצב <span class="en">BinaryCara</span> מחושב הווריאנס הבינארי חסום מלמטה ברצפת זמן, ובמצב <span class="en">LibraryStrict</span> מחושבת שונות אפקטיבית ריבועית ביחס לזמן הנותר.</td>
+          <td class="c-ex">המצב משמש להשוואה בין הנוסחה הבינארית לנוסחה של הספרייה על אותה הקלטה.</td>
+        </tr>
+        <tr class="data-row" data-cat="inputs">
+          <td class="c-term"><span class="term-title">$V_{\mathrm{rem}}$</span><span class="cat-tag">01 · State</span></td>
+          <td class="c-def">Remaining variance of the binary outcome until expiry, in $\mathrm{USD}^2$. Under <span class="en">BinaryCara</span>:
+            <span class="math-block">$$V_{\mathrm{rem}} = \max\!\left\{p(1-p)\max\!\left(\frac{\tau}{T},\,\tau_{\mathrm{floor}}\right),\;\hat{\sigma}^2\tau\right\}$$</span>
+          </td>
+          <td class="c-he">הווריאנס הנותר של התוצאה הבינארית עד סוף האפוקה, ביחידות <span class="math-inline">$\mathrm{USD}^2$</span>. ככל שמתקרבים לפקיעה (<span class="math-inline">$\tau \to 0$</span>), אי-הוודאות יורדת והווריאנס מתכווץ.</td>
+          <td class="c-ex">ככל שנשאר פחות זמן לאפוקה, הווריאנס הנותר קטן והמרווח מצטמצם.</td>
+        </tr>
+        <tr class="data-row" data-cat="inputs">
+          <td class="c-term"><span class="term-title">Variance Spread</span><span class="cat-tag">01 · Flag</span></td>
+          <td class="c-def">Boolean flag $\texttt{include\_variance\_spread}$. When true, Station 4 adds the risk-variance component to the arrival-intensity spread:
+            <span class="math-block">$$s_{\mathrm{raw}} = \gamma V_{\mathrm{rem}} + \frac{2}{\gamma}\ln\!\left(1 + \frac{\gamma}{\kappa}\right)$$</span>
+          </td>
+          <td class="c-he">מתג שמדליק או מכבה את איבר הווריאנס במרווח. כשהוא פעיל, תחנה 4 מוסיפה <span class="math-inline">$\gamma V_{\mathrm{rem}}$</span> למרווח הבסיסי <span class="math-inline">$\frac{2}{\gamma}\ln\!\left(1 + \frac{\gamma}{\kappa}\right)$</span>.</td>
+          <td class="c-ex">כשהמתג פעיל, המרווח גדל בשוק תנודתי. כשהוא כבוי, המרווח נשאר דק וקבוע.</td>
+        </tr>
+        <tr class="data-row" data-cat="inputs">
+          <td class="c-term"><span class="term-title">MinT</span><span class="cat-tag">01 · Floor</span></td>
+          <td class="c-def">Minimum combined spread floor, in integer ticks:
+            <span class="math-block">$$s_{\min} = \max\!\left(n_{\mathrm{tick}} \cdot \mathrm{tick},\;\mathrm{fee\_floor}\right), \quad \mathrm{fee\_floor} = f\,p(1-p) + \mathrm{tick}$$</span>
+          </td>
+          <td class="c-he">רצפת מרווח משוקללת במספר טיקים שלמים: <span class="math-inline">$s_{\min} = \max(n_{\mathrm{tick}}\cdot\mathrm{tick},\,\mathrm{fee\_floor})$</span>. הרצפה כוללת את עמלת התוקף <span class="math-inline">$f\,p(1-p)+\mathrm{tick}$</span> כדי למנוע הפסד.</td>
+          <td class="c-ex">הגדרת <span class="en">MinT = 2</span> מונעת מרווח קטן מדי שמפסיד אחרי עמלת התוקף.</td>
+        </tr>
+
+        <!-- SECTION 2: PRICING PIPELINE -->
+        <tr class="section-row" data-sec="pricing">
+          <td colspan="4">
+            <div class="section-header">
+              <span>שלב 2 — צינור התמחור: רוחב מרווח, הטיית מלאי וציטוט דו-צדדי</span>
+              <span class="section-en">02 // PRICING PIPELINE (STATION 4 → STATION 5 → DUAL-BID)</span>
+            </div>
+          </td>
+        </tr>
+        <tr class="data-row" data-cat="pricing">
+          <td class="c-term"><span class="term-title">Station 4 — Optimal Spread</span><span class="cat-tag">02 · Station 4</span></td>
+          <td class="c-def">Computes the optimal total quote width, clamped between $s_{\min}$ and $2$:
+            <span class="math-block">$$s^* = \min\!\left(2,\;\max\!\left(s_{\min},\;(\mathbb{I}_{\mathrm{var}}\,\gamma V_{\mathrm{rem}}) + \frac{2}{\gamma}\ln\!\left(1 + \frac{\gamma}{\kappa}\right)\right)\right)$$</span>
+          </td>
+          <td class="c-he">חישוב המרווח האופטימלי הכולל. המודל מחבר את איבר הווריאנס (אם פעיל) ואת איבר עצימות ההגעה, ואז חותך את התוצאה מלמטה ברצפה <span class="math-inline">$s_{\min}$</span> ומלמעלה ב-<span class="math-inline">$2$</span>.</td>
+          <td class="c-ex">התחנה קובעת כמה רחב יהיה המרווח בכל טיק, ולכן היא לב המסחר.</td>
+        </tr>
+        <tr class="data-row" data-cat="pricing">
+          <td class="c-term"><span class="term-title">Inventory Skew ($q$)</span><span class="cat-tag">02 · State</span></td>
+          <td class="c-def">Net unhedged position $q = q_{\mathrm{UP}} - q_{\mathrm{DN}}$ in shares. Station 5 applies the linear inventory penalty $\Delta r = -q\gamma V_{\mathrm{rem}}$ to the mid-price.</td>
+          <td class="c-he">הפוזיציה הנקייה ללא גידור, <span class="math-inline">$q = q_{\mathrm{UP}} - q_{\mathrm{DN}}$</span>, במניות. תחנה 5 מזיזה את המחיר ב-<span class="math-inline">$-q\gamma V_{\mathrm{rem}}$</span> כדי לאזן את החשיפה.</td>
+          <td class="c-ex">כשנצברות <span class="en">20</span> מניות <span class="en">UP</span>, ה-<span class="en">skew</span> מוריד את מחיר ההצעה.</td>
+        </tr>
+        <tr class="data-row" data-cat="pricing">
+          <td class="c-term"><span class="term-title">Station 5 — Reservation Price</span><span class="cat-tag">02 · Station 5</span></td>
+          <td class="c-def">Indifference fair price shifted by net inventory $q = q_{\mathrm{UP}} - q_{\mathrm{DN}}$:
+            <span class="math-block">$$r_i = \mathrm{clamp}\!\left(s_i - q\gamma V_{\mathrm{rem}},\;\mathrm{tick},\;1 - \mathrm{tick}\right)$$</span>
+          </td>
+          <td class="c-he">מחיר ייחוס שמוזז לפי המלאי הנקי <span class="math-inline">$q = q_{\mathrm{UP}} - q_{\mathrm{DN}}$</span>. כאשר מחזיקים מלאי <span class="en">UP</span> עודף (<span class="math-inline">$q > 0$</span>), מחיר הייחוס יורד כדי לעודד מכירה.</td>
+          <td class="c-ex">כשהמלאי ארוך, התחנה מורידה את מחיר ה-<span class="en">UP</span> כדי למשוך מוכרים.</td>
+        </tr>
+        <tr class="data-row" data-cat="pricing">
+          <td class="c-term"><span class="term-title">Dual-Bid</span><span class="cat-tag">02 · Quotes</span></td>
+          <td class="c-def">Two passive buy legs derived from $r_i$ and $s^*$, quantized to ticks such that $b_{\mathrm{UP}} + b_{\mathrm{DN}} \le 0.98$:
+            <span class="math-block">$$b_{\mathrm{UP}} = r_i - \frac{s^*}{2}, \qquad b_{\mathrm{DN}} = 1 - \left(r_i + \frac{s^*}{2}\right)$$</span>
+          </td>
+          <td class="c-he">שתי הצעות קנייה פסיביות שנגזרות מ-<span class="math-inline">$r_i$</span> ומ-<span class="math-inline">$s^*$</span>. סכומן מוגבל ל-<span class="math-inline">$0.98$</span> כדי להבטיח מרווח ארביטראז' חיובי מול פדיון של <span class="math-inline">$\$1.00$</span>.</td>
+          <td class="c-ex">שתי ההצעות יושבות זו מול זו, וסכומן נשאר מתחת ל-<span class="en">$0.98</span> כדי להבטיח רווח.</td>
+        </tr>
+
+        <!-- SECTION 3: EXECUTION & LIFECYCLE -->
+        <tr class="section-row" data-sec="execution">
+          <td colspan="4">
+            <div class="section-header">
+              <span>שלב 3 — הגנות ביצוע, ניהול פקודות ומיזוג זוגות</span>
+              <span class="section-en">03 // EXECUTION GUARDS &amp; POSITION LIFECYCLE</span>
+            </div>
+          </td>
+        </tr>
+        <tr class="data-row" data-cat="execution">
+          <td class="c-term"><span class="term-title">Post-Only</span><span class="cat-tag">03 · Guard</span></td>
+          <td class="c-def">Local execution guard that clamps or suppresses a leg when it would cross the best ask, when the ask is missing, or when our own resting bid would self-cross.</td>
+          <td class="c-he">מנגנון הגנה מקומי שמונע חציית ספר (Crossing). הוא מקטין או מבטל רגל כשההצעה חוצה את ה-Ask, כשאין Ask עדכני בספר, או כשההצעה חוצה פקודה קיימת שלנו.</td>
+          <td class="c-ex">ההגנה מונעת חציית שאילתא ותשלום עמלת תוקף.</td>
+        </tr>
+        <tr class="data-row" data-cat="execution">
+          <td class="c-term"><span class="term-title">RPM</span><span class="cat-tag">03 · Rate</span></td>
+          <td class="c-def">Rate of cancel-and-replace requests per minute over the trailing $60\,\mathrm{s}$ rolling window.</td>
+          <td class="c-he">קצב בקשות ביטול והחלפה לדקה בחלון נע של <span class="math-inline">$60\,\mathrm{s}$</span> אחרונות. מדד קריטי לשמירה על מגבלות API ועדיפות בתור (FIFO).</td>
+          <td class="c-ex">המספר עולה כשהמערכת מבטלת ומחליפה הצעות לעיתים קרובות.</td>
+        </tr>
+        <tr class="data-row" data-cat="execution">
+          <td class="c-term"><span class="term-title">Fills</span><span class="cat-tag">03 · Event</span></td>
+          <td class="c-def">Total count of executed order fills in the replay or parameter sweep run, denoted $N_{\mathrm{fills}}$.</td>
+          <td class="c-he">מספר המילויים הכולל שבוצעו בהרצה או בסריקת הפרמטרים, מסומן כ-<span class="math-inline">$N_{\mathrm{fills}}$</span>.</td>
+          <td class="c-ex">בהרצה נרשמו <span class="en">148</span> מילויים.</td>
+        </tr>
+        <tr class="data-row" data-cat="execution">
+          <td class="c-term"><span class="term-title">Merges</span><span class="cat-tag">03 · Settlement</span></td>
+          <td class="c-def">Count of atomic VWAP pair-merge events, where equal $\mathrm{UP}$ and $\mathrm{DN}$ share quantities are redeemed for $\$1.00$ per pair.</td>
+          <td class="c-he">מספר אירועי מיזוג זוגות אטומיים במחיר VWAP: כמויות שוות של מניות <span class="en">UP</span> ו-<span class="en">DN</span> נפדות מיידית תמורת <span class="math-inline">$\$1.00$</span> לזוג ומשחררות בטחונות.</td>
+          <td class="c-ex">כל מיזוג ממיר זוג <span class="en">UP+DN</span> לפדיון של <span class="en">$1.00</span>.</td>
+        </tr>
+        <tr class="data-row" data-cat="execution">
+          <td class="c-term"><span class="term-title">Pairs</span><span class="cat-tag">03 · Inventory</span></td>
+          <td class="c-def">Total merged leg pairs, $N_{\mathrm{pairs}} = \min(Q_{\mathrm{UP}}, Q_{\mathrm{DN}})$. Each pair locks in $(\$1 - \bar{c}_{\mathrm{UP}} - \bar{c}_{\mathrm{DN}})$ of realized PnL.</td>
+          <td class="c-he">סך כל זוגות הרגליים שמוזגו, <span class="math-inline">$N_{\mathrm{pairs}} = \min(Q_{\mathrm{UP}}, Q_{\mathrm{DN}})$</span>. כל זוג נועל רווח ממומש של <span class="math-inline">$(\$1 - \bar{c}_{\mathrm{UP}} - \bar{c}_{\mathrm{DN}})$</span>.</td>
+          <td class="c-ex">כל זוג שמוזג נועל את ההפרש בין <span class="en">$1.00</span> לעלות שני הצדדים.</td>
+        </tr>
+
+        <!-- SECTION 4: METRICS & PNL -->
+        <tr class="section-row" data-sec="metrics">
+          <td colspan="4">
+            <div class="section-header">
+              <span>שלב 4 — מדידת איכות ביצוע, רווחיות והשוואה לבסיס</span>
+              <span class="section-en">04 // PERFORMANCE ANALYTICS &amp; PNL</span>
+            </div>
+          </td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">us (microseconds)</span><span class="cat-tag">04 · Latency</span></td>
+          <td class="c-def">Unit of time used in latency measurements: $1\,\mathrm{us} = 10^{-6}\,\mathrm{s}$. It reports how many microseconds the pricing, risk, and total decision stages consume; lower values indicate faster execution.</td>
+          <td class="c-he">יחידת זמן למדידות Latency: <span class="math-inline">$1\,\mathrm{us} = 10^{-6}\,\mathrm{s}$</span>. היא מציינת כמה מיקרו-שניות צרכו שלבי התמחור, הסיכון וההחלטה הכוללת; ערכים נמוכים מעידים על ביצוע מהיר יותר.</td>
+          <td class="c-ex"><span class="en">[LATENCY] pricing=0us risk=11us total=11us (budget 25/10/100us)</span></td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">MO1s</span><span class="cat-tag">04 · Markout</span></td>
+          <td class="c-def">Mean post-fill markout after $1\,\mathrm{s}$, in basis points (for mid-price $m$ in USD; negative indicates adverse selection):
+            <span class="math-block">$$\mathrm{MO}_{1\mathrm{s}} = \frac{10^4}{N}\sum_{i=1}^{N}\left(m_i(t_i + 1) - m_i(t_i)\right)$$</span>
+          </td>
+          <td class="c-he">ממוצע סטיית מחיר אחרי מילוי באופק של <span class="math-inline">$1\,\mathrm{s}$</span>, בנקודות בסיס (bps). ערך שלילי מעיד על בחירה לרעה (Adverse Selection) — השוק ברח נגדנו מיד לאחר הביצוע.</td>
+          <td class="c-ex">ערך שלילי מראה שהמחיר ירד שנייה אחרי המילוי.</td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">MO5s</span><span class="cat-tag">04 · Markout</span></td>
+          <td class="c-def">Mean post-fill markout at a $5\,\mathrm{s}$ horizon, in basis points:
+            <span class="math-block">$$\mathrm{MO}_{5\mathrm{s}} = \frac{10^4}{N}\sum_{i=1}^{N}\left(m_i(t_i + 5) - m_i(t_i)\right)$$</span>
+          </td>
+          <td class="c-he">ממוצע סטיית מחיר באופק של <span class="math-inline">$5\,\mathrm{s}$</span> לאחר המילוי, בנקודות בסיס. בודק אם תנועת המחיר השלילית נמשכת מעבר לשנייה הראשונה.</td>
+          <td class="c-ex">המדד בודק אם הבחירה לרעה נמשכת גם חמש שניות אחרי המילוי.</td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">Realized PnL</span><span class="cat-tag">04 · PnL</span></td>
+          <td class="c-def">PnL permanently locked in by pair merges and epoch settlement:
+            <span class="math-block">$$P_{\mathrm{real}} = \sum_{\mathrm{pairs}}\left(\$1 - \bar{c}_{\mathrm{UP}} - \bar{c}_{\mathrm{DN}}\right)$$</span>
+          </td>
+          <td class="c-he">רווח ממומש שננעל סופית באמצעות מיזוג זוגות ופדיון בסוף האפוקה: <span class="math-inline">$P_{\mathrm{real}} = \sum_{\mathrm{pairs}}(\$1 - \bar{c}_{\mathrm{UP}} - \bar{c}_{\mathrm{DN}})$</span>.</td>
+          <td class="c-ex">הרווח שננעל אחרי מיזוג הזוגות והיישוב.</td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">Unrealized PnL</span><span class="cat-tag">04 · PnL</span></td>
+          <td class="c-def">Mark-to-market PnL of open unmerged legs, where $C_o$ is total cost basis:
+            <span class="math-block">$$P_{\mathrm{unreal}} = \sum_{o \in \{\mathrm{UP}, \mathrm{DN}\}}\left(Q_o\,m_o - C_o\right)$$</span>
+          </td>
+          <td class="c-he">רווח שוק (Mark-to-Market) על פוזיציות פתוחות שטרם מוזגו, כאשר <span class="math-inline">$C_o$</span> הוא בסיס העלות הכולל של רגל <span class="math-inline">$o$</span>.</td>
+          <td class="c-ex">שווי הפוזיציות הפתוחות לפי מחיר השוק הנוכחי.</td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">Net PnL</span><span class="cat-tag">04 · Objective</span></td>
+          <td class="c-def">Total run profit and loss: $P_{\mathrm{net}} = P_{\mathrm{real}} + P_{\mathrm{unreal}}$. Parameter sweeps rank and sort all runs by this objective.</td>
+          <td class="c-he">סך הרווח הנקי בהרצה: <span class="math-inline">$P_{\mathrm{net}} = P_{\mathrm{real}} + P_{\mathrm{unreal}}$</span>. סריקת הפרמטרים ממיינת ומדרגת את כל ההרצות לפי מדד זה.</td>
+          <td class="c-ex">הסריקה בוחרת את הפרמטרים עם ה-<span class="en">Net PnL</span> הגבוה ביותר.</td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">Rebate</span><span class="cat-tag">04 · Incentives</span></td>
+          <td class="c-def">Estimated maker fee rebate from rolling $30$-day liquidity-weighted volume, mapped to Polymarket tier rates:
+            <span class="math-block">$$wV = \sum_{k} \mathrm{shares}_k \, p_k(1 - p_k)$$</span>
+          </td>
+          <td class="c-he">החזר עמלות עושה שוק (Maker Rebate) משוער לפי נפח משוקלל ב-<span class="math-inline">$30$</span> הימים האחרונים: <span class="math-inline">$wV = \sum_k \mathrm{shares}_k\,p_k(1-p_k)$</span>, הממופה למדרגות התגמול.</td>
+          <td class="c-ex">ההחזר נצבר לפי נפח המסחר המשוקלל של <span class="en">30</span> יום.</td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">Baseline PnL</span><span class="cat-tag">04 · Benchmark</span></td>
+          <td class="c-def">Net PnL ($P_{\mathrm{base}}$) of the naive baseline engine replayed on the exact same market capture. Serves as the benchmark for AlphaEdge.</td>
+          <td class="c-he">רווח נטו (<span class="math-inline">$P_{\mathrm{base}}$</span>) של מנוע הבסיס הנאיבי על אותה הקלטת שוק בדיוק. משמש כנקודת הייחוס לחישוב ה-<span class="en">AlphaEdge</span>.</td>
+          <td class="c-ex">הבסיס הנאיבי קונה ומחזיק, ולכן משמש כנקודת השוואה.</td>
+        </tr>
+        <tr class="data-row" data-cat="metrics">
+          <td class="c-term"><span class="term-title">AlphaEdge</span><span class="cat-tag">04 · Edge</span></td>
+          <td class="c-def">Excess strategy return over the naive baseline:
+            <span class="math-block">$$\mathrm{AlphaEdge} = P_{\mathrm{net}} - P_{\mathrm{base}}$$</span>
+          </td>
+          <td class="c-he">התשואה העודפת של האסטרטגיה על פני מנוע הבסיס הנאיבי: <span class="math-inline">$\mathrm{AlphaEdge} = P_{\mathrm{net}} - P_{\mathrm{base}}$</span>.</td>
+          <td class="c-ex"><span class="en">AlphaEdge</span> חיובי גבוה מראה שהאסטרטגיה ניצחה את הבסיס בהרבה.</td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="empty-state" id="emptyState">לא נמצאו מונחים התואמים לחיפוש.</div>
+  </div>
+
+  <div class="note">
+    <span>הנוסחאות מרונדרות באמצעות KaTeX תקני ומסודרות לפי ארכיטקטורת הזרימה של המנוע.</span>
+    <span>עמודת Example מציגה הקשר שימוש תפעולי, לא מיקום בקוד.</span>
+  </div>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+  renderMathInElement(document.body, {
+    delimiters: [
+      { left: "$$", right: "$$", display: true },
+      { left: "$", right: "$", display: false }
+    ],
+    throwOnError: false
+  });
+
+  const searchInput = document.getElementById("searchInput");
+  const filterBtns = document.querySelectorAll(".filter-btn");
+  const dataRows = Array.from(document.querySelectorAll("#glossaryTable tbody tr.data-row"));
+  const sectionRows = Array.from(document.querySelectorAll("#glossaryTable tbody tr.section-row"));
+  const rowCount = document.getElementById("row-count");
+  const emptyState = document.getElementById("emptyState");
+
+  let activeCat = "all";
+
+  function filterTable() {
+    const query = searchInput.value.trim().toLowerCase();
+    let visible = 0;
+    const visibleBySec = {};
+
+    dataRows.forEach(row => {
+      const cat = row.getAttribute("data-cat");
+      const text = row.textContent.toLowerCase();
+      const matchesCat = activeCat === "all" || cat === activeCat;
+      const matchesQuery = !query || text.includes(query);
+
+      if (matchesCat && matchesQuery) {
+        row.style.display = "";
+        visible++;
+        visibleBySec[cat] = (visibleBySec[cat] || 0) + 1;
+      } else {
+        row.style.display = "none";
+      }
+    });
+
+    sectionRows.forEach(secRow => {
+      const sec = secRow.getAttribute("data-sec");
+      secRow.style.display = (visibleBySec[sec] || 0) > 0 ? "" : "none";
+    });
+
+    rowCount.textContent = `${visible} מונחים`;
+    emptyState.style.display = visible === 0 ? "block" : "none";
+  }
+
+  searchInput.addEventListener("input", filterTable);
+
+  filterBtns.forEach(btn => {
+    btn.addEventListener("click", () => {
+      filterBtns.forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      activeCat = btn.getAttribute("data-cat");
+      filterTable();
+    });
+  });
+});
+</script>
+</body>
+</html>
