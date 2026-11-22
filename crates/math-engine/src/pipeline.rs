@@ -53,6 +53,10 @@ impl MathPipelineConfig {
         };
         let station2 = Station2Config {
             variance_mode: cfg.variance_mode,
+            lead_lag_cancel_threshold: cfg.lead_lag_cancel_threshold,
+            lead_lag_window_ms: cfg.lead_lag_window_ms,
+            lead_lag_cooldown_ms: cfg.lead_lag_cooldown_ms,
+            lead_lag_directional: cfg.lead_lag_directional,
             ..Station2Config::default()
         };
         let kappa = KappaConfig {
@@ -139,8 +143,12 @@ pub struct PipelineFlags {
     pub strike_missing: bool,
     /// `true` when either UP or DOWN L2 book was crossed/locked.
     pub crossed_book: bool,
-    /// `true` when Binance lead-lag jump triggered defensive maker cancel.
+    /// `true` when either UP or DOWN Binance lead-lag defensive cancel fired.
     pub defensive_cancel: bool,
+    /// `true` when Binance lead-lag jump/cooldown requires cancelling UP bids.
+    pub defensive_cancel_up: bool,
+    /// `true` when Binance lead-lag jump/cooldown requires cancelling DOWN bids.
+    pub defensive_cancel_dn: bool,
 }
 
 /// Complete step-by-step trace of Stations 1–6 (`Copy`, zero heap allocations).
@@ -195,7 +203,8 @@ pub struct MathPipeline {
     st2: RollingTwapAndVariance,
     st3: KappaEstimator,
     pricer: DualBidPricer,
-    pending_defensive_cancel: bool,
+    pending_defensive_cancel_up: bool,
+    pending_defensive_cancel_dn: bool,
 }
 
 impl MathPipeline {
@@ -209,7 +218,8 @@ impl MathPipeline {
             st2: RollingTwapAndVariance::new(config.station2)?,
             st3: KappaEstimator::new(config.kappa)?,
             pricer: DualBidPricer::new(config.pricer)?,
-            pending_defensive_cancel: false,
+            pending_defensive_cancel_up: false,
+            pending_defensive_cancel_dn: false,
         })
     }
 
@@ -224,7 +234,8 @@ impl MathPipeline {
         self.sg.reset();
         self.st2.reset();
         self.st3.reset();
-        self.pending_defensive_cancel = false;
+        self.pending_defensive_cancel_up = false;
+        self.pending_defensive_cancel_dn = false;
     }
 
     /// Computes `[expiry_ms - 60s, expiry_ms]` terminal TWAP when available,
@@ -246,9 +257,14 @@ impl MathPipeline {
             return Ok(self.st2.peek_lead_lag());
         }
         let tau_secs = expiry_ms.saturating_sub(ts_ms) as f64 / 1000.0;
-        let sig = self.st2.compute_lead_lag(spot_usd, strike_usd, tau_secs)?;
-        if sig.trigger_defensive_cancel {
-            self.pending_defensive_cancel = true;
+        let sig = self
+            .st2
+            .compute_lead_lag_at(ts_ms, spot_usd, strike_usd, tau_secs)?;
+        if sig.trigger_defensive_cancel_up {
+            self.pending_defensive_cancel_up = true;
+        }
+        if sig.trigger_defensive_cancel_dn {
+            self.pending_defensive_cancel_dn = true;
         }
         Ok(sig)
     }
@@ -276,7 +292,7 @@ impl MathPipeline {
         };
         if input.book_up.is_crossed() || input.book_dn.is_crossed() {
             flags.crossed_book = true;
-            flags.defensive_cancel = self.take_defensive_cancel();
+            self.take_defensive_cancel_into(&mut flags, input.now_ms);
             return self.suppressed_result(
                 input,
                 None,
@@ -288,9 +304,15 @@ impl MathPipeline {
         self.evaluate_uncrossed(input, flags, eval_t0)
     }
 
-    fn take_defensive_cancel(&mut self) -> bool {
+    fn take_defensive_cancel_into(&mut self, flags: &mut PipelineFlags, now_ms: u64) {
         self.st2.clear_one_shot_lead_lag();
-        std::mem::take(&mut self.pending_defensive_cancel)
+        let up = std::mem::take(&mut self.pending_defensive_cancel_up)
+            || self.st2.is_cooldown_up_active(now_ms);
+        let dn = std::mem::take(&mut self.pending_defensive_cancel_dn)
+            || self.st2.is_cooldown_dn_active(now_ms);
+        flags.defensive_cancel_up = up;
+        flags.defensive_cancel_dn = dn;
+        flags.defensive_cancel = up || dn;
     }
 
     fn evaluate_uncrossed(
@@ -304,7 +326,7 @@ impl MathPipeline {
             input.book_up.best_ask(),
             input.book_up.raw_mid_usd()?,
         ) else {
-            flags.defensive_cancel = self.take_defensive_cancel();
+            self.take_defensive_cancel_into(&mut flags, input.now_ms);
             return self.suppressed_result(
                 input,
                 None,
@@ -322,7 +344,7 @@ impl MathPipeline {
         )?;
         let Some(sg_out) = sg_opt else {
             flags.sg_warming_up = true;
-            flags.defensive_cancel = self.take_defensive_cancel();
+            self.take_defensive_cancel_into(&mut flags, input.now_ms);
             return self.suppressed_with_s1(input, raw_mid, flags, eval_t0, s1_ns);
         };
         flags.sg_clamped_to_bbo = sg_out.clamped_to_bbo;
@@ -356,8 +378,11 @@ impl MathPipeline {
                 .evaluate(input.now_ms, input.expiry_ms, sg_out.s_i, input.strike_usd)?;
         let t3 = clock_ns(&self.clock)?;
         let s2_ns = t3.saturating_sub(t2);
-        let latched = std::mem::take(&mut self.pending_defensive_cancel);
-        flags.defensive_cancel = st2_out.lead_lag.trigger_defensive_cancel || latched;
+        let latched_up = std::mem::take(&mut self.pending_defensive_cancel_up);
+        let latched_dn = std::mem::take(&mut self.pending_defensive_cancel_dn);
+        flags.defensive_cancel_up = st2_out.lead_lag.trigger_defensive_cancel_up || latched_up;
+        flags.defensive_cancel_dn = st2_out.lead_lag.trigger_defensive_cancel_dn || latched_dn;
+        flags.defensive_cancel = flags.defensive_cancel_up || flags.defensive_cancel_dn;
 
         let kappa_out = self.st3.estimate(input.book_up, sg_out.s_i)?;
         let kappa_pos = FinitePosF64::try_new(kappa_out.kappa)?;
@@ -730,5 +755,111 @@ mod tests {
             assert_eq!(b.pricer.map(|p| p.s_star), g.pricer.map(|p| p.s_star));
             assert_eq!(b.pricer.map(|p| p.r_i), g.pricer.map(|p| p.r_i));
         }
+    }
+
+    #[test]
+    fn directional_rolling_cancel_latches_and_holds_cooldown_across_silent_ticks() {
+        let clock = MonotonicClock::start();
+        let ec = EngineConfig {
+            lead_lag_cancel_threshold: 0.02,
+            lead_lag_window_ms: 1_000,
+            lead_lag_cooldown_ms: 500,
+            lead_lag_directional: true,
+            ..EngineConfig::default()
+        };
+        let mut pipe =
+            MathPipeline::new(MathPipelineConfig::from_engine_config(&ec).unwrap(), clock).unwrap();
+        let (up, dn) = sample_up_dn_books();
+
+        for tick in 0..5_u64 {
+            let _ = pipe
+                .on_binance_spot(100_000 + tick * 100, 90_000.0, Some(90_000.0), 300_000)
+                .unwrap();
+            let tr = pipe
+                .evaluate(&PipelineInput {
+                    now_ms: 100_000 + tick * 100,
+                    expiry_ms: 300_000,
+                    tick_size_micro: MicroUsdc(10_000),
+                    fee_schedule: FeeSchedule::btc_5m_default(),
+                    inventory_q: SignedSharesMicro::ZERO,
+                    book_up: &up,
+                    book_dn: &dn,
+                    spot_usd: Some(90_000.0),
+                    strike_usd: Some(90_000.0),
+                    active_bid_up: None,
+                    active_bid_dn: None,
+                    cost_context: CostContext::default(),
+                })
+                .unwrap();
+            assert!(!tr.flags.defensive_cancel);
+        }
+
+        // Gradual drop over 1s triggers ONLY UP side via fast-path and stays latched until cooldown expires.
+        for step in 1..=5_u64 {
+            let t = 100_400 + step * 100;
+            let _ = pipe
+                .on_binance_spot(t, 90_000.0 - (step as f64) * 35.0, Some(90_000.0), 300_000)
+                .unwrap();
+        }
+        let silent_during_cd = pipe
+            .evaluate(&PipelineInput {
+                now_ms: 101_000,
+                expiry_ms: 300_000,
+                tick_size_micro: MicroUsdc(10_000),
+                fee_schedule: FeeSchedule::btc_5m_default(),
+                inventory_q: SignedSharesMicro::ZERO,
+                book_up: &up,
+                book_dn: &dn,
+                spot_usd: Some(89_825.0),
+                strike_usd: Some(90_000.0),
+                active_bid_up: None,
+                active_bid_dn: None,
+                cost_context: CostContext::default(),
+            })
+            .unwrap();
+        assert!(silent_during_cd.flags.defensive_cancel);
+        assert!(silent_during_cd.flags.defensive_cancel_up);
+        assert!(!silent_during_cd.flags.defensive_cancel_dn);
+
+        // Silent tick still within window+cooldown keeps UP blocked and DOWN clear.
+        let silent_still_cd = pipe
+            .evaluate(&PipelineInput {
+                now_ms: 101_800,
+                expiry_ms: 300_000,
+                tick_size_micro: MicroUsdc(10_000),
+                fee_schedule: FeeSchedule::btc_5m_default(),
+                inventory_q: SignedSharesMicro::ZERO,
+                book_up: &up,
+                book_dn: &dn,
+                spot_usd: Some(89_825.0),
+                strike_usd: Some(90_000.0),
+                active_bid_up: None,
+                active_bid_dn: None,
+                cost_context: CostContext::default(),
+            })
+            .unwrap();
+        assert!(silent_still_cd.flags.defensive_cancel_up);
+        assert!(!silent_still_cd.flags.defensive_cancel_dn);
+
+        // After window + cooldown expires cleanly, both clear.
+        let silent_after_cd = pipe
+            .evaluate(&PipelineInput {
+                now_ms: 103_000,
+                expiry_ms: 300_000,
+                tick_size_micro: MicroUsdc(10_000),
+                fee_schedule: FeeSchedule::btc_5m_default(),
+                inventory_q: SignedSharesMicro::ZERO,
+                book_up: &up,
+                book_dn: &dn,
+                spot_usd: Some(89_825.0),
+                strike_usd: Some(90_000.0),
+                active_bid_up: None,
+                active_bid_dn: None,
+                cost_context: CostContext::default(),
+            })
+            .unwrap();
+        assert!(!silent_after_cd.flags.defensive_cancel);
+        assert!(!silent_after_cd.flags.defensive_cancel_up);
+        assert!(!silent_after_cd.flags.defensive_cancel_dn);
     }
 }
