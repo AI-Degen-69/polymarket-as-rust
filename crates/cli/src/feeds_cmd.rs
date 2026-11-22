@@ -119,11 +119,11 @@ async fn run_discover(duration: Duration, jsonl_arg: Option<&Path>) -> Result<()
         Some(path) => CaptureTarget::Explicit(path.to_path_buf()),
         None => {
             let start_stamp = log_paths::format_utc_stamp(SystemTime::now());
-            let inprogress_path = log_paths::capture_inprogress_path(
+            let inprogress_path = log_paths::reserve_capture_inprogress_path(
                 Path::new(log_paths::CAPTURES_DIR),
                 &start_stamp,
                 duration,
-            );
+            )?;
             CaptureTarget::Auto {
                 inprogress_path,
                 start_stamp,

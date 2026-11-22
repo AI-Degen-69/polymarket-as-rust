@@ -1,6 +1,8 @@
 //! Standardized log folder layout, UTC timestamp naming, and capture finalization.
 
 use std::error::Error;
+use std::fs::OpenOptions;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -27,6 +29,16 @@ pub(crate) fn default_feature_log_path_at(feature: &str, now: SystemTime) -> Pat
     PathBuf::from(format!("logs/{feature}/{stamp}.jsonl"))
 }
 
+/// Build the default sandbox JSONL path `logs/sandbox/<DD-MM_HH-MM-SSZ>_<action>.jsonl`.
+pub(crate) fn default_sandbox_log_path(action: &str) -> PathBuf {
+    default_sandbox_log_path_at(action, SystemTime::now())
+}
+
+pub(crate) fn default_sandbox_log_path_at(action: &str, now: SystemTime) -> PathBuf {
+    let stamp = format_utc_stamp(now);
+    PathBuf::from(format!("logs/sandbox/{stamp}_{action}.jsonl"))
+}
+
 /// Format a duration cleanly for capture filenames (e.g., `20s`, `5m`, `1h`, `1m30s`, `500ms`).
 pub(crate) fn format_duration_compact(d: Duration) -> String {
     if d.as_secs() == 0 && d.subsec_millis() > 0 {
@@ -50,38 +62,117 @@ pub(crate) fn format_duration_compact(d: Duration) -> String {
     out
 }
 
+const MAX_COLLISION_SUFFIX: usize = 10_000;
+
 /// Construct the in-progress capture path `<captures_dir>/<stamp>_<target-dur>.inprogress.jsonl`.
+#[cfg(test)]
 pub(crate) fn capture_inprogress_path(
     captures_dir: &Path,
     start_stamp: &str,
     target_dur: Duration,
 ) -> PathBuf {
-    let dur = format_duration_compact(target_dur);
-    captures_dir.join(format!("{start_stamp}_{dur}.inprogress.jsonl"))
+    capture_inprogress_path_with_suffix(captures_dir, start_stamp, target_dur, 1)
 }
 
-/// Construct the finalized capture path `<dir>/<stamp>_<actual-dur>_<N>w.jsonl`.
-pub(crate) fn capture_final_path(
+fn capture_inprogress_path_with_suffix(
+    captures_dir: &Path,
+    start_stamp: &str,
+    target_dur: Duration,
+    suffix: usize,
+) -> PathBuf {
+    let dur = format_duration_compact(target_dur);
+    if suffix <= 1 {
+        captures_dir.join(format!("{start_stamp}_{dur}.inprogress.jsonl"))
+    } else {
+        captures_dir.join(format!("{start_stamp}_{dur}-{suffix}.inprogress.jsonl"))
+    }
+}
+
+/// Atomically reserve a unique `.inprogress.jsonl` capture file, appending `-2`, `-3`, ... on
+/// same-second collisions so concurrent captures never truncate each other.
+pub(crate) fn reserve_capture_inprogress_path(
+    captures_dir: &Path,
+    start_stamp: &str,
+    target_dur: Duration,
+) -> Result<PathBuf, std::io::Error> {
+    std::fs::create_dir_all(captures_dir)?;
+    for suffix in 1..=MAX_COLLISION_SUFFIX {
+        let candidate =
+            capture_inprogress_path_with_suffix(captures_dir, start_stamp, target_dur, suffix);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        format!(
+            "exhausted {MAX_COLLISION_SUFFIX} capture file collision suffixes in `{}`",
+            captures_dir.display()
+        ),
+    ))
+}
+
+fn capture_final_path_with_suffix(
     inprogress_path: &Path,
     start_stamp: &str,
     actual_dur: Duration,
     windows_touched: usize,
+    suffix: usize,
 ) -> PathBuf {
     let dur = format_duration_compact(actual_dur);
     let windows = windows_touched.max(1);
-    inprogress_path.with_file_name(format!("{start_stamp}_{dur}_{windows}w.jsonl"))
+    if suffix <= 1 {
+        inprogress_path.with_file_name(format!("{start_stamp}_{dur}_{windows}w.jsonl"))
+    } else {
+        inprogress_path.with_file_name(format!("{start_stamp}_{dur}_{windows}w-{suffix}.jsonl"))
+    }
 }
 
-/// Atomically rename an `.inprogress.jsonl` capture file to `<stamp>_<actual-dur>_<N>w.jsonl`.
+/// Atomically finalize an `.inprogress.jsonl` capture file to `<stamp>_<actual-dur>_<N>w.jsonl`
+/// without overwriting an existing capture (appending `-2`, `-3`, ... on collision).
 pub(crate) fn finalize_capture_file(
     inprogress_path: &Path,
     start_stamp: &str,
     actual_dur: Duration,
     windows_touched: usize,
 ) -> Result<PathBuf, std::io::Error> {
-    let final_path = capture_final_path(inprogress_path, start_stamp, actual_dur, windows_touched);
-    std::fs::rename(inprogress_path, &final_path)?;
-    Ok(final_path)
+    for suffix in 1..=MAX_COLLISION_SUFFIX {
+        let final_path = capture_final_path_with_suffix(
+            inprogress_path,
+            start_stamp,
+            actual_dur,
+            windows_touched,
+            suffix,
+        );
+        match std::fs::hard_link(inprogress_path, &final_path) {
+            Ok(()) => {
+                std::fs::remove_file(inprogress_path)?;
+                return Ok(final_path);
+            }
+            Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+            Err(err) if err.kind() == ErrorKind::Unsupported => {
+                if final_path.exists() {
+                    continue;
+                }
+                std::fs::rename(inprogress_path, &final_path)?;
+                return Ok(final_path);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::AlreadyExists,
+        format!(
+            "exhausted {MAX_COLLISION_SUFFIX} finalized capture collision suffixes for `{}`",
+            inprogress_path.display()
+        ),
+    ))
 }
 
 /// Pick the newest finalized `.jsonl` capture in `captures_dir` by `LastWriteTime` (modified time).
@@ -181,6 +272,17 @@ mod tests {
 
         let path = default_feature_log_path_at("lifecycle", sys);
         assert_eq!(path, PathBuf::from("logs/lifecycle/22-11_11-00-00Z.jsonl"));
+
+        let sandbox_health = default_sandbox_log_path_at("health", sys);
+        assert_eq!(
+            sandbox_health,
+            PathBuf::from("logs/sandbox/22-11_11-00-00Z_health.jsonl")
+        );
+        let sandbox_feeds = default_sandbox_log_path_at("feeds", sys);
+        assert_eq!(
+            sandbox_feeds,
+            PathBuf::from("logs/sandbox/22-11_11-00-00Z_feeds.jsonl")
+        );
     }
 
     #[test]
@@ -242,6 +344,39 @@ mod tests {
         let out = dir.join("out.jsonl");
         assert_eq!(resolve_replay_input_in(None, &out, &dir).unwrap(), newer);
         assert!(resolve_replay_input_in(None, &newer, &dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn same_second_capture_reservation_and_finalization_handle_collisions() {
+        let dir = unique_temp_dir("collisions");
+        let stamp = "22-11_11-00-00Z";
+
+        // Same-second in-progress reservations get clean base name first, then -2, -3.
+        let p1 = reserve_capture_inprogress_path(&dir, stamp, Duration::from_secs(20)).unwrap();
+        let p2 = reserve_capture_inprogress_path(&dir, stamp, Duration::from_secs(20)).unwrap();
+        let p3 = reserve_capture_inprogress_path(&dir, stamp, Duration::from_secs(20)).unwrap();
+        assert_eq!(p1, dir.join("22-11_11-00-00Z_20s.inprogress.jsonl"));
+        assert_eq!(p2, dir.join("22-11_11-00-00Z_20s-2.inprogress.jsonl"));
+        assert_eq!(p3, dir.join("22-11_11-00-00Z_20s-3.inprogress.jsonl"));
+
+        std::fs::write(&p1, "first\n").unwrap();
+        std::fs::write(&p2, "second\n").unwrap();
+        std::fs::write(&p3, "third\n").unwrap();
+
+        // Finalizing with the same actual duration and window count never overwrites prior files.
+        let f1 = finalize_capture_file(&p1, stamp, Duration::from_secs(5), 1).unwrap();
+        let f2 = finalize_capture_file(&p2, stamp, Duration::from_secs(5), 1).unwrap();
+        let f3 = finalize_capture_file(&p3, stamp, Duration::from_secs(5), 1).unwrap();
+
+        assert_eq!(f1, dir.join("22-11_11-00-00Z_5s_1w.jsonl"));
+        assert_eq!(f2, dir.join("22-11_11-00-00Z_5s_1w-2.jsonl"));
+        assert_eq!(f3, dir.join("22-11_11-00-00Z_5s_1w-3.jsonl"));
+        assert_eq!(std::fs::read_to_string(&f1).unwrap(), "first\n");
+        assert_eq!(std::fs::read_to_string(&f2).unwrap(), "second\n");
+        assert_eq!(std::fs::read_to_string(&f3).unwrap(), "third\n");
+        assert!(!p1.exists() && !p2.exists() && !p3.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

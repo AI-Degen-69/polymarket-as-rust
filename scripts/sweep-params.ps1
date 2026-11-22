@@ -65,14 +65,22 @@ foreach ($v in $parsedVarSpreads) {
     }
 }
 
+if ($Latest -and -not [string]::IsNullOrWhiteSpace($InputPath)) {
+    throw "Cannot pass both -InputPath and -Latest"
+}
+
+$resolvedInput = ""
+if (-not [string]::IsNullOrWhiteSpace($InputPath)) {
+    if (-not (Test-Path -LiteralPath $InputPath)) {
+        throw "Input capture file not found: $InputPath"
+    }
+    $resolvedInput = (Resolve-Path -LiteralPath $InputPath).Path
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 Push-Location $repoRoot
 try {
-    if ($Latest -and -not [string]::IsNullOrWhiteSpace($InputPath)) {
-        throw "Cannot pass both -InputPath and -Latest"
-    }
-
-    if ([string]::IsNullOrWhiteSpace($InputPath)) {
+    if ([string]::IsNullOrWhiteSpace($resolvedInput)) {
         $capturesDir = Join-Path $repoRoot "logs/captures"
         if (-not (Test-Path -LiteralPath $capturesDir)) {
             throw "Captures directory not found: $capturesDir (pass -InputPath or run poly-as feeds --discover)"
@@ -86,11 +94,6 @@ try {
         }
         $resolvedInput = $latestFile.FullName
         Write-Host "[SWEEP] Auto-selected latest capture: $resolvedInput" -ForegroundColor Cyan
-    } else {
-        if (-not (Test-Path -LiteralPath $InputPath)) {
-            throw "Input capture file not found: $InputPath"
-        }
-        $resolvedInput = (Resolve-Path -LiteralPath $InputPath).Path
     }
     if ($BinPath -ne "") {
         $binPath = $BinPath
@@ -124,8 +127,25 @@ try {
     $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
     $captureStem = [System.IO.Path]::GetFileNameWithoutExtension($resolvedInput)
     $sweepBase = Join-Path $repoRoot "logs/sweeps"
-    $sweepDir = Join-Path $sweepBase ("{0}_{1}runs_{2}" -f $stamp, $totalRuns, $captureStem)
-    New-Item -ItemType Directory -Force -Path $sweepDir | Out-Null
+    if (-not (Test-Path -LiteralPath $sweepBase)) {
+        New-Item -ItemType Directory -Force -Path $sweepBase | Out-Null
+    }
+    $baseDirName = "{0}_{1}runs_{2}" -f $stamp, $totalRuns, $captureStem
+    $sweepDir = $null
+    for ($suffix = 1; $suffix -le 10000; $suffix++) {
+        $dirName = if ($suffix -eq 1) { $baseDirName } else { "{0}-{1}" -f $baseDirName, $suffix }
+        $candidate = Join-Path $sweepBase $dirName
+        try {
+            New-Item -ItemType Directory -Path $candidate -ErrorAction Stop | Out-Null
+            $sweepDir = $candidate
+            break
+        } catch [System.IO.IOException] {
+            continue
+        }
+    }
+    if ($null -eq $sweepDir) {
+        throw "Failed to allocate unique sweep directory under $sweepBase for $baseDirName"
+    }
     Write-Host "[SWEEP] Output folder: $sweepDir" -ForegroundColor Cyan
     if ($resolvedInput.StartsWith($sweepDir, [System.StringComparison]::OrdinalIgnoreCase)) {
         throw "Input capture must not live inside this sweep output folder: $resolvedInput"

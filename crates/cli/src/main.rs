@@ -516,17 +516,17 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 require_allowlisted_egress,
                 jsonl,
             } => sandbox_cmd::run(
-                jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("sandbox")),
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("health")),
                 sandbox_cmd::SandboxAction::Health {
                     require_allowlisted_egress,
                 },
             ),
             SandboxCommands::Markets { limit, jsonl } => sandbox_cmd::run(
-                jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("sandbox")),
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("markets")),
                 sandbox_cmd::SandboxAction::Markets { limit },
             ),
             SandboxCommands::Book { asset_id, jsonl } => sandbox_cmd::run(
-                jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("sandbox")),
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("book")),
                 sandbox_cmd::SandboxAction::Book { asset_id },
             ),
             SandboxCommands::Validate {
@@ -534,7 +534,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 confirm_sandbox_trade,
                 jsonl,
             } => sandbox_cmd::run(
-                jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("sandbox")),
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("validate")),
                 sandbox_cmd::SandboxAction::Validate {
                     asset_id,
                     confirm_sandbox_trade,
@@ -548,7 +548,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 reconnect_after_secs,
                 jsonl,
             } => sandbox_cmd::run(
-                jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("sandbox")),
+                jsonl.unwrap_or_else(|| log_paths::default_sandbox_log_path("feeds")),
                 sandbox_cmd::SandboxAction::Feeds {
                     up_asset_id,
                     dn_asset_id,
