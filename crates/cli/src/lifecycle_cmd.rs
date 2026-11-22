@@ -735,9 +735,7 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
         }
     }
 
-    stats.final_q_up = sim_q_up;
-    stats.final_q_dn = sim_q_dn;
-    stats.final_net_delta_micro = (sim_q_up.as_u64() as i64) - (sim_q_dn.as_u64() as i64);
+    stats.set_final_inventory(sim_q_up, sim_q_dn);
 
     let p_summary = pricing_lat.summary();
     let r_summary = risk_lat.summary();
@@ -1143,6 +1141,7 @@ impl LivePaperSimulator {
             }
             PolyMarketEvent::LastTrade {
                 outcome,
+                side,
                 price,
                 size,
                 ..
@@ -1150,13 +1149,15 @@ impl LivePaperSimulator {
                 if outcome == Outcome::Up {
                     self.pending_up_trades.push(size);
                 }
-                let fills = self.broker.on_public_trade(outcome, price, size, now_ms);
+                let fills = self
+                    .broker
+                    .on_public_trade_with_side(outcome, side, price, size, now_ms);
                 for fill in &fills {
                     self.process_fill(fill, now_ms, now_ns, jsonl)?;
                 }
                 self.telemetry
                     .naive_engine
-                    .on_public_trade(outcome, price, size, now_ms);
+                    .on_public_trade_with_side(outcome, side, price, size, now_ms);
             }
             PolyMarketEvent::TickSizeChange { new_tick_micro, .. } => {
                 self.desc.tick_size_micro = new_tick_micro;
@@ -1515,21 +1516,14 @@ impl LivePaperSimulator {
                         } else {
                             OrderSide::Buy
                         };
-                        let merges_before = self.ledger.total_pairs_merged;
-                        let fee = self.ledger.record_taker_flatten(
+                        let (fee, merge_opt) = self.ledger.record_taker_flatten_with_merge(
                             outcome,
                             side,
                             price,
                             SharesMicro(flatten_shares),
                         )?;
-                        let merged_delta = self
-                            .ledger
-                            .total_pairs_merged
-                            .0
-                            .saturating_sub(merges_before.0);
-                        if merged_delta > 0 {
-                            self.stats.merges_count = self.stats.merges_count.saturating_add(1);
-                            self.stats.total_pairs_merged = self.ledger.total_pairs_merged;
+                        if let Some(merge) = merge_opt {
+                            self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
                         }
                         print_lifecycle_flatten(
                             &self.desc.slug,
@@ -2000,8 +1994,11 @@ impl LivePaperSimulator {
         self.telemetry.naive_engine.broker = FifoPaperBroker::new(broker_cfg);
         self.telemetry.naive_engine.active_up_id = None;
         self.telemetry.naive_engine.active_dn_id = None;
-        self.telemetry.naive_engine.ledger.fee_schedule = next_desc.fee_schedule;
-        self.ledger.fee_schedule = next_desc.fee_schedule;
+        self.telemetry
+            .naive_engine
+            .ledger
+            .set_fee_schedule(next_desc.fee_schedule);
+        self.ledger.set_fee_schedule(next_desc.fee_schedule);
 
         self.book_up = BookMaintainer::new(Outcome::Up);
         self.book_dn = BookMaintainer::new(Outcome::Down);
@@ -2087,9 +2084,8 @@ impl LivePaperSimulator {
         self.stats.fees_paid_micro = self.ledger.fees_paid_micro;
         self.stats.estimated_rebate_micro = self.ledger.estimated_rebate_micro;
         self.stats.total_pairs_merged = self.ledger.total_pairs_merged;
-        self.stats.final_q_up = self.ledger.filled_up;
-        self.stats.final_q_dn = self.ledger.filled_dn;
-        self.stats.final_net_delta_micro = self.ledger.net_inventory().as_i64();
+        self.stats
+            .set_final_inventory(self.ledger.filled_up, self.ledger.filled_dn);
         self.stats.rpm_60s = self.telemetry.rpm_60s(now_ms);
         self.stats.fill_ratio = self.telemetry.fill_ratio();
         self.stats.markout_1s_bps = self.telemetry.avg_markout_1s_bps();

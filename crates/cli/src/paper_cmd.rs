@@ -207,8 +207,11 @@ impl PaperState {
         telemetry.naive_engine.broker = FifoPaperBroker::new(broker_cfg);
         telemetry.naive_engine.active_up_id = None;
         telemetry.naive_engine.active_dn_id = None;
-        telemetry.naive_engine.ledger.fee_schedule = next_desc.fee_schedule;
-        ledger.fee_schedule = next_desc.fee_schedule;
+        telemetry
+            .naive_engine
+            .ledger
+            .set_fee_schedule(next_desc.fee_schedule);
+        ledger.set_fee_schedule(next_desc.fee_schedule);
         telemetry.reset_epoch();
 
         self.clob_epoch = next_epoch;
@@ -518,6 +521,7 @@ fn process_replay_env(
                 }
                 ReplayPolyEvent::LastTrade {
                     outcome,
+                    side,
                     price,
                     size,
                     exch_ts_ms,
@@ -530,8 +534,9 @@ fn process_replay_env(
                         .active_order(outcome, OrderSide::Buy)
                         .map_or(SharesMicro::ZERO, |o| o.volume_ahead);
 
-                    // Execute trade against broker
-                    let fills = broker.on_public_trade(outcome, price, size, exch_ts_ms);
+                    // Execute directional trade against broker
+                    let fills =
+                        broker.on_public_trade_with_side(outcome, side, price, size, exch_ts_ms);
 
                     let vol_ahead_after = broker
                         .active_order(outcome, OrderSide::Buy)
@@ -595,10 +600,10 @@ fn process_replay_env(
                         telemetry.record_fill(fill, inv_before, inv_after, mid_at_fill);
                     }
 
-                    // Feed public trade into naive baseline engine
+                    // Feed directional public trade into naive baseline engine
                     telemetry
                         .naive_engine
-                        .on_public_trade(outcome, price, size, exch_ts_ms);
+                        .on_public_trade_with_side(outcome, side, price, size, exch_ts_ms);
                 }
                 ReplayPolyEvent::TickSizeChange { new_tick_micro, .. } => {
                     if let Some(desc) = state.desc.as_mut() {
@@ -1327,6 +1332,7 @@ fn handle_live_poly_event(
         }
         PolyMarketEvent::LastTrade {
             outcome,
+            side,
             price,
             size,
             exch_ts_ms,
@@ -1338,7 +1344,7 @@ fn handle_live_poly_event(
                 .active_order(outcome, OrderSide::Buy)
                 .map_or(SharesMicro::ZERO, |o| o.volume_ahead);
 
-            let fills = broker.on_public_trade(outcome, price, size, exch_ts_ms);
+            let fills = broker.on_public_trade_with_side(outcome, side, price, size, exch_ts_ms);
 
             let vol_ahead_after = broker
                 .active_order(outcome, OrderSide::Buy)
@@ -1403,7 +1409,7 @@ fn handle_live_poly_event(
 
             telemetry
                 .naive_engine
-                .on_public_trade(outcome, price, size, exch_ts_ms);
+                .on_public_trade_with_side(outcome, side, price, size, exch_ts_ms);
         }
         PolyMarketEvent::TickSizeChange { new_tick_micro, .. } => {
             if let Some(d) = state.desc.as_mut() {
@@ -2009,6 +2015,104 @@ mod tests {
             state.latest_up.unwrap().best_bid().unwrap().price,
             MicroUsdc(490_000)
         );
+        let _ = std::fs::remove_file(test_jsonl);
+    }
+
+    #[test]
+    fn test_directional_trade_filtering_and_rebate_carry_across_rollover() {
+        let clock = MonotonicClock::start();
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let market1 = test_market("btc-5m-dir-1", start_ms, expiry_ms);
+        let mut market2 = test_market("btc-5m-dir-2", expiry_ms, expiry_ms + 300_000);
+        market2.fee_schedule.fee_rate_e6 = 0;
+
+        let mut state = PaperState::new();
+        state.set_market(market1.clone());
+
+        let broker_config = FifoBrokerConfig {
+            order_latency_ms: 0,
+            cancel_latency_ms: 0,
+            ..Default::default()
+        };
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut broker = FifoPaperBroker::new(broker_config);
+        let mut ledger = PaperLedger::new(market1.fee_schedule);
+        let mut telemetry =
+            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let cfg = EngineConfig::default();
+        let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
+        let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
+
+        let _ = broker
+            .submit_new(NewOrderParams {
+                outcome: Outcome::Up,
+                side: OrderSide::Buy,
+                price: MicroUsdc(490_000),
+                size: base_size,
+                now_ms: start_ms,
+                current_best_bid: Some(MicroUsdc(490_000)),
+                current_best_ask: Some(MicroUsdc(510_000)),
+                book_depth_at_price: SharesMicro::ZERO,
+            })
+            .unwrap();
+
+        let temp_dir = std::env::temp_dir();
+        let test_jsonl = temp_dir.join("test_directional_rebate_carry.jsonl");
+        let mut jsonl = JsonlWriter::create(&test_jsonl).unwrap();
+
+        // Buy-aggressor trade must NOT fill resting Buy bid.
+        handle_live_poly_event(
+            PolyMarketEvent::LastTrade {
+                outcome: Outcome::Up,
+                side: OrderSide::Buy,
+                price: MicroUsdc(480_000),
+                size: SharesMicro(10 * ONE_SHARE_MICRO),
+                rx_mono_ns: 100,
+                exch_ts_ms: start_ms + 100,
+                epoch: 0,
+            },
+            "btc-5m-dir-1",
+            &mut state,
+            &mut pipe,
+            (&mut broker, &mut ledger, &mut telemetry),
+            (&mut jsonl, &clock),
+        )
+        .unwrap();
+        assert_eq!(ledger.filled_up, SharesMicro::ZERO);
+
+        // Sell-aggressor trade fills resting Buy bid and accrues maker rebate.
+        handle_live_poly_event(
+            PolyMarketEvent::LastTrade {
+                outcome: Outcome::Up,
+                side: OrderSide::Sell,
+                price: MicroUsdc(480_000),
+                size: base_size,
+                rx_mono_ns: 200,
+                exch_ts_ms: start_ms + 200,
+                epoch: 0,
+            },
+            "btc-5m-dir-1",
+            &mut state,
+            &mut pipe,
+            (&mut broker, &mut ledger, &mut telemetry),
+            (&mut jsonl, &clock),
+        )
+        .unwrap();
+        assert_eq!(ledger.filled_up, base_size);
+        let prior_rebate = ledger.estimated_rebate_micro;
+        assert!(prior_rebate > 0);
+
+        // Rollover into a zero-fee market must preserve prior epoch accrued rebate.
+        state.rollover_to_market(
+            market2,
+            1,
+            &mut broker,
+            &mut ledger,
+            &mut telemetry,
+            &mut pipe,
+        );
+        assert_eq!(ledger.estimated_rebate_micro, prior_rebate);
         let _ = std::fs::remove_file(test_jsonl);
     }
 }
