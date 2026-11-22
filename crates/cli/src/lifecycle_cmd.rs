@@ -2299,19 +2299,12 @@ impl LivePaperSimulator {
 
 fn build_risk_actor(
     harness: ActorPipelineHarness,
-    v_max_micro: MicroUsdc,
-    base_size_shares: u64,
-    min_order_size_shares: u64,
+    risk_config: RiskConfig,
     initial_tick_size: MicroUsdc,
     now_ns: u64,
     fault: FaultInjection,
 ) -> Result<RiskActor, Box<dyn Error>> {
-    let risk_config = RiskConfig {
-        v_max_micro,
-        base_order_size_shares: base_size_shares,
-        min_order_size_shares,
-        ..Default::default()
-    };
+    let min_order_size_shares = risk_config.min_order_size_shares;
     let risk_engine = DollarNotionalRiskEngine::new(risk_config)?;
     let hysteresis = HysteresisGate::new(HysteresisConfig {
         hysteresis_buf: 0.25,
@@ -2365,9 +2358,13 @@ fn spawn_managed_session(
 
     let risk_actor = build_risk_actor(
         harness.clone(),
-        v_max_micro,
-        args.base_size,
-        min_order_shares,
+        RiskConfig {
+            v_max_micro,
+            base_order_size_shares: args.base_size,
+            min_order_size_shares: min_order_shares,
+            cap_tier1_reducing_to_delta: cfg.cap_tier1_reducing_to_delta,
+            ..Default::default()
+        },
         desc.tick_size_micro,
         initial_now_ns,
         args.fault.into(),
@@ -3206,9 +3203,12 @@ mod tests {
         let v_max_micro = MicroUsdc(v_max_usd * 1_000_000);
         let risk_actor = build_risk_actor(
             harness.clone(),
-            v_max_micro,
-            base_size,
-            5,
+            RiskConfig {
+                v_max_micro,
+                base_order_size_shares: base_size,
+                min_order_size_shares: 5,
+                ..Default::default()
+            },
             desc.tick_size_micro,
             1_000,
             FaultInjection::None,

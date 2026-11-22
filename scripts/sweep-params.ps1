@@ -49,6 +49,10 @@ param(
 
     [string[]]$LeadLagDirectionals = @("true"),
 
+    [string[]]$HedgeSkewMults = @("1.0"),
+
+    [string[]]$CapTier1Hedges = @("false"),
+
     [uint64]$MaxCombinedBidMicro = 990000,
 
     [ValidateSet("conservative", "optimistic")]
@@ -126,12 +130,30 @@ foreach ($d in $parsedLLDirectionals) {
 if ($parsedLLThresholds.Count -eq 0 -or $parsedLLWindows.Count -eq 0 -or $parsedLLCooldowns.Count -eq 0 -or $parsedLLDirectionals.Count -eq 0) {
     throw "LeadLagThresholds, LeadLagWindows, LeadLagCooldowns, and LeadLagDirectionals must each contain at least one value"
 }
+$parsedHedgeSkews = @($HedgeSkewMults | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    $m = [double]::Parse($_, $inv)
+    if ([double]::IsNaN($m) -or [double]::IsInfinity($m) -or $m -lt 0.0 -or $m -gt 1.0) {
+        throw "Invalid HedgeSkewMults entry '$_' (expected finite number in [0.0, 1.0])"
+    }
+    $m
+})
+$parsedCapTier1 = @($CapTier1Hedges | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -ne '' })
+foreach ($c in $parsedCapTier1) {
+    if ($c -ne "true" -and $c -ne "false") {
+        throw "Invalid CapTier1Hedges entry '$c' (expected 'true' or 'false')"
+    }
+}
+if ($parsedHedgeSkews.Count -eq 0 -or $parsedCapTier1.Count -eq 0) {
+    throw "HedgeSkewMults and CapTier1Hedges must each contain at least one value"
+}
 $showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
 $showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
 $showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.015 }).Count -gt 0)
 $showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 1000 }).Count -gt 0)
 $showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 1000 }).Count -gt 0)
 $showLLDir = ($parsedLLDirectionals.Count -gt 1) -or (@($parsedLLDirectionals | Where-Object { $_ -ne "true" }).Count -gt 0)
+$showHedgeSkew = ($parsedHedgeSkews.Count -gt 1) -or (@($parsedHedgeSkews | Where-Object { $_ -ne 1.0 }).Count -gt 0)
+$showCapTier1 = ($parsedCapTier1.Count -gt 1) -or (@($parsedCapTier1 | Where-Object { $_ -ne "false" }).Count -gt 0)
 foreach ($v in $parsedVarSpreads) {
     if ($v -ne "true" -and $v -ne "false") {
         throw "Invalid VarianceSpreads entry '$v' (expected 'true' or 'false')"
@@ -260,7 +282,7 @@ try {
         }
     }
 
-    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count * $parsedLLThresholds.Count * $parsedLLWindows.Count * $parsedLLCooldowns.Count * $parsedLLDirectionals.Count
+    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count * $parsedLLThresholds.Count * $parsedLLWindows.Count * $parsedLLCooldowns.Count * $parsedLLDirectionals.Count * $parsedHedgeSkews.Count * $parsedCapTier1.Count
     $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
     $sweepBase = Join-Path $repoRoot "logs/sweeps"
     if (-not (Test-Path -LiteralPath $sweepBase)) {
@@ -312,263 +334,297 @@ try {
                             foreach ($llWin in $parsedLLWindows) {
                                 foreach ($llCd in $parsedLLCooldowns) {
                                     foreach ($llDir in $parsedLLDirectionals) {
-                        $runIdx++
-                        $stem = "g${gammaTag}_var-${varStr}_t${minTicks}_b${MaxCombinedBidMicro}_${QueueDecay}"
-                        if ($showCrossLoss) {
-                            $stem += "_xt-${crossLoss}"
-                        }
-                        if ($showEntryProb) {
-                            $epTag = $entryProb.Replace(".", "p")
-                            $stem += "_ep-${epTag}"
-                        }
-                        if ($showLLThresh) {
-                            $lltTag = $llThresh.Replace(".", "p")
-                            $stem += "_llt-${lltTag}"
-                        }
-                        if ($showLLWin) {
-                            $stem += "_llw-${llWin}"
-                        }
-                        if ($showLLCd) {
-                            $stem += "_llc-${llCd}"
-                        }
-                        if ($showLLDir) {
-                            $stem += "_lld-${llDir}"
-                        }
+                                        foreach ($hedgeSkew in $parsedHedgeSkews) {
+                                            $hsStr = $hedgeSkew.ToString("R", $inv)
+                                            $hsTag = $hsStr.Replace(".", "p").Replace("-", "m")
+                                            foreach ($capT1 in $parsedCapTier1) {
+                                                $runIdx++
+                                                $stem = "g${gammaTag}_var-${varStr}_t${minTicks}_b${MaxCombinedBidMicro}_${QueueDecay}"
+                                                if ($showCrossLoss) {
+                                                    $stem += "_xt-${crossLoss}"
+                                                }
+                                                if ($showEntryProb) {
+                                                    $epTag = $entryProb.Replace(".", "p")
+                                                    $stem += "_ep-${epTag}"
+                                                }
+                                                if ($showLLThresh) {
+                                                    $lltTag = $llThresh.Replace(".", "p")
+                                                    $stem += "_llt-${lltTag}"
+                                                }
+                                                if ($showLLWin) {
+                                                    $stem += "_llw-${llWin}"
+                                                }
+                                                if ($showLLCd) {
+                                                    $stem += "_llc-${llCd}"
+                                                }
+                                                if ($showLLDir) {
+                                                    $stem += "_lld-${llDir}"
+                                                }
+                                                if ($showHedgeSkew) {
+                                                    $stem += "_hs-${hsTag}"
+                                                }
+                                                if ($showCapTier1) {
+                                                    $stem += "_t1c-${capT1}"
+                                                }
 
-                        $extraProgress = ""
-                        if ($showCrossLoss) { $extraProgress += " xtick=$crossLoss" }
-                        if ($showEntryProb) { $extraProgress += " max_p=$entryProb" }
-                        if ($showLLThresh) { $extraProgress += " ll_th=$llThresh" }
-                        if ($showLLWin) { $extraProgress += " ll_win=$llWin" }
-                        if ($showLLCd) { $extraProgress += " ll_cd=$llCd" }
-                        if ($showLLDir) { $extraProgress += " ll_dir=$llDir" }
+                                                $extraProgress = ""
+                                                if ($showCrossLoss) { $extraProgress += " xtick=$crossLoss" }
+                                                if ($showEntryProb) { $extraProgress += " max_p=$entryProb" }
+                                                if ($showLLThresh) { $extraProgress += " ll_th=$llThresh" }
+                                                if ($showLLWin) { $extraProgress += " ll_win=$llWin" }
+                                                if ($showLLCd) { $extraProgress += " ll_cd=$llCd" }
+                                                if ($showLLDir) { $extraProgress += " ll_dir=$llDir" }
+                                                if ($showHedgeSkew) { $extraProgress += " hskew=$hsStr" }
+                                                if ($showCapTier1) { $extraProgress += " t1cap=$capT1" }
 
-                        $capRuns = [System.Collections.Generic.List[PSCustomObject]]::new()
-                        for ($capIdx = 0; $capIdx -lt $captures.Count; $capIdx++) {
-                            $cap = $captures[$capIdx]
-                            if ($isMultiCapture) {
-                                $capOutDir = Join-Path $sweepDir $cap.Stem
-                                $outJsonl = Join-Path $capOutDir "$stem.jsonl"
-                                $outLog = Join-Path $capOutDir "$stem.log"
-                                Write-Host ("[{0}/{1} | {2}/{3}] Replaying {4} gamma={5} var_spread={6} min_ticks={7}{8}..." -f $runIdx, $totalRuns, ($capIdx + 1), $captures.Count, $cap.Stem, $gammaStr, $varStr, $minTicks, $extraProgress)
-                            } else {
-                                $outJsonl = Join-Path $sweepDir "$stem.jsonl"
-                                $outLog = Join-Path $sweepDir "$stem.log"
-                                Write-Host ("[{0}/{1}] Replaying gamma={2} var_spread={3} min_ticks={4}{5}..." -f $runIdx, $totalRuns, $gammaStr, $varStr, $minTicks, $extraProgress)
-                            }
+                                $capRuns = [System.Collections.Generic.List[PSCustomObject]]::new()
+                                for ($capIdx = 0; $capIdx -lt $captures.Count; $capIdx++) {
+                                    $cap = $captures[$capIdx]
+                                    if ($isMultiCapture) {
+                                        $capOutDir = Join-Path $sweepDir $cap.Stem
+                                        $outJsonl = Join-Path $capOutDir "$stem.jsonl"
+                                        $outLog = Join-Path $capOutDir "$stem.log"
+                                        Write-Host ("[{0}/{1} | {2}/{3}] Replaying {4} gamma={5} var_spread={6} min_ticks={7}{8}..." -f $runIdx, $totalRuns, ($capIdx + 1), $captures.Count, $cap.Stem, $gammaStr, $varStr, $minTicks, $extraProgress)
+                                    } else {
+                                        $outJsonl = Join-Path $sweepDir "$stem.jsonl"
+                                        $outLog = Join-Path $sweepDir "$stem.log"
+                                        Write-Host ("[{0}/{1}] Replaying gamma={2} var_spread={3} min_ticks={4}{5}..." -f $runIdx, $totalRuns, $gammaStr, $varStr, $minTicks, $extraProgress)
+                                    }
 
-                            $cliArgs = @(
-                                "lifecycle",
-                                "--source", "replay",
-                                "--input", $cap.Path,
-                                "--v-max", $VMax.ToString($inv),
-                                "--base-size", $BaseSize.ToString($inv),
-                                "--queue-decay", $QueueDecay,
-                                "--gamma", $gammaStr,
-                                "--include-variance-spread", $varStr,
-                                "--min-spread-ticks", $minTicks.ToString($inv),
-                                "--max-combined-bid-micro", $MaxCombinedBidMicro.ToString($inv),
-                                "--lead-lag-threshold", $llThresh,
-                                "--lead-lag-window-ms", $llWin.ToString($inv),
-                                "--lead-lag-cooldown-ms", $llCd.ToString($inv),
-                                "--lead-lag-directional", $llDir,
-                                "--jsonl", $outJsonl
-                            )
-                            if ($crossLoss -ne "off") {
-                                $cliArgs += @("--max-cross-tick-loss-micro", $crossLoss)
-                            }
-                            if ($entryProb -ne "off") {
-                                $cliArgs += @("--max-entry-prob", $entryProb)
-                            }
+                                    $cliArgs = @(
+                                        "lifecycle",
+                                        "--source", "replay",
+                                        "--input", $cap.Path,
+                                        "--v-max", $VMax.ToString($inv),
+                                        "--base-size", $BaseSize.ToString($inv),
+                                        "--queue-decay", $QueueDecay,
+                                        "--gamma", $gammaStr,
+                                        "--include-variance-spread", $varStr,
+                                        "--min-spread-ticks", $minTicks.ToString($inv),
+                                        "--max-combined-bid-micro", $MaxCombinedBidMicro.ToString($inv),
+                                        "--lead-lag-threshold", $llThresh,
+                                        "--lead-lag-window-ms", $llWin.ToString($inv),
+                                        "--lead-lag-cooldown-ms", $llCd.ToString($inv),
+                                        "--lead-lag-directional", $llDir,
+                                        "--hedge-skew-mult", $hsStr,
+                                        "--cap-tier1-hedge", $capT1,
+                                        "--jsonl", $outJsonl
+                                    )
+                                    if ($crossLoss -ne "off") {
+                                        $cliArgs += @("--max-cross-tick-loss-micro", $crossLoss)
+                                    }
+                                    if ($entryProb -ne "off") {
+                                        $cliArgs += @("--max-entry-prob", $entryProb)
+                                    }
 
-                            $prevCrossLossEnv = $env:MAX_CROSS_TICK_LOSS_MICRO
-                            $prevEntryProbEnv = $env:MAX_ENTRY_PROB
-                            $prevLLThreshEnv = $env:LEAD_LAG_CANCEL_THRESHOLD
-                            $prevLLWinEnv = $env:LEAD_LAG_WINDOW_MS
-                            $prevLLCdEnv = $env:LEAD_LAG_COOLDOWN_MS
-                            $prevLLDirEnv = $env:LEAD_LAG_DIRECTIONAL
-                            try {
-                                if ($crossLoss -eq "off") {
-                                    $env:MAX_CROSS_TICK_LOSS_MICRO = "off"
+                                    $prevCrossLossEnv = $env:MAX_CROSS_TICK_LOSS_MICRO
+                                    $prevEntryProbEnv = $env:MAX_ENTRY_PROB
+                                    $prevLLThreshEnv = $env:LEAD_LAG_CANCEL_THRESHOLD
+                                    $prevLLWinEnv = $env:LEAD_LAG_WINDOW_MS
+                                    $prevLLCdEnv = $env:LEAD_LAG_COOLDOWN_MS
+                                    $prevLLDirEnv = $env:LEAD_LAG_DIRECTIONAL
+                                    $prevHedgeSkewEnv = $env:HEDGE_SKEW_MULT
+                                    $prevCapTier1Env = $env:CAP_TIER1_REDUCING_TO_DELTA
+                                    try {
+                                        if ($crossLoss -eq "off") {
+                                            $env:MAX_CROSS_TICK_LOSS_MICRO = "off"
+                                        }
+                                        if ($entryProb -eq "off") {
+                                            $env:MAX_ENTRY_PROB = "off"
+                                        }
+                                        $env:LEAD_LAG_CANCEL_THRESHOLD = $llThresh
+                                        $env:LEAD_LAG_WINDOW_MS = $llWin.ToString($inv)
+                                        $env:LEAD_LAG_COOLDOWN_MS = $llCd.ToString($inv)
+                                        $env:LEAD_LAG_DIRECTIONAL = $llDir
+                                        $env:HEDGE_SKEW_MULT = $hsStr
+                                        $env:CAP_TIER1_REDUCING_TO_DELTA = $capT1
+                                        & $binPath @cliArgs *> $outLog
+                                        if ($LASTEXITCODE -ne 0) {
+                                            $tail = if (Test-Path -LiteralPath $outLog) { (Get-Content -LiteralPath $outLog -Tail 20) -join "`n" } else { "" }
+                                            throw "Sweep run failed (exit=$LASTEXITCODE) for $($cap.Stem)/$stem.`n$tail"
+                                        }
+                                    } finally {
+                                        if ($null -eq $prevCrossLossEnv) {
+                                            Remove-Item Env:MAX_CROSS_TICK_LOSS_MICRO -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:MAX_CROSS_TICK_LOSS_MICRO = $prevCrossLossEnv
+                                        }
+                                        if ($null -eq $prevEntryProbEnv) {
+                                            Remove-Item Env:MAX_ENTRY_PROB -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:MAX_ENTRY_PROB = $prevEntryProbEnv
+                                        }
+                                        if ($null -eq $prevLLThreshEnv) {
+                                            Remove-Item Env:LEAD_LAG_CANCEL_THRESHOLD -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:LEAD_LAG_CANCEL_THRESHOLD = $prevLLThreshEnv
+                                        }
+                                        if ($null -eq $prevLLWinEnv) {
+                                            Remove-Item Env:LEAD_LAG_WINDOW_MS -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:LEAD_LAG_WINDOW_MS = $prevLLWinEnv
+                                        }
+                                        if ($null -eq $prevLLCdEnv) {
+                                            Remove-Item Env:LEAD_LAG_COOLDOWN_MS -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:LEAD_LAG_COOLDOWN_MS = $prevLLCdEnv
+                                        }
+                                        if ($null -eq $prevLLDirEnv) {
+                                            Remove-Item Env:LEAD_LAG_DIRECTIONAL -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:LEAD_LAG_DIRECTIONAL = $prevLLDirEnv
+                                        }
+                                        if ($null -eq $prevHedgeSkewEnv) {
+                                            Remove-Item Env:HEDGE_SKEW_MULT -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:HEDGE_SKEW_MULT = $prevHedgeSkewEnv
+                                        }
+                                        if ($null -eq $prevCapTier1Env) {
+                                            Remove-Item Env:CAP_TIER1_REDUCING_TO_DELTA -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:CAP_TIER1_REDUCING_TO_DELTA = $prevCapTier1Env
+                                        }
+                                    }
+
+                                    $summaryLine = Get-Content -LiteralPath $outJsonl -Tail 1
+                                    if (-not $summaryLine) {
+                                        throw "No summary event emitted in $outJsonl"
+                                    }
+                                    $summaryObj = $summaryLine | ConvertFrom-Json
+                                    if ($summaryObj.event -ne "summary") {
+                                        throw "Final JSONL row is not a summary event in $outJsonl (found '$($summaryObj.event)')"
+                                    }
+
+                                    $payload = $summaryObj.payload
+                                    $realized = [double]$payload.realized_pnl_micro / 1e6
+                                    $unreal = [double]$payload.unrealized_pnl_micro / 1e6
+                                    $netPnl = [double]$payload.net_pnl_micro / 1e6
+                                    $rebate = [double]$payload.estimated_rebate_micro / 1e6
+                                    $netPlusReb = $netPnl + $rebate
+                                    $basePnl = [double]$payload.baseline_pnl_micro / 1e6
+                                    $alphaEdge = $netPnl - $basePnl
+                                    $pairs = [double]$payload.total_pairs_merged_micro / 1e6
+                                    $fills = [int]$payload.fills_count
+                                    $merges = [int]$payload.merges_count
+                                    $rpm = [int]$payload.rpm_60s
+                                    $mo1s = [double]$payload.markout_1s_bps
+                                    $mo5s = [double]$payload.markout_5s_bps
+
+                                    $capRuns.Add([PSCustomObject]@{
+                                        CaptureName   = $cap.Name
+                                        CaptureStem   = $cap.Stem
+                                        Windows       = $cap.Windows
+                                        Fills         = $fills
+                                        Merges        = $merges
+                                        PairsNum      = $pairs
+                                        RealizedNum   = $realized
+                                        UnrealNum     = $unreal
+                                        NetPnLNum     = $netPnl
+                                        RebateNum     = $rebate
+                                        NetPlusRebNum = $netPlusReb
+                                        BasePnLNum    = $basePnl
+                                        AlphaEdgeNum  = $alphaEdge
+                                        RPM           = $rpm
+                                        MO1sNum       = $mo1s
+                                        MO5sNum       = $mo5s
+                                    })
                                 }
-                                if ($entryProb -eq "off") {
-                                    $env:MAX_ENTRY_PROB = "off"
-                                }
-                                $env:LEAD_LAG_CANCEL_THRESHOLD = $llThresh
-                                $env:LEAD_LAG_WINDOW_MS = $llWin.ToString($inv)
-                                $env:LEAD_LAG_COOLDOWN_MS = $llCd.ToString($inv)
-                                $env:LEAD_LAG_DIRECTIONAL = $llDir
-                                & $binPath @cliArgs *> $outLog
-                                if ($LASTEXITCODE -ne 0) {
-                                    $tail = if (Test-Path -LiteralPath $outLog) { (Get-Content -LiteralPath $outLog -Tail 20) -join "`n" } else { "" }
-                                    throw "Sweep run failed (exit=$LASTEXITCODE) for $($cap.Stem)/$stem.`n$tail"
-                                }
-                            } finally {
-                                if ($null -eq $prevCrossLossEnv) {
-                                    Remove-Item Env:MAX_CROSS_TICK_LOSS_MICRO -ErrorAction SilentlyContinue
+
+                                if (-not $isMultiCapture) {
+                                    $c = $capRuns[0]
+                                    $results.Add([PSCustomObject]@{
+                                        Gamma      = $gammaStr
+                                        VarSpr     = $varStr
+                                        MinT       = $minTicks
+                                        XTick      = $crossLoss
+                                        MaxP       = $entryProb
+                                        LLTh       = $llThresh
+                                        LLWin      = $llWin
+                                        LLCd       = $llCd
+                                        LLDir      = $llDir
+                                        HSkew      = $hsStr
+                                        T1Cap      = $capT1
+                                        Fills      = $c.Fills
+                                        Merges     = $c.Merges
+                                        Pairs      = $c.PairsNum.ToString("F2", $inv)
+                                        Realized   = $c.RealizedNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        Unreal     = $c.UnrealNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        NetPnL     = $c.NetPnLNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        Rebate     = $c.RebateNum.ToString("0.0000", $inv)
+                                        BasePnL    = $c.BasePnLNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        AlphaEdge  = $c.AlphaEdgeNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        RPM        = $c.RPM
+                                        MO1s       = $c.MO1sNum.ToString("+0.0;-0.0;+0.0", $inv)
+                                        MO5s       = $c.MO5sNum.ToString("+0.0;-0.0;+0.0", $inv)
+                                        NetPnLNum  = $c.NetPnLNum
+                                    })
                                 } else {
-                                    $env:MAX_CROSS_TICK_LOSS_MICRO = $prevCrossLossEnv
+                                    $sumFills = 0
+                                    $sumMerges = 0
+                                    $sumPairs = 0.0
+                                    $sumRealized = 0.0
+                                    $sumUnreal = 0.0
+                                    $sumNetPnl = 0.0
+                                    $sumRebate = 0.0
+                                    $sumBasePnl = 0.0
+                                    $sumAlphaEdge = 0.0
+                                    $maxRpm = 0
+                                    $weightedMo1s = 0.0
+                                    $weightedMo5s = 0.0
+                                    $winCaps = 0
+
+                                    foreach ($c in $capRuns) {
+                                        $sumFills += $c.Fills
+                                        $sumMerges += $c.Merges
+                                        $sumPairs += $c.PairsNum
+                                        $sumRealized += $c.RealizedNum
+                                        $sumUnreal += $c.UnrealNum
+                                        $sumNetPnl += $c.NetPnLNum
+                                        $sumRebate += $c.RebateNum
+                                        $sumBasePnl += $c.BasePnLNum
+                                        $sumAlphaEdge += $c.AlphaEdgeNum
+                                        if ($c.RPM -gt $maxRpm) { $maxRpm = $c.RPM }
+                                        $weightedMo1s += ($c.Fills * $c.MO1sNum)
+                                        $weightedMo5s += ($c.Fills * $c.MO5sNum)
+                                        if ($c.NetPlusRebNum -gt 0.0) { $winCaps++ }
+                                    }
+
+                                    $sumNetPlusReb = $sumNetPnl + $sumRebate
+                                    $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
+                                    $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
+
+                                    $results.Add([PSCustomObject]@{
+                                        Gamma      = $gammaStr
+                                        VarSpr     = $varStr
+                                        MinT       = $minTicks
+                                        XTick      = $crossLoss
+                                        MaxP       = $entryProb
+                                        LLTh       = $llThresh
+                                        LLWin      = $llWin
+                                        LLCd       = $llCd
+                                        LLDir      = $llDir
+                                        HSkew      = $hsStr
+                                        T1Cap      = $capT1
+                                        Fills      = $sumFills
+                                        Merges     = $sumMerges
+                                        Pairs      = $sumPairs.ToString("F2", $inv)
+                                        Realized   = $sumRealized.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        Unreal     = $sumUnreal.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        NetPnL     = $sumNetPnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        Rebate     = $sumRebate.ToString("0.0000", $inv)
+                                        NetPlusReb = $sumNetPlusReb.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        BasePnL    = $sumBasePnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        AlphaEdge  = $sumAlphaEdge.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                        RPM        = $maxRpm
+                                        MO1s       = $avgMo1s.ToString("+0.0;-0.0;+0.0", $inv)
+                                        MO5s       = $avgMo5s.ToString("+0.0;-0.0;+0.0", $inv)
+                                        WinCap     = ("{0}/{1}" -f $winCaps, $captures.Count)
+                                        NetPnLNum  = $sumNetPnl
+                                        CapRuns    = $capRuns
+                                    })
                                 }
-                                if ($null -eq $prevEntryProbEnv) {
-                                    Remove-Item Env:MAX_ENTRY_PROB -ErrorAction SilentlyContinue
-                                } else {
-                                    $env:MAX_ENTRY_PROB = $prevEntryProbEnv
-                                }
-                                if ($null -eq $prevLLThreshEnv) {
-                                    Remove-Item Env:LEAD_LAG_CANCEL_THRESHOLD -ErrorAction SilentlyContinue
-                                } else {
-                                    $env:LEAD_LAG_CANCEL_THRESHOLD = $prevLLThreshEnv
-                                }
-                                if ($null -eq $prevLLWinEnv) {
-                                    Remove-Item Env:LEAD_LAG_WINDOW_MS -ErrorAction SilentlyContinue
-                                } else {
-                                    $env:LEAD_LAG_WINDOW_MS = $prevLLWinEnv
-                                }
-                                if ($null -eq $prevLLCdEnv) {
-                                    Remove-Item Env:LEAD_LAG_COOLDOWN_MS -ErrorAction SilentlyContinue
-                                } else {
-                                    $env:LEAD_LAG_COOLDOWN_MS = $prevLLCdEnv
-                                }
-                                if ($null -eq $prevLLDirEnv) {
-                                    Remove-Item Env:LEAD_LAG_DIRECTIONAL -ErrorAction SilentlyContinue
-                                } else {
-                                    $env:LEAD_LAG_DIRECTIONAL = $prevLLDirEnv
-                                }
-                            }
-
-                            $summaryLine = Get-Content -LiteralPath $outJsonl -Tail 1
-                            if (-not $summaryLine) {
-                                throw "No summary event emitted in $outJsonl"
-                            }
-                            $summaryObj = $summaryLine | ConvertFrom-Json
-                            if ($summaryObj.event -ne "summary") {
-                                throw "Final JSONL row is not a summary event in $outJsonl (found '$($summaryObj.event)')"
-                            }
-
-                            $payload = $summaryObj.payload
-                            $realized = [double]$payload.realized_pnl_micro / 1e6
-                            $unreal = [double]$payload.unrealized_pnl_micro / 1e6
-                            $netPnl = [double]$payload.net_pnl_micro / 1e6
-                            $rebate = [double]$payload.estimated_rebate_micro / 1e6
-                            $netPlusReb = $netPnl + $rebate
-                            $basePnl = [double]$payload.baseline_pnl_micro / 1e6
-                            $alphaEdge = $netPnl - $basePnl
-                            $pairs = [double]$payload.total_pairs_merged_micro / 1e6
-                            $fills = [int]$payload.fills_count
-                            $merges = [int]$payload.merges_count
-                            $rpm = [int]$payload.rpm_60s
-                            $mo1s = [double]$payload.markout_1s_bps
-                            $mo5s = [double]$payload.markout_5s_bps
-
-                            $capRuns.Add([PSCustomObject]@{
-                                CaptureName  = $cap.Name
-                                CaptureStem  = $cap.Stem
-                                Windows      = $cap.Windows
-                                Fills        = $fills
-                                Merges       = $merges
-                                PairsNum     = $pairs
-                                RealizedNum  = $realized
-                                UnrealNum    = $unreal
-                                NetPnLNum    = $netPnl
-                                RebateNum    = $rebate
-                                NetPlusRebNum = $netPlusReb
-                                BasePnLNum   = $basePnl
-                                AlphaEdgeNum = $alphaEdge
-                                RPM          = $rpm
-                                MO1sNum      = $mo1s
-                                MO5sNum      = $mo5s
-                            })
-                        }
-
-                        if (-not $isMultiCapture) {
-                            $c = $capRuns[0]
-                            $results.Add([PSCustomObject]@{
-                                Gamma      = $gammaStr
-                                VarSpr     = $varStr
-                                MinT       = $minTicks
-                                XTick      = $crossLoss
-                                MaxP       = $entryProb
-                                LLTh       = $llThresh
-                                LLWin      = $llWin
-                                LLCd       = $llCd
-                                LLDir      = $llDir
-                                Fills      = $c.Fills
-                                Merges     = $c.Merges
-                                Pairs      = $c.PairsNum.ToString("F2", $inv)
-                                Realized   = $c.RealizedNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                Unreal     = $c.UnrealNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                NetPnL     = $c.NetPnLNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                Rebate     = $c.RebateNum.ToString("0.0000", $inv)
-                                BasePnL    = $c.BasePnLNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                AlphaEdge  = $c.AlphaEdgeNum.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                RPM        = $c.RPM
-                                MO1s       = $c.MO1sNum.ToString("+0.0;-0.0;+0.0", $inv)
-                                MO5s       = $c.MO5sNum.ToString("+0.0;-0.0;+0.0", $inv)
-                                NetPnLNum  = $c.NetPnLNum
-                            })
-                        } else {
-                            $sumFills = 0
-                            $sumMerges = 0
-                            $sumPairs = 0.0
-                            $sumRealized = 0.0
-                            $sumUnreal = 0.0
-                            $sumNetPnl = 0.0
-                            $sumRebate = 0.0
-                            $sumBasePnl = 0.0
-                            $sumAlphaEdge = 0.0
-                            $maxRpm = 0
-                            $weightedMo1s = 0.0
-                            $weightedMo5s = 0.0
-                            $winCaps = 0
-
-                            foreach ($c in $capRuns) {
-                                $sumFills += $c.Fills
-                                $sumMerges += $c.Merges
-                                $sumPairs += $c.PairsNum
-                                $sumRealized += $c.RealizedNum
-                                $sumUnreal += $c.UnrealNum
-                                $sumNetPnl += $c.NetPnLNum
-                                $sumRebate += $c.RebateNum
-                                $sumBasePnl += $c.BasePnLNum
-                                $sumAlphaEdge += $c.AlphaEdgeNum
-                                if ($c.RPM -gt $maxRpm) { $maxRpm = $c.RPM }
-                                $weightedMo1s += ($c.Fills * $c.MO1sNum)
-                                $weightedMo5s += ($c.Fills * $c.MO5sNum)
-                                if ($c.NetPlusRebNum -gt 0.0) { $winCaps++ }
-                            }
-
-                            $sumNetPlusReb = $sumNetPnl + $sumRebate
-                            $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
-                            $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
-
-                            $results.Add([PSCustomObject]@{
-                                Gamma      = $gammaStr
-                                VarSpr     = $varStr
-                                MinT       = $minTicks
-                                XTick      = $crossLoss
-                                MaxP       = $entryProb
-                                LLTh       = $llThresh
-                                LLWin      = $llWin
-                                LLCd       = $llCd
-                                LLDir      = $llDir
-                                Fills      = $sumFills
-                                Merges     = $sumMerges
-                                Pairs      = $sumPairs.ToString("F2", $inv)
-                                Realized   = $sumRealized.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                Unreal     = $sumUnreal.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                NetPnL     = $sumNetPnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                Rebate     = $sumRebate.ToString("0.0000", $inv)
-                                NetPlusReb = $sumNetPlusReb.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                BasePnL    = $sumBasePnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                AlphaEdge  = $sumAlphaEdge.ToString("+0.0000;-0.0000;+0.0000", $inv)
-                                RPM        = $maxRpm
-                                MO1s       = $avgMo1s.ToString("+0.0;-0.0;+0.0", $inv)
-                                MO5s       = $avgMo5s.ToString("+0.0;-0.0;+0.0", $inv)
-                                WinCap     = ("{0}/{1}" -f $winCaps, $captures.Count)
-                                NetPnLNum  = $sumNetPnl
-                                CapRuns    = $capRuns
-                            })
-                        }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -601,6 +657,12 @@ try {
     }
     if ($showLLDir) {
         $cols.Add(@{ Name = "LLDir"; Dash = "-----"; Width = 5; Prop = "LLDir" })
+    }
+    if ($showHedgeSkew) {
+        $cols.Add(@{ Name = "HSkew"; Dash = "-----"; Width = 5; Prop = "HSkew" })
+    }
+    if ($showCapTier1) {
+        $cols.Add(@{ Name = "T1Cap"; Dash = "-----"; Width = 5; Prop = "T1Cap" })
     }
     $cols.Add(@{ Name = "Fills"; Dash = "-----"; Width = 5; Prop = "Fills" })
     $cols.Add(@{ Name = "Merges"; Dash = "------"; Width = 6; Prop = "Merges" })
@@ -668,6 +730,8 @@ try {
             if ($showLLWin) { $comboDesc += " ll_win=$($r.LLWin)" }
             if ($showLLCd) { $comboDesc += " ll_cd=$($r.LLCd)" }
             if ($showLLDir) { $comboDesc += " ll_dir=$($r.LLDir)" }
+            if ($showHedgeSkew) { $comboDesc += " hskew=$($r.HSkew)" }
+            if ($showCapTier1) { $comboDesc += " t1cap=$($r.T1Cap)" }
             $summaryLines.Add(("[{0} | NetPnL={1} Net+Reb={2} WinCap={3}]" -f $comboDesc, $r.NetPnL, $r.NetPlusReb, $r.WinCap))
             $summaryLines.Add(($capFmt -f "Capture", "Win", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "Net+Reb", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s"))
             foreach ($cr in $r.CapRuns) {
