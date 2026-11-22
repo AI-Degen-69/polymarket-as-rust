@@ -12,7 +12,7 @@ use feeds::{
     BinanceSpotEvent, BookMaintainer, DEFAULT_RING_CAPACITY, FeedHealthEvent, GammaDiscoveryClient,
     OracleTwapEvent, PolyMarketEvent,
 };
-use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
+use math_engine::{CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 use paper_sim::{
     BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, NaiveQuotesInput, NewOrderParams,
     PaperLedger, TrajectorySnapshot,
@@ -738,6 +738,11 @@ fn eval_sim_step(
         active_bid_dn: broker
             .active_order(Outcome::Down, OrderSide::Buy)
             .map(|o| o.price),
+        cost_context: CostContext {
+            avg_cost_up: ledger.avg_cost_up(),
+            avg_cost_dn: ledger.avg_cost_dn(),
+            allow_cross_tick_override: false,
+        },
     };
 
     let trace = pipe.evaluate(&inp)?;

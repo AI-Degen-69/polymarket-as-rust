@@ -11,7 +11,7 @@ use execution::{
     L2HmacSigner, MarketDomain, OrderSigner, SettlementConfig, SettlementWorker, decide_settlement,
 };
 use feeds::GammaDiscoveryClient;
-use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
+use math_engine::{CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 
 use crate::exec_report::{
     ExecReportStats, print_exec_header, print_exec_summary, record_latency,
@@ -273,6 +273,7 @@ pub(crate) fn run(args: ExecArgs) -> Result<(), Box<dyn Error>> {
             strike_usd: None,
             active_bid_up: None,
             active_bid_dn: None,
+            cost_context: CostContext::default(),
         };
         let trace = pipeline.evaluate(&input)?;
         let c1 = clock.now_ns()?;

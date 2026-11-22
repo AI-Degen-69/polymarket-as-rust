@@ -13,7 +13,7 @@ use feeds::{
     BinanceSpotEvent, BookMaintainer, DEFAULT_RING_CAPACITY, FeedHealthEvent, GammaDiscoveryClient,
     OracleTwapEvent, PolyMarketEvent,
 };
-use math_engine::{MathPipeline, MathPipelineConfig, PipelineInput};
+use math_engine::{CostContext, MathPipeline, MathPipelineConfig, PipelineInput};
 use rtrb::RingBuffer;
 use tokio::sync::mpsc;
 
@@ -340,6 +340,7 @@ fn eval_and_record_tick(
         strike_usd: state.strike_usd,
         active_bid_up: None,
         active_bid_dn: None,
+        cost_context: CostContext::default(),
     };
     let trace = pipe.evaluate(&inp)?;
     if trace.flags.sg_warming_up {

@@ -16,7 +16,7 @@ use feeds::{
     GammaDiscoveryClient, OracleTwapEvent, PolyMarketEvent,
 };
 use math_engine::{
-    MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
+    CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
 };
 use paper_sim::{
     BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, MergeEvent, NaiveQuotesInput,
@@ -104,6 +104,7 @@ struct PricingJob {
     strike_usd: Option<f64>,
     active_bid_up: Option<MicroUsdc>,
     active_bid_dn: Option<MicroUsdc>,
+    cost_context: CostContext,
     spot_ticks: Vec<(u64, f64)>,
     up_trade_sizes: Vec<SharesMicro>,
     reset_epoch: bool,
@@ -191,6 +192,7 @@ fn pricing_actor_loop(
             strike_usd: job.strike_usd,
             active_bid_up: job.active_bid_up,
             active_bid_dn: job.active_bid_dn,
+            cost_context: job.cost_context,
         };
 
         let reply = match pipeline.evaluate(&input) {
@@ -1786,6 +1788,14 @@ impl LivePaperSimulator {
             strike_usd: self.strike_usd,
             active_bid_up,
             active_bid_dn,
+            cost_context: CostContext {
+                avg_cost_up: self.ledger.avg_cost_up(),
+                avg_cost_dn: self.ledger.avg_cost_dn(),
+                allow_cross_tick_override: risk_lifecycle::allows_cross_tick_override(
+                    self.current_tier,
+                    self.current_phase,
+                ),
+            },
             spot_ticks: std::mem::take(&mut self.pending_spot_ticks),
             up_trade_sizes: std::mem::take(&mut self.pending_up_trades),
             reset_epoch: std::mem::take(&mut self.pending_reset_epoch),
@@ -4288,6 +4298,7 @@ mod tests {
                 min_spread_ticks: Some(1),
                 max_combined_bid_micro: Some(990_000),
                 fee_spread_floor: Some(false),
+                ..Default::default()
             },
             pinning: CorePinning::default(),
             jsonl: out.clone(),
@@ -4322,6 +4333,7 @@ mod tests {
                 min_spread_ticks: Some(1),
                 max_combined_bid_micro: Some(990_000),
                 fee_spread_floor: Some(false),
+                ..Default::default()
             },
             pinning: CorePinning::default(),
             jsonl,

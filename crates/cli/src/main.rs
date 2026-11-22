@@ -126,6 +126,12 @@ pub(crate) struct MathOverrides {
     /// Override whether Station 4 enforces taker-fee spread floor (`true` default; auto-disabled at 1 tick unless set).
     #[arg(long)]
     pub(crate) fee_spread_floor: Option<bool>,
+    /// Optional maximum allowed cross-tick pair loss in micro-USDC (`0` enforces `cost_old + bid_new <= max_combined_bid_micro`).
+    #[arg(long)]
+    pub(crate) max_cross_tick_loss_micro: Option<u64>,
+    /// Optional extreme-probability entry guard in `(0.5, 1.0)` blocking fresh directional entries outside `[1 - p_max, p_max]`.
+    #[arg(long)]
+    pub(crate) max_entry_prob: Option<f64>,
 }
 
 impl MathOverrides {
@@ -135,6 +141,8 @@ impl MathOverrides {
             || self.include_variance_spread.is_some()
             || self.min_spread_ticks.is_some()
             || self.fee_spread_floor.is_some()
+            || self.max_cross_tick_loss_micro.is_some()
+            || self.max_entry_prob.is_some()
     }
 
     pub(crate) fn apply_to(
@@ -166,6 +174,15 @@ impl MathOverrides {
                 return Err("`--max-combined-bid-micro` must be in 1..=990000".into());
             }
             cfg.max_combined_bid_micro = core_types::MicroUsdc(max_bid);
+        }
+        if let Some(loss) = self.max_cross_tick_loss_micro {
+            cfg.max_cross_tick_loss_micro = Some(loss);
+        }
+        if let Some(p_max) = self.max_entry_prob {
+            if !p_max.is_finite() || p_max <= 0.5 || p_max >= 1.0 {
+                return Err("`--max-entry-prob` must be finite in (0.5, 1.0)".into());
+            }
+            cfg.max_entry_prob = Some(p_max);
         }
         cfg.validate()?;
         Ok(())
@@ -1155,5 +1172,59 @@ mod tests {
             }
             _ => panic!("expected Lifecycle"),
         }
+    }
+
+    #[test]
+    fn cli_parses_and_validates_cost_aware_math_overrides() {
+        let parsed = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--max-cross-tick-loss-micro",
+            "20000",
+            "--max-entry-prob",
+            "0.85",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Lifecycle { math, .. } => {
+                assert!(math.is_any_set());
+                assert_eq!(math.max_cross_tick_loss_micro, Some(20_000));
+                assert_eq!(math.max_entry_prob, Some(0.85));
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.max_cross_tick_loss_micro, Some(20_000));
+                assert_eq!(cfg.max_entry_prob, Some(0.85));
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        let zero_loss =
+            Cli::try_parse_from(["poly-as", "paper", "--max-cross-tick-loss-micro", "0"]).unwrap();
+        match zero_loss.command {
+            Commands::Paper { math, .. } => {
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.max_cross_tick_loss_micro, Some(0));
+                assert_eq!(cfg.max_entry_prob, None);
+            }
+            _ => panic!("expected Paper"),
+        }
+
+        for bad_prob in [0.5, 0.49, 1.0, 1.05, f64::NAN, f64::INFINITY] {
+            let mut cfg = core_types::EngineConfig::default();
+            let err = MathOverrides {
+                max_entry_prob: Some(bad_prob),
+                ..Default::default()
+            }
+            .apply_to(&mut cfg);
+            assert!(err.is_err(), "expected error for max_entry_prob={bad_prob}");
+        }
+
+        assert!(
+            Cli::try_parse_from(["poly-as", "lifecycle", "--max-cross-tick-loss-micro", "-5"])
+                .is_err()
+        );
     }
 }
