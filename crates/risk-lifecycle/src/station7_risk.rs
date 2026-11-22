@@ -86,6 +86,8 @@ pub struct RiskConfig {
     pub tier2_max_u: f64,
     /// Threshold upper bound for Tier 3 One-Sided (default 0.90).
     pub tier3_max_u: f64,
+    /// Cap Tier-1 reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (default `false`).
+    pub cap_tier1_reducing_to_delta: bool,
 }
 
 impl Default for RiskConfig {
@@ -97,6 +99,7 @@ impl Default for RiskConfig {
             tier1_max_u: 0.20,
             tier2_max_u: 0.60,
             tier3_max_u: 0.90,
+            cap_tier1_reducing_to_delta: false,
         }
     }
 }
@@ -474,8 +477,22 @@ impl DollarNotionalRiskEngine {
 
         let target_size = match tier {
             RiskTier::Tier1Normal => {
-                // Tier 1: linear Station 7 scaling on both legs, capped by remaining capacity & cash.
-                linear_size.min(remaining_capacity).min(affordable)
+                // Tier 1: linear Station 7 scaling on both legs, optionally capping reducing-leg overshoot.
+                if is_reducing
+                    && self.config.cap_tier1_reducing_to_delta
+                    && net_delta_shares >= ONE_SHARE_MICRO
+                {
+                    let desired_reducing = net_delta_shares.max(min_order_micro.as_u64());
+                    let max_reducing = SharesMicro::from_raw(
+                        desired_reducing.saturating_sub(open_bid_shares_leg.as_u64()),
+                    );
+                    linear_size
+                        .min(max_reducing)
+                        .min(remaining_capacity)
+                        .min(affordable)
+                } else {
+                    linear_size.min(remaining_capacity).min(affordable)
+                }
             }
             RiskTier::Tier2ModerateSkew => {
                 if is_accumulating {
@@ -619,6 +636,7 @@ mod tests {
             tier1_max_u: 0.20,
             tier2_max_u: 0.60,
             tier3_max_u: 0.90,
+            ..Default::default()
         };
         let engine = DollarNotionalRiskEngine::new(config).unwrap();
 
@@ -680,5 +698,84 @@ mod tests {
             RiskTier::Tier2ModerateSkew,
             Some(EpochPhase::MandatoryFlatten)
         ));
+    }
+
+    #[test]
+    fn tier1_reducing_cap_prevents_flip_overshoot_while_preserving_dust_quoting() {
+        let base_cfg = RiskConfig::default();
+        let capped_cfg = RiskConfig {
+            cap_tier1_reducing_to_delta: true,
+            ..Default::default()
+        };
+        let base_engine = DollarNotionalRiskEngine::new(base_cfg).unwrap();
+        let capped_engine = DollarNotionalRiskEngine::new(capped_cfg).unwrap();
+
+        let input = RiskEvaluationInput {
+            bid_up: Some(MicroUsdc(500_000)),
+            bid_dn: Some(MicroUsdc(480_000)),
+            ..Default::default()
+        };
+
+        // Case 1: q = +15sh (cost = $7.50, u = 0.15 -> Tier1Normal)
+        let snap_15 = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(15 * ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(7_500_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+        let d_base = base_engine.evaluate(&snap_15, &input).unwrap();
+        assert_eq!(d_base.tier, RiskTier::Tier1Normal);
+        assert_eq!(
+            d_base.size_dn,
+            Some(SharesMicro::from_raw(20 * ONE_SHARE_MICRO))
+        );
+        let d_cap = capped_engine.evaluate(&snap_15, &input).unwrap();
+        assert_eq!(d_cap.tier, RiskTier::Tier1Normal);
+        assert_eq!(
+            d_cap.size_dn,
+            Some(SharesMicro::from_raw(15 * ONE_SHARE_MICRO))
+        );
+
+        // Case 2: q = +4.99sh (1 <= |q| < 5) -> caps DN to 5sh (min order size), avoiding 20sh flip
+        let snap_4_99 = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(4_990_000),
+            unhedged_cost_up_micro: MicroUsdc(2_495_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+        let d_4_99 = capped_engine.evaluate(&snap_4_99, &input).unwrap();
+        assert_eq!(d_4_99.tier, RiskTier::Tier1Normal);
+        assert_eq!(
+            d_4_99.size_dn,
+            Some(SharesMicro::from_raw(5 * ONE_SHARE_MICRO))
+        );
+
+        // Case 3: q = +0.01sh (< 1sh dust) -> keeps 20sh so dust never stalls quoting
+        let snap_dust = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(10_000),
+            unhedged_cost_up_micro: MicroUsdc(5_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+        let d_dust = capped_engine.evaluate(&snap_dust, &input).unwrap();
+        assert_eq!(d_dust.tier, RiskTier::Tier1Normal);
+        assert_eq!(
+            d_dust.size_dn,
+            Some(SharesMicro::from_raw(20 * ONE_SHARE_MICRO))
+        );
+
+        // Case 4: Symmetric q = -15sh -> caps UP to 15sh
+        let snap_neg_15 = OrderRegistrySnapshot {
+            unhedged_dn: SharesMicro::from_raw(15 * ONE_SHARE_MICRO),
+            unhedged_cost_dn_micro: MicroUsdc(7_500_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+        let d_neg = capped_engine.evaluate(&snap_neg_15, &input).unwrap();
+        assert_eq!(d_neg.tier, RiskTier::Tier1Normal);
+        assert_eq!(
+            d_neg.size_up,
+            Some(SharesMicro::from_raw(15 * ONE_SHARE_MICRO))
+        );
     }
 }

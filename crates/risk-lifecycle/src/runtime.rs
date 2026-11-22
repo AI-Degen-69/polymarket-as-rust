@@ -866,12 +866,34 @@ impl RiskActor {
                     }
                 }
 
-                // If accumulation prohibited in PreExpiryLockout, zero out the accumulating leg:
+                // If accumulation prohibited in PreExpiryLockout, zero out the accumulating leg
+                // and strictly cap the reducing leg to the remaining offsetting delta.
+                let min_order_micro = self
+                    .risk_engine
+                    .config()
+                    .min_order_size_shares
+                    .saturating_mul(core_types::ONE_SHARE_MICRO);
                 let (mut auth_size_up, mut auth_size_dn) = if prohibit_accumulation {
                     if snapshot.unhedged_up > snapshot.unhedged_dn {
-                        (None, risk_decision.size_dn)
+                        (
+                            None,
+                            cap_size_to_offset(
+                                risk_decision.size_dn,
+                                snapshot.unhedged_up,
+                                snapshot.unhedged_dn,
+                                min_order_micro,
+                            ),
+                        )
                     } else if snapshot.unhedged_dn > snapshot.unhedged_up {
-                        (risk_decision.size_up, None)
+                        (
+                            cap_size_to_offset(
+                                risk_decision.size_up,
+                                snapshot.unhedged_dn,
+                                snapshot.unhedged_up,
+                                min_order_micro,
+                            ),
+                            None,
+                        )
                     } else {
                         (None, None)
                     }
@@ -880,28 +902,21 @@ impl RiskActor {
                 };
 
                 // Extreme-probability hedge exemption: cap reducing leg strictly to offsetting delta.
-                let min_order_micro = self
-                    .risk_engine
-                    .config()
-                    .min_order_size_shares
-                    .saturating_mul(core_types::ONE_SHARE_MICRO);
                 if proposal.hedge_only_up {
-                    let offset_up = snapshot
-                        .unhedged_dn
-                        .as_u64()
-                        .saturating_sub(snapshot.unhedged_up.as_u64());
-                    auth_size_up = auth_size_up
-                        .map(|s| s.min(SharesMicro::from_raw(offset_up)))
-                        .filter(|s| s.as_u64() >= min_order_micro);
+                    auth_size_up = cap_size_to_offset(
+                        auth_size_up,
+                        snapshot.unhedged_dn,
+                        snapshot.unhedged_up,
+                        min_order_micro,
+                    );
                 }
                 if proposal.hedge_only_dn {
-                    let offset_dn = snapshot
-                        .unhedged_up
-                        .as_u64()
-                        .saturating_sub(snapshot.unhedged_dn.as_u64());
-                    auth_size_dn = auth_size_dn
-                        .map(|s| s.min(SharesMicro::from_raw(offset_dn)))
-                        .filter(|s| s.as_u64() >= min_order_micro);
+                    auth_size_dn = cap_size_to_offset(
+                        auth_size_dn,
+                        snapshot.unhedged_up,
+                        snapshot.unhedged_dn,
+                        min_order_micro,
+                    );
                 }
 
                 let (cancel_up, cancel_dn) =
@@ -1097,6 +1112,18 @@ impl RiskActor {
         self.last_expiry_ms = None;
         self.breakers = CircuitBreakers::new(BreakerConfig::default(), new_tick_size, now_ns);
     }
+}
+
+/// Caps a reducing order size strictly to the offsetting share delta, filtering out sub-min dust.
+fn cap_size_to_offset(
+    size: Option<SharesMicro>,
+    held_opp: SharesMicro,
+    held_leg: SharesMicro,
+    min_order_micro: u64,
+) -> Option<SharesMicro> {
+    let offset = held_opp.as_u64().saturating_sub(held_leg.as_u64());
+    size.map(|s| s.min(SharesMicro::from_raw(offset)))
+        .filter(|s| s.as_u64() >= min_order_micro)
 }
 
 #[cfg(test)]
@@ -1909,5 +1936,188 @@ mod tests {
         assert!(matches!(tr3.action_dn, OrderAction::Cancel { .. }));
         assert!(p3.try_recv().is_ok());
         assert!(p3.try_recv().is_ok());
+    }
+
+    #[test]
+    fn test_pre_expiry_lockout_caps_reducing_order_to_delta_and_blocks_submin_flips() {
+        let make_actor = || {
+            let (harness, priority_rx, routine_rx) = ActorPipelineHarness::new(16, 16);
+            let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+            let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+            let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+            let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+            let actor = RiskActor::new(
+                harness.clone(),
+                engine,
+                hysteresis,
+                lifecycle,
+                breakers,
+                FaultInjection::None,
+            );
+            (actor, harness, priority_rx, routine_rx)
+        };
+
+        // 1. tau = 53s (PreExpiryLockout) with q = +11.94sh (Tier1Normal, cost=$2.51, hedge_only_dn=false)
+        // -> authorizes strictly 11.94sh DN and None UP.
+        let (mut actor_up, harness_up, _p_up, mut r_up) = make_actor();
+        harness_up.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(11_940_000),
+            unhedged_cost_up_micro: MicroUsdc(2_507_400),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_up.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: 247_000, // tau = 53s
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(210_000)),
+                bid_dn: Some(MicroUsdc(690_000)),
+                pair_cost_micro: Some(MicroUsdc(900_000)),
+                gross_margin_bps: Some(1_000),
+            },
+            bid_up_raw: 0.21,
+            bid_dn_raw: 0.69,
+            hedge_only_dn: false,
+            best_bid_up: Some(MicroUsdc(210_000)),
+            best_ask_up: Some(MicroUsdc(220_000)),
+            best_bid_dn: Some(MicroUsdc(680_000)),
+            best_ask_dn: Some(MicroUsdc(700_000)),
+            ..Default::default()
+        });
+        let trace_1 = actor_up.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(trace_1.phase, EpochPhase::PreExpiryLockout);
+        assert_eq!(trace_1.tier, RiskTier::Tier1Normal);
+        assert_eq!(trace_1.action_up, OrderAction::Hold);
+        assert_eq!(
+            trace_1.action_dn,
+            OrderAction::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(690_000),
+                size: SharesMicro::from_raw(11_940_000),
+            }
+        );
+        assert_eq!(
+            r_up.try_recv().unwrap(),
+            ExecutionCommand::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(690_000),
+                size: SharesMicro::from_raw(11_940_000),
+            }
+        );
+
+        // 2. tau = 53s with q = +2.08sh (< 5sh min) -> suppresses both legs instead of submitting 20sh flip!
+        let (mut actor_dust, harness_dust, _p_dust, mut r_dust) = make_actor();
+        harness_dust.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(2_080_000),
+            unhedged_cost_up_micro: MicroUsdc(436_800),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_dust.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: 247_000,
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(210_000)),
+                bid_dn: Some(MicroUsdc(690_000)),
+                pair_cost_micro: Some(MicroUsdc(900_000)),
+                gross_margin_bps: Some(1_000),
+            },
+            bid_up_raw: 0.21,
+            bid_dn_raw: 0.69,
+            best_bid_up: Some(MicroUsdc(210_000)),
+            best_ask_up: Some(MicroUsdc(220_000)),
+            best_bid_dn: Some(MicroUsdc(680_000)),
+            best_ask_dn: Some(MicroUsdc(700_000)),
+            ..Default::default()
+        });
+        let trace_2 = actor_dust.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(trace_2.phase, EpochPhase::PreExpiryLockout);
+        assert_eq!(trace_2.action_up, OrderAction::Hold);
+        assert_eq!(trace_2.action_dn, OrderAction::Hold);
+        assert!(r_dust.try_recv().is_err());
+
+        // 3. Symmetric q = -11.94sh -> authorizes strictly 11.94sh UP and None DN.
+        let (mut actor_dn, harness_dn, _p_dn, mut r_dn) = make_actor();
+        harness_dn.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_dn: SharesMicro::from_raw(11_940_000),
+            unhedged_cost_dn_micro: MicroUsdc(2_507_400),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_dn.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: 247_000,
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(690_000)),
+                bid_dn: Some(MicroUsdc(210_000)),
+                pair_cost_micro: Some(MicroUsdc(900_000)),
+                gross_margin_bps: Some(1_000),
+            },
+            bid_up_raw: 0.69,
+            bid_dn_raw: 0.21,
+            best_bid_up: Some(MicroUsdc(680_000)),
+            best_ask_up: Some(MicroUsdc(700_000)),
+            best_bid_dn: Some(MicroUsdc(210_000)),
+            best_ask_dn: Some(MicroUsdc(220_000)),
+            ..Default::default()
+        });
+        let trace_3 = actor_dn.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(trace_3.phase, EpochPhase::PreExpiryLockout);
+        assert_eq!(
+            trace_3.action_up,
+            OrderAction::SubmitNew {
+                outcome: Outcome::Up,
+                price: MicroUsdc(690_000),
+                size: SharesMicro::from_raw(11_940_000),
+            }
+        );
+        assert_eq!(trace_3.action_dn, OrderAction::Hold);
+        assert_eq!(
+            r_dn.try_recv().unwrap(),
+            ExecutionCommand::SubmitNew {
+                outcome: Outcome::Up,
+                price: MicroUsdc(690_000),
+                size: SharesMicro::from_raw(11_940_000),
+            }
+        );
+
+        // 4. Symmetric q = -2.08sh (< 5sh min) -> suppresses both legs cleanly.
+        let (mut actor_dn_dust, harness_dn_dust, _p_dn_dust, mut r_dn_dust) = make_actor();
+        harness_dn_dust.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_dn: SharesMicro::from_raw(2_080_000),
+            unhedged_cost_dn_micro: MicroUsdc(436_800),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_dn_dust.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: 247_000,
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(690_000)),
+                bid_dn: Some(MicroUsdc(210_000)),
+                pair_cost_micro: Some(MicroUsdc(900_000)),
+                gross_margin_bps: Some(1_000),
+            },
+            bid_up_raw: 0.69,
+            bid_dn_raw: 0.21,
+            best_bid_up: Some(MicroUsdc(680_000)),
+            best_ask_up: Some(MicroUsdc(700_000)),
+            best_bid_dn: Some(MicroUsdc(210_000)),
+            best_ask_dn: Some(MicroUsdc(220_000)),
+            ..Default::default()
+        });
+        let trace_4 = actor_dn_dust.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(trace_4.phase, EpochPhase::PreExpiryLockout);
+        assert_eq!(trace_4.action_up, OrderAction::Hold);
+        assert_eq!(trace_4.action_dn, OrderAction::Hold);
+        assert!(r_dn_dust.try_recv().is_err());
     }
 }
