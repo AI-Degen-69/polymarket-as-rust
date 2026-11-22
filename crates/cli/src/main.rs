@@ -25,6 +25,7 @@ mod sandbox_cmd;
 mod sandbox_report;
 mod trace_cmd;
 mod trace_report;
+mod window_gate;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -260,9 +261,15 @@ enum Commands {
         /// Discover active 5-minute BTC market and stream live feeds.
         #[arg(long)]
         discover: bool,
-        /// Live capture duration (`20s`, `500ms`, `1m`).
-        #[arg(long, default_value = "20s")]
-        duration: String,
+        /// Live capture duration (`20s`, `500ms`, `1m`; defaults to `20s` when `--windows` is omitted).
+        #[arg(long, conflicts_with = "windows")]
+        duration: Option<String>,
+        /// Capture `N` full 5-minute windows (`N >= 1`) and stop cleanly at the end of window `N`.
+        #[arg(long, conflicts_with = "duration")]
+        windows: Option<u32>,
+        /// Allow starting mid-window instead of waiting idle for the next fresh 5-minute boundary.
+        #[arg(long, default_value_t = false)]
+        allow_mid_window: bool,
         /// Replay recorded JSONL feed log offline.
         #[arg(long)]
         replay: Option<PathBuf>,
@@ -314,6 +321,9 @@ enum Commands {
         /// Simulation duration (`60s`, `300s`, `5m`).
         #[arg(long, default_value = "60s")]
         duration: String,
+        /// Allow starting `--source live` mid-window instead of waiting idle for the next fresh 5-minute boundary.
+        #[arg(long, default_value_t = false)]
+        allow_mid_window: bool,
         /// Maximum dollar position capital in USD (`$50` default).
         #[arg(long, default_value_t = 50)]
         v_max: u64,
@@ -343,6 +353,9 @@ enum Commands {
         /// Live run duration (`60s`, `90s`, `300s`).
         #[arg(long, default_value = "90s")]
         duration: String,
+        /// Allow starting `--source live` mid-window instead of waiting idle for the next fresh 5-minute boundary.
+        #[arg(long, default_value_t = false)]
+        allow_mid_window: bool,
         /// Fast-forward virtual clock in sim-epoch mode.
         #[arg(long)]
         fast_forward: bool,
@@ -405,12 +418,16 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Feeds {
             discover,
             duration,
+            windows,
+            allow_mid_window,
             replay,
             replay_out,
             jsonl,
         } => feeds_cmd::run(FeedsArgs {
             discover,
             duration,
+            windows,
+            allow_mid_window,
             replay,
             replay_out,
             jsonl,
@@ -452,6 +469,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             source,
             input,
             duration,
+            allow_mid_window,
             v_max,
             base_size,
             latency_ms,
@@ -465,6 +483,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             input,
             duration,
+            allow_mid_window,
             v_max,
             base_size,
             latency_ms,
@@ -476,6 +495,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             source,
             input,
             duration,
+            allow_mid_window,
             fast_forward,
             inject_fault,
             v_max,
@@ -493,6 +513,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             input,
             duration,
+            allow_mid_window,
             fast_forward,
             fault: match inject_fault {
                 CliFaultModeArg::None => CliFaultMode::None,
@@ -635,12 +656,16 @@ mod tests {
             Commands::Feeds {
                 discover,
                 duration,
+                windows,
+                allow_mid_window,
                 replay,
                 replay_out,
                 jsonl,
             } => {
                 assert!(discover);
-                assert_eq!(duration, "20s");
+                assert_eq!(duration.as_deref(), Some("20s"));
+                assert!(windows.is_none());
+                assert!(!allow_mid_window);
                 assert!(replay.is_none());
                 assert!(replay_out.is_none());
                 assert_eq!(jsonl, Some(PathBuf::from("logs/phase1-feeds.jsonl")));
@@ -659,6 +684,44 @@ mod tests {
             }
             _ => panic!("expected Feeds"),
         }
+
+        let windowed = Cli::try_parse_from([
+            "poly-as",
+            "feeds",
+            "--discover",
+            "--windows",
+            "3",
+            "--allow-mid-window",
+        ])
+        .unwrap();
+        match windowed.command {
+            Commands::Feeds {
+                discover,
+                duration,
+                windows,
+                allow_mid_window,
+                ..
+            } => {
+                assert!(discover);
+                assert!(duration.is_none());
+                assert_eq!(windows, Some(3));
+                assert!(allow_mid_window);
+            }
+            _ => panic!("expected Feeds"),
+        }
+
+        assert!(
+            Cli::try_parse_from([
+                "poly-as",
+                "feeds",
+                "--discover",
+                "--duration",
+                "60s",
+                "--windows",
+                "2",
+            ])
+            .is_err()
+        );
 
         let replay =
             Cli::try_parse_from(["poly-as", "feeds", "--replay", "logs/rec.jsonl"]).unwrap();
@@ -824,6 +887,7 @@ mod tests {
             Commands::Paper {
                 source,
                 duration,
+                allow_mid_window,
                 v_max,
                 base_size,
                 latency_ms,
@@ -832,10 +896,26 @@ mod tests {
             } => {
                 assert!(matches!(source, CliTraceSource::Live));
                 assert_eq!(duration, "60s");
+                assert!(!allow_mid_window);
                 assert_eq!(v_max, 100);
                 assert_eq!(base_size, 25);
                 assert_eq!(latency_ms, 50);
                 assert_eq!(jsonl, Some(PathBuf::from("logs/phase3-paper.jsonl")));
+            }
+            _ => panic!("expected Paper"),
+        }
+
+        let paper_mid =
+            Cli::try_parse_from(["poly-as", "paper", "--source", "live", "--allow-mid-window"])
+                .unwrap();
+        match paper_mid.command {
+            Commands::Paper {
+                source,
+                allow_mid_window,
+                ..
+            } => {
+                assert!(matches!(source, CliTraceSource::Live));
+                assert!(allow_mid_window);
             }
             _ => panic!("expected Paper"),
         }
@@ -893,8 +973,12 @@ mod tests {
         .unwrap();
         match lc.command {
             Commands::Lifecycle {
-                queue_decay, math, ..
+                allow_mid_window,
+                queue_decay,
+                math,
+                ..
             } => {
+                assert!(!allow_mid_window);
                 assert_eq!(queue_decay, CliQueueDecay::Optimistic);
                 assert_eq!(math.gamma, Some(0.02));
                 assert_eq!(math.include_variance_spread, Some(false));
@@ -1002,6 +1086,26 @@ mod tests {
                 assert_eq!(math.gamma, Some(0.08));
             }
             _ => panic!("expected Lifecycle replay"),
+        }
+
+        let lc_mid = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "live",
+            "--allow-mid-window",
+        ])
+        .unwrap();
+        match lc_mid.command {
+            Commands::Lifecycle {
+                source,
+                allow_mid_window,
+                ..
+            } => {
+                assert!(matches!(source, CliLifecycleSource::Live));
+                assert!(allow_mid_window);
+            }
+            _ => panic!("expected Lifecycle live"),
         }
     }
 }

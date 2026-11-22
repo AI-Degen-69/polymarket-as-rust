@@ -76,6 +76,7 @@ pub(crate) struct LifecycleArgs {
     pub(crate) source: LifecycleSourceMode,
     pub(crate) input: Option<PathBuf>,
     pub(crate) duration: String,
+    pub(crate) allow_mid_window: bool,
     pub(crate) fast_forward: bool,
     pub(crate) fault: CliFaultMode,
     pub(crate) v_max: u64,
@@ -2312,15 +2313,31 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     let mut cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut cfg)?;
     feeds::install_tls_provider();
-    let mut jsonl = JsonlWriter::create(&args.jsonl)?;
-    let mut pricing_lat = LatencyTracker::new()?;
-    let mut risk_lat = LatencyTracker::new()?;
-    let mut total_lat = LatencyTracker::new()?;
 
     let duration_limit = parse_duration_arg(&args.duration)?;
 
     println!("  [1/4] Discovering active Polymarket 5-minute BTC market...");
-    let (discovery, offset_est, desc) = discover_live_market(&cfg).await?;
+    let fresh = match crate::window_gate::wait_and_discover_fresh_5m_market(
+        &cfg,
+        args.allow_mid_window,
+        15_000,
+    )
+    .await?
+    {
+        crate::window_gate::GateOutcome::Ready(fresh) => fresh,
+        crate::window_gate::GateOutcome::Cancelled => return Ok(()),
+    };
+    let crate::window_gate::FreshWindowDiscovery {
+        discovery,
+        offset_est,
+        desc,
+        ..
+    } = fresh;
+
+    let mut jsonl = JsonlWriter::create(&args.jsonl)?;
+    let mut pricing_lat = LatencyTracker::new()?;
+    let mut risk_lat = LatencyTracker::new()?;
+    let mut total_lat = LatencyTracker::new()?;
     let base_raw_ms = MonotonicClock::unix_now_ms()?;
     let base_adj_ms = offset_est.adjusted_unix_ms(base_raw_ms)?;
     let base_mono_ns = clock.now_ns()?;
@@ -2902,17 +2919,6 @@ fn replay_poly_to_market_event(
             })
         }
     }
-}
-
-async fn discover_live_market(
-    cfg: &EngineConfig,
-) -> Result<(GammaDiscoveryClient, ClockOffsetEstimator, MarketDescriptor), Box<dyn Error>> {
-    let discovery = GammaDiscoveryClient::new()?;
-    let offset_est = ClockOffsetEstimator::new(cfg.clock_drift_max_ms);
-    let _sync = discovery.sync_clock(&offset_est).await?;
-    let adj_now = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
-    let desc = discovery.discover_active_5m_btc(adj_now, 15_000).await?;
-    Ok((discovery, offset_est, desc))
 }
 
 async fn discover_next_5m_market(
@@ -3913,6 +3919,7 @@ mod tests {
             source: LifecycleSourceMode::SimEpoch,
             input: None,
             duration: "10s".to_string(),
+            allow_mid_window: false,
             fast_forward: true,
             fault: CliFaultMode::None,
             v_max: 50,
@@ -4126,6 +4133,7 @@ mod tests {
             source: LifecycleSourceMode::Live,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
+            allow_mid_window: false,
             fast_forward: false,
             fault: CliFaultMode::None,
             v_max: 50,
@@ -4143,6 +4151,7 @@ mod tests {
             source: LifecycleSourceMode::Replay,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
+            allow_mid_window: false,
             fast_forward: false,
             fault: CliFaultMode::None,
             v_max: 50,
@@ -4163,6 +4172,7 @@ mod tests {
             source: LifecycleSourceMode::Replay,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
+            allow_mid_window: false,
             fast_forward: false,
             fault: CliFaultMode::None,
             v_max: 50,
@@ -4195,6 +4205,7 @@ mod tests {
             source: LifecycleSourceMode::Replay,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
+            allow_mid_window: false,
             fast_forward: false,
             fault: CliFaultMode::None,
             v_max: 50,
@@ -4247,6 +4258,7 @@ mod tests {
             source: LifecycleSourceMode::Replay,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
+            allow_mid_window: false,
             fast_forward: false,
             fault: CliFaultMode::None,
             v_max: 50,
