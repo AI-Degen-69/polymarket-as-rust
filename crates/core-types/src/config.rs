@@ -148,6 +148,10 @@ pub struct EngineConfig {
     pub lead_lag_cooldown_ms: u64,
     /// Cancel only the endangered side on lead-lag move (`true` default; `false` = legacy symmetric cancel).
     pub lead_lag_directional: bool,
+    /// Asymmetric reducing-leg skew multiplier in `[0.0, 1.0]` (`1.0` default).
+    pub hedge_skew_mult: f64,
+    /// Cap Tier-1 reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (`false` default).
+    pub cap_tier1_reducing_to_delta: bool,
     /// Maximum permitted local-to-exchange clock drift in milliseconds (`1000ms` default).
     pub clock_drift_max_ms: i64,
     /// Non-serializable live credentials (excluded from serde/JSONL).
@@ -185,6 +189,8 @@ struct RawEngineConfig {
     lead_lag_window_ms: u64,
     lead_lag_cooldown_ms: u64,
     lead_lag_directional: bool,
+    hedge_skew_mult: f64,
+    cap_tier1_reducing_to_delta: bool,
     clock_drift_max_ms: i64,
 }
 
@@ -219,6 +225,8 @@ impl Default for RawEngineConfig {
             lead_lag_window_ms: d.lead_lag_window_ms,
             lead_lag_cooldown_ms: d.lead_lag_cooldown_ms,
             lead_lag_directional: d.lead_lag_directional,
+            hedge_skew_mult: d.hedge_skew_mult,
+            cap_tier1_reducing_to_delta: d.cap_tier1_reducing_to_delta,
             clock_drift_max_ms: d.clock_drift_max_ms,
         }
     }
@@ -256,6 +264,8 @@ impl TryFrom<RawEngineConfig> for EngineConfig {
             lead_lag_window_ms: raw.lead_lag_window_ms,
             lead_lag_cooldown_ms: raw.lead_lag_cooldown_ms,
             lead_lag_directional: raw.lead_lag_directional,
+            hedge_skew_mult: raw.hedge_skew_mult,
+            cap_tier1_reducing_to_delta: raw.cap_tier1_reducing_to_delta,
             clock_drift_max_ms: raw.clock_drift_max_ms,
             credentials: LiveCredentials::default(),
         };
@@ -297,6 +307,11 @@ impl fmt::Debug for EngineConfig {
             .field("lead_lag_window_ms", &self.lead_lag_window_ms)
             .field("lead_lag_cooldown_ms", &self.lead_lag_cooldown_ms)
             .field("lead_lag_directional", &self.lead_lag_directional)
+            .field("hedge_skew_mult", &self.hedge_skew_mult)
+            .field(
+                "cap_tier1_reducing_to_delta",
+                &self.cap_tier1_reducing_to_delta,
+            )
             .field("clock_drift_max_ms", &self.clock_drift_max_ms)
             .field("credentials", &self.credentials)
             .finish()
@@ -333,6 +348,8 @@ impl Default for EngineConfig {
             lead_lag_window_ms: 1_000,
             lead_lag_cooldown_ms: 1_000,
             lead_lag_directional: true,
+            hedge_skew_mult: 1.0,
+            cap_tier1_reducing_to_delta: false,
             clock_drift_max_ms: 1_000,
             credentials: LiveCredentials::default(),
         }
@@ -476,6 +493,12 @@ where
         } else {
             cfg.max_entry_prob = Some(parse_f64("MAX_ENTRY_PROB", &v)?);
         }
+    }
+    if let Some(v) = non_empty(lookup, "HEDGE_SKEW_MULT")? {
+        cfg.hedge_skew_mult = parse_f64("HEDGE_SKEW_MULT", &v)?;
+    }
+    if let Some(v) = non_empty(lookup, "CAP_TIER1_REDUCING_TO_DELTA")? {
+        cfg.cap_tier1_reducing_to_delta = parse_bool("CAP_TIER1_REDUCING_TO_DELTA", &v)?;
     }
     Ok(())
 }
@@ -736,6 +759,12 @@ fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
         return Err(invariant(format!(
             "lead_lag_cooldown_ms ({}) must be <= {MAX_LEAD_LAG_COOLDOWN_MS}",
             cfg.lead_lag_cooldown_ms
+        )));
+    }
+    if !cfg.hedge_skew_mult.is_finite() || !(0.0..=1.0).contains(&cfg.hedge_skew_mult) {
+        return Err(invariant(format!(
+            "hedge_skew_mult must be finite in [0.0, 1.0], got {}",
+            cfg.hedge_skew_mult
         )));
     }
     if cfg.clock_drift_max_ms <= 0 || cfg.clock_drift_max_ms > MAX_CLOCK_DRIFT_MS {

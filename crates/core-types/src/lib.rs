@@ -238,6 +238,8 @@ mod tests {
         assert_eq!(cfg.gamma, 0.12);
         assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
         assert_eq!(cfg.max_entry_prob, Some(0.80));
+        assert_eq!(cfg.hedge_skew_mult, 1.0);
+        assert!(!cfg.cap_tier1_reducing_to_delta);
 
         let json = serde_json::to_string(&cfg).unwrap();
         let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();
@@ -692,5 +694,37 @@ mod tests {
         let off_cfg = EngineConfig::from_lookup(lookup_map(&off_map)).unwrap();
         assert_eq!(off_cfg.max_cross_tick_loss_micro, None);
         assert_eq!(off_cfg.max_entry_prob, None);
+    }
+
+    #[test]
+    fn config_validates_hedge_skew_mult_and_tier1_reducing_cap() {
+        for mult_str in ["0.0", "0.25", "1.0"] {
+            let mut m = HashMap::new();
+            m.insert("HEDGE_SKEW_MULT", mult_str);
+            m.insert("CAP_TIER1_REDUCING_TO_DELTA", "true");
+            let cfg = EngineConfig::from_lookup(lookup_map(&m)).unwrap();
+            let expected: f64 = mult_str.parse().unwrap();
+            assert_eq!(cfg.hedge_skew_mult, expected);
+            assert!(cfg.cap_tier1_reducing_to_delta);
+
+            let json = serde_json::to_string(&cfg).unwrap();
+            let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();
+            assert_eq!(roundtrip.hedge_skew_mult, expected);
+            assert!(roundtrip.cap_tier1_reducing_to_delta);
+        }
+
+        let mut false_map = HashMap::new();
+        false_map.insert("CAP_TIER1_REDUCING_TO_DELTA", "false");
+        let false_cfg = EngineConfig::from_lookup(lookup_map(&false_map)).unwrap();
+        assert!(!false_cfg.cap_tier1_reducing_to_delta);
+
+        for bad_mult in ["-0.01", "1.01", "NaN", "inf", "-inf"] {
+            let mut m = HashMap::new();
+            m.insert("HEDGE_SKEW_MULT", bad_mult);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&m)).is_err(),
+                "expected error for HEDGE_SKEW_MULT={bad_mult}"
+            );
+        }
     }
 }
