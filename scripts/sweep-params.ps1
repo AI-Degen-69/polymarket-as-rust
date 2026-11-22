@@ -16,11 +16,11 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$InputPath,
 
-    [double[]]$Gammas = @(0.02, 0.05, 0.08, 0.12, 0.15),
+    [string[]]$Gammas = @("0.02", "0.05", "0.08", "0.12", "0.15"),
 
     [string[]]$VarianceSpreads = @("false", "true"),
 
-    [int[]]$MinSpreadTicks = @(1),
+    [string[]]$MinSpreadTicks = @("1"),
 
     [uint64]$MaxCombinedBidMicro = 990000,
 
@@ -36,6 +36,24 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
+$inv = [System.Globalization.CultureInfo]::InvariantCulture
+$parsedGammas = @($Gammas | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    [double]::Parse($_, $inv)
+})
+$parsedVarSpreads = @($VarianceSpreads | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToLowerInvariant() } | Where-Object { $_ -ne '' })
+$parsedMinTicks = @($MinSpreadTicks | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    [int]::Parse($_, $inv)
+})
+
+if ($parsedGammas.Count -eq 0 -or $parsedVarSpreads.Count -eq 0 -or $parsedMinTicks.Count -eq 0) {
+    throw "Gammas, VarianceSpreads, and MinSpreadTicks must each contain at least one value"
+}
+foreach ($v in $parsedVarSpreads) {
+    if ($v -ne "true" -and $v -ne "false") {
+        throw "Invalid VarianceSpreads entry '$v' (expected 'true' or 'false')"
+    }
+}
 
 if (-not (Test-Path -LiteralPath $InputPath)) {
     throw "Input capture file not found: $InputPath"
@@ -60,22 +78,16 @@ try {
     $sweepDir = Join-Path $repoRoot "logs\sweeps"
     New-Item -ItemType Directory -Force -Path $sweepDir | Out-Null
 
-    $inv = [System.Globalization.CultureInfo]::InvariantCulture
     $results = [System.Collections.Generic.List[PSCustomObject]]::new()
-    $totalRuns = $Gammas.Count * $VarianceSpreads.Count * $MinSpreadTicks.Count
+    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count
     $runIdx = 0
 
-    foreach ($gamma in $Gammas) {
+    foreach ($gamma in $parsedGammas) {
         $gammaStr = $gamma.ToString("0.####", $inv)
         $gammaTag = $gammaStr.Replace(".", "p")
 
-        foreach ($rawVar in $VarianceSpreads) {
-            $varStr = $rawVar.Trim().ToLowerInvariant()
-            if ($varStr -ne "true" -and $varStr -ne "false") {
-                throw "Invalid VarianceSpreads entry '$rawVar' (expected 'true' or 'false')"
-            }
-
-            foreach ($minTicks in $MinSpreadTicks) {
+        foreach ($varStr in $parsedVarSpreads) {
+            foreach ($minTicks in $parsedMinTicks) {
                 $runIdx++
                 $stem = "sweep-g$gammaTag-var$varStr-t$minTicks-b$MaxCombinedBidMicro-$QueueDecay"
                 $outJsonl = Join-Path $sweepDir "$stem.jsonl"
@@ -143,11 +155,14 @@ try {
 
     Write-Host ""
     Write-Host "=== OFFLINE PARAMETER SWEEP RESULTS (sorted by NetPnL desc) ===" -ForegroundColor Green
-    Write-Host ("Input: {0} | V_max=${1} | Base={2}sh | MaxPair=${3} | Decay={4}" -f $InputPath, $VMax, $BaseSize, ($MaxCombinedBidMicro / 1e6).ToString("0.00", $inv), $QueueDecay)
+    Write-Host ('Input: {0} | V_max=${1} | Base={2}sh | MaxPair=${3} | Decay={4}' -f $InputPath, $VMax, $BaseSize, ($MaxCombinedBidMicro / 1e6).ToString("0.00", $inv), $QueueDecay)
     $sorted = $results | Sort-Object -Property NetPnLNum -Descending
-    $sorted |
-        Select-Object Gamma, VarSpr, MinT, Fills, Merges, Pairs, Realized, Unreal, NetPnL, Rebate, BasePnL, AlphaEdge, RPM, MO1s, MO5s |
-        Format-Table -AutoSize
+    $fmt = "{0,-6} {1,-6} {2,4} {3,5} {4,6} {5,7} {6,9} {7,9} {8,9} {9,7} {10,9} {11,9} {12,4} {13,6} {14,6}"
+    Write-Host ($fmt -f "Gamma", "VarSpr", "MinT", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s")
+    Write-Host ($fmt -f "-----", "------", "----", "-----", "------", "-------", "--------", "--------", "--------", "------", "--------", "---------", "---", "-----", "-----")
+    foreach ($r in $sorted) {
+        Write-Host ($fmt -f $r.Gamma, $r.VarSpr, $r.MinT, $r.Fills, $r.Merges, $r.Pairs, $r.Realized, $r.Unreal, $r.NetPnL, $r.Rebate, $r.BasePnL, $r.AlphaEdge, $r.RPM, $r.MO1s, $r.MO5s)
+    }
 }
 finally {
     Pop-Location
