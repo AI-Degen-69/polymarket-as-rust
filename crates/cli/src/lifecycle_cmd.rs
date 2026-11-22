@@ -246,6 +246,8 @@ fn pricing_actor_loop(
                     best_ask_up: trace.best_ask_up,
                     best_ask_dn: trace.best_ask_dn,
                     defensive_cancel: trace.flags.defensive_cancel,
+                    defensive_cancel_up: trace.flags.defensive_cancel_up,
+                    defensive_cancel_dn: trace.flags.defensive_cancel_dn,
                     total_compute_ns: trace.timings.total_compute_ns,
                 });
                 PricingAck {
@@ -529,6 +531,8 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
             best_ask_up: Some(MicroUsdc(bid_up_val.saturating_add(20_000))),
             best_ask_dn: Some(MicroUsdc(bid_dn_val.saturating_add(20_000))),
             defensive_cancel: args.fault == CliFaultMode::Disconnect,
+            defensive_cancel_up: args.fault == CliFaultMode::Disconnect,
+            defensive_cancel_dn: args.fault == CliFaultMode::Disconnect,
             total_compute_ns: 12_500,
         };
         harness.publish_quote(proposal);

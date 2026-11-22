@@ -57,6 +57,12 @@ pub struct QuoteProposal {
     pub best_ask_dn: Option<MicroUsdc>,
     /// Fast-path Binance spot jump defensive cancel flag.
     pub defensive_cancel: bool,
+    /// Per-side Binance lead-lag cancel / cooldown flag for UP bids.
+    #[serde(default)]
+    pub defensive_cancel_up: bool,
+    /// Per-side Binance lead-lag cancel / cooldown flag for DOWN bids.
+    #[serde(default)]
+    pub defensive_cancel_dn: bool,
     /// Nanosecond latency from pricing ingress to proposal publish.
     pub total_compute_ns: u64,
 }
@@ -80,6 +86,8 @@ impl Default for QuoteProposal {
             best_ask_up: None,
             best_ask_dn: None,
             defensive_cancel: false,
+            defensive_cancel_up: false,
+            defensive_cancel_dn: false,
             total_compute_ns: 0,
         }
     }
@@ -896,6 +904,13 @@ impl RiskActor {
                         .filter(|s| s.as_u64() >= min_order_micro);
                 }
 
+                let (cancel_up, cancel_dn) =
+                    if proposal.defensive_cancel_up || proposal.defensive_cancel_dn {
+                        (proposal.defensive_cancel_up, proposal.defensive_cancel_dn)
+                    } else {
+                        (proposal.defensive_cancel, proposal.defensive_cancel)
+                    };
+
                 // 5. Station 8 Continuous Hysteresis Gate for UP leg:
                 let quote_up = match (target_bid_up, auth_size_up) {
                     (Some(p), Some(s)) => Some(SizedQuote {
@@ -912,7 +927,7 @@ impl RiskActor {
                     proposed_quote: quote_up,
                     tick_size_micro: proposal.tick_size_micro,
                     best_ask: proposal.best_ask_up,
-                    defensive_cancel: proposal.defensive_cancel,
+                    defensive_cancel: cancel_up,
                     now_ns,
                     next_seq: proposal.seq.saturating_mul(2),
                 };
@@ -935,7 +950,7 @@ impl RiskActor {
                     proposed_quote: quote_dn,
                     tick_size_micro: proposal.tick_size_micro,
                     best_ask: proposal.best_ask_dn,
-                    defensive_cancel: proposal.defensive_cancel,
+                    defensive_cancel: cancel_dn,
                     now_ns,
                     next_seq: proposal.seq.saturating_mul(2).saturating_add(1),
                 };
@@ -1761,5 +1776,138 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_per_side_directional_defensive_cancel() {
+        let active_size = SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO);
+        let setup_actor = || {
+            let (harness, priority_rx, routine_rx) = ActorPipelineHarness::new(16, 16);
+            let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+            let mut hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+            hysteresis.set_state(
+                Outcome::Up,
+                crate::station8_hysteresis::OrderSlotState::Live {
+                    order_id: "up_1".to_string(),
+                    price: MicroUsdc(480_000),
+                    original_size: active_size,
+                    remaining_size: active_size,
+                },
+            );
+            hysteresis.set_state(
+                Outcome::Down,
+                crate::station8_hysteresis::OrderSlotState::Live {
+                    order_id: "dn_1".to_string(),
+                    price: MicroUsdc(480_000),
+                    original_size: active_size,
+                    remaining_size: active_size,
+                },
+            );
+            let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+            let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+            let risk_actor = RiskActor::new(
+                harness.clone(),
+                engine,
+                hysteresis,
+                lifecycle,
+                breakers,
+                FaultInjection::None,
+            );
+            harness.publish_registry_snapshot(OrderRegistrySnapshot {
+                available_usdc_micro: MicroUsdc(100_000_000),
+                ..Default::default()
+            });
+            (harness, priority_rx, routine_rx, risk_actor)
+        };
+
+        let base = QuoteProposal {
+            seq: 1,
+            now_ms: 100_000,
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(480_000)),
+                bid_dn: Some(MicroUsdc(480_000)),
+                pair_cost_micro: Some(MicroUsdc(960_000)),
+                gross_margin_bps: Some(400),
+            },
+            bid_up_raw: 0.48,
+            bid_dn_raw: 0.48,
+            best_bid_up: Some(MicroUsdc(480_000)),
+            best_bid_dn: Some(MicroUsdc(480_000)),
+            best_ask_up: Some(MicroUsdc(520_000)),
+            best_ask_dn: Some(MicroUsdc(520_000)),
+            ..Default::default()
+        };
+
+        // 1. UP-only directional cancel: UP cancels on priority channel, DOWN holds Live.
+        let (h1, mut p1, _r1, mut a1) = setup_actor();
+        h1.publish_quote(QuoteProposal {
+            defensive_cancel: true,
+            defensive_cancel_up: true,
+            defensive_cancel_dn: false,
+            ..base
+        });
+        let tr1 = a1.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(
+            tr1.action_up,
+            OrderAction::Cancel {
+                outcome: Outcome::Up,
+                order_id: "up_1".to_string(),
+                reason: CancelReason::DefensiveCancel,
+            }
+        );
+        assert_eq!(tr1.action_dn, OrderAction::Hold);
+        assert!(matches!(
+            p1.try_recv().unwrap(),
+            ExecutionCommand::Cancel {
+                outcome: Outcome::Up,
+                reason: CancelReason::DefensiveCancel,
+                ..
+            }
+        ));
+        assert!(p1.try_recv().is_err());
+
+        // 2. DOWN-only directional cancel: DOWN cancels, UP holds Live.
+        let (h2, mut p2, _r2, mut a2) = setup_actor();
+        h2.publish_quote(QuoteProposal {
+            defensive_cancel: true,
+            defensive_cancel_up: false,
+            defensive_cancel_dn: true,
+            ..base
+        });
+        let tr2 = a2.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(tr2.action_up, OrderAction::Hold);
+        assert_eq!(
+            tr2.action_dn,
+            OrderAction::Cancel {
+                outcome: Outcome::Down,
+                order_id: "dn_1".to_string(),
+                reason: CancelReason::DefensiveCancel,
+            }
+        );
+        assert!(matches!(
+            p2.try_recv().unwrap(),
+            ExecutionCommand::Cancel {
+                outcome: Outcome::Down,
+                reason: CancelReason::DefensiveCancel,
+                ..
+            }
+        ));
+        assert!(p2.try_recv().is_err());
+
+        // 3. Legacy symmetric flag (up=false, dn=false, defensive_cancel=true) cancels both.
+        let (h3, mut p3, _r3, mut a3) = setup_actor();
+        h3.publish_quote(QuoteProposal {
+            defensive_cancel: true,
+            defensive_cancel_up: false,
+            defensive_cancel_dn: false,
+            ..base
+        });
+        let tr3 = a3.step(1_000_000, 0).unwrap().unwrap();
+        assert!(matches!(tr3.action_up, OrderAction::Cancel { .. }));
+        assert!(matches!(tr3.action_dn, OrderAction::Cancel { .. }));
+        assert!(p3.try_recv().is_ok());
+        assert!(p3.try_recv().is_ok());
     }
 }
