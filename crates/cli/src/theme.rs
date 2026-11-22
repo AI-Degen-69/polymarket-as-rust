@@ -384,9 +384,19 @@ impl Theme {
     }
 
     /// Formats a nanosecond latency measurement in microseconds and highlights budget breaches.
+    /// Keeps sub-microsecond precision so a breach never displays as an exact budget value.
     pub(crate) fn fmt_latency_us(self, ns: u64, budget_us: u64) -> String {
-        let us = ns / 1_000;
-        let raw = format!("{us}us");
+        let whole = ns / 1_000;
+        let frac = ns % 1_000;
+        let raw = if frac == 0 {
+            format!("{whole}us")
+        } else {
+            let mut digits = format!("{frac:03}");
+            while digits.ends_with('0') {
+                digits.pop();
+            }
+            format!("{whole}.{digits}us")
+        };
         if ns > budget_us.saturating_mul(1_000) {
             self.bold_red(&raw)
         } else {
@@ -589,18 +599,24 @@ mod tests {
         let styled = Theme::styled();
         // Exact budgets stay green; +1ns breaches turn bold red even when truncated us matches.
         assert_eq!(styled.fmt_latency_us(10_000, 10), "\x1b[32m10us\x1b[0m");
-        assert_eq!(styled.fmt_latency_us(10_001, 10), "\x1b[1;31m10us\x1b[0m");
+        assert_eq!(
+            styled.fmt_latency_us(10_001, 10),
+            "\x1b[1;31m10.001us\x1b[0m"
+        );
         assert_eq!(styled.fmt_latency_us(25_000, 25), "\x1b[32m25us\x1b[0m");
-        assert_eq!(styled.fmt_latency_us(25_001, 25), "\x1b[1;31m25us\x1b[0m");
+        assert_eq!(
+            styled.fmt_latency_us(25_001, 25),
+            "\x1b[1;31m25.001us\x1b[0m"
+        );
         assert_eq!(styled.fmt_latency_us(100_000, 100), "\x1b[32m100us\x1b[0m");
         assert_eq!(
             styled.fmt_latency_us(100_001, 100),
-            "\x1b[1;31m100us\x1b[0m"
+            "\x1b[1;31m100.001us\x1b[0m"
         );
         // Large budget does not overflow when converting to nanoseconds.
         assert_eq!(
             styled.fmt_latency_us(u64::MAX, u64::MAX),
-            format!("\x1b[32m{}us\x1b[0m", u64::MAX / 1_000)
+            format!("\x1b[32m{}.615us\x1b[0m", u64::MAX / 1_000)
         );
     }
 
