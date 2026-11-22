@@ -46,6 +46,7 @@ enum CliTraceSource {
 enum CliLifecycleSource {
     Live,
     SimEpoch,
+    Replay,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -330,11 +331,14 @@ enum Commands {
         #[arg(long, default_value = "logs/phase3-paper.jsonl")]
         jsonl: PathBuf,
     },
-    /// Phase 4 risk & lifecycle actor pipeline: run deterministic 300s epoch or live feeds with 4-tier risk limits.
+    /// Phase 4 risk & lifecycle actor pipeline: run deterministic 300s epoch, live feeds, or offline replay with 4-tier risk limits.
     Lifecycle {
-        /// Source mode (`live` WebSockets or `sim-epoch` simulated 300s epoch).
+        /// Source mode (`live` WebSockets, `sim-epoch` simulated 300s epoch, or `replay` JSONL log).
         #[arg(long, value_enum, default_value_t = CliLifecycleSource::SimEpoch)]
         source: CliLifecycleSource,
+        /// Input JSONL path used when `--source replay` (defaults to `logs/phase1-feeds.jsonl`).
+        #[arg(long)]
+        input: Option<PathBuf>,
         /// Live run duration (`60s`, `90s`, `300s`).
         #[arg(long, default_value = "90s")]
         duration: String,
@@ -466,6 +470,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }),
         Commands::Lifecycle {
             source,
+            input,
             duration,
             fast_forward,
             inject_fault,
@@ -480,7 +485,9 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             source: match source {
                 CliLifecycleSource::Live => LifecycleSourceMode::Live,
                 CliLifecycleSource::SimEpoch => LifecycleSourceMode::SimEpoch,
+                CliLifecycleSource::Replay => LifecycleSourceMode::Replay,
             },
+            input,
             duration,
             fast_forward,
             fault: match inject_fault {
@@ -953,5 +960,30 @@ mod tests {
             .apply_to(&mut zero_ticks_cfg)
             .is_err()
         );
+
+        let lc_replay = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--input",
+            "logs/feeds.jsonl",
+            "--gamma",
+            "0.08",
+        ])
+        .unwrap();
+        match lc_replay.command {
+            Commands::Lifecycle {
+                source,
+                input,
+                math,
+                ..
+            } => {
+                assert!(matches!(source, CliLifecycleSource::Replay));
+                assert_eq!(input, Some(PathBuf::from("logs/feeds.jsonl")));
+                assert_eq!(math.gamma, Some(0.08));
+            }
+            _ => panic!("expected Lifecycle replay"),
+        }
     }
 }

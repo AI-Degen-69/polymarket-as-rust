@@ -759,7 +759,14 @@ fn validate_replay_event(
     state: &mut ReplayState,
 ) -> Result<(), Box<dyn Error>> {
     match event {
-        "market_discovered" => serde_json::from_value::<MarketDescriptor>(payload)?.validate()?,
+        "market_discovered" => {
+            serde_json::from_value::<MarketDescriptor>(payload)?.validate()?;
+            // Live CLOB actors discard both books at rollover without requiring
+            // the outgoing epoch to end uncrossed (transient crosses up to
+            // 500ms are tolerated). Reset unconditionally so replay matches live.
+            state.book_up = BookMaintainer::new(Outcome::Up);
+            state.book_dn = BookMaintainer::new(Outcome::Down);
+        }
         "clock_sync" => {
             serde_json::from_value::<ClockSyncReport>(payload)?;
         }
@@ -1155,5 +1162,110 @@ mod tests {
         let _ = std::fs::remove_file(&too_deep);
         assert!(err.contains("exceeds 10-level limit"), "err={err}");
         assert!(err.contains("bids=11"), "err={err}");
+    }
+
+    #[test]
+    fn multi_epoch_capture_passes_replay_validation() {
+        use core_types::{FeeSchedule, ProtocolVersion};
+
+        let multi = temp_path("multi_epoch");
+        let desc1 = MarketDescriptor {
+            condition_id: "0x1111111111111111111111111111111111111111111111111111111111111111"
+                .to_string(),
+            slug: "btc-updown-5m-1000".to_string(),
+            question: "BTC 5m epoch 1".to_string(),
+            version: ProtocolVersion::PolyV2,
+            neg_risk: false,
+            asset_id_up: "1001".to_string(),
+            asset_id_dn: "1002".to_string(),
+            tick_size_micro: MicroUsdc(10_000),
+            min_order_size_micro: SharesMicro(5_000_000),
+            taker_delay_ms: 50,
+            fee_schedule: FeeSchedule::btc_5m_default(),
+            start_ts_ms: 1_000_000,
+            expiry_ts_ms: 1_300_000,
+            strike_price_usd: None,
+        };
+        let desc2 = MarketDescriptor {
+            condition_id: "0x2222222222222222222222222222222222222222222222222222222222222222"
+                .to_string(),
+            slug: "btc-updown-5m-1300".to_string(),
+            question: "BTC 5m epoch 2".to_string(),
+            asset_id_up: "2001".to_string(),
+            asset_id_dn: "2002".to_string(),
+            start_ts_ms: 1_300_000,
+            expiry_ts_ms: 1_600_000,
+            ..desc1.clone()
+        };
+
+        let mut writer = JsonlWriter::create(&multi).unwrap();
+        writer
+            .write_event(1_000_000, 10, "market_discovered", &desc1)
+            .unwrap();
+        let snap1 = PolyMarketEvent::BookSnapshot {
+            outcome: Outcome::Up,
+            book: FixedBook::try_from_slices(
+                Outcome::Up,
+                &[BookLevel {
+                    price: MicroUsdc(480_000),
+                    size: SharesMicro(10_000_000),
+                }],
+                &[BookLevel {
+                    price: MicroUsdc(490_000),
+                    size: SharesMicro(10_000_000),
+                }],
+                10,
+                1_000_000,
+            )
+            .unwrap(),
+            rx_mono_ns: 20,
+            exch_ts_ms: 1_000_000,
+            epoch: 0,
+        };
+        writer
+            .write_event(1_000_005, 20, "poly_book", &snap1)
+            .unwrap();
+        // Transient cross at the epoch boundary: live tolerates crosses up to
+        // 500ms before resync, and discards the book at rollover. Replay must
+        // accept this and reset instead of rejecting the capture.
+        let crossed_delta = PolyMarketEvent::PriceChange {
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(550_000),
+            size: SharesMicro(10_000_000),
+            best_bid: None,
+            best_ask: None,
+            rx_mono_ns: 25,
+            exch_ts_ms: 1_000_010,
+            epoch: 0,
+        };
+        writer
+            .write_event(1_000_010, 25, "poly_price_change", &crossed_delta)
+            .unwrap();
+        writer
+            .write_event(1_300_000, 30, "market_discovered", &desc2)
+            .unwrap();
+        // Second epoch starts from a delta, not a snapshot, so the test depends
+        // on the reset: bid 510k crosses the old ask 490k when the reset is
+        // missing, and is uncrossed (empty book) after the reset.
+        let epoch2_delta = PolyMarketEvent::PriceChange {
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(510_000),
+            size: SharesMicro(10_000_000),
+            best_bid: None,
+            best_ask: None,
+            rx_mono_ns: 40,
+            exch_ts_ms: 1_300_000,
+            epoch: 1,
+        };
+        writer
+            .write_event(1_300_005, 40, "poly_price_change", &epoch2_delta)
+            .unwrap();
+        writer.close().unwrap();
+
+        let res = run_replay(&multi, None);
+        let _ = std::fs::remove_file(&multi);
+        assert!(res.is_ok(), "multi-epoch replay validation failed: {res:?}");
     }
 }

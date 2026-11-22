@@ -7,9 +7,9 @@ use core_types::{
     MonotonicClock, Outcome,
 };
 use feeds::{
-    BinanceSpotEvent, BinanceSpotWsActor, BinanceWsCommand, BinanceWsConfig, ClobMarketWsActor,
-    ClobWsCommand, ClobWsConfig, DEFAULT_RING_CAPACITY, FeedHealthEvent, FeedId, FeedStats,
-    GammaDiscoveryClient, OracleTwapEvent, PolyBoltTwapWsActor, PolyBoltWsCommand,
+    BinanceSpotEvent, BinanceSpotWsActor, BinanceWsCommand, BinanceWsConfig, BookMaintainer,
+    ClobMarketWsActor, ClobWsCommand, ClobWsConfig, DEFAULT_RING_CAPACITY, FeedHealthEvent, FeedId,
+    FeedStats, GammaDiscoveryClient, OracleTwapEvent, PolyBoltTwapWsActor, PolyBoltWsCommand,
     PolyBoltWsConfig, PolyMarketEvent,
 };
 use rtrb::RingBuffer;
@@ -95,7 +95,8 @@ async fn run_discover(duration: Duration, jsonl_path: &Path) -> Result<(), Box<d
     let cfg = EngineConfig::from_env()?;
     feeds::install_tls_provider();
 
-    let (discovery, desc, mut jsonl) = setup_discovery_and_log(&cfg, &clock, jsonl_path).await?;
+    let (discovery, mut desc, offset_est, mut jsonl) =
+        setup_discovery_and_log(&cfg, &clock, jsonl_path).await?;
     let (poly_prod, mut poly_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (bin_prod, mut bin_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (ora_prod, mut ora_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
@@ -116,8 +117,23 @@ async fn run_discover(duration: Duration, jsonl_path: &Path) -> Result<(), Box<d
         oracle_cons: &mut ora_cons,
         health_rx: &mut health_rx,
     };
-    let capture_res =
-        capture_until_deadline(duration, &clock, &mut rings, &mut data, &mut jsonl).await;
+    let mut rollover_ctx = CaptureRolloverCtx {
+        discovery: &discovery,
+        offset_est: &offset_est,
+        handles: &handles,
+        current_desc: &mut desc,
+        epoch: 0,
+        last_rollover_attempt: None,
+    };
+    let capture_res = capture_until_deadline(
+        duration,
+        &clock,
+        &mut rings,
+        &mut data,
+        &mut jsonl,
+        &mut rollover_ctx,
+    )
+    .await;
     finish_discover_report(
         handles,
         capture_res,
@@ -167,7 +183,15 @@ async fn setup_discovery_and_log(
     cfg: &EngineConfig,
     clock: &MonotonicClock,
     jsonl_path: &Path,
-) -> Result<(GammaDiscoveryClient, MarketDescriptor, JsonlWriter), Box<dyn Error>> {
+) -> Result<
+    (
+        GammaDiscoveryClient,
+        MarketDescriptor,
+        ClockOffsetEstimator,
+        JsonlWriter,
+    ),
+    Box<dyn Error>,
+> {
     let discovery = GammaDiscoveryClient::new()?;
     let offset_est = ClockOffsetEstimator::new(cfg.clock_drift_max_ms);
     let sync = discovery.sync_clock(&offset_est).await?;
@@ -181,7 +205,7 @@ async fn setup_discovery_and_log(
     let mut jsonl = JsonlWriter::create(jsonl_path)?;
     jsonl.write_event(raw_now_ms, clock.now_ns()?, "market_discovered", &desc)?;
     jsonl.write_event(raw_now_ms, clock.now_ns()?, "clock_sync", &sync)?;
-    Ok((discovery, desc, jsonl))
+    Ok((discovery, desc, offset_est, jsonl))
 }
 
 fn init_capture_data(polybolt_enabled: bool) -> CaptureReportData {
@@ -232,12 +256,22 @@ pub(crate) fn spawn_actors(
     })
 }
 
+struct CaptureRolloverCtx<'a> {
+    discovery: &'a GammaDiscoveryClient,
+    offset_est: &'a ClockOffsetEstimator,
+    handles: &'a ActorHandles,
+    current_desc: &'a mut MarketDescriptor,
+    epoch: u64,
+    last_rollover_attempt: Option<tokio::time::Instant>,
+}
+
 async fn capture_until_deadline(
     duration: Duration,
     clock: &MonotonicClock,
     rings: &mut Rings<'_>,
     data: &mut CaptureReportData,
     jsonl: &mut JsonlWriter,
+    rollover: &mut CaptureRolloverCtx<'_>,
 ) -> Result<(), Box<dyn Error>> {
     let deadline = tokio::time::sleep(duration);
     tokio::pin!(deadline);
@@ -254,9 +288,79 @@ async fn capture_until_deadline(
             }
             _ = poll_tick.tick() => {
                 drain_all(clock, rings, data, jsonl)?;
+                maybe_rollover_capture(clock, rings, data, jsonl, rollover).await?;
             }
         }
     }
+    Ok(())
+}
+
+async fn maybe_rollover_capture(
+    clock: &MonotonicClock,
+    rings: &mut Rings<'_>,
+    data: &mut CaptureReportData,
+    jsonl: &mut JsonlWriter,
+    rollover: &mut CaptureRolloverCtx<'_>,
+) -> Result<(), Box<dyn Error>> {
+    let raw_now_ms = MonotonicClock::unix_now_ms()?;
+    let adjusted_now_ms = rollover.offset_est.adjusted_unix_ms(raw_now_ms)?;
+    if adjusted_now_ms < rollover.current_desc.expiry_ts_ms {
+        return Ok(());
+    }
+    let probe_due = rollover
+        .last_rollover_attempt
+        .is_none_or(|t| t.elapsed() >= Duration::from_secs(2));
+    if !probe_due {
+        return Ok(());
+    }
+    rollover.last_rollover_attempt = Some(tokio::time::Instant::now());
+
+    let next_desc = match rollover
+        .discovery
+        .discover_active_5m_btc(adjusted_now_ms, 10_000)
+        .await
+    {
+        Ok(desc) => desc,
+        Err(err) => {
+            eprintln!(
+                "WARN: rollover market discovery failed after {}: {err}",
+                rollover.current_desc.slug
+            );
+            return Ok(());
+        }
+    };
+    if next_desc.condition_id == rollover.current_desc.condition_id {
+        return Ok(());
+    }
+
+    let new_epoch = rollover
+        .handles
+        .send_clob_rollover(next_desc.asset_id_up.clone(), next_desc.asset_id_dn.clone())
+        .await?;
+
+    // Drain only pre-rollover CLOB events before switching the report maintainers and logging
+    // the new `market_discovered` record so JSONL consumers never mix epochs.
+    drain_poly_before_epoch(clock, rings, data, jsonl, Some(new_epoch))?;
+    drain_non_poly(clock, rings, data, jsonl)?;
+
+    data.maintainer_up = BookMaintainer::new(Outcome::Up);
+    data.maintainer_dn = BookMaintainer::new(Outcome::Down);
+    data.latest_up_book = None;
+    data.latest_dn_book = None;
+    rollover.epoch = new_epoch;
+    let post_rollover_ms = MonotonicClock::unix_now_ms()?;
+    jsonl.write_event(
+        post_rollover_ms,
+        clock.now_ns()?,
+        "market_discovered",
+        &next_desc,
+    )?;
+    println!(
+        "  [ROLLOVER]           : {} -> {} (epoch={})",
+        rollover.current_desc.slug, next_desc.slug, rollover.epoch
+    );
+    *rollover.current_desc = next_desc;
+    rollover.last_rollover_attempt = None;
     Ok(())
 }
 
@@ -351,13 +455,39 @@ fn drain_all(
     data: &mut CaptureReportData,
     jsonl: &mut JsonlWriter,
 ) -> Result<(), Box<dyn Error>> {
+    drain_poly_before_epoch(clock, rings, data, jsonl, None)?;
+    drain_non_poly(clock, rings, data, jsonl)?;
+    Ok(())
+}
+
+fn drain_poly_before_epoch(
+    clock: &MonotonicClock,
+    rings: &mut Rings<'_>,
+    data: &mut CaptureReportData,
+    jsonl: &mut JsonlWriter,
+    before_epoch: Option<u64>,
+) -> Result<(), Box<dyn Error>> {
     data.peak_poly_slots = data.peak_poly_slots.max(rings.poly_cons.slots());
+    while let Ok(epoch) = rings.poly_cons.peek().map(PolyMarketEvent::epoch) {
+        if before_epoch.is_some_and(|limit| epoch >= limit) {
+            break;
+        }
+        if let Ok(ev) = rings.poly_cons.pop() {
+            record_poly_event(clock, ev, data, jsonl)?;
+        }
+    }
+    Ok(())
+}
+
+fn drain_non_poly(
+    clock: &MonotonicClock,
+    rings: &mut Rings<'_>,
+    data: &mut CaptureReportData,
+    jsonl: &mut JsonlWriter,
+) -> Result<(), Box<dyn Error>> {
     data.peak_binance_slots = data.peak_binance_slots.max(rings.binance_cons.slots());
     data.peak_oracle_slots = data.peak_oracle_slots.max(rings.oracle_cons.slots());
 
-    while let Ok(ev) = rings.poly_cons.pop() {
-        record_poly_event(clock, ev, data, jsonl)?;
-    }
     while let Ok(ev) = rings.binance_cons.pop() {
         record_binance_event(clock, ev, data, jsonl)?;
     }
