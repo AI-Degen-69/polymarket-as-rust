@@ -6,13 +6,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ConfigError, redact_presence};
 use crate::market::{ExecutionMode, KappaMode, SgMode, VarianceMode, WalletMode};
 use crate::money::{
-    MicroUsdc, ONE_CENT_MICRO, ONE_DOLLAR_MICRO, SIZE_STEP_MICRO, SharesMicro, parse_decimal_micro,
+    MicroUsdc, ONE_CENT_MICRO, ONE_DOLLAR_MICRO, SIZE_STEP_MICRO, SharesMicro, TickPrecision,
+    parse_decimal_micro,
 };
 
 const MAX_GAMMA: f64 = 100.0;
 const MAX_NOTIONAL_PER_LEG_MICRO: u64 = 1_000_000 * ONE_DOLLAR_MICRO;
 const MAX_HYSTERESIS_TICKS: f64 = 10.0;
 const MAX_CLOCK_DRIFT_MS: i64 = 60_000;
+const MAX_MIN_SPREAD_TICKS: u32 =
+    ((ONE_DOLLAR_MICRO / TickPrecision::TenthMill.tick_micro().0) - 1) as u32;
 
 /// Optional live operator credentials wrapped in `SecretString` and excluded from serialization.
 #[derive(Clone, Default)]
@@ -578,8 +581,11 @@ fn validate_risk_limits(cfg: &EngineConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
-    if cfg.min_spread_ticks == 0 {
-        return Err(invariant("min_spread_ticks must be >= 1"));
+    if cfg.min_spread_ticks == 0 || cfg.min_spread_ticks > MAX_MIN_SPREAD_TICKS {
+        return Err(invariant(format!(
+            "MIN_SPREAD_TICKS ({}) must be in 1..={MAX_MIN_SPREAD_TICKS}",
+            cfg.min_spread_ticks
+        )));
     }
     if cfg.min_combined_spread_micro.0 < ONE_CENT_MICRO
         || cfg.min_combined_spread_micro.0 >= ONE_DOLLAR_MICRO

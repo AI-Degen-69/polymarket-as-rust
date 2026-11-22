@@ -119,6 +119,14 @@ pub(crate) struct MathOverrides {
 }
 
 impl MathOverrides {
+    pub(crate) const fn is_any_set(self) -> bool {
+        self.gamma.is_some()
+            || self.max_combined_bid_micro.is_some()
+            || self.include_variance_spread.is_some()
+            || self.min_spread_ticks.is_some()
+            || self.fee_spread_floor.is_some()
+    }
+
     pub(crate) fn apply_to(
         self,
         cfg: &mut core_types::EngineConfig,

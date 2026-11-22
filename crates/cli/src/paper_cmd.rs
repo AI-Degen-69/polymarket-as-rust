@@ -520,7 +520,7 @@ fn process_replay_env(
                             }
                         }
                     }
-                    broker.on_book_update(outcome, price, size, exch_ts_ms);
+                    broker.on_book_update(outcome, side, price, size, exch_ts_ms);
                 }
                 ReplayPolyEvent::LastTrade {
                     outcome,
@@ -1335,7 +1335,7 @@ fn handle_live_poly_event(
                     }
                 }
             }
-            broker.on_book_update(outcome, price, size, exch_ts_ms);
+            broker.on_book_update(outcome, side, price, size, exch_ts_ms);
         }
         PolyMarketEvent::LastTrade {
             outcome,

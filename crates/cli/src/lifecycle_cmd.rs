@@ -303,6 +303,14 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
     let mut check_cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut check_cfg)?;
 
+    if args.source == LifecycleSourceMode::SimEpoch && args.math.is_any_set() {
+        return Err(
+            "math override flags (--gamma, --max-combined-bid-micro, --include-variance-spread, \
+             --min-spread-ticks, --fee-spread-floor) apply only to `--source live`; \
+             sim-epoch uses synthetic quote proposals"
+                .into(),
+        );
+    }
     if args.source == LifecycleSourceMode::SimEpoch && args.pinning.is_active() {
         return Err(
             "--pin-pricing-core/--pin-risk-core apply to the live actor topology; \
@@ -1104,8 +1112,13 @@ impl LivePaperSimulator {
                     if let Some(active) = self.broker.active_order(outcome, OrderSide::Buy) {
                         let active_price = active.price;
                         let depth = fixed_book_depth_at(&valid_book, active_price);
-                        self.broker
-                            .on_book_update(outcome, active_price, depth, now_ms);
+                        self.broker.on_book_update(
+                            outcome,
+                            OrderSide::Buy,
+                            active_price,
+                            depth,
+                            now_ms,
+                        );
                     }
                 }
             }
@@ -1141,7 +1154,8 @@ impl LivePaperSimulator {
                     }
                 }
                 if side == OrderSide::Buy {
-                    self.broker.on_book_update(outcome, price, size, now_ms);
+                    self.broker
+                        .on_book_update(outcome, side, price, size, now_ms);
                 }
             }
             PolyMarketEvent::LastTrade {
@@ -1423,7 +1437,9 @@ impl LivePaperSimulator {
             if let Some(order) = self.broker.orders().get(&sim_id)
                 && matches!(
                     order.status,
-                    SimOrderStatus::PendingCancel { .. } | SimOrderStatus::Cancelled
+                    SimOrderStatus::PendingCancel { .. }
+                        | SimOrderStatus::PendingPlaceThenCancel { .. }
+                        | SimOrderStatus::Cancelled
                 )
             {
                 return false;
@@ -3385,5 +3401,29 @@ mod tests {
         assert!(jsonl_cancel_count >= 4);
         assert!(jsonl_cancel_all_events >= 1);
         assert!(saw_mandatory_flatten_telemetry);
+    }
+
+    #[test]
+    fn sim_epoch_rejects_math_override_flags_explicitly() {
+        let err = run(LifecycleArgs {
+            source: LifecycleSourceMode::SimEpoch,
+            duration: "10s".to_string(),
+            fast_forward: true,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides {
+                gamma: Some(0.02),
+                ..Default::default()
+            },
+            pinning: CorePinning::default(),
+            jsonl: temp_jsonl_path("sim_epoch_rejects_math"),
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("sim-epoch"),
+            "expected sim-epoch error message, got: {err}"
+        );
     }
 }
