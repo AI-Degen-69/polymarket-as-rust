@@ -3,5 +3,6 @@
 .env.*
 !.env.example
 logs/
+data/
 *.jsonl
 *.log
