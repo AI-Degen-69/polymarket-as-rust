@@ -1313,13 +1313,7 @@ impl LivePaperSimulator {
     ) -> Result<(), Box<dyn Error>> {
         self.stats.fills_count = self.stats.fills_count.saturating_add(1);
         let tau_secs = self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
-        print_lifecycle_fill(
-            now_ms,
-            tau_secs,
-            self.current_phase,
-            self.current_tier,
-            fill,
-        );
+        print_lifecycle_fill(now_ms, tau_secs, self.current_tier, fill);
         record_lifecycle_fill_jsonl(jsonl, now_ms, now_ns, &self.desc.slug, fill)?;
 
         let inv_before = self.ledger.net_inventory();
