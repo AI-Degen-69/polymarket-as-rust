@@ -380,7 +380,8 @@ def main():
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    markets_to_convert: List[tuple[Dict[str, Any], Optional[List[Dict[str, Any]]]]] = []
+    markets_to_convert: List[tuple[Dict[str, Any], Optional[Path]]] = []
+    failed_slugs: List[str] = []
 
     if args.offline_convert:
         if not raw_cache_dir.exists():
@@ -397,11 +398,14 @@ def main():
             if not market:
                 continue
             slug = market.get("slug", "")
+            cached_coin = (data.get("coin") or market.get("coin") or slug.split("-")[0]).lower()
+            if cached_coin != args.coin.lower():
+                continue
             if slug_filter is not None:
                 if slug not in slug_filter:
                     continue
                 found_slugs.add(slug)
-            markets_to_convert.append((market, data.get("snapshots", [])))
+            markets_to_convert.append((market, cf))
 
         if slug_filter is not None:
             missing = sorted(slug_filter - found_slugs)
@@ -412,7 +416,7 @@ def main():
         if args.limit_markets is not None:
             markets_to_convert = markets_to_convert[: args.limit_markets]
 
-        print(f"[*] Offline-converting {len(markets_to_convert)} cached {args.market_type} market(s) (fill_mode={args.fill_mode})...")
+        print(f"[*] Offline-converting {len(markets_to_convert)} cached {args.coin} {args.market_type} market(s) (fill_mode={args.fill_mode})...")
         if not markets_to_convert:
             print("[!] No cached markets matched in cache directory.")
             return
@@ -441,11 +445,13 @@ def main():
         if args.slugs:
             print(f"[*] Fetching {len(args.slugs)} specific market(s) by slug...")
             for s in args.slugs:
+                slug_clean = s.strip()
                 try:
-                    res_m = client.get_market_by_slug(s.strip(), coin=args.coin)
+                    res_m = client.get_market_by_slug(slug_clean, coin=args.coin)
                     markets_to_fetch.append(res_m)
                 except Exception as e:
-                    print(f"[!] Error fetching market slug {s}: {e}", file=sys.stderr)
+                    print(f"[!] Error fetching market slug {slug_clean}: {e}", file=sys.stderr)
+                    failed_slugs.append(slug_clean)
         else:
             offset = 0
             batch_size = 50
@@ -472,71 +478,76 @@ def main():
         print(f"[*] Found {len(markets_to_fetch)} resolved {args.market_type} market(s).")
         if not markets_to_fetch:
             print("[!] No resolved markets returned in the given time window.")
+            if failed_slugs:
+                print(f"[!] Exiting non-zero due to {len(failed_slugs)} failed slug(s): {', '.join(failed_slugs)}", file=sys.stderr)
+                sys.exit(1)
             return
 
         # Sort markets oldest first so replay sequence is chronological
         markets_to_fetch.sort(key=lambda m: m["start_time"])
         markets_to_convert = [(m, None) for m in markets_to_fetch]
 
-    combined_lines: List[Dict[str, Any]] = []
-    running_mono_ns = 1_000_000_000
-
-    # 4. Fetch snapshots for each market (or load from cache)
     total_markets = len(markets_to_convert)
-    for idx, (market, cached_snapshots) in enumerate(markets_to_convert, 1):
-        market_id = market["market_id"]
-        slug = market.get("slug", f"market_{market_id}")
-        cache_file = raw_cache_dir / f"{market_id}.json"
-
-        if cached_snapshots is not None:
-            snapshots = cached_snapshots
-        elif cache_file.exists():
-            print(f"[{idx}/{total_markets}] Loading cached snapshots for {slug} (ID: {market_id})...")
-            with open(cache_file, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                snapshots = data.get("snapshots", [])
-        else:
-            print(f"[{idx}/{total_markets}] Downloading snapshots for {slug} (ID: {market_id})...")
-            snapshots = client.get_all_snapshots_for_market(market_id, coin=args.coin)
-            tmp_file = cache_file.with_suffix(".json.tmp")
-            with open(tmp_file, "w", encoding="utf-8") as f:
-                json.dump({"market": market, "snapshots": snapshots}, f)
-            os.replace(tmp_file, cache_file)
-            print(f"    Saved {len(snapshots)} snapshots to cache.")
-
-        # Convert to individual replay JSONL (starting at 1s mono)
-        single_market_lines, _ = convert_market_to_capture(
-            market,
-            snapshots,
-            start_mono_ns=1_000_000_000,
-            fill_mode=args.fill_mode,
-            participation=args.trade_participation,
-        )
-        single_capture_file = out_dir / f"polybacktest_{args.market_type}_{slug}.jsonl"
-        with open(single_capture_file, "w", encoding="utf-8") as f:
-            for item in single_market_lines:
-                f.write(json.dumps(item, separators=(",", ":")) + "\n")
-
-        # Convert to combined replay JSONL (continuous monotonic timestamp)
-        combined_market_lines, running_mono_ns = convert_market_to_capture(
-            market,
-            snapshots,
-            start_mono_ns=running_mono_ns + 100_000_000,
-            fill_mode=args.fill_mode,
-            participation=args.trade_participation,
-        )
-        combined_lines.extend(combined_market_lines)
-
-    # If requested or as default, save combined replay file
     combined_name = args.combined_name or f"polybacktest_{args.market_type}_{total_markets}w.jsonl"
     combined_file = out_dir / combined_name
-    print(f"[*] Writing combined replay file to {combined_file} ({len(combined_lines)} events)...")
-    with open(combined_file, "w", encoding="utf-8") as f:
-        for item in combined_lines:
-            f.write(json.dumps(item, separators=(",", ":")) + "\n")
+    combined_tmp = combined_file.with_suffix(".jsonl.tmp")
+    combined_events = 0
+    running_mono_ns = 1_000_000_000
 
+    # 4. Fetch snapshots for each market (or load one at a time from cache) and stream combined output
+    with open(combined_tmp, "w", encoding="utf-8") as cf_out:
+        for idx, (market, offline_cache_path) in enumerate(markets_to_convert, 1):
+            market_id = market["market_id"]
+            slug = market.get("slug", f"market_{market_id}")
+            cache_file = offline_cache_path if offline_cache_path is not None else (raw_cache_dir / f"{market_id}.json")
+
+            if offline_cache_path is not None or cache_file.exists():
+                print(f"[{idx}/{total_markets}] Loading cached snapshots for {slug} (ID: {market_id})...")
+                with open(cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    snapshots = data.get("snapshots", [])
+            else:
+                print(f"[{idx}/{total_markets}] Downloading snapshots for {slug} (ID: {market_id})...")
+                snapshots = client.get_all_snapshots_for_market(market_id, coin=args.coin)
+                tmp_file = cache_file.with_suffix(".json.tmp")
+                with open(tmp_file, "w", encoding="utf-8") as f:
+                    json.dump({"coin": args.coin, "market": market, "snapshots": snapshots}, f)
+                os.replace(tmp_file, cache_file)
+                print(f"    Saved {len(snapshots)} snapshots to cache.")
+
+            # Convert to individual replay JSONL (starting at 1s mono)
+            single_market_lines, _ = convert_market_to_capture(
+                market,
+                snapshots,
+                start_mono_ns=1_000_000_000,
+                fill_mode=args.fill_mode,
+                participation=args.trade_participation,
+            )
+            single_capture_file = out_dir / f"polybacktest_{args.market_type}_{slug}.jsonl"
+            with open(single_capture_file, "w", encoding="utf-8") as f:
+                for item in single_market_lines:
+                    f.write(json.dumps(item, separators=(",", ":")) + "\n")
+
+            # Convert to combined replay JSONL (continuous monotonic timestamp) and stream to temp file
+            combined_market_lines, running_mono_ns = convert_market_to_capture(
+                market,
+                snapshots,
+                start_mono_ns=running_mono_ns + 100_000_000,
+                fill_mode=args.fill_mode,
+                participation=args.trade_participation,
+            )
+            for item in combined_market_lines:
+                cf_out.write(json.dumps(item, separators=(",", ":")) + "\n")
+            combined_events += len(combined_market_lines)
+
+    os.replace(combined_tmp, combined_file)
+    print(f"[*] Wrote combined replay file to {combined_file} ({combined_events} events).")
     print(f"[+] Done! Successfully created replay file: {combined_file}")
     print(f"    Ready to test with: rtk cargo run -p cli --bin poly-as -- paper --source replay --input {combined_file}")
+
+    if failed_slugs:
+        print(f"[!] Exiting non-zero due to {len(failed_slugs)} failed slug(s): {', '.join(failed_slugs)}", file=sys.stderr)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
