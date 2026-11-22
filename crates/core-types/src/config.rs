@@ -427,16 +427,24 @@ where
         cfg.hysteresis_tick_buffer = parse_f64("HYSTERESIS_TICK_BUFFER", &v)?;
     }
     if let Some(v) = non_empty(lookup, "MAX_CROSS_TICK_LOSS_MICRO")? {
-        cfg.max_cross_tick_loss_micro = Some(v.parse::<u64>().map_err(|_| {
-            invalid_val(
-                "MAX_CROSS_TICK_LOSS_MICRO",
-                v,
-                "expected non-negative integer micro-USDC",
-            )
-        })?);
+        if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            cfg.max_cross_tick_loss_micro = None;
+        } else {
+            cfg.max_cross_tick_loss_micro = Some(v.parse::<u64>().map_err(|_| {
+                invalid_val(
+                    "MAX_CROSS_TICK_LOSS_MICRO",
+                    v,
+                    "expected non-negative integer micro-USDC or 'off'",
+                )
+            })?);
+        }
     }
     if let Some(v) = non_empty(lookup, "MAX_ENTRY_PROB")? {
-        cfg.max_entry_prob = Some(parse_f64("MAX_ENTRY_PROB", &v)?);
+        if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            cfg.max_entry_prob = None;
+        } else {
+            cfg.max_entry_prob = Some(parse_f64("MAX_ENTRY_PROB", &v)?);
+        }
     }
     Ok(())
 }

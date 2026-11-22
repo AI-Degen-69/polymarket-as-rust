@@ -223,10 +223,31 @@ try {
                             $cliArgs += @("--max-entry-prob", $entryProb)
                         }
 
-                        & $binPath @cliArgs *> $outLog
-                        if ($LASTEXITCODE -ne 0) {
-                            $tail = if (Test-Path -LiteralPath $outLog) { (Get-Content -LiteralPath $outLog -Tail 20) -join "`n" } else { "" }
-                            throw "Sweep run failed (exit=$LASTEXITCODE) for $stem.`n$tail"
+                        $prevCrossLossEnv = $env:MAX_CROSS_TICK_LOSS_MICRO
+                        $prevEntryProbEnv = $env:MAX_ENTRY_PROB
+                        try {
+                            if ($crossLoss -eq "off") {
+                                $env:MAX_CROSS_TICK_LOSS_MICRO = "off"
+                            }
+                            if ($entryProb -eq "off") {
+                                $env:MAX_ENTRY_PROB = "off"
+                            }
+                            & $binPath @cliArgs *> $outLog
+                            if ($LASTEXITCODE -ne 0) {
+                                $tail = if (Test-Path -LiteralPath $outLog) { (Get-Content -LiteralPath $outLog -Tail 20) -join "`n" } else { "" }
+                                throw "Sweep run failed (exit=$LASTEXITCODE) for $stem.`n$tail"
+                            }
+                        } finally {
+                            if ($null -eq $prevCrossLossEnv) {
+                                Remove-Item Env:MAX_CROSS_TICK_LOSS_MICRO -ErrorAction SilentlyContinue
+                            } else {
+                                $env:MAX_CROSS_TICK_LOSS_MICRO = $prevCrossLossEnv
+                            }
+                            if ($null -eq $prevEntryProbEnv) {
+                                Remove-Item Env:MAX_ENTRY_PROB -ErrorAction SilentlyContinue
+                            } else {
+                                $env:MAX_ENTRY_PROB = $prevEntryProbEnv
+                            }
                         }
 
                         $summaryLine = Get-Content -LiteralPath $outJsonl -Tail 1

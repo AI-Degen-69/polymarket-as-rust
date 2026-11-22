@@ -211,6 +211,12 @@ impl DollarNotionalRiskEngine {
         Ok(Self { config })
     }
 
+    /// Returns the active risk configuration.
+    #[must_use]
+    pub const fn config(&self) -> RiskConfig {
+        self.config
+    }
+
     /// Evaluates Station 7 risk limits for proposed UP and DOWN bid prices.
     pub fn evaluate(
         &self,

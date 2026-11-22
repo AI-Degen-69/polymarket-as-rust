@@ -471,7 +471,9 @@ fn apply_pair_and_post_only(
     (quote, flags)
 }
 
-fn exceeds_entry_prob_bounds(bid: MicroUsdc, p_max: f64) -> bool {
+/// Returns `true` when `bid` lies strictly outside `[1.0 - p_max, p_max]` in micro-USDC.
+#[must_use]
+pub fn exceeds_entry_prob_bounds(bid: MicroUsdc, p_max: f64) -> bool {
     let max_micro = ((p_max * ONE_DOLLAR_MICRO as f64) + 1e-9).floor() as u64;
     let min_micro = ONE_DOLLAR_MICRO.saturating_sub(max_micro);
     bid.0 > max_micro || bid.0 < min_micro

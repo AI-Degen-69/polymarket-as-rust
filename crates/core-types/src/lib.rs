@@ -682,5 +682,12 @@ mod tests {
         let mut bad_loss = HashMap::new();
         bad_loss.insert("MAX_CROSS_TICK_LOSS_MICRO", "-1");
         assert!(EngineConfig::from_lookup(lookup_map(&bad_loss)).is_err());
+
+        let mut off_map = HashMap::new();
+        off_map.insert("MAX_CROSS_TICK_LOSS_MICRO", "off");
+        off_map.insert("MAX_ENTRY_PROB", "OFF");
+        let off_cfg = EngineConfig::from_lookup(lookup_map(&off_map)).unwrap();
+        assert_eq!(off_cfg.max_cross_tick_loss_micro, None);
+        assert_eq!(off_cfg.max_entry_prob, None);
     }
 }

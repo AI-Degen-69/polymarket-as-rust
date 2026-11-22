@@ -701,12 +701,34 @@ fn process_replay_env(
     Ok(())
 }
 
+fn effective_order_size(
+    outcome: Outcome,
+    target_price: MicroUsdc,
+    base_size: SharesMicro,
+    inventory_q: core_types::SignedSharesMicro,
+    max_entry_prob: Option<f64>,
+    min_order_size_micro: SharesMicro,
+) -> Option<SharesMicro> {
+    if let Some(p_max) = max_entry_prob
+        && math_engine::exceeds_entry_prob_bounds(target_price, p_max)
+    {
+        let offset = match outcome {
+            Outcome::Up if inventory_q.0 < 0 => inventory_q.0.unsigned_abs(),
+            Outcome::Down if inventory_q.0 > 0 => inventory_q.0.unsigned_abs(),
+            _ => 0,
+        };
+        let capped = base_size.min(SharesMicro::from_raw(offset));
+        return (capped >= min_order_size_micro).then_some(capped);
+    }
+    Some(base_size)
+}
+
 fn eval_sim_step(
     now_ms: u64,
     state: &mut PaperState,
     pipe: &mut MathPipeline,
     sim: SimTuple<'_>,
-    _cfg: &EngineConfig,
+    cfg: &EngineConfig,
     args: &PaperArgs,
     (tracker, jsonl, clock): (&mut LatencyTracker, &mut JsonlWriter, &MonotonicClock),
 ) -> Result<(), Box<dyn Error>> {
@@ -772,10 +794,25 @@ fn eval_sim_step(
     };
 
     // Manage UP quote
-    match desired_bid_up {
-        Some(target_price) => {
+    let sized_up = desired_bid_up.and_then(|target_price| {
+        effective_order_size(
+            Outcome::Up,
+            target_price,
+            base_size,
+            inventory_q,
+            cfg.max_entry_prob,
+            desc.min_order_size_micro,
+        )
+        .map(|sz| (target_price, sz))
+    });
+    match sized_up {
+        Some((target_price, order_size)) => {
             let should_replace = match state.active_up_id.and_then(|id| broker.get_order(id)) {
-                Some(order) => order.price != target_price || !order.status.is_active(),
+                Some(order) => {
+                    order.price != target_price
+                        || order.remaining_size > order_size
+                        || !order.status.is_active()
+                }
                 None => true,
             };
             if should_replace {
@@ -789,7 +826,7 @@ fn eval_sim_step(
                     outcome: Outcome::Up,
                     side: OrderSide::Buy,
                     price: target_price,
-                    size: base_size,
+                    size: order_size,
                     now_ms,
                     current_best_bid: best_bid_up,
                     current_best_ask: best_ask_up,
@@ -797,7 +834,7 @@ fn eval_sim_step(
                 }) {
                     state.active_up_id = Some(new_id);
                     state.stats.orders_placed = state.stats.orders_placed.saturating_add(1);
-                    telemetry.record_order_posted(base_size);
+                    telemetry.record_order_posted(order_size);
                     if let Some(order) = broker.get_order(new_id) {
                         print_order_event("SUBMIT", order);
                         record_order_jsonl(&desc.slug, "submit", order, now_ms, jsonl, clock)?;
@@ -815,10 +852,25 @@ fn eval_sim_step(
     }
 
     // Manage DOWN quote
-    match desired_bid_dn {
-        Some(target_price) => {
+    let sized_dn = desired_bid_dn.and_then(|target_price| {
+        effective_order_size(
+            Outcome::Down,
+            target_price,
+            base_size,
+            inventory_q,
+            cfg.max_entry_prob,
+            desc.min_order_size_micro,
+        )
+        .map(|sz| (target_price, sz))
+    });
+    match sized_dn {
+        Some((target_price, order_size)) => {
             let should_replace = match state.active_dn_id.and_then(|id| broker.get_order(id)) {
-                Some(order) => order.price != target_price || !order.status.is_active(),
+                Some(order) => {
+                    order.price != target_price
+                        || order.remaining_size > order_size
+                        || !order.status.is_active()
+                }
                 None => true,
             };
             if should_replace {
@@ -832,7 +884,7 @@ fn eval_sim_step(
                     outcome: Outcome::Down,
                     side: OrderSide::Buy,
                     price: target_price,
-                    size: base_size,
+                    size: order_size,
                     now_ms,
                     current_best_bid: best_bid_dn,
                     current_best_ask: best_ask_dn,
@@ -840,7 +892,7 @@ fn eval_sim_step(
                 }) {
                     state.active_dn_id = Some(new_id);
                     state.stats.orders_placed = state.stats.orders_placed.saturating_add(1);
-                    telemetry.record_order_posted(base_size);
+                    telemetry.record_order_posted(order_size);
                     if let Some(order) = broker.get_order(new_id) {
                         print_order_event("SUBMIT", order);
                         record_order_jsonl(&desc.slug, "submit", order, now_ms, jsonl, clock)?;
@@ -2142,5 +2194,50 @@ mod tests {
         );
         assert_eq!(ledger.estimated_rebate_micro, prior_rebate);
         let _ = std::fs::remove_file(test_jsonl);
+    }
+
+    #[test]
+    fn paper_hedge_order_size_caps_to_offsetting_inventory_above_max_entry_prob() {
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let min_size = SharesMicro(5 * ONE_SHARE_MICRO);
+
+        // 5 UP shares held, base_size = 20, DN bid = $0.90, max_entry_prob = 0.80 -> capped to 5 shares.
+        assert_eq!(
+            effective_order_size(
+                Outcome::Down,
+                MicroUsdc(900_000),
+                base_size,
+                core_types::SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
+                Some(0.80),
+                min_size,
+            ),
+            Some(SharesMicro(5 * ONE_SHARE_MICRO))
+        );
+
+        // 3 UP shares held (< 5 min order size) -> suppressed so zero excess directional shares open.
+        assert_eq!(
+            effective_order_size(
+                Outcome::Down,
+                MicroUsdc(900_000),
+                base_size,
+                core_types::SignedSharesMicro(3 * ONE_SHARE_MICRO as i64),
+                Some(0.80),
+                min_size,
+            ),
+            None
+        );
+
+        // Within [0.20, 0.80] -> full base_size preserved.
+        assert_eq!(
+            effective_order_size(
+                Outcome::Down,
+                MicroUsdc(500_000),
+                base_size,
+                core_types::SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
+                Some(0.80),
+                min_size,
+            ),
+            Some(base_size)
+        );
     }
 }

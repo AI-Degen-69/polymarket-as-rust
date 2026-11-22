@@ -33,6 +33,9 @@ pub struct SizedQuote {
     pub size: SharesMicro,
     /// Unrounded target price in USD from Station 6 for continuous deadband check.
     pub price_raw_usd: f64,
+    /// `true` when Station 6 capped `price` below the raw target (e.g. cross-tick or Post-Only cap).
+    #[serde(default)]
+    pub price_capped: bool,
 }
 
 /// Discrete order action emitted for an individual outcome leg.
@@ -361,8 +364,12 @@ impl HysteresisGate {
                 // 2. True Continuous Deadband evaluation on unrounded target price:
                 let active_price_usd = active_price.0 as f64 / 1_000_000.0;
                 let price_diff = (target_quote.price_raw_usd - active_price_usd).abs();
+                let active_exceeds_cap =
+                    target_quote.price_capped && active_price > target_quote.price;
 
-                if price_diff >= deadband_usd && target_quote.price != active_price {
+                if (active_exceeds_cap || price_diff >= deadband_usd)
+                    && target_quote.price != active_price
+                {
                     // Price moved significantly outside the deadband and maps to a distinct tick.
                     let next_state = OrderSlotState::PendingCancel {
                         order_id: order_id.clone(),
@@ -503,6 +510,7 @@ mod tests {
                 price: MicroUsdc(490_000), // floored at $0.49
                 size: active_size,
                 price_raw_usd: 0.49999,
+                price_capped: false,
             }),
             tick_size_micro: tick_micro,
             best_ask: Some(MicroUsdc(520_000)),
@@ -525,6 +533,7 @@ mod tests {
                 price: MicroUsdc(500_000), // floored at $0.50
                 size: active_size,
                 price_raw_usd: 0.50001,
+                price_capped: false,
             }),
             tick_size_micro: tick_micro,
             best_ask: Some(MicroUsdc(520_000)),
@@ -548,6 +557,7 @@ mod tests {
                 price: MicroUsdc(500_000), // $0.50
                 size: active_size,
                 price_raw_usd: 0.5030,
+                price_capped: false,
             }),
             tick_size_micro: tick_micro,
             best_ask: Some(MicroUsdc(520_000)),
@@ -596,6 +606,7 @@ mod tests {
                 price: active_price,
                 size: active_size,
                 price_raw_usd: 0.4900,
+                price_capped: false,
             }),
             tick_size_micro: MicroUsdc(10_000),
             best_ask: Some(MicroUsdc(520_000)),
@@ -610,6 +621,50 @@ mod tests {
                 outcome: Outcome::Up,
                 order_id: "order_def".to_string(),
                 reason: CancelReason::DefensiveCancel,
+            }
+        );
+    }
+
+    #[test]
+    fn test_capped_price_bypasses_deadband_when_resting_exceeds_cap() {
+        let mut gate = HysteresisGate::new(HysteresisConfig {
+            hysteresis_buf: 0.25,
+            min_order_size_shares: 5,
+        })
+        .unwrap();
+        let active_size = SharesMicro::from_raw(20 * ONE_SHARE_MICRO);
+        gate.set_state(
+            Outcome::Down,
+            OrderSlotState::Live {
+                order_id: "order_dn_cap".to_string(),
+                price: MicroUsdc(500_000),
+                original_size: active_size,
+                remaining_size: active_size,
+            },
+        );
+
+        let action = gate.evaluate_leg(&HysteresisInput {
+            outcome: Outcome::Down,
+            proposed_quote: Some(SizedQuote {
+                price: MicroUsdc(490_000),
+                size: active_size,
+                price_raw_usd: 0.49,
+                price_capped: true,
+            }),
+            tick_size_micro: MicroUsdc(10_000),
+            best_ask: Some(MicroUsdc(520_000)),
+            defensive_cancel: false,
+            now_ns: 1_000_000,
+            next_seq: 1,
+        });
+        assert_eq!(
+            action,
+            OrderAction::CancelAndReplace {
+                outcome: Outcome::Down,
+                old_order_id: "order_dn_cap".to_string(),
+                new_price: MicroUsdc(490_000),
+                new_size: active_size,
+                reason: CancelReason::DeadbandDrift,
             }
         );
     }
