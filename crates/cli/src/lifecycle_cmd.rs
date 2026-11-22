@@ -21,22 +21,24 @@ use paper_sim::{
     NewOrderParams, PaperLedger, SimFill, SimOrderStatus, TrajectorySnapshot,
 };
 use risk_lifecycle::{
-    ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerStatus, CircuitBreakers,
-    CorePinning, DollarNotionalRiskEngine, EpochLifecycleController, EpochPhase, ExecutionCommand,
-    FaultInjection, FlattenAction, HysteresisConfig, HysteresisGate, LifecycleConfig, OrderAction,
-    OrderRegistrySnapshot, QuoteProposal, RiskActor, RiskActorTrace, RiskConfig, RiskTier,
+    ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerStatus, CancelReason,
+    CircuitBreakers, CorePinning, DollarNotionalRiskEngine, EpochLifecycleController, EpochPhase,
+    ExecutionCommand, FaultInjection, FlattenAction, HysteresisConfig, HysteresisGate,
+    LifecycleConfig, OrderAction, OrderRegistrySnapshot, OrderSlotState, QuoteProposal, RiskActor,
+    RiskActorTrace, RiskConfig, RiskTier,
 };
 use rtrb::RingBuffer;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
 use crate::lifecycle_report::{
-    LifecycleReportStats, LifecycleStepRow, print_breaker_trip, print_epoch_rollover,
-    print_lifecycle_fill, print_lifecycle_flatten, print_lifecycle_header, print_lifecycle_merge,
-    print_lifecycle_step, print_lifecycle_summary, print_phase_transition, print_tier_transition,
-    record_breaker_jsonl, record_epoch_rollover_jsonl, record_lifecycle_fill_jsonl,
-    record_lifecycle_flatten_jsonl, record_lifecycle_merge_jsonl, record_lifecycle_summary_jsonl,
-    record_order_action_jsonl, record_phase_transition_jsonl, record_risk_tier_jsonl,
+    CancelAllRecord, LifecycleReportStats, LifecycleStepRow, OrderActionTelemetry,
+    print_breaker_trip, print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten,
+    print_lifecycle_header, print_lifecycle_merge, print_lifecycle_step, print_lifecycle_summary,
+    print_phase_transition, print_tier_transition, record_breaker_jsonl, record_cancel_all_jsonl,
+    record_epoch_rollover_jsonl, record_lifecycle_fill_jsonl, record_lifecycle_flatten_jsonl,
+    record_lifecycle_merge_jsonl, record_lifecycle_summary_jsonl, record_order_action_jsonl,
+    record_phase_transition_jsonl, record_risk_tier_jsonl,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -393,18 +395,23 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
     let mut current_phase: Option<EpochPhase> = None;
     let mut current_tier = RiskTier::Tier1Normal;
     let mut sim_q_up = SharesMicro::ZERO;
-    let sim_q_dn = SharesMicro::ZERO;
+    let mut sim_q_dn = SharesMicro::ZERO;
     let mut sim_cost_up = MicroUsdc::ZERO;
-    let sim_cost_dn = MicroUsdc::ZERO;
+    let mut sim_cost_dn = MicroUsdc::ZERO;
 
     // Simulation steps: advance from t=0s to t=305s
     let step_secs = if args.fast_forward { 5 } else { 1 };
     let total_steps = 305 / step_secs;
 
+    let mut last_now_ms = start_ms;
+    let mut last_now_ns = clock.now_ns()?;
+
     for step_idx in 0..=total_steps {
         let elapsed_secs = (step_idx * step_secs).min(305);
         let now_ms = start_ms + (elapsed_secs * 1000);
         let now_ns = clock.now_ns()? + (elapsed_secs * 1_000_000_000);
+        last_now_ms = now_ms;
+        last_now_ns = now_ns;
         let tau_secs = expiry_ms.saturating_sub(now_ms) / 1000;
 
         // Simulated market pricing & BBO
@@ -517,14 +524,114 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
             // Drain priority commands
             while let Ok(cmd) = priority_rx.try_recv() {
                 match cmd {
-                    risk_lifecycle::ExecutionCommand::CancelAll { .. } => {
-                        stats.orders_canceled += 2;
+                    risk_lifecycle::ExecutionCommand::CancelAll { reason } => {
+                        let _ = cancel_active_sim_slots_and_record(
+                            &mut risk_actor,
+                            &mut stats,
+                            &mut jsonl,
+                            &trace,
+                            now_ns,
+                            &reason,
+                        )?;
                     }
-                    risk_lifecycle::ExecutionCommand::ExecuteFlattenFak { .. } => {
-                        stats.flattens_executed += 1;
+                    risk_lifecycle::ExecutionCommand::ExecuteFlattenFak {
+                        outcome,
+                        price,
+                        size,
+                        reason,
+                    } => {
+                        let _ = cancel_active_sim_slots_and_record(
+                            &mut risk_actor,
+                            &mut stats,
+                            &mut jsonl,
+                            &trace,
+                            now_ns,
+                            &reason,
+                        )?;
+                        risk_actor.clear_flatten_in_flight();
+
+                        let (target_shares, opposite_shares) = match outcome {
+                            Outcome::Up => (sim_q_up, sim_q_dn),
+                            Outcome::Down => (sim_q_dn, sim_q_up),
+                        };
+                        let net_delta_raw =
+                            target_shares.as_u64().abs_diff(opposite_shares.as_u64());
+                        let flatten_raw = size.as_u64().min(net_delta_raw);
+                        if flatten_raw > 0 {
+                            stats.flattens_executed += 1;
+                            let side = if target_shares > opposite_shares {
+                                OrderSide::Sell
+                            } else {
+                                OrderSide::Buy
+                            };
+                            match (outcome, side) {
+                                (Outcome::Up, OrderSide::Buy) => {
+                                    sim_q_up = SharesMicro::from_raw(
+                                        sim_q_up.as_u64().saturating_add(flatten_raw),
+                                    );
+                                }
+                                (Outcome::Down, OrderSide::Buy) => {
+                                    sim_q_dn = SharesMicro::from_raw(
+                                        sim_q_dn.as_u64().saturating_add(flatten_raw),
+                                    );
+                                }
+                                (Outcome::Up, OrderSide::Sell) => {
+                                    sim_q_up = SharesMicro::from_raw(
+                                        sim_q_up.as_u64().saturating_sub(flatten_raw),
+                                    );
+                                }
+                                (Outcome::Down, OrderSide::Sell) => {
+                                    sim_q_dn = SharesMicro::from_raw(
+                                        sim_q_dn.as_u64().saturating_sub(flatten_raw),
+                                    );
+                                }
+                            }
+                            let merged = sim_q_up.min(sim_q_dn);
+                            sim_q_up = SharesMicro::from_raw(
+                                sim_q_up.as_u64().saturating_sub(merged.as_u64()),
+                            );
+                            sim_q_dn = SharesMicro::from_raw(
+                                sim_q_dn.as_u64().saturating_sub(merged.as_u64()),
+                            );
+                            if sim_q_up == SharesMicro::ZERO {
+                                sim_cost_up = MicroUsdc::ZERO;
+                            }
+                            if sim_q_dn == SharesMicro::ZERO {
+                                sim_cost_dn = MicroUsdc::ZERO;
+                            }
+
+                            print_lifecycle_flatten(
+                                "sim-epoch",
+                                outcome,
+                                side,
+                                price,
+                                SharesMicro::from_raw(flatten_raw),
+                                MicroUsdc::ZERO,
+                                &reason,
+                            );
+                            record_lifecycle_flatten_jsonl(
+                                &mut jsonl,
+                                now_ms,
+                                now_ns,
+                                "sim-epoch",
+                                outcome,
+                                side,
+                                price,
+                                SharesMicro::from_raw(flatten_raw),
+                                0,
+                                0,
+                                &reason,
+                            )?;
+                        }
                     }
-                    risk_lifecycle::ExecutionCommand::Cancel { .. } => {
+                    risk_lifecycle::ExecutionCommand::Cancel { outcome, .. }
+                        if !matches!(
+                            risk_actor.hysteresis_mut().state(outcome),
+                            OrderSlotState::Idle
+                        ) =>
+                    {
                         stats.orders_canceled += 1;
+                        let _ = risk_actor.hysteresis_mut().on_cancel_ack(outcome);
                     }
                     _ => {}
                 }
@@ -561,7 +668,12 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                             new_size,
                         );
                     }
-                    risk_lifecycle::ExecutionCommand::Cancel { outcome, .. } => {
+                    risk_lifecycle::ExecutionCommand::Cancel { outcome, .. }
+                        if !matches!(
+                            risk_actor.hysteresis_mut().state(outcome),
+                            OrderSlotState::Idle
+                        ) =>
+                    {
                         stats.orders_canceled += 1;
                         let _ = risk_actor.hysteresis_mut().on_cancel_ack(outcome);
                     }
@@ -581,10 +693,17 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                 net_delta: net_delta / 1_000_000,
                 action_up: &trace.action_up,
                 action_dn: &trace.action_dn,
+                cancel_all_reason: trace.cancel_all_reason.as_deref(),
+                flatten_in_flight: trace.flatten_in_flight,
+                best_bid_up: trace.best_bid_up,
+                best_ask_up: trace.best_ask_up,
+                best_bid_dn: trace.best_bid_dn,
+                best_ask_dn: trace.best_ask_dn,
                 pricing_ns,
                 risk_ns,
             });
 
+            let action_telemetry = OrderActionTelemetry::from_trace(&trace);
             record_order_action_jsonl(
                 &mut jsonl,
                 now_ms,
@@ -592,6 +711,7 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                 Outcome::Up,
                 &trace.action_up,
                 tau_secs,
+                action_telemetry,
             )?;
             record_order_action_jsonl(
                 &mut jsonl,
@@ -600,6 +720,7 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                 Outcome::Down,
                 &trace.action_dn,
                 tau_secs,
+                action_telemetry,
             )?;
 
             if let BreakerStatus::Tripped { .. } = trace.breaker {
@@ -614,12 +735,104 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
         }
     }
 
+    stats.final_q_up = sim_q_up;
+    stats.final_q_dn = sim_q_dn;
+    stats.final_net_delta_micro = (sim_q_up.as_u64() as i64) - (sim_q_dn.as_u64() as i64);
+
     let p_summary = pricing_lat.summary();
     let r_summary = risk_lat.summary();
     let t_summary = total_lat.summary();
 
     print_lifecycle_summary(&stats, &p_summary, &r_summary, &t_summary);
+    record_lifecycle_summary_jsonl(
+        &mut jsonl,
+        last_now_ms,
+        last_now_ns,
+        "sim-epoch",
+        "sim-epoch",
+        &stats,
+        &p_summary,
+        &r_summary,
+        &t_summary,
+    )?;
+    jsonl.close()?;
     Ok(())
+}
+
+fn cancel_active_sim_slots_and_record(
+    risk_actor: &mut RiskActor,
+    stats: &mut LifecycleReportStats,
+    jsonl: &mut JsonlWriter,
+    trace: &RiskActorTrace,
+    now_ns: u64,
+    reason_str: &str,
+) -> Result<usize, Box<dyn Error>> {
+    let cancel_reason = if matches!(trace.breaker, BreakerStatus::Tripped { .. }) {
+        CancelReason::CircuitBreaker
+    } else {
+        CancelReason::LifecycleLockout
+    };
+    let telemetry = OrderActionTelemetry::from_trace(trace);
+    let mut canceled_count = 0usize;
+
+    for outcome in [Outcome::Up, Outcome::Down] {
+        let order_id_opt = match risk_actor.hysteresis_mut().state(outcome) {
+            OrderSlotState::Idle => None,
+            OrderSlotState::Live { order_id, .. }
+            | OrderSlotState::PendingCancel { order_id, .. }
+            | OrderSlotState::PendingReconcile { order_id } => Some(order_id.clone()),
+            OrderSlotState::PendingPlace { seq, .. } => Some(format!("pending_{seq}")),
+        };
+        if let Some(order_id) = order_id_opt {
+            let _ = risk_actor.hysteresis_mut().on_cancel_ack(outcome);
+            stats.orders_canceled = stats.orders_canceled.saturating_add(1);
+            canceled_count = canceled_count.saturating_add(1);
+            let already_in_trace = {
+                let act = match outcome {
+                    Outcome::Up => &trace.action_up,
+                    Outcome::Down => &trace.action_dn,
+                };
+                matches!(act, OrderAction::Cancel { order_id: tid, .. } if *tid == order_id)
+            };
+            if !already_in_trace {
+                record_order_action_jsonl(
+                    jsonl,
+                    trace.now_ms,
+                    now_ns,
+                    outcome,
+                    &OrderAction::Cancel {
+                        outcome,
+                        order_id,
+                        reason: cancel_reason,
+                    },
+                    trace.tau_secs,
+                    telemetry,
+                )?;
+            }
+        }
+    }
+
+    if canceled_count > 0 {
+        record_cancel_all_jsonl(
+            jsonl,
+            trace.now_ms,
+            now_ns,
+            CancelAllRecord {
+                market_slug: "sim-epoch",
+                phase: Some(trace.phase),
+                tau_secs: trace.tau_secs,
+                canceled_count,
+                flatten_in_flight: Some(trace.flatten_in_flight),
+                best_bid_up: trace.best_bid_up,
+                best_ask_up: trace.best_ask_up,
+                best_bid_dn: trace.best_bid_dn,
+                best_ask_dn: trace.best_ask_dn,
+                reason: reason_str,
+            },
+        )?;
+    }
+
+    Ok(canceled_count)
 }
 
 fn fixed_book_mid(book: &FixedBook<10>) -> Option<MicroUsdc> {
@@ -651,6 +864,15 @@ struct LiveLatencies<'a> {
 struct LiveActorChannels<'a> {
     pricing_tx: &'a mpsc::Sender<(PricingJob, oneshot::Sender<PricingAck>)>,
     risk_tx: &'a mpsc::Sender<(RiskJob, oneshot::Sender<RiskAck>)>,
+}
+
+struct CancelAllParams<'a> {
+    now_ms: u64,
+    now_ns: u64,
+    tau_secs: u64,
+    cancel_reason: CancelReason,
+    reason_str: &'a str,
+    r_trace: Option<&'a RiskActorTrace>,
 }
 
 struct PendingEpochSettlement {
@@ -1099,8 +1321,8 @@ impl LivePaperSimulator {
         }
     }
 
-    fn cancel_all_resting_orders(&mut self, now_ms: u64) -> usize {
-        let active_ids: Vec<u64> = self
+    fn cancel_all_resting_orders(&mut self, now_ms: u64) -> Vec<(Outcome, u64)> {
+        let mut active: Vec<(Outcome, u64)> = self
             .broker
             .orders()
             .values()
@@ -1110,15 +1332,78 @@ impl LivePaperSimulator {
                     SimOrderStatus::PendingPlace { .. } | SimOrderStatus::Live
                 )
             })
-            .map(|o| o.sim_id)
+            .map(|o| (o.outcome, o.sim_id))
             .collect();
-        let mut canceled = 0usize;
-        for sim_id in active_ids {
+        active.sort_by_key(|(_, sim_id)| *sim_id);
+        let mut canceled = Vec::with_capacity(active.len());
+        for (outcome, sim_id) in active {
             if self.broker.cancel(sim_id, now_ms).is_ok() {
-                canceled = canceled.saturating_add(1);
+                canceled.push((outcome, sim_id));
             }
         }
         canceled
+    }
+
+    fn cancel_all_and_record(
+        &mut self,
+        params: CancelAllParams<'_>,
+        jsonl: &mut JsonlWriter,
+    ) -> Result<usize, Box<dyn Error>> {
+        let canceled = self.cancel_all_resting_orders(params.now_ms);
+        let canceled_count = canceled.len();
+        self.stats.orders_canceled = self.stats.orders_canceled.saturating_add(canceled_count);
+        let telemetry = params
+            .r_trace
+            .map(OrderActionTelemetry::from_trace)
+            .unwrap_or_default();
+
+        for (outcome, sim_id) in canceled {
+            let id_str = sim_id.to_string();
+            let already_in_trace = params.r_trace.is_some_and(|t| {
+                let act = match outcome {
+                    Outcome::Up => &t.action_up,
+                    Outcome::Down => &t.action_dn,
+                };
+                matches!(act, OrderAction::Cancel { order_id, .. } if *order_id == id_str)
+            });
+            if !already_in_trace {
+                record_order_action_jsonl(
+                    jsonl,
+                    params.now_ms,
+                    params.now_ns,
+                    outcome,
+                    &OrderAction::Cancel {
+                        outcome,
+                        order_id: id_str,
+                        reason: params.cancel_reason,
+                    },
+                    params.tau_secs,
+                    telemetry,
+                )?;
+            }
+        }
+
+        if canceled_count > 0 {
+            record_cancel_all_jsonl(
+                jsonl,
+                params.now_ms,
+                params.now_ns,
+                CancelAllRecord {
+                    market_slug: &self.desc.slug,
+                    phase: params.r_trace.map(|t| t.phase).or(self.current_phase),
+                    tau_secs: params.tau_secs,
+                    canceled_count,
+                    flatten_in_flight: params.r_trace.map(|t| t.flatten_in_flight),
+                    best_bid_up: params.r_trace.and_then(|t| t.best_bid_up),
+                    best_ask_up: params.r_trace.and_then(|t| t.best_ask_up),
+                    best_bid_dn: params.r_trace.and_then(|t| t.best_bid_dn),
+                    best_ask_dn: params.r_trace.and_then(|t| t.best_ask_dn),
+                    reason: params.reason_str,
+                },
+            )?;
+        }
+
+        Ok(canceled_count)
     }
 
     fn cancel_leg_order(&mut self, outcome: Outcome, order_id: &str, now_ms: u64) -> bool {
@@ -1128,6 +1413,14 @@ impl LivePaperSimulator {
                 .map(|o| o.sim_id)
         });
         if let Some(sim_id) = sim_id_opt {
+            if let Some(order) = self.broker.orders().get(&sim_id)
+                && matches!(
+                    order.status,
+                    SimOrderStatus::PendingCancel { .. } | SimOrderStatus::Cancelled
+                )
+            {
+                return false;
+            }
             return self.broker.cancel(sim_id, now_ms).is_ok();
         }
         false
@@ -1137,14 +1430,35 @@ impl LivePaperSimulator {
         &mut self,
         now_ms: u64,
         now_ns: u64,
+        tau_secs: u64,
+        r_trace: Option<&RiskActorTrace>,
         jsonl: &mut JsonlWriter,
     ) -> Result<(), Box<dyn Error>> {
+        let telemetry = r_trace
+            .map(OrderActionTelemetry::from_trace)
+            .unwrap_or_default();
+
         while let Ok(cmd) = self.priority_rx.try_recv() {
             match cmd {
-                ExecutionCommand::CancelAll { .. } => {
-                    let canceled = self.cancel_all_resting_orders(now_ms);
-                    self.stats.orders_canceled =
-                        self.stats.orders_canceled.saturating_add(canceled);
+                ExecutionCommand::CancelAll { reason } => {
+                    let cancel_reason = if r_trace
+                        .is_some_and(|t| matches!(t.breaker, BreakerStatus::Tripped { .. }))
+                    {
+                        CancelReason::CircuitBreaker
+                    } else {
+                        CancelReason::LifecycleLockout
+                    };
+                    let _ = self.cancel_all_and_record(
+                        CancelAllParams {
+                            now_ms,
+                            now_ns,
+                            tau_secs,
+                            cancel_reason,
+                            reason_str: &reason,
+                            r_trace,
+                        },
+                        jsonl,
+                    )?;
                     self.pending_feedback.push(RiskFeedback::OnCancelAck {
                         outcome: Outcome::Up,
                     });
@@ -1167,9 +1481,17 @@ impl LivePaperSimulator {
                     size,
                     reason,
                 } => {
-                    let canceled = self.cancel_all_resting_orders(now_ms);
-                    self.stats.orders_canceled =
-                        self.stats.orders_canceled.saturating_add(canceled);
+                    let _ = self.cancel_all_and_record(
+                        CancelAllParams {
+                            now_ms,
+                            now_ns,
+                            tau_secs,
+                            cancel_reason: CancelReason::LifecycleLockout,
+                            reason_str: &reason,
+                            r_trace,
+                        },
+                        jsonl,
+                    )?;
                     self.pending_feedback.push(RiskFeedback::OnCancelAck {
                         outcome: Outcome::Up,
                     });
@@ -1247,8 +1569,22 @@ impl LivePaperSimulator {
                         .broker
                         .active_order(outcome, OrderSide::Buy)
                         .map(|o| o.sim_id)
+                        && self.broker.cancel(existing_id, now_ms).is_ok()
                     {
-                        let _ = self.broker.cancel(existing_id, now_ms);
+                        self.stats.orders_canceled = self.stats.orders_canceled.saturating_add(1);
+                        record_order_action_jsonl(
+                            jsonl,
+                            now_ms,
+                            now_ns,
+                            outcome,
+                            &OrderAction::Cancel {
+                                outcome,
+                                order_id: existing_id.to_string(),
+                                reason: CancelReason::RiskSuppressed,
+                            },
+                            tau_secs,
+                            telemetry,
+                        )?;
                     }
                     if let Some((sim_id, capped_size)) =
                         self.submit_broker_order(outcome, price, size, now_ms)
@@ -1271,9 +1607,9 @@ impl LivePaperSimulator {
                     old_order_id,
                     new_price,
                     new_size,
-                    ..
+                    reason,
                 } => {
-                    let _ = self.cancel_leg_order(outcome, &old_order_id, now_ms);
+                    let canceled_old = self.cancel_leg_order(outcome, &old_order_id, now_ms);
                     self.telemetry.record_cancel_replace(now_ms);
                     self.pending_feedback
                         .push(RiskFeedback::OnCancelAck { outcome });
@@ -1288,8 +1624,21 @@ impl LivePaperSimulator {
                             price: new_price,
                             size: capped_size,
                         });
-                    } else {
+                    } else if canceled_old {
                         self.stats.orders_canceled = self.stats.orders_canceled.saturating_add(1);
+                        record_order_action_jsonl(
+                            jsonl,
+                            now_ms,
+                            now_ns,
+                            outcome,
+                            &OrderAction::Cancel {
+                                outcome,
+                                order_id: old_order_id,
+                                reason,
+                            },
+                            tau_secs,
+                            telemetry,
+                        )?;
                     }
                 }
                 ExecutionCommand::Cancel {
@@ -1397,7 +1746,8 @@ impl LivePaperSimulator {
             .total
             .record_ns(pricing_ack.total_compute_ns.saturating_add(risk_ns))?;
 
-        self.execute_commands(now_ms, now_ns, jsonl)?;
+        let tau_secs = self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
+        self.execute_commands(now_ms, now_ns, tau_secs, risk_ack.trace.as_ref(), jsonl)?;
 
         let mid_up = fixed_book_mid(&snap_up);
         let mid_dn = fixed_book_mid(&snap_dn);
@@ -1423,7 +1773,6 @@ impl LivePaperSimulator {
             QuoteOutput::Active { bid_up, bid_dn, .. } => (bid_up, bid_dn),
             QuoteOutput::Suppressed(_) => (None, None),
         };
-        let tau_secs = self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
         self.telemetry.record_trajectory(TrajectorySnapshot {
             ts_ms: now_ms,
             tau_secs: (self.desc.expiry_ts_ms.saturating_sub(now_ms) as f64) / 1000.0,
@@ -1508,10 +1857,17 @@ impl LivePaperSimulator {
                 net_delta,
                 action_up: &r_trace.action_up,
                 action_dn: &r_trace.action_dn,
+                cancel_all_reason: r_trace.cancel_all_reason.as_deref(),
+                flatten_in_flight: r_trace.flatten_in_flight,
+                best_bid_up: r_trace.best_bid_up,
+                best_ask_up: r_trace.best_ask_up,
+                best_bid_dn: r_trace.best_bid_dn,
+                best_ask_dn: r_trace.best_ask_dn,
                 pricing_ns: pricing_ack.total_compute_ns,
                 risk_ns,
             });
 
+            let action_telemetry = OrderActionTelemetry::from_trace(&r_trace);
             record_order_action_jsonl(
                 jsonl,
                 now_ms,
@@ -1519,6 +1875,7 @@ impl LivePaperSimulator {
                 Outcome::Up,
                 &r_trace.action_up,
                 tau_secs,
+                action_telemetry,
             )?;
             record_order_action_jsonl(
                 jsonl,
@@ -1527,6 +1884,7 @@ impl LivePaperSimulator {
                 Outcome::Down,
                 &r_trace.action_dn,
                 tau_secs,
+                action_telemetry,
             )?;
         }
 
@@ -1559,12 +1917,27 @@ impl LivePaperSimulator {
         }
     }
 
-    fn settle_expired_epoch_if_needed(&mut self, now_ms: u64) {
+    fn settle_expired_epoch_if_needed(
+        &mut self,
+        now_ms: u64,
+        now_ns: u64,
+        jsonl: &mut JsonlWriter,
+    ) -> Result<(), Box<dyn Error>> {
         if self.epoch_settled {
-            return;
+            return Ok(());
         }
-        let canceled = self.cancel_all_resting_orders(now_ms);
-        self.stats.orders_canceled = self.stats.orders_canceled.saturating_add(canceled);
+        let tau_secs = self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
+        let _ = self.cancel_all_and_record(
+            CancelAllParams {
+                now_ms,
+                now_ns,
+                tau_secs,
+                cancel_reason: CancelReason::LifecycleLockout,
+                reason_str: "Epoch expiry settlement cancel",
+                r_trace: None,
+            },
+            jsonl,
+        )?;
         let winning_outcome = self.resolve_winning_outcome();
         let settle_delta = self.ledger.settle_epoch(winning_outcome);
         let _ = self
@@ -1587,6 +1960,7 @@ impl LivePaperSimulator {
             estimated_rebate_micro: self.ledger.estimated_rebate_micro,
         });
         let _ = self.publish_registry_snapshot();
+        Ok(())
     }
 
     fn rollover_to_market(
@@ -1596,7 +1970,7 @@ impl LivePaperSimulator {
         now_ns: u64,
         jsonl: &mut JsonlWriter,
     ) -> Result<(), Box<dyn Error>> {
-        self.settle_expired_epoch_if_needed(now_ms);
+        self.settle_expired_epoch_if_needed(now_ms, now_ns, jsonl)?;
         if let Some(pending) = self.pending_settlement.take() {
             print_epoch_rollover(
                 &pending.expired_slug,
@@ -1661,8 +2035,18 @@ impl LivePaperSimulator {
         now_ns: u64,
         jsonl: &mut JsonlWriter,
     ) -> Result<(), Box<dyn Error>> {
-        let canceled = self.cancel_all_resting_orders(now_ms);
-        self.stats.orders_canceled = self.stats.orders_canceled.saturating_add(canceled);
+        let tau_secs = self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
+        let _ = self.cancel_all_and_record(
+            CancelAllParams {
+                now_ms,
+                now_ns,
+                tau_secs,
+                cancel_reason: CancelReason::LifecycleLockout,
+                reason_str: "Session shutdown cancel",
+                r_trace: None,
+            },
+            jsonl,
+        )?;
         if let Some(pending) = self.pending_settlement.take() {
             print_epoch_rollover(
                 &pending.expired_slug,
@@ -1908,7 +2292,10 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
 
                 let tau_secs = sim.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
                 if now_ms >= sim.desc.expiry_ts_ms || (sim.market_resolved_flag && tau_secs == 0) {
-                    sim.settle_expired_epoch_if_needed(now_ms);
+                    if let Err(err) = sim.settle_expired_epoch_if_needed(now_ms, now_ns, &mut jsonl) {
+                        loop_error = Some(err.to_string());
+                        break;
+                    }
                     let probe_due = last_rollover_probe
                         .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
                     if probe_due {
@@ -1931,7 +2318,10 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
                                     loop_error = Some(err.to_string());
                                     break;
                                 }
-                                sim.rollover_to_market(next_desc, now_ms, now_ns, &mut jsonl)?;
+                                if let Err(err) = sim.rollover_to_market(next_desc, now_ms, now_ns, &mut jsonl) {
+                                    loop_error = Some(err.to_string());
+                                    break;
+                                }
                                 last_rollover_probe = None;
                             }
                             Err(err) => {
@@ -2790,5 +3180,178 @@ mod tests {
         assert_eq!(ctx.sim.stats.breaker_trips, 0);
 
         let _ = ctx.shutdown_and_read_jsonl(t_tick + 100);
+    }
+
+    #[tokio::test]
+    async fn test_live_8station_orders_canceled_reconciles_between_summary_and_jsonl() {
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let mut ctx = setup_test_actors(
+            "reconcile_cancels",
+            test_market("btc-5m-reconcile", start_ms, expiry_ms),
+            50,
+            20,
+            0,
+        );
+
+        let up_book = test_book(Outcome::Up, 490_000, 510_000, 100, start_ms);
+        let dn_book = test_book(Outcome::Down, 490_000, 510_000, 100, start_ms);
+        for (outcome, book) in [(Outcome::Up, up_book), (Outcome::Down, dn_book)] {
+            ctx.sim
+                .on_poly_event(
+                    PolyMarketEvent::BookSnapshot {
+                        outcome,
+                        book,
+                        rx_mono_ns: 1_000,
+                        exch_ts_ms: start_ms,
+                    },
+                    start_ms,
+                    1_000,
+                    &mut ctx.jsonl,
+                )
+                .unwrap();
+        }
+        ctx.sim.on_binance_event(
+            BinanceSpotEvent::AggTrade {
+                price_e8: 9_500_000_000_000,
+                qty_e8: 100_000_000,
+                is_buyer_maker: false,
+                exch_ts_ms: start_ms,
+                rx_mono_ns: 1_000,
+            },
+            start_ms,
+        );
+
+        // Warm up SG filter and place UP + DN passive orders.
+        for i in 0..7_u64 {
+            ctx.step(start_ms + i * 100).await;
+        }
+        assert!(
+            ctx.sim
+                .broker
+                .active_order(Outcome::Up, OrderSide::Buy)
+                .is_some()
+        );
+        assert!(
+            ctx.sim
+                .broker
+                .active_order(Outcome::Down, OrderSide::Buy)
+                .is_some()
+        );
+
+        // Trigger a Binance spot jump so DefensiveCancel emits individual OrderAction::Cancel events.
+        let t_jump = start_ms + 750;
+        ctx.sim.on_binance_event(
+            BinanceSpotEvent::AggTrade {
+                price_e8: 9_550_000_000_000,
+                qty_e8: 100_000_000,
+                is_buyer_maker: false,
+                exch_ts_ms: t_jump,
+                rx_mono_ns: t_jump * 1_000_000,
+            },
+            t_jump,
+        );
+        ctx.step(start_ms + 800).await;
+        assert_eq!(ctx.sim.stats.orders_canceled, 2);
+
+        // Step forward so resting UP + DN quotes re-place cleanly.
+        for i in 9..12_u64 {
+            ctx.step(start_ms + i * 100).await;
+        }
+        let dn_order = ctx
+            .sim
+            .broker
+            .active_order(Outcome::Down, OrderSide::Buy)
+            .unwrap()
+            .clone();
+
+        // Fill 19 shares on DN so Q = (0, 19) (net = -19), while UP and DN orders remain open.
+        let t_fill_dn = start_ms + 1_150;
+        ctx.sim
+            .on_poly_event(
+                PolyMarketEvent::LastTrade {
+                    outcome: Outcome::Down,
+                    side: OrderSide::Sell,
+                    price: MicroUsdc(dn_order.price.0 - 10_000),
+                    size: SharesMicro(19 * ONE_SHARE_MICRO),
+                    rx_mono_ns: t_fill_dn * 1_000_000,
+                    exch_ts_ms: t_fill_dn,
+                },
+                t_fill_dn,
+                t_fill_dn * 1_000_000,
+                &mut ctx.jsonl,
+            )
+            .unwrap();
+        assert_eq!(ctx.sim.ledger.filled_dn, SharesMicro(19 * ONE_SHARE_MICRO));
+
+        // Jump to T-25s (MandatoryFlatten): cancels remaining resting orders + flattens 19 shares.
+        let t_flatten = expiry_ms - 25_000;
+        ctx.step(t_flatten).await;
+        assert_eq!(ctx.sim.current_phase, Some(EpochPhase::MandatoryFlatten));
+        assert_eq!(ctx.sim.stats.flattens_executed, 1);
+        assert_eq!(ctx.sim.ledger.net_inventory(), SignedSharesMicro::ZERO);
+
+        // Next tick at T-24s emits Hold with explicit MandatoryFlatten telemetry.
+        ctx.step(expiry_ms - 24_000).await;
+
+        let log_contents = ctx.shutdown_and_read_jsonl(expiry_ms - 23_900);
+
+        let mut jsonl_cancel_count = 0usize;
+        let mut jsonl_submit_count = 0usize;
+        let mut jsonl_replace_count = 0usize;
+        let mut jsonl_flatten_count = 0usize;
+        let mut jsonl_cancel_all_events = 0usize;
+        let mut saw_mandatory_flatten_telemetry = false;
+        let mut summary_payload: Option<serde_json::Value> = None;
+
+        for line in log_contents.lines() {
+            let entry: serde_json::Value = serde_json::from_str(line).unwrap();
+            let ev = entry["event"].as_str().unwrap();
+            let payload = &entry["payload"];
+            match ev {
+                "order_action" => {
+                    if payload.get("phase").and_then(|v| v.as_str()) == Some("MandatoryFlatten")
+                        && payload.get("flatten_in_flight").is_some()
+                        && payload.get("best_ask_up_micro").is_some()
+                    {
+                        saw_mandatory_flatten_telemetry = true;
+                    }
+                    if let Some(obj) = payload["action"].as_object() {
+                        if obj.contains_key("Cancel") {
+                            jsonl_cancel_count += 1;
+                        } else if obj.contains_key("SubmitNew") {
+                            jsonl_submit_count += 1;
+                        } else if obj.contains_key("CancelAndReplace") {
+                            jsonl_replace_count += 1;
+                        }
+                    }
+                }
+                "flatten" => jsonl_flatten_count += 1,
+                "cancel_all" => jsonl_cancel_all_events += 1,
+                "summary" => summary_payload = Some(payload.clone()),
+                _ => {}
+            }
+        }
+
+        let summary = summary_payload.expect("summary event must be recorded");
+        assert_eq!(
+            summary["orders_canceled"].as_u64().unwrap() as usize,
+            jsonl_cancel_count
+        );
+        assert_eq!(
+            summary["orders_submitted"].as_u64().unwrap() as usize,
+            jsonl_submit_count
+        );
+        assert_eq!(
+            summary["orders_replaced"].as_u64().unwrap() as usize,
+            jsonl_replace_count
+        );
+        assert_eq!(
+            summary["flattens_executed"].as_u64().unwrap() as usize,
+            jsonl_flatten_count
+        );
+        assert!(jsonl_cancel_count >= 4);
+        assert!(jsonl_cancel_all_events >= 1);
+        assert!(saw_mandatory_flatten_telemetry);
     }
 }
