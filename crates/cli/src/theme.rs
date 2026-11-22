@@ -75,7 +75,7 @@ impl Badge {
             Self::Phase => "[PHASE]",
             Self::Tier => "[TIER]",
             Self::Info => "[INFO]",
-            Self::Heartbeat => "♥ [HB]",
+            Self::Heartbeat => "[♥ BEAT]",
             Self::Maker => "[MAKER]",
             Self::Taker => "[TAKER]",
         }
@@ -198,6 +198,14 @@ impl Theme {
         self.wrap("1;35", text)
     }
 
+    pub(crate) fn strikethrough(self, text: &str) -> String {
+        if self.color {
+            self.wrap("2;9", text)
+        } else {
+            format!("~{text}~")
+        }
+    }
+
     /// Renders a boxed command header (`╭─ TITLE ─╮` / `╰─╯`) with ASCII fallback.
     pub(crate) fn banner(self, title: &str, subtitle: Option<&str>) -> String {
         let title_len = title.chars().count();
@@ -313,7 +321,7 @@ impl Theme {
             Badge::Phase => self.bold_cyan("[PHASE]"),
             Badge::Tier => self.bold_yellow("[TIER]"),
             Badge::Info => self.cyan("[INFO]"),
-            Badge::Heartbeat => self.bold_red("♥ [HB]"),
+            Badge::Heartbeat => self.bold_red("[♥ BEAT]"),
             Badge::Maker => self.bold_green("[MAKER]"),
             Badge::Taker => self.bold_yellow("[TAKER]"),
         }
@@ -691,8 +699,11 @@ mod tests {
         assert_eq!(visible_width(&pad_visible_right(inv, 25)), 25);
 
         let hb = styled.badge(Badge::Heartbeat);
-        assert_eq!(strip_ansi(&hb), "♥ [HB]");
-        assert_eq!(visible_width(&hb), 6);
+        assert_eq!(strip_ansi(&hb), "[♥ BEAT]");
+        assert_eq!(visible_width(&hb), 8);
+
+        assert_eq!(Theme::plain().strikethrough("51.48¢"), "~51.48¢~");
+        assert_eq!(styled.strikethrough("51.48¢"), "\x1b[2;9m51.48¢\x1b[0m");
     }
 
     #[test]

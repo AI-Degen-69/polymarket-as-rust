@@ -477,6 +477,8 @@ pub(crate) struct LifecycleStreamReporter {
     last_heartbeat_ms: Option<u64>,
     last_suppression: Option<SuppressionReason>,
     last_cancel_all_reason: Option<String>,
+    last_quoted_up: Option<MicroUsdc>,
+    last_quoted_dn: Option<MicroUsdc>,
 }
 
 impl LifecycleStreamReporter {
@@ -487,6 +489,8 @@ impl LifecycleStreamReporter {
             last_heartbeat_ms: None,
             last_suppression: None,
             last_cancel_all_reason: None,
+            last_quoted_up: None,
+            last_quoted_dn: None,
         }
     }
 
@@ -494,6 +498,8 @@ impl LifecycleStreamReporter {
         self.last_heartbeat_ms = None;
         self.last_suppression = None;
         self.last_cancel_all_reason = None;
+        self.last_quoted_up = None;
+        self.last_quoted_dn = None;
     }
 
     pub(crate) fn on_step(&mut self, row: &LifecycleStepRow<'_>) {
@@ -513,8 +519,8 @@ impl LifecycleStreamReporter {
         let t = self.theme;
         let utc = format_utc_hms(row.now_ms);
         let u_pct = (row.u_e6 as f64) / 10_000.0;
-        let up_str = format_action_styled(t, row.action_up);
-        let dn_str = format_action_styled(t, row.action_dn);
+        let up_str = format_action_styled(t, Outcome::Up, row.action_up, None);
+        let dn_str = format_action_styled(t, Outcome::Down, row.action_dn, None);
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
         let suppr_note = match row.quote {
             QuoteOutput::Suppressed(reason) => {
@@ -524,7 +530,7 @@ impl LifecycleStreamReporter {
         };
 
         let base = format!(
-            "{} T-{:03}s {} {} {:>5.1}% ({:>2},{:>2},d={:>+2})  UP: {} | DN: {} [Risk: {}, Total: {}]{}",
+            "{} T-{:03}s {} {} {:>5.1}% ({:>2},{:>2},d={:>+2})  {} | {} [Risk: {}, Total: {}]{}",
             t.muted(&utc),
             row.tau_secs,
             t.phase_badge(row.phase),
@@ -628,10 +634,21 @@ impl LifecycleStreamReporter {
         }
 
         if has_up_action || has_dn_action || cancel_all_changed {
-            let up_str = format_action_styled(t, row.action_up);
-            let dn_str = format_action_styled(t, row.action_dn);
+            let prev_price_for =
+                |cached: Option<MicroUsdc>, resting: Option<MicroUsdc>, action: &OrderAction| {
+                    match action {
+                        OrderAction::CancelAndReplace { new_price, .. } => {
+                            cached.or_else(|| resting.filter(|&p| p != *new_price))
+                        }
+                        _ => cached,
+                    }
+                };
+            let prev_up = prev_price_for(self.last_quoted_up, row.resting_bid_up, row.action_up);
+            let prev_dn = prev_price_for(self.last_quoted_dn, row.resting_bid_dn, row.action_dn);
+            let up_str = format_action_styled(t, Outcome::Up, row.action_up, prev_up);
+            let dn_str = format_action_styled(t, Outcome::Down, row.action_dn, prev_dn);
             let mut action_line = format!(
-                "{}UP {} | DN {}",
+                "{}{up_str} | {dn_str}",
                 row_prefix(
                     t,
                     &utc,
@@ -640,9 +657,26 @@ impl LifecycleStreamReporter {
                     Some(MidColumn::Phase(row.phase)),
                     Some(row.tier)
                 ),
-                up_str,
-                dn_str,
             );
+            let replace_reason = |action: &OrderAction| match action {
+                OrderAction::CancelAndReplace { reason, .. } => Some(*reason),
+                _ => None,
+            };
+            match (replace_reason(row.action_up), replace_reason(row.action_dn)) {
+                (Some(r_up), Some(r_dn)) if r_up == r_dn => {
+                    action_line.push_str(&format!(" | {}", t.muted(&format!("({r_up:?})"))));
+                }
+                (Some(r_up), Some(r_dn)) => {
+                    action_line.push_str(&format!(
+                        " | {}",
+                        t.muted(&format!("(UP: {r_up:?}, DN: {r_dn:?})"))
+                    ));
+                }
+                (Some(r), None) | (None, Some(r)) => {
+                    action_line.push_str(&format!(" | {}", t.muted(&format!("({r:?})"))));
+                }
+                (None, None) => {}
+            }
             if let Some(reason) = row.cancel_all_reason {
                 action_line.push_str(&format!(
                     " | fif={} UP={} DN={} reason={}",
@@ -654,6 +688,15 @@ impl LifecycleStreamReporter {
             }
             lines.push(action_line);
         }
+
+        let next_quoted = |action: &OrderAction, resting: Option<MicroUsdc>| match action {
+            OrderAction::SubmitNew { price, .. } => Some(*price),
+            OrderAction::CancelAndReplace { new_price, .. } => Some(*new_price),
+            OrderAction::Cancel { .. } => None,
+            OrderAction::Hold => resting,
+        };
+        self.last_quoted_up = next_quoted(row.action_up, row.resting_bid_up);
+        self.last_quoted_dn = next_quoted(row.action_dn, row.resting_bid_dn);
 
         // 3. Latency breaches (compare raw nanoseconds; fixed-width values align the labels)
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
@@ -733,36 +776,52 @@ impl LifecycleStreamReporter {
     }
 }
 
-fn format_action_styled(t: Theme, action: &OrderAction) -> String {
+fn format_action_styled(
+    t: Theme,
+    outcome: Outcome,
+    action: &OrderAction,
+    prev_price: Option<MicroUsdc>,
+) -> String {
+    let leg_plain = match outcome {
+        Outcome::Up => "UP",
+        Outcome::Down => "DN",
+    };
+    let leg = match outcome {
+        Outcome::Up => t.bold_green("UP"),
+        Outcome::Down => t.bold_red("DN"),
+    };
     match action {
-        OrderAction::Hold => t.muted("Hold"),
-        OrderAction::SubmitNew {
-            outcome,
-            price,
-            size,
-        } => {
-            let leg = match outcome {
-                Outcome::Up => t.bold_green("UP"),
-                Outcome::Down => t.bold_red("DN"),
-            };
-            format!(
-                "{} {} @ {}",
-                fmt_shares_3dp(*size),
-                leg,
-                Theme::fmt_cents(Some(*price))
-            )
+        OrderAction::Hold => format!("{leg_plain} {}", t.muted("Hold")),
+        OrderAction::SubmitNew { price, size, .. } => format!(
+            "{} {} @ {}",
+            fmt_shares_3dp(*size),
+            leg,
+            Theme::fmt_cents(Some(*price))
+        ),
+        OrderAction::Cancel { reason, .. } => {
+            format!("{leg} {}", t.yellow(&format!("Cancel({reason:?})")))
         }
-        OrderAction::Cancel { reason, .. } => t.yellow(&format!("Cancel({reason:?})")),
         OrderAction::CancelAndReplace {
             new_price,
             new_size,
-            reason,
             ..
-        } => t.cyan(&format!(
-            "Replace({reason:?}) {} @ {}",
-            fmt_shares_3dp(*new_size),
-            Theme::fmt_cents(Some(*new_price))
-        )),
+        } => match prev_price {
+            Some(old) => format!(
+                "{} {} {} @ {} -> {}",
+                t.cyan("Requote"),
+                fmt_shares_3dp(*new_size),
+                leg,
+                t.strikethrough(&Theme::fmt_cents(Some(old))),
+                Theme::fmt_cents(Some(*new_price)),
+            ),
+            None => format!(
+                "{} {} {} @ {}",
+                t.cyan("Requote"),
+                fmt_shares_3dp(*new_size),
+                leg,
+                Theme::fmt_cents(Some(*new_price)),
+            ),
+        },
     }
 }
 
@@ -1509,7 +1568,7 @@ mod tests {
         let l0 = rep.format_step(&sample_row(base_ms, 300, &hold, &hold));
         assert_eq!(l0.len(), 1);
         assert!(l0[0].contains("[QUOTE]"));
-        assert!(l0[0].contains("♥ [HB]"));
+        assert!(l0[0].contains("[♥ BEAT]"));
         assert!(l0[0].contains("BTC +$14 (+2bp)"));
         assert!(l0[0].contains("Book UP 51¢/52¢ DN 48¢/49¢"));
         assert!(l0[0].contains("Quote 50¢/47¢ (97¢)"));
@@ -1595,7 +1654,7 @@ mod tests {
         assert_eq!(act_lines.len(), 1);
         assert!(act_lines[0].contains("[ORDER]"));
         assert!(act_lines[0].contains("20 UP @ 50¢"));
-        assert!(act_lines[0].contains("Cancel(RiskSuppressed)"));
+        assert!(act_lines[0].contains("DN Cancel(RiskSuppressed)"));
 
         let replace = OrderAction::CancelAndReplace {
             outcome: Outcome::Down,
@@ -1606,7 +1665,49 @@ mod tests {
         };
         let rep_lines = rep.format_step(&sample_row(base_ms + 650, 299, &hold, &replace));
         assert_eq!(rep_lines.len(), 1);
-        assert!(rep_lines[0].contains("Replace(DeadbandDrift) 20 @ 37¢"));
+        assert!(rep_lines[0].contains("UP Hold | Requote 20 DN @ ~47¢~ -> 37¢ | (DeadbandDrift)"));
+
+        // Paired requote tracks prior SubmitNew prices in both plain and styled modes.
+        for (mode_idx, theme) in [Theme::plain(), Theme::styled()].into_iter().enumerate() {
+            let mut paired_rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, theme);
+            let sub_up = OrderAction::SubmitNew {
+                outcome: Outcome::Up,
+                price: MicroUsdc(500_000),
+                size: SharesMicro::from_raw(20 * 1_000_000),
+            };
+            let sub_dn = OrderAction::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(480_000),
+                size: SharesMicro::from_raw(20 * 1_000_000),
+            };
+            paired_rep.format_step(&sample_row(base_ms, 300, &sub_up, &sub_dn));
+
+            let req_up = OrderAction::CancelAndReplace {
+                outcome: Outcome::Up,
+                old_order_id: "ord-u".to_string(),
+                new_price: MicroUsdc(494_800),
+                new_size: SharesMicro::from_raw(20 * 1_000_000),
+                reason: CancelReason::DeadbandDrift,
+            };
+            let req_dn = OrderAction::CancelAndReplace {
+                outcome: Outcome::Down,
+                old_order_id: "ord-d".to_string(),
+                new_price: MicroUsdc(465_200),
+                new_size: SharesMicro::from_raw(20 * 1_000_000),
+                reason: CancelReason::DeadbandDrift,
+            };
+            let lines = paired_rep.format_step(&sample_row(base_ms + 100, 299, &req_up, &req_dn));
+            assert_eq!(lines.len(), 1);
+            if mode_idx == 0 {
+                assert!(lines[0].contains(
+                    "Requote 20 UP @ ~50¢~ -> 49.48¢ | Requote 20 DN @ ~48¢~ -> 46.52¢ | (DeadbandDrift)"
+                ));
+            } else {
+                assert!(lines[0].contains("\x1b[2;9m50¢\x1b[0m"));
+                assert!(lines[0].contains("\x1b[2;9m48¢\x1b[0m"));
+                assert!(lines[0].contains("\x1b[2m(DeadbandDrift)\x1b[0m"));
+            }
+        }
 
         // Latency breach emits immediately.
         let mut lat_row = sample_row(base_ms + 700, 299, &hold, &hold);
