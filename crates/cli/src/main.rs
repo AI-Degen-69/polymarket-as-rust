@@ -23,6 +23,7 @@ mod paper_cmd;
 mod paper_report;
 mod sandbox_cmd;
 mod sandbox_report;
+mod theme;
 mod trace_cmd;
 mod trace_report;
 mod window_gate;
@@ -244,6 +245,9 @@ enum SandboxCommands {
     about = "Polymarket 5-Minute BTC Avellaneda-Stoikov HFT Bot (Terminal CLI)"
 )]
 struct Cli {
+    /// Control ANSI terminal color output (`auto`, `always`, `never`).
+    #[arg(long, global = true, value_enum, default_value_t = theme::ColorChoice::Auto)]
+    color: theme::ColorChoice,
     #[command(subcommand)]
     command: Commands,
 }
@@ -410,6 +414,7 @@ enum Commands {
 }
 
 fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    theme::init(cli.color);
     match cli.command {
         Commands::Doctor { jsonl } => {
             let path = jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("doctor"));
@@ -602,13 +607,16 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn main() -> ExitCode {
-    match dispatch_cli(Cli::parse()) {
+    let cli = Cli::parse();
+    theme::init(cli.color);
+    match dispatch_cli(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            eprintln!("ERROR: {err}");
+            let t = theme::current();
+            eprintln!("{} {err}", t.bold_red("ERROR:"));
             let mut cause = err.source();
             while let Some(inner) = cause {
-                eprintln!("  caused by: {inner}");
+                eprintln!("  {} {inner}", t.muted("caused by:"));
                 cause = inner.source();
             }
             ExitCode::FAILURE
@@ -1107,5 +1115,17 @@ mod tests {
             }
             _ => panic!("expected Lifecycle live"),
         }
+    }
+
+    #[test]
+    fn cli_parses_global_color_flag_before_and_after_subcommand() {
+        let default_cli = Cli::try_parse_from(["poly-as", "doctor"]).unwrap();
+        assert_eq!(default_cli.color, theme::ColorChoice::Auto);
+
+        let before = Cli::try_parse_from(["poly-as", "--color", "always", "doctor"]).unwrap();
+        assert_eq!(before.color, theme::ColorChoice::Always);
+
+        let after = Cli::try_parse_from(["poly-as", "lifecycle", "--color", "never"]).unwrap();
+        assert_eq!(after.color, theme::ColorChoice::Never);
     }
 }

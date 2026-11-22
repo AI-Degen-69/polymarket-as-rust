@@ -1,11 +1,14 @@
 //! Shared fresh 5-minute window alignment gate for live capture and trading commands.
 
 use std::error::Error;
+use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use core_types::{ClockOffsetEstimator, EngineConfig, MarketDescriptor, MonotonicClock};
 use feeds::{ClockSyncReport, GammaDiscoveryClient};
+
+use crate::theme::{self, Badge, Theme};
 
 /// Duration of one Polymarket 5-minute BTC epoch in milliseconds.
 pub(crate) const WINDOW_MS: u64 = 300_000;
@@ -81,6 +84,23 @@ pub(crate) fn format_utc_hms(unix_ms: u64) -> String {
         )
 }
 
+/// Formats the single-line mid-window wait status string.
+pub(crate) fn format_countdown_line(
+    t: Theme,
+    elapsed_s: f64,
+    remaining_s: f64,
+    target_utc: &str,
+) -> String {
+    format!(
+        "  {} Mid-window ({:.1}s in) | next fresh boundary {} UTC in {:>5.1}s {}",
+        t.badge(Badge::Wait),
+        elapsed_s,
+        t.cyan(target_utc),
+        remaining_s,
+        t.muted("(Ctrl+C to cancel)")
+    )
+}
+
 /// Synchronizes exchange clock offset, waits idle until the next fresh 5-minute boundary when
 /// mid-window (unless `allow_mid_window`), and discovers the matching active 5-minute BTC market.
 pub(crate) async fn wait_and_discover_fresh_5m_market(
@@ -88,6 +108,7 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
     allow_mid_window: bool,
     min_remaining_ms: u64,
 ) -> Result<GateOutcome<FreshWindowDiscovery>, Box<dyn Error>> {
+    let t = theme::current();
     let discovery = GammaDiscoveryClient::new()?;
     let offset_est = ClockOffsetEstimator::new(cfg.clock_drift_max_ms);
     let mut sync_report = discovery.sync_clock(&offset_est).await?;
@@ -99,8 +120,9 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
         } => {
             if !allow_mid_window {
                 println!(
-                    "  [WAIT] Fresh 5m window active ({} UTC); proceeding immediately...",
-                    format_utc_hms(current_window_start_ms)
+                    "  {} Fresh 5m window active ({} UTC); proceeding immediately...",
+                    t.badge(Badge::Ready),
+                    t.cyan(&format_utc_hms(current_window_start_ms))
                 );
             }
             let desc = discovery
@@ -121,9 +143,14 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
             let elapsed_s = elapsed_in_window_ms as f64 / 1_000.0;
             let wait_s = wait_ms as f64 / 1_000.0;
             let target_utc = format_utc_hms(next_window_start_ms);
-            println!(
-                "  [WAIT] Mid-window ({elapsed_s:.1}s into current 5m window); waiting {wait_s:.1}s until next fresh boundary {target_utc} UTC... (Ctrl+C to cancel)"
-            );
+            let is_tty = std::io::stdout().is_terminal();
+
+            if !is_tty {
+                println!(
+                    "{}",
+                    format_countdown_line(t, elapsed_s, wait_s, &target_utc)
+                );
+            }
 
             let ctrl_c = tokio::signal::ctrl_c();
             tokio::pin!(ctrl_c);
@@ -134,17 +161,42 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
                     break;
                 }
                 let remaining_ms = next_window_start_ms.saturating_sub(current_adj);
+                if is_tty {
+                    let current_elapsed_s = (current_adj % WINDOW_MS) as f64 / 1_000.0;
+                    let remaining_s = remaining_ms as f64 / 1_000.0;
+                    print!(
+                        "\r{}   ",
+                        format_countdown_line(t, current_elapsed_s, remaining_s, &target_utc)
+                    );
+                    let _ = std::io::stdout().flush();
+                }
+                let sleep_ms = if is_tty {
+                    remaining_ms.min(250)
+                } else {
+                    remaining_ms
+                };
                 tokio::select! {
                     _ = &mut ctrl_c => {
-                        println!("  [WAIT] Ctrl+C received; cancelled before window open.");
+                        if is_tty {
+                            println!();
+                        }
+                        println!(
+                            "  {} Ctrl+C received; cancelled before window open.",
+                            t.badge(Badge::Signal)
+                        );
                         return Ok(GateOutcome::Cancelled);
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(remaining_ms)) => {}
+                    _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
                 }
             }
 
+            if is_tty {
+                println!();
+            }
             println!(
-                "  [WAIT] Fresh 5m window boundary reached ({target_utc} UTC); discovering market..."
+                "  {} Fresh 5m window boundary reached ({} UTC); discovering market...",
+                t.badge(Badge::Ready),
+                t.cyan(&target_utc)
             );
 
             if let Ok(refreshed) = discovery.sync_clock(&offset_est).await {
@@ -158,7 +210,10 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
                 let now_ms = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
                 let discover_res = tokio::select! {
                     _ = &mut ctrl_c => {
-                        println!("  [WAIT] Ctrl+C received; cancelled during boundary discovery.");
+                        println!(
+                            "  {} Ctrl+C received; cancelled during boundary discovery.",
+                            t.badge(Badge::Signal)
+                        );
                         return Ok(GateOutcome::Cancelled);
                     }
                     res = discovery.discover_active_5m_btc(now_ms, min_remaining_ms) => res,
@@ -176,8 +231,10 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
                     Ok(stale) => {
                         if !printed_stale_notice {
                             println!(
-                                "  [WAIT] Gamma still serving prior window ({}); retrying for {target_utc} UTC...",
-                                stale.slug
+                                "  {} Gamma still serving prior window ({}); retrying for {} UTC...",
+                                t.badge(Badge::Wait),
+                                t.muted(&stale.slug),
+                                target_utc
                             );
                             printed_stale_notice = true;
                         }
@@ -195,7 +252,10 @@ pub(crate) async fn wait_and_discover_fresh_5m_market(
                 if attempt + 1 < GAMMA_BOUNDARY_RETRY_ATTEMPTS {
                     tokio::select! {
                         _ = &mut ctrl_c => {
-                            println!("  [WAIT] Ctrl+C received; cancelled during boundary retry.");
+                            println!(
+                                "  {} Ctrl+C received; cancelled during boundary retry.",
+                                t.badge(Badge::Signal)
+                            );
                             return Ok(GateOutcome::Cancelled);
                         }
                         _ = tokio::time::sleep(GAMMA_BOUNDARY_RETRY_INTERVAL) => {}
@@ -310,5 +370,15 @@ mod tests {
     fn format_utc_hms_formats_known_timestamp() {
         assert_eq!(format_utc_hms(1_795_345_200_000), "11:00:00Z");
         assert_eq!(format_utc_hms(1_795_345_500_000), "11:05:00Z");
+    }
+
+    #[test]
+    fn format_countdown_line_contains_wait_badge_and_target() {
+        let plain = format_countdown_line(Theme::plain(), 42.3, 257.7, "11:05:00Z");
+        assert!(!plain.contains('\x1b'));
+        assert!(plain.contains("[WAIT]"));
+        assert!(plain.contains("42.3s in"));
+        assert!(plain.contains("257.7s"));
+        assert!(plain.contains("11:05:00Z UTC"));
     }
 }
