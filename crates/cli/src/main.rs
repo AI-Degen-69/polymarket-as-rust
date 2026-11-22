@@ -236,6 +236,9 @@ impl MathOverrides {
             if win > 6_000 {
                 return Err("`--lead-lag-window-ms` must be <= 6000".into());
             }
+            if win > 0 && win < 50 {
+                return Err("`--lead-lag-window-ms` must be 0 or >= 50ms".into());
+            }
             cfg.lead_lag_window_ms = win;
         }
         if let Some(cd) = self.lead_lag_cooldown_ms {
@@ -1377,6 +1380,14 @@ mod tests {
         assert!(
             MathOverrides {
                 lead_lag_window_ms: Some(6_001),
+                ..Default::default()
+            }
+            .apply_to(&mut cfg)
+            .is_err()
+        );
+        assert!(
+            MathOverrides {
+                lead_lag_window_ms: Some(25),
                 ..Default::default()
             }
             .apply_to(&mut cfg)

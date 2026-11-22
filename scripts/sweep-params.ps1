@@ -105,8 +105,8 @@ $parsedLLThresholds = @($LeadLagThresholds | ForEach-Object { $_ -split ',' } | 
 })
 $parsedLLWindows = @($LeadLagWindows | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
     $w = [uint64]::Parse($_, $inv)
-    if ($w -gt 6000) {
-        throw "Invalid LeadLagWindows entry '$_' (expected 0..=6000)"
+    if ($w -gt 6000 -or ($w -gt 0 -and $w -lt 50)) {
+        throw "Invalid LeadLagWindows entry '$_' (expected 0 or 50..=6000)"
     }
     $w
 })

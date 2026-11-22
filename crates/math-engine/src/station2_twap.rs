@@ -99,6 +99,9 @@ impl Station2Config {
         if self.lead_lag_window_ms > MAX_LEAD_LAG_WINDOW_MS {
             return Err(err_desc("station2 lead_lag_window_ms must be <= 6000"));
         }
+        if self.lead_lag_window_ms > 0 && self.lead_lag_window_ms < LEAD_LAG_BUCKET_MS {
+            return Err(err_desc("station2 lead_lag_window_ms must be 0 or >= 50ms"));
+        }
         if self.lead_lag_cooldown_ms > MAX_LEAD_LAG_COOLDOWN_MS {
             return Err(err_desc("station2 lead_lag_cooldown_ms must be <= 10000"));
         }

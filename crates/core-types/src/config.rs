@@ -15,6 +15,7 @@ const MAX_NOTIONAL_PER_LEG_MICRO: u64 = 1_000_000 * ONE_DOLLAR_MICRO;
 const MAX_HYSTERESIS_TICKS: f64 = 10.0;
 const MAX_CLOCK_DRIFT_MS: i64 = 60_000;
 const MAX_LEAD_LAG_WINDOW_MS: u64 = 6_000;
+const MIN_LEAD_LAG_WINDOW_MS: u64 = 50;
 const MAX_LEAD_LAG_COOLDOWN_MS: u64 = 10_000;
 const MAX_MIN_SPREAD_TICKS: u32 =
     ((ONE_DOLLAR_MICRO / TickPrecision::TenthMill.tick_micro().0) - 1) as u32;
@@ -725,6 +726,12 @@ fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
             cfg.lead_lag_window_ms
         )));
     }
+    if cfg.lead_lag_window_ms > 0 && cfg.lead_lag_window_ms < MIN_LEAD_LAG_WINDOW_MS {
+        return Err(invariant(format!(
+            "lead_lag_window_ms ({}) must be 0 or >= {MIN_LEAD_LAG_WINDOW_MS}ms",
+            cfg.lead_lag_window_ms
+        )));
+    }
     if cfg.lead_lag_cooldown_ms > MAX_LEAD_LAG_COOLDOWN_MS {
         return Err(invariant(format!(
             "lead_lag_cooldown_ms ({}) must be <= {MAX_LEAD_LAG_COOLDOWN_MS}",
@@ -922,6 +929,16 @@ mod tests {
         let mut bad_win = HashMap::new();
         bad_win.insert("LEAD_LAG_WINDOW_MS", "6001");
         assert!(EngineConfig::from_lookup(lookup_map(&bad_win)).is_err());
+
+        // Window in 1..49 rejected (below 50ms bucket resolution)
+        for sub_bucket in ["1", "10", "49"] {
+            let mut bad_sub = HashMap::new();
+            bad_sub.insert("LEAD_LAG_WINDOW_MS", sub_bucket);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&bad_sub)).is_err(),
+                "expected error for window={sub_bucket}"
+            );
+        }
 
         // Cooldown > 10000 rejected
         let mut bad_cd = HashMap::new();
