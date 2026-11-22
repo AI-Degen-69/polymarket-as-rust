@@ -21,6 +21,10 @@ pub struct PricerConfig {
     pub min_spread_ticks: u32,
     /// Maximum allowed sum `bid_up + bid_dn` in micro-USDC (`980_000` = `$0.98` default).
     pub max_combined_bid_micro: MicroUsdc,
+    /// Optional cross-tick pair-cost loss budget in micro-USDC (`None` disables cross-tick cap).
+    pub max_cross_tick_loss_micro: Option<u64>,
+    /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`None` disables entry guard).
+    pub max_entry_prob: Option<f64>,
 }
 
 impl PricerConfig {
@@ -34,6 +38,8 @@ impl PricerConfig {
             min_combined_spread_micro: MicroUsdc(20_000),
             min_spread_ticks: 2,
             max_combined_bid_micro: MicroUsdc(980_000),
+            max_cross_tick_loss_micro: None,
+            max_entry_prob: None,
         }
     }
 
@@ -61,8 +67,24 @@ impl PricerConfig {
                 "max_combined_bid_micro must lie in (0, 1_000_000)",
             ));
         }
+        if let Some(p_max) = self.max_entry_prob
+            && (!p_max.is_finite() || p_max <= 0.5 || p_max >= 1.0)
+        {
+            return Err(err_desc("max_entry_prob must be finite in (0.5, 1.0)"));
+        }
         Ok(())
     }
+}
+
+/// Active unmerged inventory cost basis and escalation override context for Station 6.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CostContext {
+    /// Active VWAP cost basis per unmerged UP share (`None` when flat UP).
+    pub avg_cost_up: Option<MicroUsdc>,
+    /// Active VWAP cost basis per unmerged DOWN share (`None` when flat DOWN).
+    pub avg_cost_dn: Option<MicroUsdc>,
+    /// Bypass cross-tick pair-cost cap during risk escalation (Tier 3/4 or flatten phases).
+    pub allow_cross_tick_override: bool,
 }
 
 /// Live orderbook and resting quote boundaries consumed by Station 6's 3-way Post-Only guard.
@@ -132,6 +154,8 @@ pub struct PricerInput {
     pub fee_schedule: FeeSchedule,
     /// Live L2 + own-resting Post-Only boundaries.
     pub bounds: PostOnlyBounds,
+    /// Active orphaned-inventory VWAP cost basis and risk-escalation override flag.
+    pub cost_context: CostContext,
 }
 
 /// Step-by-step trace and latencies for Stations 4–6.
@@ -157,6 +181,14 @@ pub struct PricerTrace {
     pub bid_dn_floored: Option<MicroUsdc>,
     /// `true` when 1-tick pair-cost step-down adjusted either leg.
     pub pair_cost_adjusted: bool,
+    /// `true` when cross-tick pair-cost cap lowered or suppressed `bid_up`.
+    pub cross_tick_clamped_up: bool,
+    /// `true` when cross-tick pair-cost cap lowered or suppressed `bid_dn`.
+    pub cross_tick_clamped_dn: bool,
+    /// `true` when extreme-probability entry guard suppressed `bid_up`.
+    pub entry_guard_suppressed_up: bool,
+    /// `true` when extreme-probability entry guard suppressed `bid_dn`.
+    pub entry_guard_suppressed_dn: bool,
     /// `true` when UP Post-Only ceiling lowered `bid_up`.
     pub post_only_clamped_up: bool,
     /// `true` when DOWN Post-Only ceiling lowered `bid_dn`.
@@ -315,6 +347,10 @@ fn compute_station6(
         bid_up_floored,
         bid_dn_floored,
         pair_cost_adjusted: flags.pair_adjusted,
+        cross_tick_clamped_up: flags.cross_tick_clamped_up,
+        cross_tick_clamped_dn: flags.cross_tick_clamped_dn,
+        entry_guard_suppressed_up: flags.entry_guard_suppressed_up,
+        entry_guard_suppressed_dn: flags.entry_guard_suppressed_dn,
         post_only_clamped_up: flags.clamped_up,
         post_only_clamped_dn: flags.clamped_dn,
         post_only_suppressed_up: flags.suppressed_up,
@@ -329,6 +365,10 @@ fn compute_station6(
 #[derive(Default)]
 struct Station6Flags {
     pair_adjusted: bool,
+    cross_tick_clamped_up: bool,
+    cross_tick_clamped_dn: bool,
+    entry_guard_suppressed_up: bool,
+    entry_guard_suppressed_dn: bool,
     clamped_up: bool,
     clamped_dn: bool,
     suppressed_up: bool,
@@ -342,9 +382,49 @@ fn apply_pair_and_post_only(
     tick: MicroUsdc,
 ) -> (QuoteOutput, Station6Flags) {
     let mut flags = Station6Flags::default();
+    let (mut up_guarded, mut dn_guarded) = (bid_up_floored, bid_dn_floored);
+
+    if let Some(p_max) = cfg.max_entry_prob {
+        apply_entry_prob_guard(
+            &mut up_guarded,
+            &mut dn_guarded,
+            input.inventory_q,
+            p_max,
+            &mut flags,
+        );
+    }
+
+    if let Some(loss) = cfg.max_cross_tick_loss_micro
+        && !input.cost_context.allow_cross_tick_override
+    {
+        if input.inventory_q.0 > 0
+            && let Some(cost_up) = input.cost_context.avg_cost_up
+        {
+            dn_guarded = apply_cross_tick_cap(
+                dn_guarded,
+                cost_up,
+                cfg.max_combined_bid_micro,
+                loss,
+                tick,
+                &mut flags.cross_tick_clamped_dn,
+            );
+        } else if input.inventory_q.0 < 0
+            && let Some(cost_dn) = input.cost_context.avg_cost_dn
+        {
+            up_guarded = apply_cross_tick_cap(
+                up_guarded,
+                cost_dn,
+                cfg.max_combined_bid_micro,
+                loss,
+                tick,
+                &mut flags.cross_tick_clamped_up,
+            );
+        }
+    }
+
     let (up_paired, dn_paired, violated) = enforce_pair_cost(
-        bid_up_floored,
-        bid_dn_floored,
+        up_guarded,
+        dn_guarded,
         input.inventory_q,
         tick,
         cfg.max_combined_bid_micro,
@@ -358,14 +438,14 @@ fn apply_pair_and_post_only(
     }
 
     let b = input.bounds;
-    let (bid_up, clamped_up, sup_up) = apply_post_only_leg(
+    let (mut bid_up, clamped_up, sup_up) = apply_post_only_leg(
         up_paired,
         b.best_ask_up,
         b.best_bid_dn,
         b.active_bid_dn,
         tick,
     );
-    let (bid_dn, clamped_dn, sup_dn) = apply_post_only_leg(
+    let (mut bid_dn, clamped_dn, sup_dn) = apply_post_only_leg(
         dn_paired,
         b.best_ask_dn,
         b.best_bid_up,
@@ -377,8 +457,77 @@ fn apply_pair_and_post_only(
     flags.suppressed_up = sup_up;
     flags.suppressed_dn = sup_dn;
 
+    if let Some(p_max) = cfg.max_entry_prob {
+        apply_entry_prob_guard(
+            &mut bid_up,
+            &mut bid_dn,
+            input.inventory_q,
+            p_max,
+            &mut flags,
+        );
+    }
+
     let quote = finalize_quote(bid_up, bid_dn);
     (quote, flags)
+}
+
+fn exceeds_entry_prob_bounds(bid: MicroUsdc, p_max: f64) -> bool {
+    let max_micro = ((p_max * ONE_DOLLAR_MICRO as f64) + 1e-9).floor() as u64;
+    let min_micro = ONE_DOLLAR_MICRO.saturating_sub(max_micro);
+    bid.0 > max_micro || bid.0 < min_micro
+}
+
+fn apply_entry_prob_guard(
+    bid_up: &mut Option<MicroUsdc>,
+    bid_dn: &mut Option<MicroUsdc>,
+    inventory_q: SignedSharesMicro,
+    p_max: f64,
+    flags: &mut Station6Flags,
+) {
+    if inventory_q.0 >= 0
+        && let Some(u) = *bid_up
+        && exceeds_entry_prob_bounds(u, p_max)
+    {
+        *bid_up = None;
+        flags.entry_guard_suppressed_up = true;
+    }
+    if inventory_q.0 <= 0
+        && let Some(d) = *bid_dn
+        && exceeds_entry_prob_bounds(d, p_max)
+    {
+        *bid_dn = None;
+        flags.entry_guard_suppressed_dn = true;
+    }
+}
+
+fn apply_cross_tick_cap(
+    leg_bid: Option<MicroUsdc>,
+    held_avg_cost: MicroUsdc,
+    max_combined_bid_micro: MicroUsdc,
+    loss_micro: u64,
+    tick: MicroUsdc,
+    clamped_flag: &mut bool,
+) -> Option<MicroUsdc> {
+    let bid = leg_bid?;
+    let budget = u128::from(max_combined_bid_micro.0).saturating_add(u128::from(loss_micro));
+    let cost = u128::from(held_avg_cost.0);
+    if budget <= cost {
+        *clamped_flag = true;
+        return None;
+    }
+    let tick_u128 = u128::from(tick.0);
+    let cap_u128 = ((budget - cost) / tick_u128) * tick_u128;
+    if cap_u128 < tick_u128 {
+        *clamped_flag = true;
+        return None;
+    }
+    let cap = MicroUsdc(u64::try_from(cap_u128).unwrap_or(u64::MAX));
+    if bid > cap {
+        *clamped_flag = true;
+        Some(cap)
+    } else {
+        Some(bid)
+    }
 }
 
 fn quantize_bid_leg(
@@ -528,6 +677,7 @@ mod tests {
             tick_size_micro: MicroUsdc(tick_micro),
             fee_schedule: FeeSchedule::btc_5m_default(),
             bounds,
+            cost_context: CostContext::default(),
         }
     }
 
@@ -707,6 +857,8 @@ mod tests {
             min_combined_spread_micro: MicroUsdc(10_000),
             min_spread_ticks: 1,
             max_combined_bid_micro: MicroUsdc(990_000),
+            max_cross_tick_loss_micro: None,
+            max_entry_prob: None,
         };
         let pricer = DualBidPricer::new(cfg).unwrap();
         let bounds = PostOnlyBounds {
@@ -725,6 +877,7 @@ mod tests {
             tick_size_micro: MicroUsdc(10_000),
             fee_schedule: FeeSchedule::btc_5m_default(),
             bounds,
+            cost_context: CostContext::default(),
         };
         let t = pricer.price(&input, &clock).unwrap();
         assert_close(t.s_min, 0.01, 1e-12);
@@ -748,5 +901,235 @@ mod tests {
         assert!(!t_self.post_only_clamped_up);
         assert!(!t_self.post_only_clamped_dn);
         assert_eq!(t_self.quote, t.quote);
+    }
+
+    #[test]
+    fn cross_tick_pair_cap_clamps_symmetrically_and_respects_override_and_underflow() {
+        let clock = MonotonicClock::start();
+        let mut base_cfg = PricerConfig::try_default().unwrap();
+        base_cfg.include_variance_spread = false;
+        base_cfg.enforce_fee_floor = false;
+        base_cfg.min_combined_spread_micro = MicroUsdc(20_000);
+        base_cfg.min_spread_ticks = 2;
+        base_cfg.max_combined_bid_micro = MicroUsdc(980_000);
+
+        // Input with q=+20 (heavy UP), s_i=0.80, v_rem=0.04, gamma=0.15 =>
+        // r_i = 0.80 - 20 * 0.15 * 0.04 = 0.68, s* ~ 0.0399 => bid_up=$0.66, bid_dn=$0.30 (or similar).
+        // Tune v_rem=0 so r_i=s_i=0.72, s*=0.0399 => bid_up=$0.70, bid_dn=$0.26.
+        let mut inp = make_input(20, 10_000, base_bounds());
+        inp.s_i = 0.72;
+        inp.v_rem = 0.0;
+        inp.cost_context = CostContext {
+            avg_cost_up: Some(MicroUsdc(910_000)),
+            avg_cost_dn: None,
+            allow_cross_tick_override: false,
+        };
+
+        let base_pricer = DualBidPricer::new(base_cfg).unwrap();
+        let t_base = base_pricer.price(&inp, &clock).unwrap();
+        assert_eq!(
+            t_base.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(700_000)),
+                bid_dn: Some(MicroUsdc(260_000)),
+                pair_cost_micro: Some(MicroUsdc(960_000)),
+                gross_margin_bps: Some(400),
+            }
+        );
+
+        // Loss = 0 => cap = 980_000 + 0 - 910_000 = 70_000 ($0.07).
+        let mut cfg_zero = base_cfg;
+        cfg_zero.max_cross_tick_loss_micro = Some(0);
+        let pricer_zero = DualBidPricer::new(cfg_zero).unwrap();
+        let t_zero = pricer_zero.price(&inp, &clock).unwrap();
+        // Stations 4-5 must be 100% identical to baseline!
+        assert_close(t_zero.s_star, t_base.s_star, 1e-12);
+        assert_close(t_zero.r_i, t_base.r_i, 1e-12);
+        assert!(!t_zero.cross_tick_clamped_up);
+        assert!(t_zero.cross_tick_clamped_dn);
+        assert_eq!(
+            t_zero.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(700_000)),
+                bid_dn: Some(MicroUsdc(70_000)),
+                pair_cost_micro: Some(MicroUsdc(770_000)),
+                gross_margin_bps: Some(2_300),
+            }
+        );
+
+        // Loss = 20_000 => cap = 980_000 + 20_000 - 910_000 = 90_000 ($0.09).
+        let mut cfg_20k = base_cfg;
+        cfg_20k.max_cross_tick_loss_micro = Some(20_000);
+        let pricer_20k = DualBidPricer::new(cfg_20k).unwrap();
+        let t_20k = pricer_20k.price(&inp, &clock).unwrap();
+        assert!(t_20k.cross_tick_clamped_dn);
+        assert_eq!(
+            t_20k.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(700_000)),
+                bid_dn: Some(MicroUsdc(90_000)),
+                pair_cost_micro: Some(MicroUsdc(790_000)),
+                gross_margin_bps: Some(2_100),
+            }
+        );
+
+        // Risk escalation override bypasses cross-tick cap cleanly.
+        let mut inp_override = inp;
+        inp_override.cost_context.allow_cross_tick_override = true;
+        let t_override = pricer_zero.price(&inp_override, &clock).unwrap();
+        assert!(!t_override.cross_tick_clamped_dn);
+        assert_eq!(t_override.quote, t_base.quote);
+
+        // Symmetry for q < 0 (heavy DN): avg_cost_dn = $0.91, bid_up = $0.26 -> clamped to $0.07 / $0.09.
+        let mut inp_neg = make_input(-20, 10_000, base_bounds());
+        inp_neg.s_i = 0.28;
+        inp_neg.v_rem = 0.0;
+        inp_neg.cost_context = CostContext {
+            avg_cost_up: None,
+            avg_cost_dn: Some(MicroUsdc(910_000)),
+            allow_cross_tick_override: false,
+        };
+        let t_neg_zero = pricer_zero.price(&inp_neg, &clock).unwrap();
+        assert!(t_neg_zero.cross_tick_clamped_up);
+        assert!(!t_neg_zero.cross_tick_clamped_dn);
+        assert_eq!(
+            t_neg_zero.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(70_000)),
+                bid_dn: Some(MicroUsdc(700_000)),
+                pair_cost_micro: Some(MicroUsdc(770_000)),
+                gross_margin_bps: Some(2_300),
+            }
+        );
+        let t_neg_20k = pricer_20k.price(&inp_neg, &clock).unwrap();
+        assert!(t_neg_20k.cross_tick_clamped_up);
+        assert_eq!(
+            t_neg_20k.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(90_000)),
+                bid_dn: Some(MicroUsdc(700_000)),
+                pair_cost_micro: Some(MicroUsdc(790_000)),
+                gross_margin_bps: Some(2_100),
+            }
+        );
+
+        // Zero underflow when cost_up >= max_combined_bid_micro + loss (suppresses DN cleanly).
+        for extreme_cost in [980_000, 990_000, 995_000] {
+            let mut inp_underflow = inp;
+            inp_underflow.cost_context.avg_cost_up = Some(MicroUsdc(extreme_cost));
+            let t_uf = pricer_zero.price(&inp_underflow, &clock).unwrap();
+            assert!(t_uf.cross_tick_clamped_dn);
+            assert_eq!(
+                t_uf.quote,
+                QuoteOutput::Active {
+                    bid_up: Some(MicroUsdc(700_000)),
+                    bid_dn: None,
+                    pair_cost_micro: None,
+                    gross_margin_bps: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn extreme_probability_entry_guard_blocks_fresh_entries_but_allows_hedges() {
+        let clock = MonotonicClock::start();
+        let mut cfg = PricerConfig::try_default().unwrap();
+        cfg.include_variance_spread = false;
+        cfg.enforce_fee_floor = false;
+        cfg.max_entry_prob = Some(0.85);
+        let pricer = DualBidPricer::new(cfg).unwrap();
+
+        // Bounds with wide ask so Post-Only never suppresses $0.91.
+        let mut bounds = base_bounds();
+        bounds.best_ask_up = Some(MicroUsdc(950_000));
+        bounds.best_ask_dn = Some(MicroUsdc(950_000));
+
+        // Flat (q=0) at s_i = 0.93 => bid_up=$0.91 (> 0.85) and bid_dn=$0.05 (< 0.15): both blocked!
+        let mut inp_flat = make_input(0, 10_000, bounds);
+        inp_flat.s_i = 0.93;
+        inp_flat.v_rem = 0.0;
+        let t_flat = pricer.price(&inp_flat, &clock).unwrap();
+        assert!(t_flat.entry_guard_suppressed_up);
+        assert!(t_flat.entry_guard_suppressed_dn);
+        assert_eq!(
+            t_flat.quote,
+            QuoteOutput::Suppressed(SuppressionReason::BothLegsSuppressed)
+        );
+
+        // Boundary check: exact $0.85 (bid_up=$0.85, bid_dn=$0.11): $0.85 allowed, $0.11 blocked.
+        let mut inp_edge = make_input(0, 10_000, bounds);
+        inp_edge.s_i = 0.87;
+        inp_edge.v_rem = 0.0;
+        let t_edge = pricer.price(&inp_edge, &clock).unwrap();
+        assert!(!t_edge.entry_guard_suppressed_up);
+        assert!(t_edge.entry_guard_suppressed_dn);
+        assert_eq!(
+            t_edge.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(850_000)),
+                bid_dn: None,
+                pair_cost_micro: None,
+                gross_margin_bps: None,
+            }
+        );
+
+        // Boundary check: exact $0.15 is allowed (avoids 1.0 - 0.85 IEEE-754 precision trap).
+        let mut inp_edge_low = make_input(0, 10_000, bounds);
+        inp_edge_low.s_i = 0.17;
+        inp_edge_low.v_rem = 0.0;
+        let t_edge_low = pricer.price(&inp_edge_low, &clock).unwrap();
+        assert!(!t_edge_low.entry_guard_suppressed_up);
+        assert!(!t_edge_low.entry_guard_suppressed_dn);
+        assert_eq!(
+            t_edge_low.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(150_000)),
+                bid_dn: Some(MicroUsdc(810_000)),
+                pair_cost_micro: Some(MicroUsdc(960_000)),
+                gross_margin_bps: Some(400),
+            }
+        );
+
+        // Long UP (q=+20) at s_i = 0.93 => bid_up=$0.91 blocked, bid_dn=$0.05 ALLOWED as hedge!
+        let mut inp_long = make_input(20, 10_000, bounds);
+        inp_long.s_i = 0.93;
+        inp_long.v_rem = 0.0;
+        let t_long = pricer.price(&inp_long, &clock).unwrap();
+        assert!(t_long.entry_guard_suppressed_up);
+        assert!(!t_long.entry_guard_suppressed_dn);
+        assert_eq!(
+            t_long.quote,
+            QuoteOutput::Active {
+                bid_up: None,
+                bid_dn: Some(MicroUsdc(50_000)),
+                pair_cost_micro: None,
+                gross_margin_bps: None,
+            }
+        );
+
+        // Long DOWN (q=-20) at s_i = 0.07 => bid_dn=$0.91 blocked, bid_up=$0.05 ALLOWED as hedge!
+        let mut inp_short = make_input(-20, 10_000, bounds);
+        inp_short.s_i = 0.07;
+        inp_short.v_rem = 0.0;
+        let t_short = pricer.price(&inp_short, &clock).unwrap();
+        assert!(!t_short.entry_guard_suppressed_up);
+        assert!(t_short.entry_guard_suppressed_dn);
+        assert_eq!(
+            t_short.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(50_000)),
+                bid_dn: None,
+                pair_cost_micro: None,
+                gross_margin_bps: None,
+            }
+        );
+
+        // Invalid max_entry_prob bounds rejected cleanly.
+        for bad in [0.5, 0.49, 1.0, 1.01, f64::NAN, f64::INFINITY] {
+            let mut bad_cfg = cfg;
+            bad_cfg.max_entry_prob = Some(bad);
+            assert!(DualBidPricer::new(bad_cfg).is_err());
+        }
     }
 }
