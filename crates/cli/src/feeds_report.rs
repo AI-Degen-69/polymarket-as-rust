@@ -761,8 +761,9 @@ fn validate_replay_event(
     match event {
         "market_discovered" => {
             serde_json::from_value::<MarketDescriptor>(payload)?.validate()?;
-            state.book_up.check_uncrossed()?;
-            state.book_dn.check_uncrossed()?;
+            // Live CLOB actors discard both books at rollover without requiring
+            // the outgoing epoch to end uncrossed (transient crosses up to
+            // 500ms are tolerated). Reset unconditionally so replay matches live.
             state.book_up = BookMaintainer::new(Outcome::Up);
             state.book_dn = BookMaintainer::new(Outcome::Down);
         }
@@ -1224,31 +1225,42 @@ mod tests {
         writer
             .write_event(1_000_005, 20, "poly_book", &snap1)
             .unwrap();
+        // Transient cross at the epoch boundary: live tolerates crosses up to
+        // 500ms before resync, and discards the book at rollover. Replay must
+        // accept this and reset instead of rejecting the capture.
+        let crossed_delta = PolyMarketEvent::PriceChange {
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(550_000),
+            size: SharesMicro(10_000_000),
+            best_bid: None,
+            best_ask: None,
+            rx_mono_ns: 25,
+            exch_ts_ms: 1_000_010,
+            epoch: 0,
+        };
+        writer
+            .write_event(1_000_010, 25, "poly_price_change", &crossed_delta)
+            .unwrap();
         writer
             .write_event(1_300_000, 30, "market_discovered", &desc2)
             .unwrap();
-        let snap2 = PolyMarketEvent::BookSnapshot {
+        // Second epoch starts from a delta, not a snapshot, so the test depends
+        // on the reset: bid 510k crosses the old ask 490k when the reset is
+        // missing, and is uncrossed (empty book) after the reset.
+        let epoch2_delta = PolyMarketEvent::PriceChange {
             outcome: Outcome::Up,
-            book: FixedBook::try_from_slices(
-                Outcome::Up,
-                &[BookLevel {
-                    price: MicroUsdc(510_000),
-                    size: SharesMicro(10_000_000),
-                }],
-                &[BookLevel {
-                    price: MicroUsdc(520_000),
-                    size: SharesMicro(10_000_000),
-                }],
-                30,
-                1_300_000,
-            )
-            .unwrap(),
+            side: OrderSide::Buy,
+            price: MicroUsdc(510_000),
+            size: SharesMicro(10_000_000),
+            best_bid: None,
+            best_ask: None,
             rx_mono_ns: 40,
             exch_ts_ms: 1_300_000,
             epoch: 1,
         };
         writer
-            .write_event(1_300_005, 40, "poly_book", &snap2)
+            .write_event(1_300_005, 40, "poly_price_change", &epoch2_delta)
             .unwrap();
         writer.close().unwrap();
 

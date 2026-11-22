@@ -2529,6 +2529,9 @@ async fn run_replay_epoch(
     let mut last_sim_ns = 0_u64;
     let mut epoch = 0_u64;
     let mut session: Option<ManagedLifecycleSession> = None;
+    // Spot ticks observed at/after the outgoing market's expiry. They must not
+    // mutate the prior settlement, but they seed the next market after rollover.
+    let mut post_expiry_spots: Vec<(u64, f64)> = Vec::new();
 
     for line_res in reader.lines() {
         let line = line_res?;
@@ -2551,6 +2554,102 @@ async fn run_replay_epoch(
         let cur_sim_ms = anchor_ts_ms.saturating_add(cur_sim_ns / 1_000_000);
         last_sim_ms = cur_sim_ms;
         last_sim_ns = cur_sim_ns;
+
+        // If the active market expired at or before this event, settle it at the
+        // expiry boundary before post-expiry prices can mutate settlement state.
+        if let Some(sess) = session.as_mut()
+            && !sess.sim.epoch_settled
+            && cur_sim_ms >= sess.sim.desc.expiry_ts_ms
+        {
+            let expiry_ms = sess.sim.desc.expiry_ts_ms;
+            {
+                let mut latencies = LiveLatencies {
+                    pricing: &mut pricing_lat,
+                    risk: &mut risk_lat,
+                    total: &mut total_lat,
+                };
+                step_replay_eval_grid(
+                    sess,
+                    anchor_ts_ms,
+                    expiry_ms,
+                    &mut next_eval_ms,
+                    &mut latencies,
+                    &mut jsonl,
+                )
+                .await?;
+            }
+            let expiry_ns = expiry_ms
+                .saturating_sub(anchor_ts_ms)
+                .saturating_mul(1_000_000);
+            sess.sim
+                .settle_expired_epoch_if_needed(expiry_ms, expiry_ns, &mut jsonl)?;
+        }
+        if let Some(sess) = session.as_mut()
+            && sess.sim.epoch_settled
+            && cur_sim_ms >= sess.sim.desc.expiry_ts_ms
+        {
+            match env.event.as_str() {
+                "market_discovered" => {
+                    let desc: MarketDescriptor = serde_json::from_value(env.payload)?;
+                    desc.validate()?;
+                    if desc.condition_id != sess.sim.desc.condition_id {
+                        epoch = epoch.saturating_add(1);
+                        sess.sim
+                            .rollover_to_market(desc, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                        for (ts_ms, spot) in post_expiry_spots.drain(..) {
+                            sess.sim.observe_spot(spot, ts_ms);
+                        }
+                        next_eval_ms =
+                            Some(cur_sim_ms.checked_add(100).ok_or(
+                                "replay timestamp too large to advance the evaluation grid",
+                            )?);
+                    }
+                }
+                "binance_tick" => {
+                    let ev: BinanceSpotEvent = serde_json::from_value(env.payload)?;
+                    let spot = match &ev {
+                        BinanceSpotEvent::BookTicker { bid_e8, ask_e8, .. } => {
+                            (*bid_e8 as f64 + *ask_e8 as f64) / 200_000_000.0
+                        }
+                        BinanceSpotEvent::AggTrade { price_e8, .. } => {
+                            *price_e8 as f64 / 100_000_000.0
+                        }
+                    };
+                    if spot > 0.0 && spot.is_finite() {
+                        sess.sim.latest_spot = Some(spot);
+                        post_expiry_spots.push((cur_sim_ms, spot));
+                    }
+                }
+                "polybolt_event" => {
+                    let ev: OracleTwapEvent = serde_json::from_value(env.payload)?;
+                    let spot_opt = match &ev {
+                        OracleTwapEvent::ChainlinkSpot { spot_e8, .. } => {
+                            Some(*spot_e8 as f64 / 100_000_000.0)
+                        }
+                        OracleTwapEvent::ChainlinkTwap {
+                            twap_e8, spot_e8, ..
+                        } => {
+                            let effective = if *spot_e8 > 0 { *spot_e8 } else { *twap_e8 };
+                            Some(effective as f64 / 100_000_000.0)
+                        }
+                    };
+                    if let Some(spot) = spot_opt
+                        && spot > 0.0
+                        && spot.is_finite()
+                    {
+                        sess.sim.latest_spot = Some(spot);
+                        post_expiry_spots.push((cur_sim_ms, spot));
+                    }
+                }
+                "poly_book" | "poly_price_change" | "poly_trade" | "poly_tick_size"
+                | "poly_bba" => {}
+                "clock_sync" | "feed_health" | "feeds_summary" => {}
+                other => {
+                    return Err(format!("unknown event `{other}` in replay input").into());
+                }
+            }
+            continue;
+        }
 
         if let Some(sess) = session.as_mut() {
             let mut latencies = LiveLatencies {
@@ -2578,11 +2677,21 @@ async fn run_replay_epoch(
                         epoch = epoch.saturating_add(1);
                         sess.sim
                             .rollover_to_market(desc, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
-                        next_eval_ms = Some(cur_sim_ms.saturating_add(100));
+                        for (ts_ms, spot) in post_expiry_spots.drain(..) {
+                            sess.sim.observe_spot(spot, ts_ms);
+                        }
+                        next_eval_ms =
+                            Some(cur_sim_ms.checked_add(100).ok_or(
+                                "replay timestamp too large to advance the evaluation grid",
+                            )?);
                     }
                 } else {
                     let sess = spawn_managed_session(desc, &cfg, &args, cur_sim_ns, clock)?;
-                    next_eval_ms = Some(cur_sim_ms.saturating_add(100));
+                    next_eval_ms = Some(
+                        cur_sim_ms
+                            .checked_add(100)
+                            .ok_or("replay timestamp too large to advance the evaluation grid")?,
+                    );
                     session = Some(sess);
                 }
             }
@@ -2679,7 +2788,10 @@ async fn step_replay_eval_grid(
         sess.sim
             .step_tick(eval_ms, eval_ns, 0, &actors, latencies, jsonl)
             .await?;
-        *next_eval_ms = Some(eval_ms.saturating_add(100));
+        let next_ms = eval_ms
+            .checked_add(100)
+            .ok_or("replay timestamp too large to advance the evaluation grid")?;
+        *next_eval_ms = Some(next_ms);
     }
     Ok(())
 }
@@ -2699,6 +2811,9 @@ fn replay_poly_to_market_event(
         } => {
             if tag != "poly_book" {
                 return Err(format!("outer tag `{tag}` mismatches BookSnapshot").into());
+            }
+            if book.outcome != outcome {
+                return Err("replay BookSnapshot outcome mismatch".into());
             }
             let fixed = FixedBook::<10>::try_from_slices(
                 outcome,
