@@ -41,6 +41,12 @@ impl Default for FifoBrokerConfig {
 pub enum SimOrderStatus {
     /// In flight to exchange; cannot be filled until `active_at_ms`.
     PendingPlace { active_at_ms: u64 },
+    /// Cancel arrived while placement was still in flight; activates at `active_at_ms`
+    /// and transitions to `PendingCancel { cancel_at_ms }` until `cancel_at_ms`.
+    PendingPlaceThenCancel {
+        active_at_ms: u64,
+        cancel_at_ms: u64,
+    },
     /// Resting on the exchange orderbook with queue priority.
     Live,
     /// Cancel request in flight; STILL subject to fills until `cancel_at_ms`!
@@ -63,7 +69,10 @@ impl SimOrderStatus {
     pub const fn is_active(self) -> bool {
         matches!(
             self,
-            Self::PendingPlace { .. } | Self::Live | Self::PendingCancel { .. }
+            Self::PendingPlace { .. }
+                | Self::PendingPlaceThenCancel { .. }
+                | Self::Live
+                | Self::PendingCancel { .. }
         )
     }
 
@@ -72,6 +81,7 @@ impl SimOrderStatus {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PendingPlace { .. } => "PendingPlace",
+            Self::PendingPlaceThenCancel { .. } => "PendingPlaceThenCancel",
             Self::Live => "Live",
             Self::PendingCancel { .. } => "PendingCancel",
             Self::Filled => "Filled",
@@ -177,6 +187,18 @@ impl FifoPaperBroker {
             match order.status {
                 SimOrderStatus::PendingPlace { active_at_ms } if now_ms >= active_at_ms => {
                     order.status = SimOrderStatus::Live;
+                }
+                SimOrderStatus::PendingPlaceThenCancel {
+                    active_at_ms: _,
+                    cancel_at_ms,
+                } if now_ms >= cancel_at_ms => {
+                    order.status = SimOrderStatus::Cancelled;
+                }
+                SimOrderStatus::PendingPlaceThenCancel {
+                    active_at_ms,
+                    cancel_at_ms,
+                } if now_ms >= active_at_ms => {
+                    order.status = SimOrderStatus::PendingCancel { cancel_at_ms };
                 }
                 SimOrderStatus::PendingCancel { cancel_at_ms } if now_ms >= cancel_at_ms => {
                     order.status = SimOrderStatus::Cancelled;
@@ -287,12 +309,16 @@ impl FifoPaperBroker {
                     // Cancel catches up or arrives before/with placement -> never goes live
                     order.status = SimOrderStatus::Cancelled;
                 } else {
-                    // Goes live at active_at_ms, dies at cancel_at_ms
-                    order.status = SimOrderStatus::PendingCancel { cancel_at_ms };
+                    // Remains unfillable until active_at_ms, then fillable until cancel_at_ms.
+                    order.status = SimOrderStatus::PendingPlaceThenCancel {
+                        active_at_ms,
+                        cancel_at_ms,
+                    };
                 }
                 Ok(())
             }
-            SimOrderStatus::PendingCancel { .. } => Ok(()),
+            SimOrderStatus::PendingCancel { .. }
+            | SimOrderStatus::PendingPlaceThenCancel { .. } => Ok(()),
             SimOrderStatus::Filled => Err(PaperSimError::InvalidCancelState {
                 sim_id,
                 status: "Filled",
@@ -468,10 +494,11 @@ impl FifoPaperBroker {
         fills
     }
 
-    /// Handles book depth drop at `price`, optionally reducing `volume_ahead` under `Optimistic` decay.
+    /// Handles book depth drop at `price` on `side`, optionally reducing `volume_ahead` under `Optimistic` decay.
     pub fn on_book_update(
         &mut self,
         outcome: Outcome,
+        side: OrderSide,
         price: MicroUsdc,
         new_depth: SharesMicro,
         now_ms: u64,
@@ -479,7 +506,11 @@ impl FifoPaperBroker {
         self.update_time(now_ms);
         if self.config.queue_decay_policy == QueueDecayPolicy::Optimistic {
             for order in self.orders.values_mut() {
-                if order.outcome == outcome && order.price == price && order.status.is_fillable() {
+                if order.outcome == outcome
+                    && order.side == side
+                    && order.price == price
+                    && order.status.is_fillable()
+                {
                     order.volume_ahead.0 = order.volume_ahead.0.min(new_depth.0);
                 }
             }
@@ -516,14 +547,7 @@ impl FifoPaperBroker {
     pub fn open_bid_notional(&self, outcome: Outcome) -> u64 {
         let mut notional = 0_u64;
         for order in self.orders.values() {
-            if order.outcome == outcome
-                && order.side == OrderSide::Buy
-                && matches!(
-                    order.status,
-                    SimOrderStatus::PendingPlace { .. }
-                        | SimOrderStatus::Live
-                        | SimOrderStatus::PendingCancel { .. }
-                )
+            if order.outcome == outcome && order.side == OrderSide::Buy && order.status.is_active()
             {
                 let cost = (order.remaining_size.0 as u128 * order.price.0 as u128
                     / core_types::MICRO_SCALE as u128) as u64;
@@ -538,18 +562,150 @@ impl FifoPaperBroker {
     pub fn open_bid_shares(&self, outcome: Outcome) -> SharesMicro {
         let mut total = 0_u64;
         for order in self.orders.values() {
-            if order.outcome == outcome
-                && order.side == OrderSide::Buy
-                && matches!(
-                    order.status,
-                    SimOrderStatus::PendingPlace { .. }
-                        | SimOrderStatus::Live
-                        | SimOrderStatus::PendingCancel { .. }
-                )
+            if order.outcome == outcome && order.side == OrderSide::Buy && order.status.is_active()
             {
                 total = total.saturating_add(order.remaining_size.0);
             }
         }
         SharesMicro(total)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core_types::ONE_SHARE_MICRO;
+
+    use super::*;
+
+    #[test]
+    fn optimistic_book_update_ignores_opposite_side_depth_drop() {
+        let mut broker = FifoPaperBroker::new(FifoBrokerConfig {
+            order_latency_ms: 0,
+            cancel_latency_ms: 0,
+            queue_decay_policy: QueueDecayPolicy::Optimistic,
+        });
+        let price = MicroUsdc(450_000);
+        let id = broker
+            .submit_new(NewOrderParams {
+                outcome: Outcome::Up,
+                side: OrderSide::Buy,
+                price,
+                size: SharesMicro(20 * ONE_SHARE_MICRO),
+                now_ms: 100,
+                current_best_bid: Some(price),
+                current_best_ask: Some(MicroUsdc(460_000)),
+                book_depth_at_price: SharesMicro(100 * ONE_SHARE_MICRO),
+            })
+            .unwrap();
+
+        // Sell-side book delta at the same price must not shrink a resting Buy order's queue.
+        broker.on_book_update(
+            Outcome::Up,
+            OrderSide::Sell,
+            price,
+            SharesMicro(10 * ONE_SHARE_MICRO),
+            110,
+        );
+        assert_eq!(
+            broker.get_order(id).unwrap().volume_ahead,
+            SharesMicro(100 * ONE_SHARE_MICRO)
+        );
+
+        // Matching Buy-side book depth drop reduces volume_ahead.
+        broker.on_book_update(
+            Outcome::Up,
+            OrderSide::Buy,
+            price,
+            SharesMicro(10 * ONE_SHARE_MICRO),
+            120,
+        );
+        assert_eq!(
+            broker.get_order(id).unwrap().volume_ahead,
+            SharesMicro(10 * ONE_SHARE_MICRO)
+        );
+    }
+
+    #[test]
+    fn cancel_during_pending_place_waits_for_activation_before_becoming_fillable() {
+        let mut broker = FifoPaperBroker::new(FifoBrokerConfig {
+            order_latency_ms: 40,
+            cancel_latency_ms: 50,
+            queue_decay_policy: QueueDecayPolicy::Conservative,
+        });
+        let price = MicroUsdc(450_000);
+        let size = SharesMicro(20 * ONE_SHARE_MICRO);
+
+        // Order 1: placed at t=100 (active_at_ms=140), cancelled at t=110 (cancel_at_ms=160).
+        let id1 = broker
+            .submit_new(NewOrderParams {
+                outcome: Outcome::Up,
+                side: OrderSide::Buy,
+                price,
+                size,
+                now_ms: 100,
+                current_best_bid: Some(price),
+                current_best_ask: Some(MicroUsdc(460_000)),
+                book_depth_at_price: SharesMicro::ZERO,
+            })
+            .unwrap();
+        broker.cancel(id1, 110).unwrap();
+        assert_eq!(
+            broker.get_order(id1).unwrap().status,
+            SimOrderStatus::PendingPlaceThenCancel {
+                active_at_ms: 140,
+                cancel_at_ms: 160,
+            }
+        );
+
+        // Trade-through at t=130 (< active_at_ms=140) must produce 0 fills.
+        let fills_early = broker.on_public_trade_with_side(
+            Outcome::Up,
+            OrderSide::Sell,
+            MicroUsdc(440_000),
+            SharesMicro(10 * ONE_SHARE_MICRO),
+            130,
+        );
+        assert!(fills_early.is_empty());
+
+        // Trade-through at t=150 (in [140, 160)) transitions to PendingCancel and fills.
+        let fills_window = broker.on_public_trade_with_side(
+            Outcome::Up,
+            OrderSide::Sell,
+            MicroUsdc(440_000),
+            SharesMicro(10 * ONE_SHARE_MICRO),
+            150,
+        );
+        assert_eq!(fills_window.len(), 1);
+        assert_eq!(
+            broker.get_order(id1).unwrap().status,
+            SimOrderStatus::PendingCancel { cancel_at_ms: 160 }
+        );
+
+        // Order 2: identical window without trade before t=160 cancels cleanly at cancel_at_ms.
+        let id2 = broker
+            .submit_new(NewOrderParams {
+                outcome: Outcome::Up,
+                side: OrderSide::Buy,
+                price,
+                size,
+                now_ms: 200,
+                current_best_bid: Some(price),
+                current_best_ask: Some(MicroUsdc(460_000)),
+                book_depth_at_price: SharesMicro::ZERO,
+            })
+            .unwrap();
+        broker.cancel(id2, 210).unwrap();
+        let fills_at_cancel = broker.on_public_trade_with_side(
+            Outcome::Up,
+            OrderSide::Sell,
+            MicroUsdc(440_000),
+            SharesMicro(10 * ONE_SHARE_MICRO),
+            260,
+        );
+        assert!(fills_at_cancel.is_empty());
+        assert_eq!(
+            broker.get_order(id2).unwrap().status,
+            SimOrderStatus::Cancelled
+        );
     }
 }

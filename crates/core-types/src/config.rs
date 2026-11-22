@@ -6,13 +6,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ConfigError, redact_presence};
 use crate::market::{ExecutionMode, KappaMode, SgMode, VarianceMode, WalletMode};
 use crate::money::{
-    MicroUsdc, ONE_CENT_MICRO, ONE_DOLLAR_MICRO, SIZE_STEP_MICRO, SharesMicro, parse_decimal_micro,
+    MicroUsdc, ONE_CENT_MICRO, ONE_DOLLAR_MICRO, SIZE_STEP_MICRO, SharesMicro, TickPrecision,
+    parse_decimal_micro,
 };
 
 const MAX_GAMMA: f64 = 100.0;
 const MAX_NOTIONAL_PER_LEG_MICRO: u64 = 1_000_000 * ONE_DOLLAR_MICRO;
 const MAX_HYSTERESIS_TICKS: f64 = 10.0;
 const MAX_CLOCK_DRIFT_MS: i64 = 60_000;
+const MAX_MIN_SPREAD_TICKS: u32 =
+    ((ONE_DOLLAR_MICRO / TickPrecision::TenthMill.tick_micro().0) - 1) as u32;
 
 /// Optional live operator credentials wrapped in `SecretString` and excluded from serialization.
 #[derive(Clone, Default)]
@@ -114,6 +117,8 @@ pub struct EngineConfig {
     pub base_order_size_shares: SharesMicro,
     /// Minimum combined spread floor (`$0.02` default, covering `1.25%` max taker drag).
     pub min_combined_spread_micro: MicroUsdc,
+    /// Minimum combined spread floor in integer ticks (`2` default).
+    pub min_spread_ticks: u32,
     /// Maximum combined dual-bid cost (`$0.98` default).
     pub max_combined_bid_micro: MicroUsdc,
     /// Continuous hysteresis deadband buffer (`0.25` ticks default -> `1.25 * tick`).
@@ -126,6 +131,8 @@ pub struct EngineConfig {
     pub sg_mode: SgMode,
     /// Whether Station 4 includes `gamma * V_rem` term (`true` default).
     pub include_variance_spread: bool,
+    /// Whether Station 4 enforces taker-fee profitability floor (`true` default).
+    pub enforce_fee_floor: bool,
     /// Maximum permitted local-to-exchange clock drift in milliseconds (`1000ms` default).
     pub clock_drift_max_ms: i64,
     /// Non-serializable live credentials (excluded from serde/JSONL).
@@ -149,12 +156,14 @@ struct RawEngineConfig {
     max_notional_per_leg_micro: MicroUsdc,
     base_order_size_shares: SharesMicro,
     min_combined_spread_micro: MicroUsdc,
+    min_spread_ticks: u32,
     max_combined_bid_micro: MicroUsdc,
     hysteresis_tick_buffer: f64,
     variance_mode: VarianceMode,
     kappa_mode: KappaMode,
     sg_mode: SgMode,
     include_variance_spread: bool,
+    enforce_fee_floor: bool,
     clock_drift_max_ms: i64,
 }
 
@@ -175,12 +184,14 @@ impl Default for RawEngineConfig {
             max_notional_per_leg_micro: d.max_notional_per_leg_micro,
             base_order_size_shares: d.base_order_size_shares,
             min_combined_spread_micro: d.min_combined_spread_micro,
+            min_spread_ticks: d.min_spread_ticks,
             max_combined_bid_micro: d.max_combined_bid_micro,
             hysteresis_tick_buffer: d.hysteresis_tick_buffer,
             variance_mode: d.variance_mode,
             kappa_mode: d.kappa_mode,
             sg_mode: d.sg_mode,
             include_variance_spread: d.include_variance_spread,
+            enforce_fee_floor: d.enforce_fee_floor,
             clock_drift_max_ms: d.clock_drift_max_ms,
         }
     }
@@ -204,12 +215,14 @@ impl TryFrom<RawEngineConfig> for EngineConfig {
             max_notional_per_leg_micro: raw.max_notional_per_leg_micro,
             base_order_size_shares: raw.base_order_size_shares,
             min_combined_spread_micro: raw.min_combined_spread_micro,
+            min_spread_ticks: raw.min_spread_ticks,
             max_combined_bid_micro: raw.max_combined_bid_micro,
             hysteresis_tick_buffer: raw.hysteresis_tick_buffer,
             variance_mode: raw.variance_mode,
             kappa_mode: raw.kappa_mode,
             sg_mode: raw.sg_mode,
             include_variance_spread: raw.include_variance_spread,
+            enforce_fee_floor: raw.enforce_fee_floor,
             clock_drift_max_ms: raw.clock_drift_max_ms,
             credentials: LiveCredentials::default(),
         };
@@ -237,12 +250,14 @@ impl fmt::Debug for EngineConfig {
             )
             .field("base_order_size_shares", &self.base_order_size_shares)
             .field("min_combined_spread_micro", &self.min_combined_spread_micro)
+            .field("min_spread_ticks", &self.min_spread_ticks)
             .field("max_combined_bid_micro", &self.max_combined_bid_micro)
             .field("hysteresis_tick_buffer", &self.hysteresis_tick_buffer)
             .field("variance_mode", &self.variance_mode)
             .field("kappa_mode", &self.kappa_mode)
             .field("sg_mode", &self.sg_mode)
             .field("include_variance_spread", &self.include_variance_spread)
+            .field("enforce_fee_floor", &self.enforce_fee_floor)
             .field("clock_drift_max_ms", &self.clock_drift_max_ms)
             .field("credentials", &self.credentials)
             .finish()
@@ -265,12 +280,14 @@ impl Default for EngineConfig {
             max_notional_per_leg_micro: MicroUsdc(50_000_000),
             base_order_size_shares: SharesMicro(20_000_000),
             min_combined_spread_micro: MicroUsdc(20_000),
+            min_spread_ticks: 2,
             max_combined_bid_micro: MicroUsdc(980_000),
             hysteresis_tick_buffer: 0.25,
             variance_mode: VarianceMode::BinaryCara,
             kappa_mode: KappaMode::TradeNormalizedDepth,
             sg_mode: SgMode::Causal,
             include_variance_spread: true,
+            enforce_fee_floor: true,
             clock_drift_max_ms: 1_000,
             credentials: LiveCredentials::default(),
         }
@@ -438,6 +455,14 @@ where
     if let Some(v) = non_empty(lookup, "INCLUDE_VARIANCE_SPREAD")? {
         cfg.include_variance_spread = parse_bool("INCLUDE_VARIANCE_SPREAD", &v)?;
     }
+    if let Some(v) = non_empty(lookup, "ENFORCE_FEE_FLOOR")? {
+        cfg.enforce_fee_floor = parse_bool("ENFORCE_FEE_FLOOR", &v)?;
+    }
+    if let Some(v) = non_empty(lookup, "MIN_SPREAD_TICKS")? {
+        cfg.min_spread_ticks = v
+            .parse::<u32>()
+            .map_err(|_| invalid_val("MIN_SPREAD_TICKS", v, "expected positive integer ticks"))?;
+    }
     if let Some(v) = non_empty(lookup, "CLOCK_DRIFT_MAX_MS")? {
         cfg.clock_drift_max_ms = v
             .parse::<i64>()
@@ -556,6 +581,12 @@ fn validate_risk_limits(cfg: &EngineConfig) -> Result<(), ConfigError> {
 }
 
 fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
+    if cfg.min_spread_ticks == 0 || cfg.min_spread_ticks > MAX_MIN_SPREAD_TICKS {
+        return Err(invariant(format!(
+            "MIN_SPREAD_TICKS ({}) must be in 1..={MAX_MIN_SPREAD_TICKS}",
+            cfg.min_spread_ticks
+        )));
+    }
     if cfg.min_combined_spread_micro.0 < ONE_CENT_MICRO
         || cfg.min_combined_spread_micro.0 >= ONE_DOLLAR_MICRO
     {

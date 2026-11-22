@@ -75,6 +75,8 @@ pub(crate) struct LifecycleArgs {
     pub(crate) fault: CliFaultMode,
     pub(crate) v_max: u64,
     pub(crate) base_size: u64,
+    pub(crate) queue_decay: paper_sim::QueueDecayPolicy,
+    pub(crate) math: crate::MathOverrides,
     pub(crate) pinning: CorePinning,
     pub(crate) jsonl: PathBuf,
 }
@@ -298,6 +300,17 @@ fn risk_actor_loop(
 }
 
 pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
+    let mut check_cfg = EngineConfig::from_env()?;
+    args.math.apply_to(&mut check_cfg)?;
+
+    if args.source == LifecycleSourceMode::SimEpoch && args.math.is_any_set() {
+        return Err(
+            "math override flags (--gamma, --max-combined-bid-micro, --include-variance-spread, \
+             --min-spread-ticks, --fee-spread-floor) apply only to `--source live`; \
+             sim-epoch uses synthetic quote proposals"
+                .into(),
+        );
+    }
     if args.source == LifecycleSourceMode::SimEpoch && args.pinning.is_active() {
         return Err(
             "--pin-pricing-core/--pin-risk-core apply to the live actor topology; \
@@ -1099,8 +1112,13 @@ impl LivePaperSimulator {
                     if let Some(active) = self.broker.active_order(outcome, OrderSide::Buy) {
                         let active_price = active.price;
                         let depth = fixed_book_depth_at(&valid_book, active_price);
-                        self.broker
-                            .on_book_update(outcome, active_price, depth, now_ms);
+                        self.broker.on_book_update(
+                            outcome,
+                            OrderSide::Buy,
+                            active_price,
+                            depth,
+                            now_ms,
+                        );
                     }
                 }
             }
@@ -1136,7 +1154,8 @@ impl LivePaperSimulator {
                     }
                 }
                 if side == OrderSide::Buy {
-                    self.broker.on_book_update(outcome, price, size, now_ms);
+                    self.broker
+                        .on_book_update(outcome, side, price, size, now_ms);
                 }
             }
             PolyMarketEvent::LastTrade {
@@ -1418,7 +1437,9 @@ impl LivePaperSimulator {
             if let Some(order) = self.broker.orders().get(&sim_id)
                 && matches!(
                     order.status,
-                    SimOrderStatus::PendingCancel { .. } | SimOrderStatus::Cancelled
+                    SimOrderStatus::PendingCancel { .. }
+                        | SimOrderStatus::PendingPlaceThenCancel { .. }
+                        | SimOrderStatus::Cancelled
                 )
             {
                 return false;
@@ -1751,16 +1772,22 @@ impl LivePaperSimulator {
         }
         let tick_prec =
             TickPrecision::from_micro(self.desc.tick_size_micro).unwrap_or(TickPrecision::Cent);
+        let best_ask_up = snap_up.best_ask().map(|l| l.price);
+        let best_ask_dn = snap_dn.best_ask().map(|l| l.price);
+        let naive_up_px =
+            paper_sim::NaiveBaselineEngine::target_bid_price(mid_up, best_ask_up, tick_prec);
+        let naive_dn_px =
+            paper_sim::NaiveBaselineEngine::target_bid_price(mid_dn, best_ask_dn, tick_prec);
         self.telemetry.naive_engine.update_quotes(NaiveQuotesInput {
             mid_up,
             mid_dn,
             best_bid_up: snap_up.best_bid().map(|l| l.price),
-            best_ask_up: snap_up.best_ask().map(|l| l.price),
+            best_ask_up,
             best_bid_dn: snap_dn.best_bid().map(|l| l.price),
-            best_ask_dn: snap_dn.best_ask().map(|l| l.price),
+            best_ask_dn,
             tick: tick_prec,
-            depth_up: fixed_book_depth_at(&snap_up, mid_up.unwrap_or(MicroUsdc(500_000))),
-            depth_dn: fixed_book_depth_at(&snap_dn, mid_dn.unwrap_or(MicroUsdc(500_000))),
+            depth_up: naive_up_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(&snap_up, px)),
+            depth_dn: naive_dn_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(&snap_dn, px)),
             now_ms,
         });
 
@@ -2137,7 +2164,8 @@ fn build_risk_actor(
 }
 
 async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(), Box<dyn Error>> {
-    let cfg = EngineConfig::from_env()?;
+    let mut cfg = EngineConfig::from_env()?;
+    args.math.apply_to(&mut cfg)?;
     feeds::install_tls_provider();
     let mut jsonl = JsonlWriter::create(&args.jsonl)?;
     let mut pricing_lat = LatencyTracker::new()?;
@@ -2188,9 +2216,13 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
     let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg)?;
     let math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
 
+    let broker_cfg = FifoBrokerConfig {
+        queue_decay_policy: args.queue_decay,
+        ..FifoBrokerConfig::default()
+    };
     let mut sim = LivePaperSimulator::new(
         desc,
-        FifoBrokerConfig::default(),
+        broker_cfg,
         v_max_micro,
         args.base_size,
         harness.clone(),
@@ -3369,5 +3401,29 @@ mod tests {
         assert!(jsonl_cancel_count >= 4);
         assert!(jsonl_cancel_all_events >= 1);
         assert!(saw_mandatory_flatten_telemetry);
+    }
+
+    #[test]
+    fn sim_epoch_rejects_math_override_flags_explicitly() {
+        let err = run(LifecycleArgs {
+            source: LifecycleSourceMode::SimEpoch,
+            duration: "10s".to_string(),
+            fast_forward: true,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides {
+                gamma: Some(0.02),
+                ..Default::default()
+            },
+            pinning: CorePinning::default(),
+            jsonl: temp_jsonl_path("sim_epoch_rejects_math"),
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("sim-epoch"),
+            "expected sim-epoch error message, got: {err}"
+        );
     }
 }

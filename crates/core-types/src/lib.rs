@@ -584,4 +584,35 @@ mod tests {
         assert_eq!(parsed["payload"]["zero_ns_samples"], 1);
         let _ = std::fs::remove_file(&path);
     }
+
+    #[test]
+    fn config_rejects_out_of_range_min_spread_ticks() {
+        let mut zero_map = HashMap::new();
+        zero_map.insert("MIN_SPREAD_TICKS", "0");
+        let zero_err = EngineConfig::from_lookup(lookup_map(&zero_map)).unwrap_err();
+        assert!(zero_err.to_string().contains("MIN_SPREAD_TICKS"));
+
+        let mut huge_map = HashMap::new();
+        huge_map.insert("MIN_SPREAD_TICKS", "10000");
+        let huge_err = EngineConfig::from_lookup(lookup_map(&huge_map)).unwrap_err();
+        assert!(huge_err.to_string().contains("MIN_SPREAD_TICKS"));
+
+        let mut min_valid = HashMap::new();
+        min_valid.insert("MIN_SPREAD_TICKS", "1");
+        assert_eq!(
+            EngineConfig::from_lookup(lookup_map(&min_valid))
+                .unwrap()
+                .min_spread_ticks,
+            1
+        );
+
+        let mut max_valid = HashMap::new();
+        max_valid.insert("MIN_SPREAD_TICKS", "9999");
+        assert_eq!(
+            EngineConfig::from_lookup(lookup_map(&max_valid))
+                .unwrap()
+                .min_spread_ticks,
+            9_999
+        );
+    }
 }
