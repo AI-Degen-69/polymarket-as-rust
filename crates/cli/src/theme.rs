@@ -343,49 +343,42 @@ impl Theme {
         }
     }
 
-    /// Formats a price compactly: `.51` for sub-dollar cents, `.515` for sub-cents, `$1.00` for `>= $1`, `--` for `None`.
-    pub(crate) fn fmt_price_compact(px: Option<MicroUsdc>) -> String {
+    /// Formats a price in cents (`21¢`, `55.5¢`, `55.25¢`, rounded to `0.01¢`) or `--` for `None`.
+    pub(crate) fn fmt_cents(px: Option<MicroUsdc>) -> String {
         let Some(MicroUsdc(m)) = px else {
             return "--".to_string();
         };
-        if m < 1_000_000 {
-            if m.is_multiple_of(10_000) {
-                format!(".{:02}", m / 10_000)
-            } else if m.is_multiple_of(1_000) {
-                format!(".{:03}", m / 1_000)
-            } else {
-                format!(".{:06}", m)
-            }
-        } else if m.is_multiple_of(10_000) {
-            format!("${}.{:02}", m / 1_000_000, (m % 1_000_000) / 10_000)
+        let hundredths = m.saturating_add(50) / 100;
+        let cents = hundredths / 100;
+        let rem = hundredths % 100;
+        if rem == 0 {
+            format!("{cents}¢")
+        } else if rem.is_multiple_of(10) {
+            format!("{cents}.{}¢", rem / 10)
         } else {
-            format!("${}.{:06}", m / 1_000_000, m % 1_000_000)
+            format!("{cents}.{rem:02}¢")
         }
     }
 
-    /// Formats best bid / ask pair cleanly (`.51/.52` or `--/--`).
+    /// Formats best bid / ask pair cleanly (`21¢/22¢`, `--/1¢`, or `--/--`).
     pub(crate) fn fmt_bbo(bid: Option<MicroUsdc>, ask: Option<MicroUsdc>) -> String {
-        format!(
-            "{}/{}",
-            Self::fmt_price_compact(bid),
-            Self::fmt_price_compact(ask)
-        )
+        format!("{}/{}", Self::fmt_cents(bid), Self::fmt_cents(ask))
     }
 
-    /// Formats resting UP/DN quotes and combined pair cost (`.50/.47 (.97)`).
+    /// Formats resting UP/DN quotes and combined pair cost (`21¢/74¢ (95¢)`).
     pub(crate) fn fmt_pair_quotes(up: Option<MicroUsdc>, dn: Option<MicroUsdc>) -> String {
         match (up, dn) {
             (Some(u), Some(d)) => {
                 let sum = MicroUsdc(u.0.saturating_add(d.0));
                 format!(
                     "{}/{} ({})",
-                    Self::fmt_price_compact(Some(u)),
-                    Self::fmt_price_compact(Some(d)),
-                    Self::fmt_price_compact(Some(sum)),
+                    Self::fmt_cents(Some(u)),
+                    Self::fmt_cents(Some(d)),
+                    Self::fmt_cents(Some(sum)),
                 )
             }
-            (Some(u), None) => format!("{}/--", Self::fmt_price_compact(Some(u))),
-            (None, Some(d)) => format!("--/{}", Self::fmt_price_compact(Some(d))),
+            (Some(u), None) => format!("{}/--", Self::fmt_cents(Some(u))),
+            (None, Some(d)) => format!("--/{}", Self::fmt_cents(Some(d))),
             (None, None) => "--/--".to_string(),
         }
     }
@@ -459,6 +452,40 @@ fn latency_us_raw(ns: u64) -> String {
         digits.pop();
     }
     format!("{whole}.{digits}us")
+}
+
+/// Strips ANSI CSI/SGR escape sequences (`\x1b[...<final>`) while preserving Unicode scalars.
+pub(crate) fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for seq_ch in chars.by_ref() {
+                if ('@'..='~').contains(&seq_ch) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Counts visible Unicode scalar positions after stripping ANSI escape sequences.
+pub(crate) fn visible_width(s: &str) -> usize {
+    strip_ansi(s).chars().count()
+}
+
+/// Pads `s` on the right with spaces so its visible width reaches at least `width`.
+pub(crate) fn pad_visible_right(s: &str, width: usize) -> String {
+    let pad = width.saturating_sub(visible_width(s));
+    if pad == 0 {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(pad))
+    }
 }
 
 /// Returns `true` if `NO_COLOR` is set to a non-empty value.
@@ -598,27 +625,36 @@ mod tests {
 
     #[test]
     fn compact_price_bbo_pair_and_spot_formatters() {
-        assert_eq!(Theme::fmt_price_compact(None), "--");
-        assert_eq!(Theme::fmt_price_compact(Some(MicroUsdc(510_000))), ".51");
-        assert_eq!(Theme::fmt_price_compact(Some(MicroUsdc(50_000))), ".05");
-        assert_eq!(Theme::fmt_price_compact(Some(MicroUsdc(515_000))), ".515");
-        assert_eq!(
-            Theme::fmt_price_compact(Some(MicroUsdc(1_000_000))),
-            "$1.00"
-        );
+        assert_eq!(Theme::fmt_cents(None), "--");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(210_000))), "21¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(10_000))), "1¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(500_000))), "50¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(950_000))), "95¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(555_000))), "55.5¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(552_500))), "55.25¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(473_318))), "47.33¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(466_682))), "46.67¢");
+        assert_eq!(Theme::fmt_cents(Some(MicroUsdc(1_000_000))), "100¢");
 
         assert_eq!(
-            Theme::fmt_bbo(Some(MicroUsdc(510_000)), Some(MicroUsdc(520_000))),
-            ".51/.52"
+            Theme::fmt_bbo(Some(MicroUsdc(210_000)), Some(MicroUsdc(220_000))),
+            "21¢/22¢"
         );
-        assert_eq!(Theme::fmt_bbo(None, Some(MicroUsdc(520_000))), "--/.52");
+        assert_eq!(Theme::fmt_bbo(None, Some(MicroUsdc(10_000))), "--/1¢");
+        assert_eq!(Theme::fmt_bbo(Some(MicroUsdc(990_000)), None), "99¢/--");
+        assert_eq!(Theme::fmt_bbo(None, None), "--/--");
+
         assert_eq!(
-            Theme::fmt_pair_quotes(Some(MicroUsdc(500_000)), Some(MicroUsdc(470_000))),
-            ".50/.47 (.97)"
+            Theme::fmt_pair_quotes(Some(MicroUsdc(210_000)), Some(MicroUsdc(740_000))),
+            "21¢/74¢ (95¢)"
+        );
+        assert_eq!(
+            Theme::fmt_pair_quotes(None, Some(MicroUsdc(780_000))),
+            "--/78¢"
         );
         assert_eq!(
             Theme::fmt_pair_quotes(Some(MicroUsdc(500_000)), None),
-            ".50/--"
+            "50¢/--"
         );
         assert_eq!(Theme::fmt_pair_quotes(None, None), "--/--");
 
@@ -632,6 +668,31 @@ mod tests {
             "-$14 (-2bp)"
         );
         assert_eq!(plain.fmt_spot_vs_strike(None, Some(90_000.0)), "n/a");
+    }
+
+    #[test]
+    fn ansi_strip_visible_width_and_padding_handle_unicode_and_sgr() {
+        let plain = "Book UP 21¢/22¢ DN 78¢/79¢";
+        assert_eq!(strip_ansi(plain), plain);
+        assert_eq!(visible_width(plain), 26);
+        assert_eq!(pad_visible_right(plain, 28).chars().count(), 28);
+        assert_eq!(pad_visible_right(plain, 20), plain);
+
+        let styled = Theme::styled();
+        let btc = format!("BTC {}", styled.red("-$29 (-5bp)"));
+        assert_eq!(strip_ansi(&btc), "BTC -$29 (-5bp)");
+        assert_eq!(visible_width(&btc), 15);
+        let padded = pad_visible_right(&btc, 19);
+        assert_eq!(visible_width(&padded), 19);
+        assert_eq!(strip_ansi(&padded), "BTC -$29 (-5bp)    ");
+
+        let inv = "Inv 0U/1.5D (Δ-1.5)";
+        assert_eq!(visible_width(inv), 19);
+        assert_eq!(visible_width(&pad_visible_right(inv, 25)), 25);
+
+        let hb = styled.badge(Badge::Heartbeat);
+        assert_eq!(strip_ansi(&hb), "♥ [HB]");
+        assert_eq!(visible_width(&hb), 6);
     }
 
     #[test]
