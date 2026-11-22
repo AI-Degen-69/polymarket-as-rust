@@ -17,6 +17,38 @@ pub(crate) const TOTAL_BUDGET_US: u64 = 100;
 pub(crate) const HEARTBEAT_NORMAL_MS: u64 = 5_000;
 pub(crate) const HEARTBEAT_FAST_MS: u64 = 1_000;
 
+/// Fixed column widths for stream rows: event badge, phase badge, tier badge.
+const EVENT_BADGE_WIDTH: usize = 10;
+const PHASE_BADGE_WIDTH: usize = 10;
+const TIER_BADGE_WIDTH: usize = 4;
+/// Fixed value width keeps `Pricing` / `Risk` / `Total` labels aligned across latency rows.
+const LATENCY_VALUE_WIDTH: usize = 10;
+
+/// Builds the canonical prefix shared by every stream row: `HH:MM:SSZ T-NNNs [EVENT] [PHASE] [TIER] `.
+/// Missing badges leave their column blank so positions never shift.
+fn row_prefix(
+    t: Theme,
+    utc: &str,
+    tau_secs: u64,
+    event: Option<Badge>,
+    phase: Option<EpochPhase>,
+    tier: Option<RiskTier>,
+) -> String {
+    let event = event.map_or_else(
+        || " ".repeat(EVENT_BADGE_WIDTH),
+        |kind| {
+            let pad = EVENT_BADGE_WIDTH.saturating_sub(kind.label().chars().count());
+            format!("{}{}", t.badge(kind), " ".repeat(pad))
+        },
+    );
+    let phase = phase.map_or_else(
+        || " ".repeat(PHASE_BADGE_WIDTH),
+        |phase| t.phase_badge(phase),
+    );
+    let tier = tier.map_or_else(|| " ".repeat(TIER_BADGE_WIDTH), |tier| t.tier_badge(tier));
+    format!("{} T-{:03}s {event}{phase} {tier} ", t.muted(utc), tau_secs)
+}
+
 /// Terminal output mode for `poly-as lifecycle`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LifecycleDisplayMode {
@@ -512,11 +544,15 @@ impl LifecycleStreamReporter {
                         None => format!("{reason:?}"),
                     };
                     lines.push(format!(
-                        "{} T-{:03}s {} {} | quoting suppressed: {}",
-                        t.muted(&utc),
-                        row.tau_secs,
-                        t.badge(Badge::Suppr),
-                        t.phase_badge(row.phase),
+                        "{}| quoting suppressed: {}",
+                        row_prefix(
+                            t,
+                            &utc,
+                            row.tau_secs,
+                            Some(Badge::Suppr),
+                            Some(row.phase),
+                            None
+                        ),
                         t.yellow(&detail),
                     ));
                     self.last_suppression = Some(reason);
@@ -525,11 +561,15 @@ impl LifecycleStreamReporter {
             QuoteOutput::Active { .. } => {
                 if let Some(prev) = self.last_suppression.take() {
                     lines.push(format!(
-                        "{} T-{:03}s {} {} | quoting resumed (cleared {prev:?})",
-                        t.muted(&utc),
-                        row.tau_secs,
-                        t.badge(Badge::Resume),
-                        t.phase_badge(row.phase),
+                        "{}| quoting resumed (cleared {prev:?})",
+                        row_prefix(
+                            t,
+                            &utc,
+                            row.tau_secs,
+                            Some(Badge::Resume),
+                            Some(row.phase),
+                            None
+                        ),
                     ));
                 }
             }
@@ -550,12 +590,15 @@ impl LifecycleStreamReporter {
 
         if let Some(prev) = cleared_cancel_all {
             lines.push(format!(
-                "{} T-{:03}s {} {} {} | cancel-all cleared (was {})",
-                t.muted(&utc),
-                row.tau_secs,
-                t.badge(Badge::Resume),
-                t.phase_badge(row.phase),
-                t.tier_badge(row.tier),
+                "{}| cancel-all cleared (was {})",
+                row_prefix(
+                    t,
+                    &utc,
+                    row.tau_secs,
+                    Some(Badge::Resume),
+                    Some(row.phase),
+                    Some(row.tier)
+                ),
                 t.muted(&prev),
             ));
         }
@@ -564,12 +607,15 @@ impl LifecycleStreamReporter {
             let up_str = format_action_styled(t, row.action_up);
             let dn_str = format_action_styled(t, row.action_dn);
             let mut action_line = format!(
-                "{} T-{:03}s {} {} {} UP {} | DN {}",
-                t.muted(&utc),
-                row.tau_secs,
-                t.badge(Badge::Order),
-                t.phase_badge(row.phase),
-                t.tier_badge(row.tier),
+                "{}UP {} | DN {}",
+                row_prefix(
+                    t,
+                    &utc,
+                    row.tau_secs,
+                    Some(Badge::Order),
+                    Some(row.phase),
+                    Some(row.tier)
+                ),
                 up_str,
                 dn_str,
             );
@@ -585,23 +631,21 @@ impl LifecycleStreamReporter {
             lines.push(action_line);
         }
 
-        // 3. Latency breaches (compare raw nanoseconds; detail aligns with action rows)
+        // 3. Latency breaches (compare raw nanoseconds; fixed-width values align the labels)
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
         if row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000)
             || row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000)
             || total_ns > TOTAL_BUDGET_US.saturating_mul(1_000)
         {
-            // `[LATENCY]` is 9 visible chars, `[ORDER]` is 7; 15 spaces put the detail
-            // at the same column as the action rows' `UP`/`DN` text.
+            let ideal = t.muted(&format!(
+                "(Ideal: Total < {TOTAL_BUDGET_US}us | Pricing < {PRICING_BUDGET_US}us AND Risk < {RISK_BUDGET_US}us)"
+            ));
             lines.push(format!(
-                "{} T-{:03}s {}{} {} Pricing + {} Risk = {} Total | (Ideal: Total < {TOTAL_BUDGET_US}us | Pricing < {PRICING_BUDGET_US}us AND Risk < {RISK_BUDGET_US}us)",
-                t.muted(&utc),
-                row.tau_secs,
-                t.badge(Badge::Latency),
-                " ".repeat(15),
-                t.fmt_latency_us(row.pricing_ns, PRICING_BUDGET_US),
-                t.fmt_latency_us(row.risk_ns, RISK_BUDGET_US),
-                t.fmt_latency_us(total_ns, TOTAL_BUDGET_US),
+                "{}{} Pricing + {} Risk = {} Total | {ideal}",
+                row_prefix(t, &utc, row.tau_secs, Some(Badge::Latency), None, None),
+                t.fmt_latency_us_width(row.pricing_ns, PRICING_BUDGET_US, LATENCY_VALUE_WIDTH),
+                t.fmt_latency_us_width(row.risk_ns, RISK_BUDGET_US, LATENCY_VALUE_WIDTH),
+                t.fmt_latency_us_width(total_ns, TOTAL_BUDGET_US, LATENCY_VALUE_WIDTH),
             ));
         }
 
@@ -638,11 +682,15 @@ impl LifecycleStreamReporter {
         let sep = t.muted("|");
 
         format!(
-            "{} T-{:03}s {} {} {:>5.1}% {sep} BTC {} {sep} UP {} DN {} {sep} Q {} {sep} {} {sep} {}",
-            t.muted(utc),
-            row.tau_secs,
-            t.phase_badge(row.phase),
-            t.tier_badge(row.tier),
+            "{}{:>5.1}% {sep} BTC {} {sep} UP {} DN {} {sep} Q {} {sep} {} {sep} {}",
+            row_prefix(
+                t,
+                utc,
+                row.tau_secs,
+                Some(Badge::Heartbeat),
+                Some(row.phase),
+                Some(row.tier)
+            ),
             u_pct,
             btc,
             up_bbo,
@@ -715,16 +763,22 @@ pub(crate) fn print_breaker_trip(status: BreakerStatus) {
     );
 }
 
-pub(crate) fn print_lifecycle_fill(market_slug: &str, fill: &SimFill) {
+pub(crate) fn print_lifecycle_fill(
+    now_ms: u64,
+    tau_secs: u64,
+    phase: Option<EpochPhase>,
+    tier: RiskTier,
+    fill: &SimFill,
+) {
     let t = theme::current();
+    let utc = format_utc_hms(now_ms);
     let leg = match fill.outcome {
         Outcome::Up => t.bold_green("UP"),
         Outcome::Down => t.bold_cyan("DN"),
     };
     println!(
-        "  {} {} | #{} {} {} {} @ {} (maker={})",
-        t.badge(Badge::Fill),
-        t.muted(market_slug),
+        "{}#{} {} {} {} @ {} (maker={})",
+        row_prefix(t, &utc, tau_secs, Some(Badge::Fill), phase, Some(tier)),
         fill.sim_id,
         leg,
         fill.side.as_str(),
@@ -735,15 +789,18 @@ pub(crate) fn print_lifecycle_fill(market_slug: &str, fill: &SimFill) {
 }
 
 pub(crate) fn print_lifecycle_merge(
-    market_slug: &str,
+    now_ms: u64,
+    tau_secs: u64,
+    phase: Option<EpochPhase>,
+    tier: RiskTier,
     merge: &MergeEvent,
     total_merged: SharesMicro,
 ) {
     let t = theme::current();
+    let utc = format_utc_hms(now_ms);
     println!(
-        "  {} {} | {} pairs | pair_cost={} (UP={}, DN={}) -> PnL={} (total={})",
-        t.badge(Badge::Merge),
-        t.muted(market_slug),
+        "{}pairs: {} | pair_cost={} (UP={}, DN={}) -> PnL={} (total={})",
+        row_prefix(t, &utc, tau_secs, Some(Badge::Merge), phase, Some(tier)),
         merge.merged_pairs,
         Theme::fmt_price_compact(Some(merge.pair_cost)),
         Theme::fmt_price_compact(Some(merge.avg_cost_up)),
@@ -1289,6 +1346,41 @@ mod tests {
     }
 
     #[test]
+    fn stream_rows_share_canonical_badge_columns() {
+        let t = Theme::plain();
+        let order = row_prefix(
+            t,
+            "00:00:00Z",
+            300,
+            Some(Badge::Order),
+            Some(EpochPhase::ActiveQuoting),
+            Some(RiskTier::Tier1Normal),
+        );
+        let latency = row_prefix(t, "00:00:00Z", 300, Some(Badge::Latency), None, None);
+        let heartbeat = row_prefix(
+            t,
+            "00:00:00Z",
+            300,
+            Some(Badge::Heartbeat),
+            Some(EpochPhase::ActiveQuoting),
+            Some(RiskTier::Tier1Normal),
+        );
+        assert_eq!(order.chars().count(), latency.chars().count());
+        assert_eq!(order.chars().count(), heartbeat.chars().count());
+        // Compare character columns, not byte offsets: `♥` is multi-byte.
+        let quote_col = order.find("[QUOTE]").map(|i| order[..i].chars().count());
+        let hb_quote_col = heartbeat
+            .find("[QUOTE]")
+            .map(|i| heartbeat[..i].chars().count());
+        assert_eq!(hb_quote_col, quote_col);
+        let tier_col = order.find("[T1]").map(|i| order[..i].chars().count());
+        let hb_tier_col = heartbeat
+            .find("[T1]")
+            .map(|i| heartbeat[..i].chars().count());
+        assert_eq!(hb_tier_col, tier_col);
+    }
+
+    #[test]
     fn stream_mode_suppresses_10hz_hold_noise_and_respects_5s_and_1s_heartbeats() {
         let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
         let hold = OrderAction::Hold;
@@ -1298,12 +1390,13 @@ mod tests {
         let l0 = rep.format_step(&sample_row(base_ms, 300, &hold, &hold));
         assert_eq!(l0.len(), 1);
         assert!(l0[0].contains("[QUOTE]"));
+        assert!(l0[0].contains("♥ [HB]"));
         assert!(l0[0].contains("+$14 (+2bp)"));
         assert!(l0[0].contains("UP .51/.52 DN .48/.49"));
         assert!(l0[0].contains("Q .50/.47 (.97)"));
         assert!(l0[0].contains("20/0/+20"));
         assert!(l0[0].contains("+$0.20"));
-        assert!(l0[0].chars().count() <= 120);
+        assert!(l0[0].chars().count() <= 135);
 
         // 100ms..4900ms idle Hold ticks emit nothing.
         for offset in (100..5_000).step_by(100) {
@@ -1391,7 +1484,8 @@ mod tests {
         let lat_lines = rep.format_step(&lat_row);
         assert_eq!(lat_lines.len(), 1);
         assert!(lat_lines[0].contains("[LATENCY]"));
-        assert!(lat_lines[0].contains("31us Pricing"));
+        assert!(lat_lines[0].contains("31us"));
+        assert!(lat_lines[0].contains("Pricing"));
     }
 
     #[test]
@@ -1486,7 +1580,8 @@ mod tests {
         let p_lines = rep.format_step(&pricing_over);
         assert_eq!(p_lines.len(), 1);
         assert!(p_lines[0].contains("[LATENCY]"));
-        assert!(p_lines[0].contains("25.001us Pricing"));
+        assert!(p_lines[0].contains("25.001us"));
+        assert!(p_lines[0].contains("Pricing"));
 
         // Risk +1ns over budget (10_001ns) triggers [LATENCY] event.
         let mut risk_over = sample_row(base_ms + 300, 300, &hold, &hold);
@@ -1495,6 +1590,7 @@ mod tests {
         let r_lines = rep.format_step(&risk_over);
         assert_eq!(r_lines.len(), 1);
         assert!(r_lines[0].contains("[LATENCY]"));
-        assert!(r_lines[0].contains("10.001us Risk"));
+        assert!(r_lines[0].contains("10.001us"));
+        assert!(r_lines[0].contains("Risk"));
     }
 }

@@ -1312,7 +1312,14 @@ impl LivePaperSimulator {
         jsonl: &mut JsonlWriter,
     ) -> Result<(), Box<dyn Error>> {
         self.stats.fills_count = self.stats.fills_count.saturating_add(1);
-        print_lifecycle_fill(&self.desc.slug, fill);
+        let tau_secs = self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
+        print_lifecycle_fill(
+            now_ms,
+            tau_secs,
+            self.current_phase,
+            self.current_tier,
+            fill,
+        );
         record_lifecycle_fill_jsonl(jsonl, now_ms, now_ns, &self.desc.slug, fill)?;
 
         let inv_before = self.ledger.net_inventory();
@@ -1359,7 +1366,14 @@ impl LivePaperSimulator {
         self.cumulative_merged_cost_micro = self
             .cumulative_merged_cost_micro
             .saturating_add(merged_cost);
-        print_lifecycle_merge(&self.desc.slug, merge, self.ledger.total_pairs_merged);
+        print_lifecycle_merge(
+            now_ms,
+            self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000,
+            self.current_phase,
+            self.current_tier,
+            merge,
+            self.ledger.total_pairs_merged,
+        );
         record_lifecycle_merge_jsonl(
             jsonl,
             now_ms,

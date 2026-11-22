@@ -47,6 +47,35 @@ pub(crate) enum Badge {
     Phase,
     Tier,
     Info,
+    Heartbeat,
+}
+
+impl Badge {
+    /// Visible badge text, used to pad columns without counting ANSI escape codes.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Fill => "[FILL]",
+            Self::Merge => "[MERGE]",
+            Self::Flatten => "[FLATTEN]",
+            Self::Breaker => "[BREAKER]",
+            Self::Wait => "[WAIT]",
+            Self::Ready => "[READY]",
+            Self::Pass => "[PASS]",
+            Self::Warn => "[WARN]",
+            Self::Fail => "[FAIL]",
+            Self::Order => "[ORDER]",
+            Self::Trade => "[TRADE]",
+            Self::Suppr => "[SUPPR]",
+            Self::Resume => "[RESUME]",
+            Self::Latency => "[LATENCY]",
+            Self::Epoch => "[EPOCH]",
+            Self::Signal => "[SIGNAL]",
+            Self::Phase => "[PHASE]",
+            Self::Tier => "[TIER]",
+            Self::Info => "[INFO]",
+            Self::Heartbeat => "♥ [HB]",
+        }
+    }
 }
 
 /// Resolved terminal styling capabilities.
@@ -280,6 +309,7 @@ impl Theme {
             Badge::Phase => self.bold_cyan("[PHASE]"),
             Badge::Tier => self.bold_yellow("[TIER]"),
             Badge::Info => self.cyan("[INFO]"),
+            Badge::Heartbeat => self.bold_red("♥ [HB]"),
         }
     }
 
@@ -384,24 +414,21 @@ impl Theme {
     }
 
     /// Formats a nanosecond latency measurement in microseconds and highlights budget breaches.
-    /// Keeps sub-microsecond precision so a breach never displays as an exact budget value.
     pub(crate) fn fmt_latency_us(self, ns: u64, budget_us: u64) -> String {
-        let whole = ns / 1_000;
-        let frac = ns % 1_000;
-        let raw = if frac == 0 {
-            format!("{whole}us")
-        } else {
-            let mut digits = format!("{frac:03}");
-            while digits.ends_with('0') {
-                digits.pop();
-            }
-            format!("{whole}.{digits}us")
-        };
-        if ns > budget_us.saturating_mul(1_000) {
+        self.fmt_latency_us_width(ns, budget_us, 0)
+    }
+
+    /// Pads a latency measurement to a fixed-width cell, outside the ANSI style. Left-aligned,
+    /// so the detail starts on the same column as other rows.
+    pub(crate) fn fmt_latency_us_width(self, ns: u64, budget_us: u64, width: usize) -> String {
+        let raw = latency_us_raw(ns);
+        let styled = if ns > budget_us.saturating_mul(1_000) {
             self.bold_red(&raw)
         } else {
             self.green(&raw)
-        }
+        };
+        let pad = " ".repeat(width.saturating_sub(raw.chars().count()));
+        format!("{styled}{pad}")
     }
 
     /// Formats a pass/fail boolean status badge.
@@ -412,6 +439,20 @@ impl Theme {
             self.badge(Badge::Fail)
         }
     }
+}
+
+/// Formats nanoseconds as microseconds, keeping fractional detail so a breach cannot hide.
+fn latency_us_raw(ns: u64) -> String {
+    let whole = ns / 1_000;
+    let frac = ns % 1_000;
+    if frac == 0 {
+        return format!("{whole}us");
+    }
+    let mut digits = format!("{frac:03}");
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    format!("{whole}.{digits}us")
 }
 
 /// Returns `true` if `NO_COLOR` is set to a non-empty value.
