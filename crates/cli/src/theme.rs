@@ -454,6 +454,15 @@ mod tests {
         assert!(banner.starts_with("+-"));
         assert!(banner.contains("POLY-AS LIFECYCLE"));
         assert!(banner.contains("| Mode: SimEpoch"));
+        let widths: Vec<usize> = banner.lines().map(|l| l.chars().count()).collect();
+        assert_eq!(widths.len(), 3);
+        assert_eq!(widths[0], widths[1]);
+        assert_eq!(widths[1], widths[2]);
+
+        let no_sub = t.banner("SHORT", None);
+        let no_sub_widths: Vec<usize> = no_sub.lines().map(|l| l.chars().count()).collect();
+        assert_eq!(no_sub_widths.len(), 2);
+        assert_eq!(no_sub_widths[0], no_sub_widths[1]);
 
         let sec = t.section("EPOCH 1");
         assert!(!sec.contains('\x1b'));

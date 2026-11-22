@@ -906,7 +906,7 @@ pub(crate) fn print_lifecycle_summary(
         t.kv(
             "Pricing Pipeline:",
             &format!(
-                "{} / {} / {} / {} (Target P99 < {PRICING_BUDGET_US}us)",
+                "{}us / {}us / {} / {}us (Target P99 < {PRICING_BUDGET_US}us)",
                 pricing_lat.p50_ns / 1_000,
                 pricing_lat.p95_ns / 1_000,
                 t.fmt_latency_us(pricing_lat.p99_ns, PRICING_BUDGET_US),
@@ -919,7 +919,7 @@ pub(crate) fn print_lifecycle_summary(
         t.kv(
             "Risk & Hysteresis:",
             &format!(
-                "{} / {} / {} / {} (Target P99 < {RISK_BUDGET_US}us)",
+                "{}us / {}us / {} / {}us (Target P99 < {RISK_BUDGET_US}us)",
                 risk_lat.p50_ns / 1_000,
                 risk_lat.p95_ns / 1_000,
                 t.fmt_latency_us(risk_lat.p99_ns, RISK_BUDGET_US),
@@ -932,7 +932,7 @@ pub(crate) fn print_lifecycle_summary(
         t.kv(
             "Total Internal Path:",
             &format!(
-                "{} / {} / {} / {} (Target P99 < {TOTAL_BUDGET_US}us)",
+                "{}us / {}us / {} / {}us (Target P99 < {TOTAL_BUDGET_US}us)",
                 total_lat.p50_ns / 1_000,
                 total_lat.p95_ns / 1_000,
                 t.fmt_latency_us(total_lat.p99_ns, TOTAL_BUDGET_US),
