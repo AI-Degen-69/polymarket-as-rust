@@ -17,6 +17,7 @@ pub(crate) struct PaperReportStats {
     pub(crate) merges_count: u64,
     pub(crate) total_pairs_merged: SharesMicro,
     pub(crate) total_compute_ns_sum: u64,
+    pub(crate) epoch_rollovers: u64,
 }
 
 impl Default for PaperReportStats {
@@ -29,6 +30,7 @@ impl Default for PaperReportStats {
             merges_count: 0,
             total_pairs_merged: SharesMicro::ZERO,
             total_compute_ns_sum: 0,
+            epoch_rollovers: 0,
         }
     }
 }
@@ -74,6 +76,7 @@ struct PaperSummaryJsonl<'a> {
     source: &'a str,
     market_slug: &'a str,
     total_ticks: usize,
+    epoch_rollovers: u64,
     q_up_micro: u64,
     q_dn_micro: u64,
     net_q_micro: i64,
@@ -342,6 +345,7 @@ pub(crate) fn record_summary_jsonl(
         source,
         market_slug,
         total_ticks: stats.total_ticks,
+        epoch_rollovers: stats.epoch_rollovers,
         q_up_micro: disp.q_up.0,
         q_dn_micro: disp.q_dn.0,
         net_q_micro: disp.net_q.as_i64(),

@@ -22,12 +22,24 @@ use tokio::sync::mpsc;
 
 use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
 use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent, canonical_target_path};
+use crate::lifecycle_report::{print_epoch_rollover, record_epoch_rollover_jsonl};
 use crate::paper_report::{
     PaperReportStats, PaperSummaryDisplay, print_fill_event, print_merge_event, print_order_event,
     print_paper_header, print_summary_table, print_trade_eval, record_fill_jsonl,
     record_merge_jsonl, record_order_jsonl, record_summary_jsonl, record_tick_jsonl,
 };
 use crate::trace_cmd::TraceSourceMode;
+
+#[derive(Debug, Clone)]
+struct PendingEpochSettlement {
+    expired_slug: String,
+    winning_outcome: Outcome,
+    settle_delta_micro: i64,
+    total_realized_pnl_micro: i64,
+    pairs_merged_micro: u64,
+    fees_paid_micro: u64,
+    estimated_rebate_micro: u64,
+}
 
 pub(crate) struct PaperArgs {
     pub(crate) source: TraceSourceMode,
@@ -86,9 +98,94 @@ impl PaperState {
         if let Some(k) = desc.strike_price_usd {
             self.strike_usd = Some(k.get());
         } else {
-            self.strike_usd = None;
+            self.strike_usd = self.spot_usd;
         }
+        self.book_up = BookMaintainer::new(Outcome::Up);
+        self.book_dn = BookMaintainer::new(Outcome::Down);
+        self.latest_up = None;
+        self.latest_dn = None;
+        self.active_up_id = None;
+        self.active_dn_id = None;
         self.desc = Some(desc);
+    }
+
+    fn resolve_winning_outcome(&self) -> Outcome {
+        if let (Some(spot), Some(strike)) = (self.spot_usd, self.strike_usd) {
+            if spot >= strike {
+                return Outcome::Up;
+            }
+            return Outcome::Down;
+        }
+        let mid_up = self
+            .latest_up
+            .as_ref()
+            .and_then(fixed_book_mid)
+            .unwrap_or(MicroUsdc(500_000));
+        let mid_dn = self
+            .latest_dn
+            .as_ref()
+            .and_then(fixed_book_mid)
+            .unwrap_or(MicroUsdc(500_000));
+        if mid_up >= mid_dn {
+            Outcome::Up
+        } else {
+            Outcome::Down
+        }
+    }
+
+    fn settle_expired_epoch(
+        &mut self,
+        now_ms: u64,
+        broker: &mut FifoPaperBroker,
+        ledger: &mut PaperLedger,
+        telemetry: &mut BaselineTelemetry,
+    ) -> Option<PendingEpochSettlement> {
+        let desc = self.desc.as_ref()?;
+        if let Some(id) = self.active_up_id.take() {
+            let _ = broker.cancel(id, now_ms);
+            self.stats.orders_cancelled = self.stats.orders_cancelled.saturating_add(1);
+            telemetry.record_cancel_replace(now_ms);
+        }
+        if let Some(id) = self.active_dn_id.take() {
+            let _ = broker.cancel(id, now_ms);
+            self.stats.orders_cancelled = self.stats.orders_cancelled.saturating_add(1);
+            telemetry.record_cancel_replace(now_ms);
+        }
+
+        let winning_outcome = self.resolve_winning_outcome();
+        let settle_delta = ledger.settle_epoch(winning_outcome);
+        let _ = telemetry.naive_engine.ledger.settle_epoch(winning_outcome);
+
+        Some(PendingEpochSettlement {
+            expired_slug: desc.slug.clone(),
+            winning_outcome,
+            settle_delta_micro: settle_delta,
+            total_realized_pnl_micro: ledger.realized_pnl_micro,
+            pairs_merged_micro: ledger.total_pairs_merged.0,
+            fees_paid_micro: ledger.fees_paid_micro,
+            estimated_rebate_micro: ledger.estimated_rebate_micro,
+        })
+    }
+
+    fn rollover_to_market(
+        &mut self,
+        next_desc: MarketDescriptor,
+        broker: &mut FifoPaperBroker,
+        ledger: &mut PaperLedger,
+        telemetry: &mut BaselineTelemetry,
+        pipe: &mut MathPipeline,
+    ) {
+        let broker_cfg = *broker.config();
+        *broker = FifoPaperBroker::new(broker_cfg);
+        telemetry.naive_engine.broker = FifoPaperBroker::new(broker_cfg);
+        telemetry.naive_engine.active_up_id = None;
+        telemetry.naive_engine.active_dn_id = None;
+        telemetry.naive_engine.ledger.fee_schedule = next_desc.fee_schedule;
+        ledger.fee_schedule = next_desc.fee_schedule;
+
+        self.set_market(next_desc);
+        pipe.reset_epoch();
+        self.stats.epoch_rollovers = self.stats.epoch_rollovers.saturating_add(1);
     }
 
     fn observe_spot(&mut self, spot: f64) {
@@ -235,7 +332,9 @@ fn finalize_paper_output(
     clock: &MonotonicClock,
 ) -> Result<(), Box<dyn Error>> {
     let slug = state.desc.as_ref().map_or("unknown", |d| d.slug.as_str());
-    let now_ms = state.next_eval_ms.unwrap_or(0);
+    let now_ms = state
+        .next_eval_ms
+        .unwrap_or_else(|| MonotonicClock::unix_now_ms().unwrap_or(0));
     let mid_up = state
         .latest_up
         .as_ref()
@@ -782,7 +881,7 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     let mut pipe = MathPipeline::new(pipe_cfg, clock)?;
     let mut tracker = LatencyTracker::new()?;
     let mut jsonl = JsonlWriter::create(&args.jsonl)?;
-    let (discovery, offset_est, desc) = discover_live_market(cfg).await?;
+    let (discovery, offset_est, mut desc) = discover_live_market(cfg).await?;
     let base_adj_ms = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
     let base_mono_ns = clock.now_ns()?;
 
@@ -825,6 +924,10 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     let target_duration = parse_duration_arg(&args.duration)?;
     let deadline = tokio::time::Instant::now() + target_duration;
     let mut interval = tokio::time::interval(Duration::from_millis(100));
+    let mut last_rollover_probe: Option<tokio::time::Instant> = None;
+    let mut market_resolved_flag = false;
+    let mut epoch_settled = false;
+    let mut pending_settlement: Option<PendingEpochSettlement> = None;
 
     println!("Streaming live market feeds for paper simulation... (Press Ctrl+C to stop)");
 
@@ -951,22 +1054,124 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                 while let Ok(h) = health_rx.try_recv() {
                     if let FeedHealthEvent::MarketResolved { .. } = h {
                         println!("[HEALTH] Active 5m epoch market resolved!");
+                        market_resolved_flag = true;
                     }
                 }
 
                 // Compute now_ms from base clock
                 let now_ns = clock.now_ns()?;
                 let now_ms = base_adj_ms.saturating_add(now_ns.saturating_sub(base_mono_ns) / 1_000_000);
+                state.next_eval_ms = Some(now_ms);
 
-                eval_sim_step(
-                    now_ms,
-                    &mut state,
-                    &mut pipe,
-                    (&mut broker, &mut ledger, &mut telemetry),
-                    cfg,
-                    args,
-                    (&mut tracker, &mut jsonl, &clock),
-                )?;
+                let tau_secs = desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
+                let is_expired = now_ms >= desc.expiry_ts_ms || (market_resolved_flag && tau_secs == 0);
+
+                if is_expired {
+                    if !epoch_settled {
+                        pending_settlement = state.settle_expired_epoch(
+                            now_ms,
+                            &mut broker,
+                            &mut ledger,
+                            &mut telemetry,
+                        );
+                        epoch_settled = true;
+                    }
+
+                    let probe_due = last_rollover_probe
+                        .is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
+                    if probe_due {
+                        last_rollover_probe = Some(tokio::time::Instant::now());
+                        match discover_next_5m_market(
+                            &discovery,
+                            &offset_est,
+                            &desc.condition_id,
+                        )
+                        .await
+                        {
+                            Ok(next_desc) => {
+                                println!(
+                                    "\n[ROLLOVER] Discovered next 5m market: {} (expires in {}s)",
+                                    next_desc.slug,
+                                    next_desc.expiry_ts_ms.saturating_sub(now_ms) / 1000
+                                );
+                                if let Err(err) = handles
+                                    .send_clob_rollover(
+                                        next_desc.asset_id_up.clone(),
+                                        next_desc.asset_id_dn.clone(),
+                                    )
+                                    .await
+                                {
+                                    eprintln!("[ROLLOVER] Failed to switch CLOB feed subscriptions: {err}");
+                                    break;
+                                }
+
+                                while poly_cons.pop().is_ok() {}
+
+                                if let Some(pending) = pending_settlement.take() {
+                                    print_epoch_rollover(
+                                        &pending.expired_slug,
+                                        Some(&next_desc.slug),
+                                        pending.winning_outcome,
+                                        pending.settle_delta_micro,
+                                        pending.total_realized_pnl_micro,
+                                    );
+                                    record_epoch_rollover_jsonl(
+                                        &mut jsonl,
+                                        now_ms,
+                                        now_ns,
+                                        &pending.expired_slug,
+                                        Some(&next_desc.slug),
+                                        pending.winning_outcome,
+                                        pending.settle_delta_micro,
+                                        pending.total_realized_pnl_micro,
+                                        pending.pairs_merged_micro,
+                                        pending.fees_paid_micro,
+                                        pending.estimated_rebate_micro,
+                                    )?;
+                                }
+
+                                state.rollover_to_market(
+                                    next_desc.clone(),
+                                    &mut broker,
+                                    &mut ledger,
+                                    &mut telemetry,
+                                    &mut pipe,
+                                );
+
+                                desc = next_desc;
+                                epoch_settled = false;
+                                market_resolved_flag = false;
+                                last_rollover_probe = None;
+
+                                print_paper_header(
+                                    TraceSourceMode::Live.as_str(),
+                                    &desc,
+                                    args.v_max,
+                                    args.base_size,
+                                    args.latency_ms,
+                                    &args.duration,
+                                    &args.jsonl,
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "  [ROLLOVER] Awaiting next 5m BTC market after {}: {err}",
+                                    desc.slug
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    eval_sim_step(
+                        now_ms,
+                        &mut state,
+                        &mut pipe,
+                        (&mut broker, &mut ledger, &mut telemetry),
+                        cfg,
+                        args,
+                        (&mut tracker, &mut jsonl, &clock),
+                    )?;
+                }
 
                 // Print periodic summary every 5 seconds
                 if state.next_summary_ms.is_none() {
@@ -1022,6 +1227,31 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
 
     shutdown_actors(handles, cfg.polybolt_enabled).await;
 
+    if let Some(pending) = pending_settlement.take() {
+        let now_ns = clock.now_ns().unwrap_or(0);
+        let now_ms = base_adj_ms.saturating_add(now_ns.saturating_sub(base_mono_ns) / 1_000_000);
+        print_epoch_rollover(
+            &pending.expired_slug,
+            None,
+            pending.winning_outcome,
+            pending.settle_delta_micro,
+            pending.total_realized_pnl_micro,
+        );
+        let _ = record_epoch_rollover_jsonl(
+            &mut jsonl,
+            now_ms,
+            now_ns,
+            &pending.expired_slug,
+            None,
+            pending.winning_outcome,
+            pending.settle_delta_micro,
+            pending.total_realized_pnl_micro,
+            pending.pairs_merged_micro,
+            pending.fees_paid_micro,
+            pending.estimated_rebate_micro,
+        );
+    }
+
     finalize_paper_output(
         &state,
         &ledger,
@@ -1033,6 +1263,20 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     )
 }
 
+async fn discover_next_5m_market(
+    discovery: &GammaDiscoveryClient,
+    offset_est: &ClockOffsetEstimator,
+    expired_condition_id: &str,
+) -> Result<MarketDescriptor, Box<dyn Error>> {
+    let _sync = discovery.sync_clock(offset_est).await;
+    let adj_now = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
+    let next_desc = discovery.discover_active_5m_btc(adj_now, 15_000).await?;
+    if next_desc.condition_id == expired_condition_id {
+        return Err("Gamma still returning expired condition_id; awaiting next 5m market".into());
+    }
+    Ok(next_desc)
+}
+
 async fn discover_live_market(
     cfg: &EngineConfig,
 ) -> Result<(GammaDiscoveryClient, ClockOffsetEstimator, MarketDescriptor), Box<dyn Error>> {
@@ -1042,4 +1286,266 @@ async fn discover_live_market(
     let adj_now = offset_est.adjusted_unix_ms(MonotonicClock::unix_now_ms()?)?;
     let desc = discovery.discover_active_5m_btc(adj_now, 15_000).await?;
     Ok((discovery, offset_est, desc))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core_types::{BookLevel, FeeSchedule, ProtocolVersion};
+    use paper_sim::SimFill;
+
+    fn test_market(slug: &str, start_ts_ms: u64, expiry_ts_ms: u64) -> MarketDescriptor {
+        MarketDescriptor {
+            condition_id: format!("cond_{slug}"),
+            slug: slug.to_string(),
+            question: "BTC 5m test".to_string(),
+            version: ProtocolVersion::PolyV2,
+            neg_risk: false,
+            asset_id_up: format!("up_{slug}"),
+            asset_id_dn: format!("dn_{slug}"),
+            tick_size_micro: MicroUsdc(10_000),
+            min_order_size_micro: SharesMicro(5_000_000),
+            taker_delay_ms: 50,
+            fee_schedule: FeeSchedule::btc_5m_default(),
+            start_ts_ms,
+            expiry_ts_ms,
+            strike_price_usd: None,
+        }
+    }
+
+    fn test_book(outcome: Outcome, best_bid_micro: u64, best_ask_micro: u64) -> FixedBook<10> {
+        let bids = [BookLevel {
+            price: MicroUsdc(best_bid_micro),
+            size: SharesMicro(100 * ONE_SHARE_MICRO),
+        }];
+        let asks = [BookLevel {
+            price: MicroUsdc(best_ask_micro),
+            size: SharesMicro(100 * ONE_SHARE_MICRO),
+        }];
+        FixedBook::try_from_slices(outcome, &bids, &asks, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn test_paper_epoch_settlement_and_rollover() {
+        let clock = MonotonicClock::start();
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let market1 = test_market("btc-5m-epoch1", start_ms, expiry_ms);
+
+        let mut state = PaperState::new();
+        state.set_market(market1.clone());
+        state.observe_spot(95_000.0);
+        state.strike_usd = Some(94_000.0); // Spot > Strike -> Outcome::Up wins
+        state.latest_up = Some(test_book(Outcome::Up, 490_000, 510_000));
+        state.latest_dn = Some(test_book(Outcome::Down, 490_000, 510_000));
+
+        let broker_config = FifoBrokerConfig::default();
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut broker = FifoPaperBroker::new(broker_config);
+        let mut ledger = PaperLedger::new(market1.fee_schedule);
+        let mut telemetry =
+            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+
+        let cfg = EngineConfig::default();
+        let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
+        let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
+
+        // Simulate an active UP order
+        let order_id = broker
+            .submit_new(NewOrderParams {
+                outcome: Outcome::Up,
+                side: OrderSide::Buy,
+                price: MicroUsdc(480_000),
+                size: base_size,
+                now_ms: start_ms,
+                current_best_bid: Some(MicroUsdc(490_000)),
+                current_best_ask: Some(MicroUsdc(510_000)),
+                book_depth_at_price: SharesMicro::ZERO,
+            })
+            .unwrap();
+        state.active_up_id = Some(order_id);
+
+        // Record a fill on UP: 20 shares @ $0.48
+        let fill = SimFill {
+            sim_id: order_id,
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(480_000),
+            filled_shares: base_size,
+            fill_ts_ms: start_ms + 1000,
+            is_maker: true,
+        };
+        let _ = ledger.record_fill(&fill).unwrap();
+        assert_eq!(ledger.filled_up, base_size);
+
+        // At expiry, settle epoch
+        let pending = state
+            .settle_expired_epoch(expiry_ms, &mut broker, &mut ledger, &mut telemetry)
+            .expect("should produce pending settlement");
+
+        assert_eq!(pending.expired_slug, "btc-5m-epoch1");
+        assert_eq!(pending.winning_outcome, Outcome::Up);
+        // 20 shares bought at $0.48, settled at $1.00 -> gain = 20 * (1.00 - 0.48) = $10.40 = 10_400_000 micro
+        assert_eq!(pending.settle_delta_micro, 10_400_000);
+        assert_eq!(pending.total_realized_pnl_micro, 10_400_000);
+        assert_eq!(ledger.filled_up, SharesMicro::ZERO);
+        assert_eq!(state.active_up_id, None);
+
+        // Rollover to next market
+        let market2 = test_market("btc-5m-epoch2", expiry_ms, expiry_ms + 300_000);
+        state.rollover_to_market(
+            market2.clone(),
+            &mut broker,
+            &mut ledger,
+            &mut telemetry,
+            &mut pipe,
+        );
+
+        assert_eq!(state.desc.as_ref().unwrap().slug, "btc-5m-epoch2");
+        assert_eq!(state.stats.epoch_rollovers, 1);
+        assert!(state.latest_up.is_none());
+        assert!(state.latest_dn.is_none());
+        assert_eq!(state.active_up_id, None);
+        assert_eq!(state.active_dn_id, None);
+    }
+
+    #[test]
+    fn test_winning_outcome_resolution() {
+        let mut state = PaperState::new();
+        state.set_market(test_market("btc-5m-test", 0, 300_000));
+
+        // Case 1: Spot >= Strike -> Up
+        state.spot_usd = Some(95_000.0);
+        state.strike_usd = Some(95_000.0);
+        assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
+
+        // Case 2: Spot < Strike -> Down
+        state.spot_usd = Some(94_999.0);
+        state.strike_usd = Some(95_000.0);
+        assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
+
+        // Case 3: No strike, fallback to book mid (UP >= DN -> Up)
+        state.spot_usd = None;
+        state.strike_usd = None;
+        state.latest_up = Some(test_book(Outcome::Up, 550_000, 560_000));
+        state.latest_dn = Some(test_book(Outcome::Down, 440_000, 450_000));
+        assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
+
+        // Case 4: No strike, fallback to book mid (UP < DN -> Down)
+        state.latest_up = Some(test_book(Outcome::Up, 440_000, 450_000));
+        state.latest_dn = Some(test_book(Outcome::Down, 550_000, 560_000));
+        assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
+    }
+
+    #[test]
+    fn test_paper_sim_post_rollover_resumes_quoting() {
+        let clock = MonotonicClock::start();
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let market1 = test_market("btc-5m-epoch1", start_ms, expiry_ms);
+
+        let mut state = PaperState::new();
+        state.set_market(market1.clone());
+
+        let broker_config = FifoBrokerConfig::default();
+        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
+        let mut broker = FifoPaperBroker::new(broker_config);
+        let mut ledger = PaperLedger::new(market1.fee_schedule);
+        let mut telemetry =
+            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+
+        let cfg = EngineConfig::default();
+        let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
+        let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
+        let mut tracker = LatencyTracker::new().unwrap();
+        let temp_dir = std::env::temp_dir();
+        let test_jsonl = temp_dir.join("test_rollover_resume.jsonl");
+        let mut jsonl = JsonlWriter::create(&test_jsonl).unwrap();
+        let args = PaperArgs {
+            source: TraceSourceMode::Live,
+            input: None,
+            duration: "300s".to_string(),
+            v_max: 50,
+            base_size: 20,
+            latency_ms: 0,
+            jsonl: test_jsonl.clone(),
+        };
+
+        // Rollover to market 2
+        let market2 = test_market("btc-5m-epoch2", expiry_ms, expiry_ms + 300_000);
+        state.rollover_to_market(
+            market2.clone(),
+            &mut broker,
+            &mut ledger,
+            &mut telemetry,
+            &mut pipe,
+        );
+
+        // Before book snapshots arrive: latest_up and latest_dn are None
+        assert!(state.latest_up.is_none());
+        assert!(state.latest_dn.is_none());
+        // eval_sim_step should return Ok(()) without panicking or placing quotes
+        let res = eval_sim_step(
+            expiry_ms + 100,
+            &mut state,
+            &mut pipe,
+            (&mut broker, &mut ledger, &mut telemetry),
+            &cfg,
+            &args,
+            (&mut tracker, &mut jsonl, &clock),
+        );
+        assert!(res.is_ok());
+        assert!(broker.active_order(Outcome::Up, OrderSide::Buy).is_none());
+        assert!(broker.active_order(Outcome::Down, OrderSide::Buy).is_none());
+
+        // Book snapshots arrive for market 2
+        let up_book = test_book(Outcome::Up, 490_000, 510_000);
+        let dn_book = test_book(Outcome::Down, 490_000, 510_000);
+        state
+            .book_up
+            .apply_snapshot(
+                up_book.bids_slice(),
+                up_book.asks_slice(),
+                clock.now_ns().unwrap(),
+                expiry_ms + 200,
+            )
+            .unwrap();
+        state
+            .book_dn
+            .apply_snapshot(
+                dn_book.bids_slice(),
+                dn_book.asks_slice(),
+                clock.now_ns().unwrap(),
+                expiry_ms + 200,
+            )
+            .unwrap();
+        state.latest_up = Some(up_book);
+        state.latest_dn = Some(dn_book);
+        state.observe_spot(95_000.0);
+        state.strike_usd = Some(95_000.0);
+
+        // Feed binance spot to prime the pipeline
+        for i in 0..15 {
+            let t = expiry_ms + 200 + i * 100;
+            let _ = pipe.on_binance_spot(
+                t,
+                95_000.0 + (i as f64 * 0.1),
+                state.strike_usd,
+                market2.expiry_ts_ms,
+            );
+        }
+
+        // Now eval_sim_step evaluates without panic
+        let res = eval_sim_step(
+            expiry_ms + 2000,
+            &mut state,
+            &mut pipe,
+            (&mut broker, &mut ledger, &mut telemetry),
+            &cfg,
+            &args,
+            (&mut tracker, &mut jsonl, &clock),
+        );
+        assert!(res.is_ok());
+        let _ = std::fs::remove_file(test_jsonl);
+    }
 }
