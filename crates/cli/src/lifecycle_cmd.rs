@@ -2452,14 +2452,31 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
     let t = theme::current();
     println!("{}", t.section("Active Config's Parameters"));
 
-    let rows: [(&str, String); 17] = [
-        ("Gamma", cfg.gamma.to_string()),
-        ("Variance Mode", format!("{:?}", cfg.variance_mode)),
-        ("Kappa Mode", format!("{:?}", cfg.kappa_mode)),
-        ("SG Mode", format!("{:?}", cfg.sg_mode)),
+    let rows: [(&str, String, &str); 17] = [
+        (
+            "Gamma",
+            cfg.gamma.to_string(),
+            "Risk aversion strength; higher tightens spread",
+        ),
+        (
+            "Variance Mode",
+            format!("{:?}", cfg.variance_mode),
+            "Remaining-variance model used in spread",
+        ),
+        (
+            "Kappa Mode",
+            format!("{:?}", cfg.kappa_mode),
+            "Liquidity arrival-intensity estimator",
+        ),
+        (
+            "SG Mode",
+            format!("{:?}", cfg.sg_mode),
+            "Savitzky-Golay denoising filter mode",
+        ),
         (
             "Include Variance Spread",
             cfg.include_variance_spread.to_string(),
+            "Adds gamma*V_rem variance term to spread",
         ),
         (
             "Min Combined Spread",
@@ -2468,10 +2485,12 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
                 cfg.min_combined_spread_micro.0 as f64 / 1e6,
                 cfg.min_spread_ticks
             ),
+            "Floor on combined quote spread",
         ),
         (
             "Max Combined Bid",
             format!("${:.2}", cfg.max_combined_bid_micro.0 as f64 / 1e6),
+            "Cap on UP+DOWN bid sum",
         ),
         (
             "Cross Tick Loss Cap",
@@ -2479,41 +2498,69 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
                 Some(m) => format!("{m} micro-USDC"),
                 None => "off".to_string(),
             },
+            "Maximum loss absorbed to close a cross-tick pair",
         ),
         (
             "Max Entry Prob",
             cfg.max_entry_prob
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "off".to_string()),
+            "Blocks fresh entries outside [1-p, p]",
         ),
         (
             "Lead/Lag Threshold",
             cfg.lead_lag_cancel_threshold.to_string(),
+            "Defensive-cancel trigger on lead/lag shift",
         ),
-        ("Lead/Lag Window", format!("{} ms", cfg.lead_lag_window_ms)),
+        (
+            "Lead/Lag Window",
+            format!("{} ms", cfg.lead_lag_window_ms),
+            "Lookback window for the lead/lag signal",
+        ),
         (
             "Lead/Lag Cooldown",
             format!("{} ms", cfg.lead_lag_cooldown_ms),
+            "Minimum time between defensive cancels",
         ),
-        ("Lead/Lag Directional", cfg.lead_lag_directional.to_string()),
-        ("Hedge Skew Multiplier", cfg.hedge_skew_mult.to_string()),
+        (
+            "Lead/Lag Directional",
+            cfg.lead_lag_directional.to_string(),
+            "Cancel only the endangered side",
+        ),
+        (
+            "Hedge Skew Multiplier",
+            cfg.hedge_skew_mult.to_string(),
+            "Asymmetric reducing-leg skew damping (0-1)",
+        ),
         (
             "Cap Tier-1 Reducing",
             cfg.cap_tier1_reducing_to_delta.to_string(),
+            "Limit Tier-1 reduce size to |delta q|",
         ),
-        ("Execution Mode", format!("{:?}", cfg.execution_mode)),
-        ("Dry Run", cfg.dry_run.to_string()),
+        (
+            "Execution Mode",
+            format!("{:?}", cfg.execution_mode),
+            "Paper / dry-run / canary-live safety mode",
+        ),
+        (
+            "Dry Run",
+            cfg.dry_run.to_string(),
+            "Order gates armed; no live dispatch",
+        ),
     ];
 
-    let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(10);
-    let val_w = rows.iter().map(|(_, v)| v.len()).max().unwrap_or(10);
+    let label_w = rows.iter().map(|(l, _, _)| l.len()).max().unwrap_or(10);
+    let val_w = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(10);
+    let desc_w = rows.iter().map(|(_, _, d)| d.len()).max().unwrap_or(20);
 
-    let row = |label: &str, val: &str| format!("  {label:<label_w$} | {val:<val_w$}");
-    println!("{}", row("Parameter", "Value"));
-    println!("{}", "-".repeat(label_w + val_w + 6));
+    let row = |label: &str, val: &str, desc: &str| {
+        format!("  {label:<label_w$} | {val:<val_w$} | {desc:<desc_w$}")
+    };
+    println!("{}", row("Parameter", "Value", "Description"));
+    println!("{}", "-".repeat(label_w + val_w + desc_w + 8));
 
-    for (label, val) in rows {
-        println!("{}", row(label, &val));
+    for (label, val, desc) in rows {
+        println!("{}", row(label, &val, desc));
     }
 }
 
