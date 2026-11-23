@@ -55,19 +55,13 @@ fn row_prefix(
 ) -> String {
     let event = event.map_or_else(
         || " ".repeat(EVENT_BADGE_WIDTH),
-        |kind| {
-            let pad = EVENT_BADGE_WIDTH.saturating_sub(kind.label().chars().count());
-            format!("{}{}", t.badge(kind), " ".repeat(pad))
-        },
+        |kind| theme::pad_visible_right(&t.badge(kind), EVENT_BADGE_WIDTH),
     );
     let mid = mid.map_or_else(
         || " ".repeat(PHASE_BADGE_WIDTH),
         |mid| match mid {
             MidColumn::Phase(phase) => t.phase_badge(phase),
-            MidColumn::Badge(kind) => {
-                let pad = PHASE_BADGE_WIDTH.saturating_sub(kind.label().chars().count());
-                format!("{}{}", t.badge(kind), " ".repeat(pad))
-            }
+            MidColumn::Badge(kind) => theme::pad_visible_right(&t.badge(kind), PHASE_BADGE_WIDTH),
         },
     );
     let tier = tier.map_or_else(|| " ".repeat(TIER_BADGE_WIDTH), |tier| t.tier_badge(tier));
@@ -456,12 +450,7 @@ fn format_epoch_banner(
     let start_utc = format_utc_hms(start_ts_ms);
     let end_utc = format_utc_hms(expiry_ts_ms);
     let span_secs = expiry_ts_ms.saturating_sub(start_ts_ms) / 1_000;
-    let label = format!("  {} EPOCH #{epoch_num}", t.epoch_icon(false));
-    let label = format!(
-        "{}{}",
-        t.bold_cyan(&label),
-        " ".repeat(EPOCH_LABEL_WIDTH.saturating_sub(theme::visible_width(&label)))
-    );
+    let label = epoch_label(t, t.epoch_icon(false), &format!("EPOCH #{epoch_num}"));
     let bar = t.bar();
     let rule = t.epoch_rule();
     format!(
@@ -480,14 +469,17 @@ fn format_epoch_banner(
 fn fmt_usd_grouped(value: f64) -> String {
     let raw = format!("{value:.2}");
     let (whole, cents) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
-    let mut grouped = String::new();
-    for (idx, ch) in whole.chars().enumerate() {
-        if idx > 0 && (whole.len() - idx).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(ch);
-    }
-    format!("{grouped}.{cents}")
+    format!("{}.{cents}", group_thousands(whole))
+}
+
+/// Padded, colored label that anchors the framed epoch blocks.
+fn epoch_label(t: Theme, icon: &str, title: &str) -> String {
+    let raw = format!("  {icon} {title}");
+    let padded = format!(
+        "{raw}{}",
+        " ".repeat(EPOCH_LABEL_WIDTH.saturating_sub(raw.chars().count()))
+    );
+    t.bold_cyan(&padded)
 }
 
 /// `UP` / `DOWN` label for epoch winners.
@@ -1341,12 +1333,7 @@ fn format_epoch_rollover_block(
     total_realized_pnl_micro: i64,
 ) -> String {
     let bar = t.bar();
-    let label = format!("  {} EPOCH ROLLOVER", t.epoch_icon(true));
-    let label = format!(
-        "{}{}",
-        t.bold_cyan(&label),
-        " ".repeat(EPOCH_LABEL_WIDTH.saturating_sub(theme::visible_width(&label)))
-    );
+    let label = epoch_label(t, t.epoch_icon(true), "EPOCH ROLLOVER");
     let next = match next_slug {
         Some(next) => short_epoch_transition(t, expired_slug, next),
         None => format!(
@@ -1385,8 +1372,8 @@ pub(crate) fn print_lifecycle_summary(
 const SUMMARY_LABEL_WIDTH: usize = 16;
 const SUMMARY_VALUE_WIDTH: usize = 12;
 
-fn fmt_count(n: u64) -> String {
-    let raw = n.to_string();
+/// Groups a digit string in threes (`6295` -> `6,295`).
+fn group_thousands(raw: &str) -> String {
     let mut out = String::new();
     for (idx, ch) in raw.chars().enumerate() {
         if idx > 0 && (raw.len() - idx).is_multiple_of(3) {
@@ -1397,9 +1384,8 @@ fn fmt_count(n: u64) -> String {
     out
 }
 
-fn pad_left(text: &str, width: usize) -> String {
-    let pad = width.saturating_sub(theme::visible_width(text));
-    format!("{}{text}", " ".repeat(pad))
+fn fmt_count(n: u64) -> String {
+    group_thousands(&n.to_string())
 }
 
 /// One `label value` cell with a fixed-width right-aligned number.
@@ -1407,8 +1393,17 @@ fn summary_cell(t: Theme, label: &str, value: &str) -> String {
     format!(
         "{} {}",
         t.muted(&format!("{label:<width$}", width = SUMMARY_LABEL_WIDTH)),
-        pad_left(value, SUMMARY_VALUE_WIDTH)
+        theme::pad_visible_left(value, SUMMARY_VALUE_WIDTH)
     )
+}
+
+fn push_summary_section(out: &mut String, t: Theme, title: &str) {
+    out.push_str(&format!("\n  {}", t.bold_cyan(title)));
+}
+
+fn push_summary_row(out: &mut String, t: Theme, cells: &[(&str, &str)]) {
+    out.push('\n');
+    out.push_str(&summary_row(t, cells));
 }
 
 fn summary_row(t: Theme, cells: &[(&str, &str)]) -> String {
@@ -1462,42 +1457,43 @@ fn format_lifecycle_summary(
     let epochs = fmt_count(stats.epochs_completed as u64);
     let rollovers = fmt_count(stats.epoch_rollovers as u64);
     let rpm = fmt_count(stats.rpm_60s as u64);
-    out.push_str(&format!("\n  {}\n", t.bold_cyan("EXECUTION & FILLS")));
-    out.push_str(&summary_row(
+    push_summary_section(&mut out, t, "EXECUTION & FILLS");
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Ticks", &ticks),
             ("Phase shifts", &phases),
             ("Orders", &submitted),
         ],
-    ));
-    out.push('\n');
-    out.push_str(&summary_row(
+    );
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Replaced", &replaced),
             ("Canceled", &canceled),
             ("Held (FIFO)", &held),
         ],
-    ));
-    out.push('\n');
-    out.push_str(&summary_row(
+    );
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Fills", &fills),
             ("Merges", &merges),
             ("Pairs merged", &pairs),
         ],
-    ));
-    out.push('\n');
-    out.push_str(&summary_row(
+    );
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Epochs", &epochs),
             ("Rollovers", &rollovers),
             ("RPM (60s)", &rpm),
         ],
-    ));
+    );
 
     // Inventory & PnL
     let q_up = fmt_shares_2dp(stats.final_q_up.0);
@@ -1515,42 +1511,43 @@ fn format_lifecycle_summary(
     let fill_ratio = format!("{:.1}%", stats.fill_ratio * 100.0);
     let markout_1s = signed_bps(stats.markout_1s_bps);
     let markout_5s = signed_bps(stats.markout_5s_bps);
-    out.push_str(&format!("\n  {}\n", t.bold_cyan("INVENTORY & PNL")));
-    out.push_str(&summary_row(
+    push_summary_section(&mut out, t, "INVENTORY & PNL");
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Inventory UP", &q_up),
             ("Inventory DN", &q_dn),
             ("Net delta", &net_delta),
         ],
-    ));
-    out.push('\n');
-    out.push_str(&summary_row(
+    );
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Realized", &realized),
             ("Unrealized", &unrealized),
             ("Net PnL", &net_pnl),
         ],
-    ));
-    out.push('\n');
-    out.push_str(&summary_row(
+    );
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Settlement", &settlement),
             ("Fees paid", &fees),
             ("Est rebate", &rebate),
         ],
-    ));
-    out.push('\n');
-    out.push_str(&summary_row(
+    );
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Fill ratio", &fill_ratio),
             ("Markout 1s", &markout_1s),
             ("Markout 5s", &markout_5s),
         ],
-    ));
+    );
 
     // Risk & breakers
     let breakers_raw = fmt_count(stats.breaker_trips as u64);
@@ -1566,15 +1563,16 @@ fn format_lifecycle_summary(
         t.muted(&flattens_raw)
     };
     let baseline = t.fmt_pnl(stats.baseline_pnl_micro);
-    out.push_str(&format!("\n  {}\n", t.bold_cyan("RISK & BREAKERS")));
-    out.push_str(&summary_row(
+    push_summary_section(&mut out, t, "RISK & BREAKERS");
+    push_summary_row(
+        &mut out,
         t,
         &[
             ("Breakers", &breakers),
             ("Flattens", &flattens),
             ("Baseline PnL", &baseline),
         ],
-    ));
+    );
 
     out.push_str("\n\n");
     out.push_str(&format!(
@@ -1597,73 +1595,63 @@ fn format_latency_table(t: Theme, rows: &[(&str, &LatencySummary, u64)]) -> Stri
     const STAGE_W: usize = 18;
     const NUM_W: usize = 8;
     const TARGET_W: usize = 9;
-    let cols = [STAGE_W, NUM_W, NUM_W, NUM_W, NUM_W, TARGET_W];
-    let (h, v, cross) = if t.box_drawing() {
-        ("─", "│", "┼")
+    const COLS: [usize; 6] = [STAGE_W, NUM_W, NUM_W, NUM_W, NUM_W, TARGET_W];
+    let (h, v, cross, corners) = if t.box_drawing() {
+        ("─", "│", "┼", ("┌", "┐", "├", "┤", "└", "┘"))
     } else {
-        ("-", "|", "+")
-    };
-    let (top_left, top_right, mid_left, mid_right, bot_left, bot_right) = if t.box_drawing() {
-        ("┌", "┐", "├", "┤", "└", "┘")
-    } else {
-        ("+", "+", "+", "+", "+", "+")
+        ("-", "|", "+", ("+", "+", "+", "+", "+", "+"))
     };
 
     let border = |left: &str, mid: &str, right: &str| {
-        let mut s = String::from("  ");
-        s.push_str(left);
-        for (idx, width) in cols.iter().enumerate() {
-            s.push_str(&h.repeat(width + 2));
-            s.push_str(if idx + 1 == cols.len() { right } else { mid });
+        let mut line = String::from("  ");
+        line.push_str(left);
+        for (idx, width) in COLS.iter().enumerate() {
+            line.push_str(&h.repeat(width + 2));
+            line.push_str(if idx + 1 == COLS.len() { right } else { mid });
         }
-        s
+        line
     };
-    let row = |cells: &[String]| {
-        let mut s = String::from("  ");
-        s.push_str(v);
-        for (idx, (text, width)) in cells.iter().zip(cols.iter()).enumerate() {
-            let pad = width.saturating_sub(theme::visible_width(text));
-            s.push(' ');
+    let row = |cells: [String; 6]| {
+        let mut line = String::from("  ");
+        line.push_str(v);
+        for (idx, (text, width)) in cells.iter().zip(COLS).enumerate() {
+            line.push(' ');
             if idx == 0 {
-                s.push_str(text);
-                s.push_str(&" ".repeat(pad));
+                line.push_str(&theme::pad_visible_right(text, width));
             } else {
-                s.push_str(&" ".repeat(pad));
-                s.push_str(text);
+                line.push_str(&theme::pad_visible_left(text, width));
             }
-            s.push(' ');
-            s.push_str(v);
+            line.push(' ');
+            line.push_str(v);
         }
-        s
+        line
     };
 
-    let mut out = String::new();
-    out.push_str(&border(top_left, cross, top_right));
-    out.push('\n');
-    out.push_str(&row(&[
-        t.muted(&format!("{:<width$}", "Stage", width = STAGE_W)),
-        pad_left(&t.muted("P50"), NUM_W),
-        pad_left(&t.muted("P95"), NUM_W),
-        pad_left(&t.muted("P99"), NUM_W),
-        pad_left(&t.muted("MAX"), NUM_W),
-        pad_left(&t.muted("Target"), TARGET_W),
-    ]));
-    out.push('\n');
-    out.push_str(&border(mid_left, cross, mid_right));
+    let (top_left, top_right, mid_left, mid_right, bot_left, bot_right) = corners;
+    let mut lines = vec![
+        border(top_left, cross, top_right),
+        row([
+            t.muted("Stage"),
+            t.muted("P50"),
+            t.muted("P95"),
+            t.muted("P99"),
+            t.muted("MAX"),
+            t.muted("Target"),
+        ]),
+        border(mid_left, cross, mid_right),
+    ];
     for (name, lat, budget) in rows {
-        out.push('\n');
-        out.push_str(&row(&[
-            format!("{name:<width$}", width = STAGE_W),
-            pad_left(&format!("{}", lat.p50_ns / 1_000), NUM_W),
-            pad_left(&format!("{}", lat.p95_ns / 1_000), NUM_W),
+        lines.push(row([
+            (*name).to_string(),
+            format!("{}", lat.p50_ns / 1_000),
+            format!("{}", lat.p95_ns / 1_000),
             t.fmt_latency_us_width(lat.p99_ns, *budget, NUM_W),
-            pad_left(&format!("{}", lat.max_ns / 1_000), NUM_W),
-            pad_left(&format!("<{budget}µs"), TARGET_W),
+            format!("{}", lat.max_ns / 1_000),
+            format!("<{budget}µs"),
         ]));
     }
-    out.push('\n');
-    out.push_str(&border(bot_left, cross, bot_right));
-    out
+    lines.push(border(bot_left, cross, bot_right));
+    lines.join("\n")
 }
 
 pub(crate) fn record_phase_transition_jsonl(

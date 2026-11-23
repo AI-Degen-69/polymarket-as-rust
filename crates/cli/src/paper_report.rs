@@ -171,11 +171,11 @@ fn format_order_event(t: Theme, action: &str, order: &SimOrder) -> String {
         "CANCEL" | "CANCELLED" => t.yellow(&format!("{action:<7}")),
         _ => t.cyan(&format!("{action:<7}")),
     };
+    let label = status_label(order.status);
     let status = match order.status {
-        SimOrderStatus::Cancelled => t.yellow("Cancelled"),
-        SimOrderStatus::Filled => t.green("Filled"),
-        SimOrderStatus::Live => t.green("Live"),
-        other => t.gray(status_label(other)),
+        SimOrderStatus::Cancelled => t.yellow(label),
+        SimOrderStatus::Filled | SimOrderStatus::Live => t.green(label),
+        _ => t.gray(label),
     };
     let bar = t.bar();
     format!(

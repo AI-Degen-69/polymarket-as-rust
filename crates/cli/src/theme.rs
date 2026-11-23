@@ -55,35 +55,6 @@ pub(crate) enum Badge {
     Taker,
 }
 
-impl Badge {
-    /// Visible badge text, used to pad columns without counting ANSI escape codes.
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Fill => "[FILL]",
-            Self::Merge => "[MERGE]",
-            Self::Flatten => "[FLATTEN]",
-            Self::Breaker => "[BREAKER]",
-            Self::Wait => "[WAIT]",
-            Self::Ready => "[READY]",
-            Self::Pass => "[PASS]",
-            Self::Warn => "[WARN]",
-            Self::Fail => "[FAIL]",
-            Self::Order => "[ORDER]",
-            Self::Trade => "[TRADE]",
-            Self::Suppr => "[SUPPR]",
-            Self::Resume => "[RESUME]",
-            Self::Latency => "[LATENCY]",
-            Self::Epoch => "[EPOCH]",
-            Self::Signal => "[SIGNAL]",
-            Self::Tier => "[TIER]",
-            Self::Info => "[INFO]",
-            Self::Heartbeat => "[♥ BEAT]",
-            Self::Maker => "[MAKER]",
-            Self::Taker => "[TAKER]",
-        }
-    }
-}
-
 /// Resolved terminal styling capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Theme {
@@ -567,6 +538,12 @@ pub(crate) fn visible_width(s: &str) -> usize {
 }
 
 /// Pads `s` on the right with spaces so its visible width reaches at least `width`.
+/// Right-aligned counterpart of [`pad_visible_right`], ignoring ANSI escapes.
+pub(crate) fn pad_visible_left(s: &str, width: usize) -> String {
+    let pad = width.saturating_sub(visible_width(s));
+    format!("{}{s}", " ".repeat(pad))
+}
+
 pub(crate) fn pad_visible_right(s: &str, width: usize) -> String {
     let pad = width.saturating_sub(visible_width(s));
     if pad == 0 {
