@@ -64,3 +64,33 @@ rtk git push origin phase-<N>-complete
 - Never commit `.env`, API keys, private keys, or `logs/*.jsonl`.
 - Never bypass checks with `--no-verify` or relax workspace deny lints outside `#[cfg(test)]`.
 - Never silently bundle unrelated edits into a commit.
+
+### Live Capture Safety
+
+A live capture may run `target\release\poly-as.exe`. Check it first:
+
+```powershell
+Get-Process poly-as -ErrorAction SilentlyContinue
+```
+
+While that process runs, never:
+
+- kill `poly-as.exe`;
+- run `cargo build --release`;
+- run `cargo clean`.
+
+Safe during capture: `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets`, and `cargo test --workspace` (all debug).
+
+## 7. Key Files & Calibration Sync Surface
+
+Every engine calibration touches five files. Edit all five in one change, or the defaults drift.
+
+| File | Role |
+| --- | --- |
+| `crates/core-types/src/config.rs` | Env parsing, defaults, validation |
+| `crates/core-types/src/lib.rs` | Default-value and env-roundtrip tests |
+| `crates/cli/src/main.rs` | CLI paths and test configs |
+| `scripts/sweep-params.ps1` | Sweep env overrides |
+| `.env.example` | Documented operator values |
+
+`.env.example` must mirror the `EngineConfig::default()` values in `config.rs`. A mismatch is drift: fix it in the same change.
