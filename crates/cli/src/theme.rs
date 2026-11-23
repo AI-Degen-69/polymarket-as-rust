@@ -14,6 +14,10 @@ const STATE_PLAIN: u8 = 1;
 const STATE_STYLED: u8 = 2;
 
 const RULE_WIDTH: usize = 82;
+/// Width of the frame drawn around phase transitions (fits a standard terminal).
+const PHASE_RULE_WIDTH: usize = 124;
+/// Epoch blocks use the same width so both frames line up in scrollback.
+const EPOCH_RULE_WIDTH: usize = PHASE_RULE_WIDTH;
 
 static THEME_STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 
@@ -44,42 +48,11 @@ pub(crate) enum Badge {
     Latency,
     Epoch,
     Signal,
-    Phase,
     Tier,
     Info,
     Heartbeat,
     Maker,
     Taker,
-}
-
-impl Badge {
-    /// Visible badge text, used to pad columns without counting ANSI escape codes.
-    pub(crate) const fn label(self) -> &'static str {
-        match self {
-            Self::Fill => "[FILL]",
-            Self::Merge => "[MERGE]",
-            Self::Flatten => "[FLATTEN]",
-            Self::Breaker => "[BREAKER]",
-            Self::Wait => "[WAIT]",
-            Self::Ready => "[READY]",
-            Self::Pass => "[PASS]",
-            Self::Warn => "[WARN]",
-            Self::Fail => "[FAIL]",
-            Self::Order => "[ORDER]",
-            Self::Trade => "[TRADE]",
-            Self::Suppr => "[SUPPR]",
-            Self::Resume => "[RESUME]",
-            Self::Latency => "[LATENCY]",
-            Self::Epoch => "[EPOCH]",
-            Self::Signal => "[SIGNAL]",
-            Self::Phase => "[PHASE]",
-            Self::Tier => "[TIER]",
-            Self::Info => "[INFO]",
-            Self::Heartbeat => "[♥ BEAT]",
-            Self::Maker => "[MAKER]",
-            Self::Taker => "[TAKER]",
-        }
-    }
 }
 
 /// Resolved terminal styling capabilities.
@@ -271,6 +244,108 @@ impl Theme {
         self.muted(&ch.repeat(RULE_WIDTH))
     }
 
+    /// Vertical column separator (`│`, ASCII `|` fallback).
+    pub(crate) const fn bar(self) -> &'static str {
+        if self.unicode { "│" } else { "|" }
+    }
+
+    /// Rightward transition arrow (`➔`, ASCII `->` fallback).
+    pub(crate) const fn arrow(self) -> &'static str {
+        if self.unicode { "➔" } else { "->" }
+    }
+
+    /// Clamp marker for a row that exceeded the width budget.
+    pub(crate) const fn ellipsis(self) -> &'static str {
+        if self.unicode { "…" } else { "..." }
+    }
+
+    /// Inline field separator (`·`, ASCII `-` fallback).
+    pub(crate) const fn dot(self) -> &'static str {
+        if self.unicode { "·" } else { "-" }
+    }
+
+    /// Low-emphasis gray (`\x1b[90m`) for trailing reason notes.
+    pub(crate) fn gray(self, text: &str) -> String {
+        self.wrap("90", text)
+    }
+
+    /// Full-width horizontal rule framing a phase transition.
+    pub(crate) fn phase_rule(self) -> String {
+        let ch = if self.unicode { "─" } else { "-" };
+        self.muted(&ch.repeat(PHASE_RULE_WIDTH))
+    }
+
+    /// True when the terminal can render Unicode box-drawing glyphs.
+    pub(crate) const fn box_drawing(self) -> bool {
+        self.unicode
+    }
+
+    /// Full-width double rule anchoring an epoch boundary (`═`), ASCII `=` fallback.
+    pub(crate) fn epoch_rule(self) -> String {
+        let ch = if self.unicode { "═" } else { "=" };
+        self.muted(&ch.repeat(EPOCH_RULE_WIDTH))
+    }
+
+    /// Single-character icon used by the epoch block: `◆` header, `★` rollover.
+    pub(crate) const fn epoch_icon(self, rollover: bool) -> &'static str {
+        match (self.unicode, rollover) {
+            (true, true) => "★",
+            (true, false) => "◆",
+            (false, true) => "*",
+            (false, false) => "+",
+        }
+    }
+
+    /// Circuit-breaker icon: `⚡` when tripped, `✔` when armed.
+    pub(crate) fn breaker_icon(self, tripped: bool) -> String {
+        match (self.unicode, tripped) {
+            (true, true) => self.bold_red("⚡"),
+            (true, false) => self.bold_green("✔"),
+            (false, true) => self.bold_red("!"),
+            (false, false) => self.bold_green("+"),
+        }
+    }
+
+    /// Short upper-case phase label (`QUOTE`, `LOCKOUT`, `FLATTEN`, `TERMINAL`).
+    pub(crate) const fn phase_tag(phase: EpochPhase) -> &'static str {
+        match phase {
+            EpochPhase::ActiveQuoting => "QUOTE",
+            EpochPhase::PreExpiryLockout => "LOCKOUT",
+            EpochPhase::MandatoryFlatten => "FLATTEN",
+            EpochPhase::TerminalLockout => "TERMINAL",
+        }
+    }
+
+    /// Phase icon with its phase color: `▶` green, `⚠` amber, `▼` dark orange, `■` red.
+    pub(crate) fn phase_icon(self, phase: EpochPhase) -> String {
+        if !self.unicode {
+            let ascii = match phase {
+                EpochPhase::ActiveQuoting => ">",
+                EpochPhase::PreExpiryLockout => "!",
+                EpochPhase::MandatoryFlatten => "v",
+                EpochPhase::TerminalLockout => "#",
+            };
+            return ascii.to_string();
+        }
+        match phase {
+            EpochPhase::ActiveQuoting => self.bold_green("▶"),
+            EpochPhase::PreExpiryLockout => self.bold_yellow("⚠"),
+            EpochPhase::MandatoryFlatten => self.wrap("38;5;208", "▼"),
+            EpochPhase::TerminalLockout => self.bold_red("■"),
+        }
+    }
+
+    /// Short phase label colored to match its icon.
+    pub(crate) fn phase_tag_styled(self, phase: EpochPhase) -> String {
+        let tag = Self::phase_tag(phase);
+        match phase {
+            EpochPhase::ActiveQuoting => self.bold_green(tag),
+            EpochPhase::PreExpiryLockout => self.bold_yellow(tag),
+            EpochPhase::MandatoryFlatten => self.wrap("38;5;208", tag),
+            EpochPhase::TerminalLockout => self.bold_red(tag),
+        }
+    }
+
     /// Renders an aligned key-value line (`  Label                  value`).
     pub(crate) fn kv(self, label: &str, value: &str) -> String {
         let padded = format!("{label:<22}");
@@ -318,7 +393,6 @@ impl Theme {
             Badge::Latency => self.bold_yellow("[LATENCY]"),
             Badge::Epoch => self.bold_cyan("[EPOCH]"),
             Badge::Signal => self.bold_yellow("[SIGNAL]"),
-            Badge::Phase => self.bold_cyan("[PHASE]"),
             Badge::Tier => self.bold_yellow("[TIER]"),
             Badge::Info => self.cyan("[INFO]"),
             Badge::Heartbeat => self.bold_red("[♥ BEAT]"),
@@ -365,29 +439,6 @@ impl Theme {
             format!("{cents}.{}¢", rem / 10)
         } else {
             format!("{cents}.{rem:02}¢")
-        }
-    }
-
-    /// Formats best bid / ask pair cleanly (`21¢/22¢`, `--/1¢`, or `--/--`).
-    pub(crate) fn fmt_bbo(bid: Option<MicroUsdc>, ask: Option<MicroUsdc>) -> String {
-        format!("{}/{}", Self::fmt_cents(bid), Self::fmt_cents(ask))
-    }
-
-    /// Formats resting UP/DN quotes and combined pair cost (`21¢/74¢ (95¢)`).
-    pub(crate) fn fmt_pair_quotes(up: Option<MicroUsdc>, dn: Option<MicroUsdc>) -> String {
-        match (up, dn) {
-            (Some(u), Some(d)) => {
-                let sum = MicroUsdc(u.0.saturating_add(d.0));
-                format!(
-                    "{}/{} ({})",
-                    Self::fmt_cents(Some(u)),
-                    Self::fmt_cents(Some(d)),
-                    Self::fmt_cents(Some(sum)),
-                )
-            }
-            (Some(u), None) => format!("{}/--", Self::fmt_cents(Some(u))),
-            (None, Some(d)) => format!("--/{}", Self::fmt_cents(Some(d))),
-            (None, None) => "--/--".to_string(),
         }
     }
 
@@ -487,6 +538,12 @@ pub(crate) fn visible_width(s: &str) -> usize {
 }
 
 /// Pads `s` on the right with spaces so its visible width reaches at least `width`.
+/// Right-aligned counterpart of [`pad_visible_right`], ignoring ANSI escapes.
+pub(crate) fn pad_visible_left(s: &str, width: usize) -> String {
+    let pad = width.saturating_sub(visible_width(s));
+    format!("{}{s}", " ".repeat(pad))
+}
+
 pub(crate) fn pad_visible_right(s: &str, width: usize) -> String {
     let pad = width.saturating_sub(visible_width(s));
     if pad == 0 {
@@ -632,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_price_bbo_pair_and_spot_formatters() {
+    fn compact_price_and_spot_formatters() {
         assert_eq!(Theme::fmt_cents(None), "--");
         assert_eq!(Theme::fmt_cents(Some(MicroUsdc(210_000))), "21¢");
         assert_eq!(Theme::fmt_cents(Some(MicroUsdc(10_000))), "1¢");
@@ -644,28 +701,6 @@ mod tests {
         assert_eq!(Theme::fmt_cents(Some(MicroUsdc(466_682))), "46.67¢");
         assert_eq!(Theme::fmt_cents(Some(MicroUsdc(1_000_000))), "100¢");
 
-        assert_eq!(
-            Theme::fmt_bbo(Some(MicroUsdc(210_000)), Some(MicroUsdc(220_000))),
-            "21¢/22¢"
-        );
-        assert_eq!(Theme::fmt_bbo(None, Some(MicroUsdc(10_000))), "--/1¢");
-        assert_eq!(Theme::fmt_bbo(Some(MicroUsdc(990_000)), None), "99¢/--");
-        assert_eq!(Theme::fmt_bbo(None, None), "--/--");
-
-        assert_eq!(
-            Theme::fmt_pair_quotes(Some(MicroUsdc(210_000)), Some(MicroUsdc(740_000))),
-            "21¢/74¢ (95¢)"
-        );
-        assert_eq!(
-            Theme::fmt_pair_quotes(None, Some(MicroUsdc(780_000))),
-            "--/78¢"
-        );
-        assert_eq!(
-            Theme::fmt_pair_quotes(Some(MicroUsdc(500_000)), None),
-            "50¢/--"
-        );
-        assert_eq!(Theme::fmt_pair_quotes(None, None), "--/--");
-
         let plain = Theme::plain();
         assert_eq!(
             plain.fmt_spot_vs_strike(Some(90_014.0), Some(90_000.0)),
@@ -676,6 +711,40 @@ mod tests {
             "-$14 (-2bp)"
         );
         assert_eq!(plain.fmt_spot_vs_strike(None, Some(90_000.0)), "n/a");
+    }
+
+    #[test]
+    fn phase_icons_rules_and_tags_are_distinct_and_width_bounded() {
+        let plain = Theme::plain();
+        assert_eq!(plain.phase_icon(EpochPhase::ActiveQuoting), ">");
+        assert_eq!(plain.phase_icon(EpochPhase::PreExpiryLockout), "!");
+        assert_eq!(plain.phase_icon(EpochPhase::MandatoryFlatten), "v");
+        assert_eq!(plain.phase_icon(EpochPhase::TerminalLockout), "#");
+        assert_eq!(Theme::phase_tag(EpochPhase::ActiveQuoting), "QUOTE");
+        assert_eq!(Theme::phase_tag(EpochPhase::PreExpiryLockout), "LOCKOUT");
+        assert_eq!(Theme::phase_tag(EpochPhase::MandatoryFlatten), "FLATTEN");
+        assert_eq!(Theme::phase_tag(EpochPhase::TerminalLockout), "TERMINAL");
+        assert_eq!(plain.phase_rule().chars().count(), PHASE_RULE_WIDTH);
+        assert_eq!(plain.bar(), "|");
+
+        let styled = Theme::styled();
+        assert_eq!(styled.bar(), "│");
+        assert_eq!(styled.arrow(), "➔");
+        assert_eq!(
+            visible_width(&styled.phase_icon(EpochPhase::MandatoryFlatten)),
+            1
+        );
+        assert!(
+            styled
+                .phase_icon(EpochPhase::MandatoryFlatten)
+                .contains("\x1b[38;5;208m")
+        );
+        assert_eq!(
+            strip_ansi(&styled.phase_tag_styled(EpochPhase::TerminalLockout)),
+            "TERMINAL"
+        );
+        assert_eq!(strip_ansi(&styled.gray("note")), "note");
+        assert!(styled.gray("note").starts_with("\x1b[90m"));
     }
 
     #[test]

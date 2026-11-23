@@ -5,7 +5,9 @@ use core_types::{
 };
 use math_engine::{QuoteOutput, SuppressionReason};
 use paper_sim::{MergeEvent, SimFill};
-use risk_lifecycle::{BreakerStatus, EpochPhase, OrderAction, RiskActorTrace, RiskTier};
+use risk_lifecycle::{
+    BreakerReason, BreakerStatus, EpochPhase, OrderAction, RiskActorTrace, RiskTier,
+};
 use serde::Serialize;
 
 use crate::theme::{self, Badge, Theme};
@@ -18,16 +20,21 @@ pub(crate) const HEARTBEAT_NORMAL_MS: u64 = 5_000;
 pub(crate) const HEARTBEAT_FAST_MS: u64 = 1_000;
 
 /// Fixed column widths for stream rows: event badge, phase badge, tier badge.
-const EVENT_BADGE_WIDTH: usize = 10;
+const EVENT_BADGE_WIDTH: usize = 9;
 const PHASE_BADGE_WIDTH: usize = 10;
 const TIER_BADGE_WIDTH: usize = 4;
+/// Fixed leg column so `UP` / `DN` actions line up even when one side holds or cancels.
+const LEG_WIDTH: usize = 21;
+/// Fixed status column for suppression/resume notices.
+const STATUS_WIDTH: usize = 18;
 /// Fixed value width keeps `Pricing` / `Risk` / `Total` labels aligned across latency rows.
 const LATENCY_VALUE_WIDTH: usize = 10;
-/// Fixed visible column widths for `|`-delimited heartbeat sections.
-const HB_BTC_WIDTH: usize = 19;
-const HB_BOOK_WIDTH: usize = 38;
-const HB_QUOTE_WIDTH: usize = 29;
-const HB_INV_WIDTH: usize = 28;
+/// Nominal latency rows are reported as a health check at most this often.
+const LATENCY_PERIOD_MS: u64 = 10_000;
+/// Width budget for phase and order rows; longer trailing text is ellipsized.
+const ROW_WIDTH_BUDGET: usize = 130;
+/// Label column for the framed epoch block (`★ EPOCH ROLLOVER`, `◆ EPOCH #2`).
+const EPOCH_LABEL_WIDTH: usize = 19;
 
 /// Content of the middle badge column: epoch phase, or any other badge such as `[MAKER]`.
 #[derive(Debug, Clone, Copy)]
@@ -48,19 +55,13 @@ fn row_prefix(
 ) -> String {
     let event = event.map_or_else(
         || " ".repeat(EVENT_BADGE_WIDTH),
-        |kind| {
-            let pad = EVENT_BADGE_WIDTH.saturating_sub(kind.label().chars().count());
-            format!("{}{}", t.badge(kind), " ".repeat(pad))
-        },
+        |kind| theme::pad_visible_right(&t.badge(kind), EVENT_BADGE_WIDTH),
     );
     let mid = mid.map_or_else(
         || " ".repeat(PHASE_BADGE_WIDTH),
         |mid| match mid {
             MidColumn::Phase(phase) => t.phase_badge(phase),
-            MidColumn::Badge(kind) => {
-                let pad = PHASE_BADGE_WIDTH.saturating_sub(kind.label().chars().count());
-                format!("{}{}", t.badge(kind), " ".repeat(pad))
-            }
+            MidColumn::Badge(kind) => theme::pad_visible_right(&t.badge(kind), PHASE_BADGE_WIDTH),
         },
     );
     let tier = tier.map_or_else(|| " ".repeat(TIER_BADGE_WIDTH), |tier| t.tier_badge(tier));
@@ -406,17 +407,13 @@ pub(crate) fn print_lifecycle_header(
 }
 
 fn format_stream_header(t: Theme) -> String {
-    let prefix = "UTC       Tau    Event     Phase      Tier   util     ";
-    let btc = theme::pad_visible_right("BTC vs Strike", HB_BTC_WIDTH);
-    let book = theme::pad_visible_right("Book (UP / DN)", HB_BOOK_WIDTH);
-    let quote = theme::pad_visible_right("Quote (Pair)", HB_QUOTE_WIDTH);
-    let inv = theme::pad_visible_right("Inv (UP/DN, Δ)", HB_INV_WIDTH);
+    let bar = t.bar();
     t.muted(&format!(
-        "{prefix} | {btc} | {book} | {quote} | {inv} | PnL"
+        "UTC       Tau    Event    Phase      Tier Util   {bar} BTC      {bar} Bk (bid/ask)      {bar} Q (ours)   {bar} Inv (UP/DN)  {bar} PnL"
     ))
 }
 
-/// Prints a prominent banner at the start of an epoch or upon rollover.
+/// Prints a framed banner anchoring a new epoch in the scrollback.
 pub(crate) fn print_epoch_banner(
     epoch_num: usize,
     slug: &str,
@@ -424,22 +421,96 @@ pub(crate) fn print_epoch_banner(
     start_ts_ms: u64,
     expiry_ts_ms: u64,
 ) {
-    let t = theme::current();
-    let strike_str = strike_usd.map_or_else(|| "pending".to_string(), |s| format!("${s:.2}"));
+    println!();
+    println!(
+        "{}",
+        format_epoch_banner(
+            theme::current(),
+            epoch_num,
+            slug,
+            strike_usd,
+            start_ts_ms,
+            expiry_ts_ms,
+        )
+    );
+}
+
+fn format_epoch_banner(
+    t: Theme,
+    epoch_num: usize,
+    slug: &str,
+    strike_usd: Option<f64>,
+    start_ts_ms: u64,
+    expiry_ts_ms: u64,
+) -> String {
+    let strike_str = strike_usd.map_or_else(
+        || "pending".to_string(),
+        |s| format!("${}", fmt_usd_grouped(s)),
+    );
     let start_utc = format_utc_hms(start_ts_ms);
     let end_utc = format_utc_hms(expiry_ts_ms);
     let span_secs = expiry_ts_ms.saturating_sub(start_ts_ms) / 1_000;
-    println!();
-    println!("{}", t.section(&format!("EPOCH #{epoch_num} :: {slug}")));
-    println!(
-        "  {} {}  {}  {} {} -> {} ({span_secs}s)",
+    let label = epoch_label(t, t.epoch_icon(false), &format!("EPOCH #{epoch_num}"));
+    let bar = t.bar();
+    let rule = t.epoch_rule();
+    format!(
+        "{rule}\n{label}{bar} {} {bar} {} {} {bar} {} {} {} {} ({span_secs}s)\n{rule}",
+        t.cyan(slug),
         t.muted("Strike:"),
         t.bold(&strike_str),
-        t.muted("|"),
         t.muted("Window:"),
         t.cyan(&start_utc),
+        t.arrow(),
         t.cyan(&end_utc),
+    )
+}
+
+/// Groups the integer part of a USD amount with thousands separators (`$61,295.92`).
+fn fmt_usd_grouped(value: f64) -> String {
+    let raw = format!("{value:.2}");
+    let (whole, cents) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
+    format!("{}.{cents}", group_thousands(whole))
+}
+
+/// Padded, colored label that anchors the framed epoch blocks.
+fn epoch_label(t: Theme, icon: &str, title: &str) -> String {
+    let raw = format!("  {icon} {title}");
+    let padded = format!(
+        "{raw}{}",
+        " ".repeat(EPOCH_LABEL_WIDTH.saturating_sub(raw.chars().count()))
     );
+    t.bold_cyan(&padded)
+}
+
+/// `UP` / `DOWN` label for epoch winners.
+fn outcome_label(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Up => "UP",
+        Outcome::Down => "DOWN",
+    }
+}
+
+fn short_epoch_transition(t: Theme, expired: &str, next: &str) -> String {
+    match (expired.rsplit_once('-'), next.rsplit_once('-')) {
+        (Some((expired_prefix, _)), Some((next_prefix, next_tail)))
+            if expired_prefix == next_prefix =>
+        {
+            format!("{} {} {}", t.cyan(expired), t.arrow(), t.cyan(next_tail))
+        }
+        _ => format!("{} {} {}", t.cyan(expired), t.arrow(), t.cyan(next)),
+    }
+}
+
+/// Human text for a breaker trip reason (never Rust enum debug output).
+fn breaker_reason_text(reason: BreakerReason) -> &'static str {
+    match reason {
+        BreakerReason::ConsecutiveApiErrors => "consecutive API errors exceeded the limit",
+        BreakerReason::PolymarketFeedStale => "Polymarket feed stale (>3s without a message)",
+        BreakerReason::BinanceFeedStale => "Binance BTC feed stale (>2s without a message)",
+        BreakerReason::ClockDriftExceeded => "clock drift beyond the 1s tolerance",
+        BreakerReason::TickSizeChangeFreeze => "tick size changed; awaiting pricing sync",
+        BreakerReason::SupervisorKillSwitch => "supervisor kill-switch engaged",
+    }
 }
 
 /// Data for a single lifecycle terminal evaluation tick.
@@ -479,6 +550,8 @@ pub(crate) struct LifecycleStreamReporter {
     last_cancel_all_reason: Option<String>,
     last_quoted_up: Option<MicroUsdc>,
     last_quoted_dn: Option<MicroUsdc>,
+    last_latency_ms: Option<u64>,
+    verbose_latency: bool,
 }
 
 impl LifecycleStreamReporter {
@@ -491,7 +564,15 @@ impl LifecycleStreamReporter {
             last_cancel_all_reason: None,
             last_quoted_up: None,
             last_quoted_dn: None,
+            last_latency_ms: None,
+            verbose_latency: false,
         }
+    }
+
+    /// Enables `--verbose-latency`: every tick prints its latency row, bypassing throttling.
+    pub(crate) fn with_verbose_latency(mut self, enabled: bool) -> Self {
+        self.verbose_latency = enabled;
+        self
     }
 
     pub(crate) fn reset_epoch(&mut self) {
@@ -500,6 +581,7 @@ impl LifecycleStreamReporter {
         self.last_cancel_all_reason = None;
         self.last_quoted_up = None;
         self.last_quoted_dn = None;
+        self.last_latency_ms = None;
     }
 
     pub(crate) fn on_step(&mut self, row: &LifecycleStepRow<'_>) {
@@ -522,15 +604,17 @@ impl LifecycleStreamReporter {
         let up_str = format_action_styled(t, Outcome::Up, row.action_up, None);
         let dn_str = format_action_styled(t, Outcome::Down, row.action_dn, None);
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
+        let bar = t.bar();
         let suppr_note = match row.quote {
-            QuoteOutput::Suppressed(reason) => {
-                format!(" | {}", t.yellow(&format!("SUPPR({reason:?})")))
-            }
+            QuoteOutput::Suppressed(reason) => format!(
+                " {bar} {}",
+                t.yellow(&format!("Suppressing: {}", suppression_detail(reason)))
+            ),
             QuoteOutput::Active { .. } => String::new(),
         };
 
         let base = format!(
-            "{} T-{:03}s {} {} {:>5.1}% ({:>2},{:>2},d={:>+2})  {} | {} [Risk: {}, Total: {}]{}",
+            "{} T-{:03}s {} {} Util {:>5.1}% Inv {}/{} (Δ{}) {bar} {} {bar} {} {bar} Risk {} {bar} Total {}{suppr_note}",
             t.muted(&utc),
             row.tau_secs,
             t.phase_badge(row.phase),
@@ -543,18 +627,19 @@ impl LifecycleStreamReporter {
             dn_str,
             t.fmt_latency_us(row.risk_ns, RISK_BUDGET_US),
             t.fmt_latency_us(total_ns, TOTAL_BUDGET_US),
-            suppr_note,
         );
 
         if row.phase == EpochPhase::MandatoryFlatten || row.cancel_all_reason.is_some() {
-            let reason = row.cancel_all_reason.unwrap_or("none");
-            format!(
-                "{base} | fif={} UP={} DN={} reason={}",
-                row.flatten_in_flight,
-                Theme::fmt_bbo(row.best_bid_up, row.best_ask_up),
-                Theme::fmt_bbo(row.best_bid_dn, row.best_ask_dn),
-                t.yellow(reason),
-            )
+            let reason = row.cancel_all_reason.map_or_else(
+                || phase_flat_reason(row.phase).unwrap_or_else(|| "none".to_string()),
+                humanize_reason,
+            );
+            let in_flight = if row.flatten_in_flight {
+                format!(" {}", t.bold_yellow("[In-Flight]"))
+            } else {
+                String::new()
+            };
+            format!("{base} {bar}{in_flight} {}", t.gray(&reason))
         } else {
             base
         }
@@ -570,18 +655,23 @@ impl LifecycleStreamReporter {
             QuoteOutput::Suppressed(reason) => {
                 if self.last_suppression != Some(reason) {
                     let detail = match self.last_suppression {
-                        Some(prev) => format!("{prev:?} -> {reason:?}"),
-                        None => format!("{reason:?}"),
+                        Some(prev) => format!(
+                            "{} {} {}",
+                            suppression_label(prev),
+                            t.arrow(),
+                            suppression_label(reason)
+                        ),
+                        None => suppression_detail(reason).to_string(),
                     };
                     lines.push(format!(
-                        "{}| quoting suppressed: {}",
-                        row_prefix(
+                        "{} {}",
+                        status_prefix(
                             t,
                             &utc,
                             row.tau_secs,
-                            Some(Badge::Suppr),
-                            Some(MidColumn::Phase(row.phase)),
-                            None
+                            row.phase,
+                            Badge::Suppr,
+                            "Quoting paused"
                         ),
                         t.yellow(&detail),
                     ));
@@ -589,17 +679,18 @@ impl LifecycleStreamReporter {
                 }
             }
             QuoteOutput::Active { .. } => {
-                if let Some(prev) = self.last_suppression.take() {
+                if self.last_suppression.take().is_some() {
                     lines.push(format!(
-                        "{}| quoting resumed (cleared {prev:?})",
-                        row_prefix(
+                        "{} {}",
+                        status_prefix(
                             t,
                             &utc,
                             row.tau_secs,
-                            Some(Badge::Resume),
-                            Some(MidColumn::Phase(row.phase)),
-                            None
+                            row.phase,
+                            Badge::Resume,
+                            "Quoting resumed"
                         ),
+                        t.gray("Both legs cleared"),
                     ));
                 }
             }
@@ -620,16 +711,16 @@ impl LifecycleStreamReporter {
 
         if let Some(prev) = cleared_cancel_all {
             lines.push(format!(
-                "{}| cancel-all cleared (was {})",
-                row_prefix(
+                "{} {}",
+                status_prefix(
                     t,
                     &utc,
                     row.tau_secs,
-                    Some(Badge::Resume),
-                    Some(MidColumn::Phase(row.phase)),
-                    Some(row.tier)
+                    row.phase,
+                    Badge::Resume,
+                    "Quoting resumed"
                 ),
-                t.muted(&prev),
+                t.gray(&format!("Cancel-all cleared (was {prev})")),
             ));
         }
 
@@ -645,10 +736,15 @@ impl LifecycleStreamReporter {
                 };
             let prev_up = prev_price_for(self.last_quoted_up, row.resting_bid_up, row.action_up);
             let prev_dn = prev_price_for(self.last_quoted_dn, row.resting_bid_dn, row.action_dn);
-            let up_str = format_action_styled(t, Outcome::Up, row.action_up, prev_up);
-            let dn_str = format_action_styled(t, Outcome::Down, row.action_dn, prev_dn);
+            let up_leg = format_action_styled(t, Outcome::Up, row.action_up, prev_up);
+            let dn_leg = format_action_styled(t, Outcome::Down, row.action_dn, prev_dn);
+            // Widen both leg cells together so `DN` never drifts on a long requote price.
+            let leg_width = LEG_WIDTH
+                .max(theme::visible_width(&up_leg))
+                .max(theme::visible_width(&dn_leg));
+            let bar = t.bar();
             let mut action_line = format!(
-                "{}{up_str} | {dn_str}",
+                "{}{} {bar} {}",
                 row_prefix(
                     t,
                     &utc,
@@ -657,41 +753,44 @@ impl LifecycleStreamReporter {
                     Some(MidColumn::Phase(row.phase)),
                     Some(row.tier)
                 ),
+                theme::pad_visible_right(&up_leg, leg_width),
+                theme::pad_visible_right(&dn_leg, leg_width),
             );
             let replace_reason = |action: &OrderAction| match action {
-                OrderAction::CancelAndReplace { reason, .. } => Some(*reason),
+                OrderAction::CancelAndReplace { reason, .. }
+                | OrderAction::Cancel { reason, .. } => Some(*reason),
                 _ => None,
             };
-            match (replace_reason(row.action_up), replace_reason(row.action_dn)) {
-                (Some(r_up), Some(r_dn)) if r_up == r_dn => {
-                    action_line.push_str(&format!(" | {}", t.muted(&format!("({r_up:?})"))));
-                }
-                (Some(r_up), Some(r_dn)) => {
-                    action_line.push_str(&format!(
-                        " | {}",
-                        t.muted(&format!("(UP: {r_up:?}, DN: {r_dn:?})"))
-                    ));
-                }
-                (Some(r), None) | (None, Some(r)) => {
-                    action_line.push_str(&format!(" | {}", t.muted(&format!("({r:?})"))));
-                }
-                (None, None) => {}
+            let explicit = match (replace_reason(row.action_up), replace_reason(row.action_dn)) {
+                (Some(r_up), Some(r_dn)) if r_up == r_dn => Some(format!("{r_up:?}")),
+                (Some(r_up), Some(r_dn)) => Some(format!("UP {r_up:?} {} DN {r_dn:?}", t.dot())),
+                (Some(r), None) | (None, Some(r)) => Some(format!("{r:?}")),
+                (None, None) => None,
+            };
+            let mut notes = Vec::new();
+            let in_flight = row.cancel_all_reason.is_some() && row.flatten_in_flight;
+            if in_flight {
+                notes.push(t.bold_yellow("[In-Flight]"));
             }
-            if let Some(reason) = row.cancel_all_reason {
-                let flat_note = if row.flatten_in_flight {
-                    " - all quotes canceled"
-                } else {
-                    ""
-                };
-                action_line.push_str(&format!(
-                    " | FIF={} UP={} DN={} reason={}{flat_note}",
-                    row.flatten_in_flight,
-                    Theme::fmt_bbo(row.best_bid_up, row.best_ask_up),
-                    Theme::fmt_bbo(row.best_bid_dn, row.best_ask_dn),
-                    t.yellow(reason),
-                ));
+            if let Some(detail) = explicit.or_else(|| {
+                row.cancel_all_reason
+                    .map(humanize_reason)
+                    .or_else(|| phase_flat_reason(row.phase))
+            }) {
+                let reserved = theme::visible_width(&action_line)
+                    + 3
+                    + if in_flight {
+                        theme::visible_width(&t.bold_yellow("[In-Flight]")) + 3
+                    } else {
+                        0
+                    };
+                let room = ROW_WIDTH_BUDGET.saturating_sub(reserved).max(8);
+                notes.push(t.gray(&truncate_to_width(t, &detail, room)));
             }
-            lines.push(action_line);
+            if !notes.is_empty() {
+                action_line.push_str(&format!(" {bar} {}", notes.join(&format!(" {bar} "))));
+            }
+            lines.push(action_line.trim_end().to_string());
         }
 
         let next_quoted = |action: &OrderAction, resting: Option<MicroUsdc>| match action {
@@ -703,31 +802,40 @@ impl LifecycleStreamReporter {
         self.last_quoted_up = next_quoted(row.action_up, row.resting_bid_up);
         self.last_quoted_dn = next_quoted(row.action_dn, row.resting_bid_dn);
 
-        // 3. Latency breaches (compare raw nanoseconds; fixed-width values align the labels)
+        // 3. Latency: breaches print immediately; nominal ticks report at most every 10s
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
-        if row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000)
-            || row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000)
-            || total_ns > TOTAL_BUDGET_US.saturating_mul(1_000)
-        {
+        let pricing_breach = row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000);
+        let risk_breach = row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000);
+        let total_breach = total_ns > TOTAL_BUDGET_US.saturating_mul(1_000);
+        let breach = pricing_breach || risk_breach || total_breach;
+        // First tick only seeds the throttle window; nominal rows report every 10s after that.
+        let previous_latency = self.last_latency_ms.get_or_insert(row.now_ms);
+        let periodic = row.now_ms.saturating_sub(*previous_latency) >= LATENCY_PERIOD_MS;
+        if self.verbose_latency || breach || periodic {
+            self.last_latency_ms = Some(row.now_ms);
             let pricing =
                 t.fmt_latency_us_width(row.pricing_ns, PRICING_BUDGET_US, LATENCY_VALUE_WIDTH);
             let risk = t.fmt_latency_us_width(row.risk_ns, RISK_BUDGET_US, LATENCY_VALUE_WIDTH);
             let total = t.fmt_latency_us_width(total_ns, TOTAL_BUDGET_US, LATENCY_VALUE_WIDTH);
-            let mut breaches = Vec::new();
-            if row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000) {
-                breaches.push(format!("Pricing > {PRICING_BUDGET_US}µs"));
+            let bar = t.bar();
+            let mut line = format!(
+                "{}Pricing {pricing} {bar} Risk {risk} {bar} Total {total}",
+                row_prefix(t, &utc, row.tau_secs, Some(Badge::Latency), None, None),
+            );
+            if breach {
+                let mut breaches = Vec::new();
+                if pricing_breach {
+                    breaches.push(format!("Pricing >{PRICING_BUDGET_US}µs"));
+                }
+                if risk_breach {
+                    breaches.push(format!("Risk >{RISK_BUDGET_US}µs"));
+                }
+                if total_breach {
+                    breaches.push(format!("Total >{TOTAL_BUDGET_US}µs"));
+                }
+                line.push_str(&format!(" {bar} {}", t.bold_yellow(&breaches.join(", "))));
             }
-            if row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000) {
-                breaches.push(format!("Risk > {RISK_BUDGET_US}µs"));
-            }
-            if total_ns > TOTAL_BUDGET_US.saturating_mul(1_000) {
-                breaches.push(format!("Total > {TOTAL_BUDGET_US}µs"));
-            }
-            let note = format!("  {}", t.bold_yellow(&breaches.join("; ")));
-            let prefix = row_prefix(t, &utc, row.tau_secs, Some(Badge::Latency), None, None);
-            lines.push(format!(
-                "{prefix} Pricing {pricing} | Risk {risk} | Total {total}{note}",
-            ));
+            lines.push(line);
         }
 
         // 4. Periodic 1-line heartbeat (1s during MandatoryFlatten/T3/T4, else 5s)
@@ -749,35 +857,26 @@ impl LifecycleStreamReporter {
         lines
     }
 
+    /// Renders the heartbeat at the richest detail level that still fits [`ROW_WIDTH_BUDGET`].
+    /// Renders the one fixed heartbeat shape so every beat scans the same way.
     fn format_heartbeat_line(&self, row: &LifecycleStepRow<'_>, utc: &str) -> String {
         let t = self.theme;
         let u_pct = (row.u_e6 as f64) / 10_000.0;
         let btc = t.fmt_spot_vs_strike(row.spot_usd, row.strike_usd);
-        let up_bbo = Theme::fmt_bbo(row.best_bid_up, row.best_ask_up);
-        let dn_bbo = Theme::fmt_bbo(row.best_bid_dn, row.best_ask_dn);
-        let quotes = Theme::fmt_pair_quotes(row.resting_bid_up, row.resting_bid_dn);
+        let book = compact_book(t, row);
+        let quote = compact_quote(row);
         let net_delta_micro = i128::from(row.q_up.as_u64()) - i128::from(row.q_dn.as_u64());
-        let pnl = t.fmt_pnl(row.net_pnl_micro);
-        let sep = t.muted("|");
-
-        let btc_col = theme::pad_visible_right(&format!("BTC {btc}"), HB_BTC_WIDTH);
-        let book_col =
-            theme::pad_visible_right(&format!("Book UP {up_bbo} DN {dn_bbo}"), HB_BOOK_WIDTH);
-        let quote_col = theme::pad_visible_right(&format!("Quote {quotes}"), HB_QUOTE_WIDTH);
-        let inv_col = theme::pad_visible_right(
-            &format!(
-                "Inv {}U/{}D (Δ{})",
-                fmt_shares_2dp(row.q_up.as_u64()),
-                fmt_shares_2dp(row.q_dn.as_u64()),
-                fmt_signed_shares_2dp(net_delta_micro),
-            ),
-            HB_INV_WIDTH,
+        let inv = format!(
+            "Inv {}/{} (Δ{})",
+            fmt_shares_2dp(row.q_up.as_u64()),
+            fmt_shares_2dp(row.q_dn.as_u64()),
+            fmt_signed_shares_2dp(net_delta_micro)
         );
-        let pnl_col = format!("PnL {pnl}");
+        let bar = t.bar();
 
         format!(
-            "{}util {:>5.1}% {sep} {btc_col} {sep} {book_col} {sep} {quote_col} {sep} {inv_col} {sep} {pnl_col}",
-            row_prefix(
+            "{prefix}Util {u_pct:.1}% {bar} BTC {btc} {bar} {book} {bar} {quote} {bar} {inv} {bar} PnL {pnl}",
+            prefix = row_prefix(
                 t,
                 utc,
                 row.tau_secs,
@@ -785,8 +884,90 @@ impl LifecycleStreamReporter {
                 Some(MidColumn::Phase(row.phase)),
                 Some(row.tier)
             ),
-            u_pct,
+            pnl = t.fmt_pnl(row.net_pnl_micro),
         )
+    }
+}
+
+/// Compact book cell: whole-cent prices without the currency glyph (`Bk 47/50·47/50`).
+fn compact_book(t: Theme, row: &LifecycleStepRow<'_>) -> String {
+    format!(
+        "Bk {}/{}{}{}/{}",
+        fmt_cents_plain(row.best_bid_up),
+        fmt_cents_plain(row.best_ask_up),
+        t.dot(),
+        fmt_cents_plain(row.best_bid_dn),
+        fmt_cents_plain(row.best_ask_dn),
+    )
+}
+
+/// Compact quote cell: our resting pair in whole cents, without the combined pair cost.
+fn compact_quote(row: &LifecycleStepRow<'_>) -> String {
+    format!(
+        "Q {}/{}",
+        fmt_cents_plain(row.resting_bid_up),
+        fmt_cents_plain(row.resting_bid_dn),
+    )
+}
+
+/// Builds the shared prefix for status notices (`[SUPPR]` / `[RESUME]`): badge columns plus a
+/// fixed-width status label ending in the column bar.
+fn status_prefix(
+    t: Theme,
+    utc: &str,
+    tau_secs: u64,
+    phase: EpochPhase,
+    badge: Badge,
+    status: &str,
+) -> String {
+    format!(
+        "{}{} {}",
+        row_prefix(
+            t,
+            utc,
+            tau_secs,
+            Some(badge),
+            Some(MidColumn::Phase(phase)),
+            None
+        ),
+        theme::pad_visible_right(status, STATUS_WIDTH),
+        t.bar(),
+    )
+}
+
+/// Human-readable suppression label used inside status notices.
+fn suppression_label(reason: SuppressionReason) -> &'static str {
+    match reason {
+        SuppressionReason::WarmingUp => "Warming up",
+        SuppressionReason::EmptyOrderBook => "Empty order book",
+        SuppressionReason::CrossedOrderBook => "Crossed order book",
+        SuppressionReason::PairMarginViolation => "Pair margin violation",
+        SuppressionReason::BothLegsSuppressed => "Both legs suppressed",
+    }
+}
+
+/// Full suppression detail for the first paused notice.
+fn suppression_detail(reason: SuppressionReason) -> &'static str {
+    match reason {
+        SuppressionReason::BothLegsSuppressed => "Both legs suppressed (no valid spread)",
+        other => suppression_label(other),
+    }
+}
+
+/// Turns an operator reason string (`stale_feed`) into readable words (`stale feed`).
+fn humanize_reason(raw: &str) -> String {
+    raw.replace('_', " ")
+}
+
+/// Explains the current lockout/flatten phase when no explicit reason string is present.
+fn phase_flat_reason(phase: EpochPhase) -> Option<String> {
+    match phase {
+        EpochPhase::ActiveQuoting => None,
+        EpochPhase::PreExpiryLockout => {
+            Some("Flat position in PreExpiryLockout (τ ≤ 60s)".to_string())
+        }
+        EpochPhase::MandatoryFlatten => Some("Flattening inventory before expiry".to_string()),
+        EpochPhase::TerminalLockout => Some("Terminal lockout — settlement imminent".to_string()),
     }
 }
 
@@ -796,45 +977,33 @@ fn format_action_styled(
     action: &OrderAction,
     prev_price: Option<MicroUsdc>,
 ) -> String {
-    let leg_plain = match outcome {
-        Outcome::Up => "UP",
-        Outcome::Down => "DN",
-    };
     let leg = match outcome {
         Outcome::Up => t.bold_green("UP"),
         Outcome::Down => t.bold_red("DN"),
     };
+    let arrow = t.arrow();
     match action {
-        OrderAction::Hold => {
-            format!("{leg_plain}: {} ({})", t.muted("hold"), t.muted("resting"))
-        }
+        OrderAction::Hold => format!("{leg}: {}", t.muted("hold (resting)")),
         OrderAction::SubmitNew { price, size, .. } => format!(
-            "{} {} @ {}",
+            "{leg}: {} @ {}",
             fmt_shares_3dp(*size),
-            leg,
             Theme::fmt_cents(Some(*price))
         ),
-        OrderAction::Cancel { reason, .. } => {
-            format!("{leg} {}", t.yellow(&format!("Cancel({reason:?})")))
-        }
+        OrderAction::Cancel { .. } => format!("{leg}: {}", t.yellow("Cancel")),
         OrderAction::CancelAndReplace {
             new_price,
             new_size,
             ..
         } => match prev_price {
             Some(old) => format!(
-                "{} {} {} @ {} -> {}",
-                t.cyan("Requote"),
+                "{leg}: {} @ {} {arrow} {}",
                 fmt_shares_3dp(*new_size),
-                leg,
                 t.strikethrough(&Theme::fmt_cents(Some(old))),
                 Theme::fmt_cents(Some(*new_price)),
             ),
             None => format!(
-                "{} {} {} @ {}",
-                t.cyan("Requote"),
+                "{leg}: {} @ {}",
                 fmt_shares_3dp(*new_size),
-                leg,
                 Theme::fmt_cents(Some(*new_price)),
             ),
         },
@@ -871,6 +1040,27 @@ fn fmt_shares_2dp(raw_micro: u64) -> String {
     }
 }
 
+/// Clamps plain text to `max_chars`, appending the theme's ellipsis when it is shortened.
+fn truncate_to_width(t: Theme, text: &str, max_chars: usize) -> String {
+    let width = text.chars().count();
+    if width <= max_chars {
+        return text.to_string();
+    }
+    let marker = t.ellipsis();
+    let keep = max_chars.saturating_sub(marker.chars().count());
+    let mut out: String = text.chars().take(keep).collect();
+    out.push_str(marker);
+    out
+}
+
+/// Rounds micro-USDC to whole cents without a currency glyph (`47`, `--`).
+fn fmt_cents_plain(px: Option<MicroUsdc>) -> String {
+    match px {
+        None => "--".to_string(),
+        Some(MicroUsdc(micro)) => format!("{}", micro.saturating_add(5_000) / 10_000),
+    }
+}
+
 /// Formats signed micro-share inventory delta up to 2 decimal places (`0`, `+20`, `-1.5`).
 fn fmt_signed_shares_2dp(delta_micro: i128) -> String {
     let mag_micro = u64::try_from(delta_micro.unsigned_abs()).unwrap_or(u64::MAX);
@@ -898,44 +1088,121 @@ pub(crate) fn print_phase_transition(
         EpochPhase::MandatoryFlatten => "unwind inventory before expiry",
         EpochPhase::TerminalLockout => "settlement imminent; all quoting ceased",
     };
-    println!();
-    println!(
-        "  {} {} -> {} (T-{tau_secs}s) | {} — {}",
-        t.badge(Badge::Phase),
+    let rule = t.phase_rule();
+    let head = format!(
+        "  {} {} :: {} {} {} (T-{tau_secs:03}s) {} ",
+        t.phase_icon(to),
+        t.bold("PHASE"),
         t.muted(&from_label),
-        t.phase_badge(to),
-        reason,
-        t.muted(meaning),
+        t.arrow(),
+        t.phase_tag_styled(to),
+        t.bar(),
     );
+    let used = theme::visible_width(&head);
+    let budget = ROW_WIDTH_BUDGET.saturating_sub(used + 3);
+    let reason_text = truncate_to_width(t, reason, budget.saturating_sub(20).max(12));
+    let meaning_max = budget.saturating_sub(theme::visible_width(&reason_text));
+    let meaning_text = truncate_to_width(t, meaning, meaning_max);
+    println!();
+    println!("{rule}");
+    println!("{head}{reason_text} — {}", t.muted(&meaning_text));
+    println!("{rule}");
 }
 
 pub(crate) fn print_tier_transition(to: RiskTier, u_e6: u64, heavy: Option<Outcome>) {
     let t = theme::current();
+    let heavy_label = match heavy {
+        Some(Outcome::Up) => "UP",
+        Some(Outcome::Down) => "DN",
+        None => "none",
+    };
     println!(
-        "  {} {} u = {:.1}% | heavy: {:?}",
+        "  {} {} Util {:.1}% {} heavy: {}",
         t.badge(Badge::Tier),
         t.tier_badge(to),
         (u_e6 as f64) / 10_000.0,
-        heavy
+        t.bar(),
+        heavy_label
     );
 }
 
 pub(crate) fn print_breaker_trip(status: BreakerStatus) {
-    let t = theme::current();
     println!();
-    println!(
-        "  {} Circuit breaker tripped: {}",
+    println!("{}", format_breaker_line(theme::current(), status));
+}
+
+fn format_breaker_line(t: Theme, status: BreakerStatus) -> String {
+    let (tripped, state, reason) = match status {
+        BreakerStatus::ArmActive => (false, "Armed", "all risk gates healthy".to_string()),
+        BreakerStatus::Tripped { reason } => (
+            true,
+            "Quoting halted",
+            breaker_reason_text(reason).to_string(),
+        ),
+    };
+    let bar = t.bar();
+    format!(
+        "  {} {} {} {} {} {}",
+        t.breaker_icon(tripped),
         t.badge(Badge::Breaker),
-        t.bold_red(&format!("{status:?}"))
+        bar,
+        t.bold(state),
+        bar,
+        t.gray(&reason),
+    )
+}
+
+pub(crate) fn print_lifecycle_fill(
+    now_ms: u64,
+    tau_secs: u64,
+    tier: RiskTier,
+    fill: &SimFill,
+    q_up: SharesMicro,
+    q_dn: SharesMicro,
+    realized_pnl_micro: i64,
+) {
+    println!(
+        "{}",
+        format_fill_line(
+            theme::current(),
+            now_ms,
+            tau_secs,
+            tier,
+            FillImpact {
+                fill,
+                q_up,
+                q_dn,
+                realized_pnl_micro,
+            },
+        )
     );
 }
 
-pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, fill: &SimFill) {
-    let t = theme::current();
+/// Post-fill context rendered after the fill itself.
+struct FillImpact<'a> {
+    fill: &'a SimFill,
+    q_up: SharesMicro,
+    q_dn: SharesMicro,
+    realized_pnl_micro: i64,
+}
+
+fn format_fill_line(
+    t: Theme,
+    now_ms: u64,
+    tau_secs: u64,
+    tier: RiskTier,
+    impact: FillImpact<'_>,
+) -> String {
+    let FillImpact {
+        fill,
+        q_up,
+        q_dn,
+        realized_pnl_micro,
+    } = impact;
     let utc = format_utc_hms(now_ms);
     let leg = match fill.outcome {
         Outcome::Up => t.bold_green("UP"),
-        Outcome::Down => t.bold_red("DN"),
+        Outcome::Down => t.bold_cyan("DN"),
     };
     let side = match fill.side {
         OrderSide::Buy => t.bold_green("BUY"),
@@ -946,8 +1213,13 @@ pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, f
     } else {
         Badge::Taker
     };
-    println!(
-        "{}#{} {} {} {} @ {}",
+    let notional_micro =
+        (u128::from(fill.price.0) * u128::from(fill.filled_shares.0)) / u128::from(1_000_000u64);
+    let notional = format!("${}", fmt_usd_grouped(notional_micro as f64 / 1_000_000.0));
+    let net_delta = i128::from(q_up.0) - i128::from(q_dn.0);
+    let bar = t.bar();
+    format!(
+        "{}#{} {} {} {} @ {} {bar} {} {} {bar} Inv {}/{} (Δ{}) {bar} {} {}",
         row_prefix(
             t,
             &utc,
@@ -957,11 +1229,18 @@ pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, f
             Some(tier)
         ),
         fill.sim_id,
-        side,
         leg,
+        side,
         fmt_shares_3dp(fill.filled_shares),
         Theme::fmt_cents(Some(fill.price)),
-    );
+        t.muted("Notional"),
+        t.bold(&notional),
+        fmt_shares_2dp(q_up.0),
+        fmt_shares_2dp(q_dn.0),
+        fmt_signed_shares_2dp(net_delta),
+        t.muted("PnL"),
+        t.fmt_pnl(realized_pnl_micro),
+    )
 }
 
 pub(crate) fn print_lifecycle_merge(
@@ -974,8 +1253,9 @@ pub(crate) fn print_lifecycle_merge(
 ) {
     let t = theme::current();
     let utc = format_utc_hms(now_ms);
+    let bar = t.bar();
     println!(
-        "{}pairs: {} | pair_cost={} (UP={}, DN={}) -> PnL={} (total={})",
+        "{}pairs {} {bar} pair cost {} {bar} UP {} {} DN {} {bar} PnL {} {bar} total {}",
         row_prefix(
             t,
             &utc,
@@ -987,6 +1267,7 @@ pub(crate) fn print_lifecycle_merge(
         merge.merged_pairs,
         Theme::fmt_cents(Some(merge.pair_cost)),
         Theme::fmt_cents(Some(merge.avg_cost_up)),
+        t.dot(),
         Theme::fmt_cents(Some(merge.avg_cost_dn)),
         t.fmt_pnl(merge.realized_gain_micro),
         total_merged
@@ -1008,14 +1289,17 @@ pub(crate) fn print_lifecycle_flatten(
         Outcome::Down => "DN",
     };
     println!(
-        "  {} {} | {} {} {} @ {} | fee=${fee} | reason={}",
+        "  {} {} {} {} {} {} @ {} {} fee ${fee} {} {}",
         t.badge(Badge::Flatten),
         t.muted(market_slug),
+        t.bar(),
         t.bold(leg),
         side.as_str(),
         fmt_shares_3dp(size),
         Theme::fmt_cents(Some(price)),
-        t.yellow(reason)
+        t.bar(),
+        t.bar(),
+        t.gray(reason)
     );
 }
 
@@ -1026,17 +1310,49 @@ pub(crate) fn print_epoch_rollover(
     settlement_pnl_delta_micro: i64,
     total_realized_pnl_micro: i64,
 ) {
-    let t = theme::current();
     println!();
     println!(
-        "  {} {} -> {} | winner={:?} | settle_delta={} | cumulative_realized={}",
-        t.badge(Badge::Epoch),
-        t.muted(expired_slug),
-        t.cyan(next_slug.unwrap_or("awaiting-next")),
-        winning_outcome,
-        t.fmt_pnl(settlement_pnl_delta_micro),
-        t.fmt_pnl(total_realized_pnl_micro)
+        "{}",
+        format_epoch_rollover_block(
+            theme::current(),
+            expired_slug,
+            next_slug,
+            winning_outcome,
+            settlement_pnl_delta_micro,
+            total_realized_pnl_micro,
+        )
     );
+}
+
+fn format_epoch_rollover_block(
+    t: Theme,
+    expired_slug: &str,
+    next_slug: Option<&str>,
+    winning_outcome: Outcome,
+    settlement_pnl_delta_micro: i64,
+    total_realized_pnl_micro: i64,
+) -> String {
+    let bar = t.bar();
+    let label = epoch_label(t, t.epoch_icon(true), "EPOCH ROLLOVER");
+    let next = match next_slug {
+        Some(next) => short_epoch_transition(t, expired_slug, next),
+        None => format!(
+            "{} {} {}",
+            t.cyan(expired_slug),
+            t.arrow(),
+            t.muted("awaiting-next")
+        ),
+    };
+    let rule = t.epoch_rule();
+    format!(
+        "{rule}\n{label}{bar} {next} {bar} {} {} {bar} {} {} {bar} {} {}\n{rule}",
+        t.muted("Winner:"),
+        t.bold(outcome_label(winning_outcome)),
+        t.muted("Settle:"),
+        t.fmt_pnl(settlement_pnl_delta_micro),
+        t.muted("CumPnL:"),
+        t.fmt_pnl(total_realized_pnl_micro),
+    )
 }
 
 pub(crate) fn print_lifecycle_summary(
@@ -1045,153 +1361,297 @@ pub(crate) fn print_lifecycle_summary(
     risk_lat: &LatencySummary,
     total_lat: &LatencySummary,
 ) {
-    let t = theme::current();
-    let net_pnl_micro = stats
-        .realized_pnl_micro
-        .saturating_add(stats.unrealized_pnl_micro);
     println!();
     println!(
         "{}",
-        t.banner("PHASE 4 LIFECYCLE & RISK EXECUTION SUMMARY", None)
+        format_lifecycle_summary(theme::current(), stats, pricing_lat, risk_lat, total_lat)
     );
-    println!("{}", t.section("EXECUTION & ORDERS"));
-    println!(
-        "{}",
-        t.kv("Ticks Evaluated:", &stats.ticks_evaluated.to_string())
+}
+
+/// Label column and right-aligned value column for the summary blocks.
+const SUMMARY_LABEL_WIDTH: usize = 16;
+const SUMMARY_VALUE_WIDTH: usize = 12;
+
+/// Groups a digit string in threes (`6295` -> `6,295`).
+fn group_thousands(raw: &str) -> String {
+    let mut out = String::new();
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx > 0 && (raw.len() - idx).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn fmt_count(n: u64) -> String {
+    group_thousands(&n.to_string())
+}
+
+/// One `label value` cell with a fixed-width right-aligned number.
+fn summary_cell(t: Theme, label: &str, value: &str) -> String {
+    format!(
+        "{} {}",
+        t.muted(&format!("{label:<width$}", width = SUMMARY_LABEL_WIDTH)),
+        theme::pad_visible_left(value, SUMMARY_VALUE_WIDTH)
+    )
+}
+
+fn push_summary_section(out: &mut String, t: Theme, title: &str) {
+    out.push_str(&format!("\n  {}", t.bold_cyan(title)));
+}
+
+fn push_summary_row(out: &mut String, t: Theme, cells: &[(&str, &str)]) {
+    out.push('\n');
+    out.push_str(&summary_row(t, cells));
+}
+
+fn summary_row(t: Theme, cells: &[(&str, &str)]) -> String {
+    let bar = t.bar();
+    let body = cells
+        .iter()
+        .map(|(label, value)| summary_cell(t, label, value))
+        .collect::<Vec<_>>()
+        .join(&format!(" {bar} "));
+    format!("    {body}")
+}
+
+fn signed_bps(bps: f64) -> String {
+    format!("{bps:+.1}bp")
+}
+
+fn format_lifecycle_summary(
+    t: Theme,
+    stats: &LifecycleReportStats,
+    pricing_lat: &LatencySummary,
+    risk_lat: &LatencySummary,
+    total_lat: &LatencySummary,
+) -> String {
+    let net_pnl_micro = stats
+        .realized_pnl_micro
+        .saturating_add(stats.unrealized_pnl_micro);
+    let rule = t.epoch_rule();
+    let mut out = String::new();
+
+    out.push_str(&rule);
+    out.push('\n');
+    out.push_str(&format!(
+        "  {} {} {}",
+        t.bold_cyan("■ LIFECYCLE SUMMARY"),
+        t.muted("│"),
+        t.gray("execution, risk and telemetry totals for this run")
+    ));
+    out.push('\n');
+    out.push_str(&rule);
+
+    // Execution & fills
+    let ticks = fmt_count(stats.ticks_evaluated as u64);
+    let phases = fmt_count(stats.phase_transitions as u64);
+    let submitted = fmt_count(stats.orders_submitted as u64);
+    let replaced = fmt_count(stats.orders_replaced as u64);
+    let canceled = fmt_count(stats.orders_canceled as u64);
+    let held = fmt_count(stats.orders_held as u64);
+    let fills = fmt_count(stats.fills_count);
+    let merges = fmt_count(stats.merges_count);
+    let pairs = fmt_shares_2dp(stats.total_pairs_merged.0);
+    let epochs = fmt_count(stats.epochs_completed as u64);
+    let rollovers = fmt_count(stats.epoch_rollovers as u64);
+    let rpm = fmt_count(stats.rpm_60s as u64);
+    push_summary_section(&mut out, t, "EXECUTION & FILLS");
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Ticks", &ticks),
+            ("Phase shifts", &phases),
+            ("Orders", &submitted),
+        ],
     );
-    println!(
-        "{}",
-        t.kv("Phase Transitions:", &stats.phase_transitions.to_string())
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Replaced", &replaced),
+            ("Canceled", &canceled),
+            ("Held (FIFO)", &held),
+        ],
     );
-    println!(
-        "{}",
-        t.kv(
-            "Orders (Sub/Rep/Cxl):",
-            &format!(
-                "{} / {} / {} (held FIFO: {})",
-                stats.orders_submitted,
-                stats.orders_replaced,
-                stats.orders_canceled,
-                stats.orders_held
-            )
-        )
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Fills", &fills),
+            ("Merges", &merges),
+            ("Pairs merged", &pairs),
+        ],
     );
-    println!(
-        "{}",
-        t.kv(
-            "Flattens / Breakers:",
-            &format!("{} / {}", stats.flattens_executed, stats.breaker_trips)
-        )
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Epochs", &epochs),
+            ("Rollovers", &rollovers),
+            ("RPM (60s)", &rpm),
+        ],
     );
 
-    println!("{}", t.section("INVENTORY & PNL"));
-    println!(
-        "{}",
-        t.kv(
-            "Paper Fills / Merges:",
-            &format!(
-                "{} fills | {} merges ({} pairs)",
-                stats.fills_count, stats.merges_count, stats.total_pairs_merged
-            )
-        )
+    // Inventory & PnL
+    let q_up = fmt_shares_2dp(stats.final_q_up.0);
+    let q_dn = fmt_shares_2dp(stats.final_q_dn.0);
+    let net_delta = fmt_signed_shares_2dp(i128::from(stats.resolved_net_delta_micro()));
+    let realized = t.fmt_pnl(stats.realized_pnl_micro);
+    let unrealized = t.fmt_pnl(stats.unrealized_pnl_micro);
+    let net_pnl = t.fmt_pnl(net_pnl_micro);
+    let settlement = t.fmt_pnl(stats.settlement_pnl_micro);
+    let fees = format!("${:.2}", stats.fees_paid_micro as f64 / MICRO_SCALE as f64);
+    let rebate = format!(
+        "${:.2}",
+        stats.estimated_rebate_micro as f64 / MICRO_SCALE as f64
     );
-    println!(
-        "{}",
-        t.kv(
-            "Final Inventory:",
-            &format!(
-                "UP={} | DN={} | Net={:+.6} sh",
-                stats.final_q_up,
-                stats.final_q_dn,
-                stats.resolved_net_delta_micro() as f64 / MICRO_SCALE as f64
-            )
-        )
+    let fill_ratio = format!("{:.1}%", stats.fill_ratio * 100.0);
+    let markout_1s = signed_bps(stats.markout_1s_bps);
+    let markout_5s = signed_bps(stats.markout_5s_bps);
+    push_summary_section(&mut out, t, "INVENTORY & PNL");
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Inventory UP", &q_up),
+            ("Inventory DN", &q_dn),
+            ("Net delta", &net_delta),
+        ],
     );
-    println!(
-        "{}",
-        t.kv(
-            "PnL (Real / Unreal):",
-            &format!(
-                "{} / {} | Net={}",
-                t.fmt_pnl(stats.realized_pnl_micro),
-                t.fmt_pnl(stats.unrealized_pnl_micro),
-                t.fmt_pnl(net_pnl_micro)
-            )
-        )
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Realized", &realized),
+            ("Unrealized", &unrealized),
+            ("Net PnL", &net_pnl),
+        ],
     );
-    println!(
-        "{}",
-        t.kv(
-            "Settle / Fees / Reb:",
-            &format!(
-                "Settle={} | Fees=${} | EstRebate=${}",
-                t.fmt_pnl(stats.settlement_pnl_micro),
-                MicroUsdc(stats.fees_paid_micro),
-                MicroUsdc(stats.estimated_rebate_micro)
-            )
-        )
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Settlement", &settlement),
+            ("Fees paid", &fees),
+            ("Est rebate", &rebate),
+        ],
     );
-    println!(
-        "{}",
-        t.kv(
-            "Epochs / Telemetry:",
-            &format!(
-                "epochs={} rollovers={} | RPM={} | Fill={:.2}% | MO(1s/5s)={:+.1}/{:+.1}bps | Base={}",
-                stats.epochs_completed,
-                stats.epoch_rollovers,
-                stats.rpm_60s,
-                stats.fill_ratio * 100.0,
-                stats.markout_1s_bps,
-                stats.markout_5s_bps,
-                t.fmt_pnl(stats.baseline_pnl_micro)
-            )
-        )
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Fill ratio", &fill_ratio),
+            ("Markout 1s", &markout_1s),
+            ("Markout 5s", &markout_5s),
+        ],
     );
 
-    println!(
-        "{}",
-        t.section("COMPUTE LATENCY HDR (P50 / P95 / P99 / MAX)")
+    // Risk & breakers
+    let breakers_raw = fmt_count(stats.breaker_trips as u64);
+    let breakers = if stats.breaker_trips > 0 {
+        t.bold_red(&breakers_raw)
+    } else {
+        t.muted(&breakers_raw)
+    };
+    let flattens_raw = fmt_count(stats.flattens_executed as u64);
+    let flattens = if stats.flattens_executed > 0 {
+        t.yellow(&flattens_raw)
+    } else {
+        t.muted(&flattens_raw)
+    };
+    let baseline = t.fmt_pnl(stats.baseline_pnl_micro);
+    push_summary_section(&mut out, t, "RISK & BREAKERS");
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Breakers", &breakers),
+            ("Flattens", &flattens),
+            ("Baseline PnL", &baseline),
+        ],
     );
-    println!(
-        "{}",
-        t.kv(
-            "Pricing Pipeline:",
-            &format!(
-                "{}us / {}us / {} / {}us (Target P99 < {PRICING_BUDGET_US}us)",
-                pricing_lat.p50_ns / 1_000,
-                pricing_lat.p95_ns / 1_000,
-                t.fmt_latency_us(pricing_lat.p99_ns, PRICING_BUDGET_US),
-                pricing_lat.max_ns / 1_000
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Risk & Hysteresis:",
-            &format!(
-                "{}us / {}us / {} / {}us (Target P99 < {RISK_BUDGET_US}us)",
-                risk_lat.p50_ns / 1_000,
-                risk_lat.p95_ns / 1_000,
-                t.fmt_latency_us(risk_lat.p99_ns, RISK_BUDGET_US),
-                risk_lat.max_ns / 1_000
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Total Internal Path:",
-            &format!(
-                "{}us / {}us / {} / {}us (Target P99 < {TOTAL_BUDGET_US}us)",
-                total_lat.p50_ns / 1_000,
-                total_lat.p95_ns / 1_000,
-                t.fmt_latency_us(total_lat.p99_ns, TOTAL_BUDGET_US),
-                total_lat.max_ns / 1_000
-            )
-        )
-    );
-    println!("{}", t.divider());
+
+    out.push_str("\n\n");
+    out.push_str(&format!(
+        "  {} {}\n",
+        t.bold_cyan("COMPUTE LATENCY HDR"),
+        t.gray("(microseconds; P99 vs budget)")
+    ));
+    out.push_str(&format_latency_table(
+        t,
+        &[
+            ("Pricing", pricing_lat, PRICING_BUDGET_US),
+            ("Risk", risk_lat, RISK_BUDGET_US),
+            ("Total", total_lat, TOTAL_BUDGET_US),
+        ],
+    ));
+    out
+}
+
+fn format_latency_table(t: Theme, rows: &[(&str, &LatencySummary, u64)]) -> String {
+    const STAGE_W: usize = 18;
+    const NUM_W: usize = 8;
+    const TARGET_W: usize = 9;
+    const COLS: [usize; 6] = [STAGE_W, NUM_W, NUM_W, NUM_W, NUM_W, TARGET_W];
+    let (h, v, cross, corners) = if t.box_drawing() {
+        ("─", "│", "┼", ("┌", "┐", "├", "┤", "└", "┘"))
+    } else {
+        ("-", "|", "+", ("+", "+", "+", "+", "+", "+"))
+    };
+
+    let border = |left: &str, mid: &str, right: &str| {
+        let mut line = String::from("  ");
+        line.push_str(left);
+        for (idx, width) in COLS.iter().enumerate() {
+            line.push_str(&h.repeat(width + 2));
+            line.push_str(if idx + 1 == COLS.len() { right } else { mid });
+        }
+        line
+    };
+    let row = |cells: [String; 6]| {
+        let mut line = String::from("  ");
+        line.push_str(v);
+        for (idx, (text, width)) in cells.iter().zip(COLS).enumerate() {
+            line.push(' ');
+            if idx == 0 {
+                line.push_str(&theme::pad_visible_right(text, width));
+            } else {
+                line.push_str(&theme::pad_visible_left(text, width));
+            }
+            line.push(' ');
+            line.push_str(v);
+        }
+        line
+    };
+
+    let (top_left, top_right, mid_left, mid_right, bot_left, bot_right) = corners;
+    let mut lines = vec![
+        border(top_left, cross, top_right),
+        row([
+            t.muted("Stage"),
+            t.muted("P50"),
+            t.muted("P95"),
+            t.muted("P99"),
+            t.muted("MAX"),
+            t.muted("Target"),
+        ]),
+        border(mid_left, cross, mid_right),
+    ];
+    for (name, lat, budget) in rows {
+        lines.push(row([
+            (*name).to_string(),
+            format!("{}", lat.p50_ns / 1_000),
+            format!("{}", lat.p95_ns / 1_000),
+            t.fmt_latency_us_width(lat.p99_ns, *budget, NUM_W),
+            format!("{}", lat.max_ns / 1_000),
+            format!("<{budget}µs"),
+        ]));
+    }
+    lines.push(border(bot_left, cross, bot_right));
+    lines.join("\n")
 }
 
 pub(crate) fn record_phase_transition_jsonl(
@@ -1593,11 +2053,16 @@ mod tests {
         assert!(l0[0].contains("[QUOTE]"));
         assert!(l0[0].contains("[♥ BEAT]"));
         assert!(l0[0].contains("BTC +$14 (+2bp)"));
-        assert!(l0[0].contains("Book UP 51¢/52¢ DN 48¢/49¢"));
-        assert!(l0[0].contains("Quote 50¢/47¢ (97¢)"));
-        assert!(l0[0].contains("Inv 20U/0D (Δ+20)"));
+        assert!(l0[0].contains("Bk 51/52-48/49"));
+        assert!(l0[0].contains("Q 50/47"));
+        assert!(l0[0].contains("Inv 20/0 (Δ+20)"));
         assert!(l0[0].contains("PnL +$0.20"));
-        assert!(l0[0].chars().count() <= 205);
+        assert!(
+            l0[0].chars().count() <= 140,
+            "heartbeat must not wrap: {} -> {}",
+            l0[0].chars().count(),
+            l0[0]
+        );
 
         // 100ms..4900ms idle Hold ticks emit nothing.
         for offset in (100..5_000).step_by(100) {
@@ -1645,7 +2110,8 @@ mod tests {
         let s1 = rep.format_step(&suppr_row);
         assert_eq!(s1.len(), 1);
         assert!(s1[0].contains("[SUPPR]"));
-        assert!(s1[0].contains("WarmingUp"));
+        assert!(s1[0].contains("Quoting paused"));
+        assert!(s1[0].contains("Warming up"));
 
         suppr_row.now_ms = base_ms + 300;
         assert!(rep.format_step(&suppr_row).is_empty());
@@ -1654,13 +2120,15 @@ mod tests {
         suppr_row.quote = QuoteOutput::Suppressed(SuppressionReason::CrossedOrderBook);
         let s2 = rep.format_step(&suppr_row);
         assert_eq!(s2.len(), 1);
-        assert!(s2[0].contains("WarmingUp -> CrossedOrderBook"));
+        assert!(s2[0].contains("Warming up"));
+        assert!(s2[0].contains("Crossed order book"));
 
         let resume_row = sample_row(base_ms + 500, 299, &hold, &hold);
         let r1 = rep.format_step(&resume_row);
         assert_eq!(r1.len(), 1);
         assert!(r1[0].contains("[RESUME]"));
-        assert!(r1[0].contains("CrossedOrderBook"));
+        assert!(r1[0].contains("Quoting resumed"));
+        assert!(r1[0].contains("Both legs cleared"));
 
         // Order action emits immediately between heartbeats.
         let submit = OrderAction::SubmitNew {
@@ -1676,8 +2144,9 @@ mod tests {
         let act_lines = rep.format_step(&sample_row(base_ms + 600, 299, &submit, &cancel));
         assert_eq!(act_lines.len(), 1);
         assert!(act_lines[0].contains("[ORDER]"));
-        assert!(act_lines[0].contains("20 UP @ 50¢"));
-        assert!(act_lines[0].contains("DN Cancel(RiskSuppressed)"));
+        assert!(act_lines[0].contains("UP: 20 @ 50¢"));
+        assert!(act_lines[0].contains("DN: Cancel"));
+        assert!(act_lines[0].contains("RiskSuppressed"));
 
         let replace = OrderAction::CancelAndReplace {
             outcome: Outcome::Down,
@@ -1688,10 +2157,10 @@ mod tests {
         };
         let rep_lines = rep.format_step(&sample_row(base_ms + 650, 299, &hold, &replace));
         assert_eq!(rep_lines.len(), 1);
-        assert!(
-            rep_lines[0]
-                .contains("UP: hold (resting) | Requote 20 DN @ ~47¢~ -> 37¢ | (DeadbandDrift)")
-        );
+        assert!(rep_lines[0].contains("UP: hold (resting)"));
+        assert!(rep_lines[0].contains("DN: 20 @ ~47¢~"));
+        assert!(rep_lines[0].contains("37¢"));
+        assert!(rep_lines[0].contains("DeadbandDrift"));
 
         // Paired requote tracks prior SubmitNew prices in both plain and styled modes.
         for (mode_idx, theme) in [Theme::plain(), Theme::styled()].into_iter().enumerate() {
@@ -1725,13 +2194,15 @@ mod tests {
             let lines = paired_rep.format_step(&sample_row(base_ms + 100, 299, &req_up, &req_dn));
             assert_eq!(lines.len(), 1);
             if mode_idx == 0 {
-                assert!(lines[0].contains(
-                    "Requote 20 UP @ ~50¢~ -> 49.48¢ | Requote 20 DN @ ~48¢~ -> 46.52¢ | (DeadbandDrift)"
-                ));
+                assert!(lines[0].contains("UP: 20 @ ~50¢~"));
+                assert!(lines[0].contains("49.48¢"));
+                assert!(lines[0].contains("DN: 20 @ ~48¢~"));
+                assert!(lines[0].contains("46.52¢"));
+                assert!(lines[0].contains("DeadbandDrift"));
             } else {
                 assert!(lines[0].contains("\x1b[2;9m50¢\x1b[0m"));
                 assert!(lines[0].contains("\x1b[2;9m48¢\x1b[0m"));
-                assert!(lines[0].contains("\x1b[2m(DeadbandDrift)\x1b[0m"));
+                assert!(lines[0].contains("\x1b[90mDeadbandDrift\x1b[0m"));
             }
         }
 
@@ -1754,9 +2225,9 @@ mod tests {
         let resize_lines =
             size_only_rep.format_step(&sample_row(base_ms + 100, 299, &resize_up, &hold));
         assert_eq!(resize_lines.len(), 1);
-        assert!(
-            resize_lines[0].contains("Requote 10 UP @ 50¢ | DN: hold (resting) | (ExcessiveSize)")
-        );
+        assert!(resize_lines[0].contains("UP: 10 @ 50¢"));
+        assert!(resize_lines[0].contains("DN: hold (resting)"));
+        assert!(resize_lines[0].contains("ExcessiveSize"));
         assert!(!resize_lines[0].contains("~50¢~"));
 
         // Epoch rollover reset clears cached prior quote prices so stale prices do not leak.
@@ -1772,9 +2243,9 @@ mod tests {
         next_epoch_row.resting_bid_up = None;
         let post_reset = size_only_rep.format_step(&next_epoch_row);
         assert_eq!(post_reset.len(), 2);
-        assert!(
-            post_reset[0].contains("Requote 10 UP @ 48¢ | DN: hold (resting) | (ExcessiveSize)")
-        );
+        assert!(post_reset[0].contains("UP: 10 @ 48¢"));
+        assert!(post_reset[0].contains("DN: hold (resting)"));
+        assert!(post_reset[0].contains("ExcessiveSize"));
         assert!(!post_reset[0].contains("~"));
 
         // Latency breach emits immediately.
@@ -1826,7 +2297,7 @@ mod tests {
         let l1 = rep.format_step(&active_row);
         assert_eq!(l1.len(), 1);
         assert!(l1[0].contains("[ORDER]"));
-        assert!(l1[0].contains("reason=circuit_breaker"));
+        assert!(l1[0].contains("circuit breaker"));
 
         // Repeated Some("circuit_breaker") stays silent.
         active_row.now_ms = base_ms + 200;
@@ -1837,14 +2308,14 @@ mod tests {
         active_row.cancel_all_reason = Some("stale_feed");
         let l2 = rep.format_step(&active_row);
         assert_eq!(l2.len(), 1);
-        assert!(l2[0].contains("reason=stale_feed"));
+        assert!(l2[0].contains("stale feed"));
 
         // Transition Some("stale_feed") -> None: emits recovery/clear notice.
         let cleared_row = sample_row(base_ms + 400, 299, &hold, &hold);
         let l3 = rep.format_step(&cleared_row);
         assert_eq!(l3.len(), 1);
         assert!(l3[0].contains("[RESUME]"));
-        assert!(l3[0].contains("cancel-all cleared (was stale_feed)"));
+        assert!(l3[0].contains("Cancel-all cleared (was stale_feed)"));
 
         // Repeated None stays silent.
         assert!(
@@ -1970,7 +2441,7 @@ mod tests {
             theme::strip_ansi(line)
                 .chars()
                 .enumerate()
-                .filter_map(|(idx, ch)| (ch == '|').then_some(idx))
+                .filter_map(|(idx, ch)| matches!(ch, '|' | '│').then_some(idx))
                 .collect()
         };
 
@@ -1984,37 +2455,365 @@ mod tests {
                 .into_iter()
                 .map(|row| {
                     let emitted = rep.format_step(row);
-                    assert_eq!(emitted.len(), 1);
-                    emitted.into_iter().next().expect("heartbeat emitted")
+                    assert!(!emitted.is_empty());
+                    // Heartbeats are always emitted last; a periodic latency row may precede them.
+                    emitted.into_iter().last().expect("heartbeat emitted")
                 })
                 .collect();
 
             let stripped_r2 = theme::strip_ansi(&lines[1]);
-            assert!(stripped_r2.contains("Inv 0U/1.5D (Δ-1.5)"));
-            assert!(stripped_r2.contains("Book UP --/1¢ DN 99¢/--"));
-            assert!(stripped_r2.contains("Quote --/78¢"));
+            assert!(stripped_r2.contains("Inv 0/1.5"));
+            assert!(stripped_r2.contains("Bk --/1"));
+            assert!(stripped_r2.contains("99/--"));
+            assert!(stripped_r2.contains("Q --/78"));
 
             let stripped_r3 = theme::strip_ansi(&lines[2]);
-            assert!(stripped_r3.contains("Inv 20.25U/10.5D (Δ+9.75)"));
+            assert!(stripped_r3.contains("Inv 20.25/10.5"));
 
             let stripped_r4 = theme::strip_ansi(&lines[3]);
-            assert!(stripped_r4.contains("Inv 0U/0D (Δ0)"));
-            assert!(stripped_r4.contains("Quote 50¢/50¢ (100¢)"));
+            assert!(stripped_r4.contains("Inv 0/0"));
+            assert!(stripped_r4.contains("Q 50/50"));
 
             let stripped_r5 = theme::strip_ansi(&lines[4]);
-            assert!(stripped_r5.contains("Book UP 47.33¢/50.33¢ DN 46.67¢/49.67¢"));
-            assert!(stripped_r5.contains("Quote 49.94¢/46.52¢ (96.46¢)"));
-            assert!(stripped_r5.contains("Inv 1000.25U/0D (Δ+1000.25)"));
+            assert!(stripped_r5.contains("Bk 47/50"));
+            assert!(stripped_r5.contains("47/50"));
+            assert!(stripped_r5.contains("Q 50/47"));
+            assert!(stripped_r5.contains("Inv 1000.25/0"));
 
+            let beat_col = lines[0]
+                .find("[♥ BEAT]")
+                .map(|i| lines[0][..i].chars().count());
             for (idx, line) in lines.iter().enumerate() {
+                let plain = theme::strip_ansi(line);
                 assert_eq!(
-                    pipe_cols(line),
-                    expected_pipes,
-                    "row {idx} pipes misaligned:\nheader: {}\nrow:    {}",
-                    theme::strip_ansi(&header),
-                    theme::strip_ansi(line),
+                    plain.matches(['|', '│']).count(),
+                    expected_pipes.len(),
+                    "row {idx} separator count drifted: {plain}"
+                );
+                assert!(
+                    plain.chars().count() <= 140,
+                    "row {idx} wraps ({} chars): {plain}",
+                    plain.chars().count()
+                );
+                assert_eq!(
+                    line.find("[♥ BEAT]").map(|i| line[..i].chars().count()),
+                    beat_col,
+                    "row {idx} event column drifted: {plain}"
                 );
             }
         }
+    }
+    #[test]
+    fn latency_rows_are_throttled_and_breaches_print_immediately() {
+        let hold = OrderAction::Hold;
+        let base_ms = 1_795_345_200_000_u64;
+        let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+
+        // Tick 0: heartbeat only; the throttle window is seeded here.
+        let first = rep.format_step(&sample_row(base_ms, 300, &hold, &hold));
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("[♥ BEAT]"));
+
+        // +5s: heartbeat only, nominal latency stays quiet.
+        let mid = rep.format_step(&sample_row(base_ms + 5_000, 295, &hold, &hold));
+        assert_eq!(mid.len(), 1);
+        assert!(mid[0].contains("[♥ BEAT]"));
+
+        // +10s: periodic health check returns.
+        let periodic = rep.format_step(&sample_row(base_ms + 10_000, 290, &hold, &hold));
+        assert_eq!(periodic.len(), 2);
+        assert!(periodic[0].contains("[LATENCY]"));
+        assert!(!periodic[0].contains(">"));
+
+        // A breach is never throttled.
+        let mut breach = sample_row(base_ms + 10_100, 289, &hold, &hold);
+        breach.risk_ns = RISK_BUDGET_US * 1_000 + 1;
+        let breach_lines = rep.format_step(&breach);
+        assert_eq!(breach_lines.len(), 1);
+        assert!(breach_lines[0].contains("Risk >10µs"));
+
+        // `--verbose-latency` restores per-tick rows.
+        let mut verbose =
+            LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain())
+                .with_verbose_latency(true);
+        assert_eq!(
+            verbose
+                .format_step(&sample_row(base_ms, 300, &hold, &hold))
+                .len(),
+            2
+        );
+        assert_eq!(
+            verbose
+                .format_step(&sample_row(base_ms + 100, 299, &hold, &hold))
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn stream_rows_stay_within_a_standard_terminal_width_in_plain_and_styled_modes() {
+        let hold = OrderAction::Hold;
+        let replace = OrderAction::CancelAndReplace {
+            outcome: Outcome::Down,
+            old_order_id: "ord-2".to_string(),
+            new_price: MicroUsdc(320_000),
+            new_size: SharesMicro::from_raw(20 * 1_000_000),
+            reason: CancelReason::DeadbandDrift,
+        };
+        let base_ms = 1_795_345_200_000_u64;
+
+        for theme in [Theme::plain(), Theme::styled()] {
+            let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, theme);
+            for (idx, line) in rep
+                .format_step(&sample_row(base_ms, 101, &hold, &replace))
+                .iter()
+                .enumerate()
+            {
+                assert!(
+                    theme::visible_width(line) <= 140,
+                    "styled line {idx} exceeds 140 visible chars: {}",
+                    theme::visible_width(line)
+                );
+            }
+            let suppr_lines = {
+                let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, theme);
+                let mut row = sample_row(base_ms, 240, &hold, &hold);
+                row.quote = QuoteOutput::Suppressed(SuppressionReason::BothLegsSuppressed);
+                rep.format_step(&row)
+            };
+            for line in &suppr_lines {
+                assert!(
+                    theme::visible_width(line) <= 140,
+                    "suppression wraps: {line}"
+                );
+            }
+            assert!(theme::strip_ansi(&suppr_lines[0]).contains("Quoting paused"));
+            assert_eq!(theme::visible_width(&theme.phase_rule()), 124);
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_grammar_tests {
+    use super::*;
+    use core_types::MicroUsdc;
+
+    fn sample_fill(maker: bool, outcome: Outcome, side: OrderSide) -> SimFill {
+        SimFill {
+            sim_id: 12,
+            outcome,
+            side,
+            price: MicroUsdc(480_000),
+            filled_shares: SharesMicro::from_raw(20_000_000),
+            fill_ts_ms: 0,
+            is_maker: maker,
+        }
+    }
+
+    #[test]
+    fn fill_row_reads_as_columns_without_key_values() {
+        let fill = sample_fill(true, Outcome::Up, OrderSide::Buy);
+        let row = format_fill_line(
+            Theme::plain(),
+            0,
+            300,
+            RiskTier::Tier1Normal,
+            FillImpact {
+                fill: &fill,
+                q_up: SharesMicro::from_raw(20_000_000),
+                q_dn: SharesMicro::ZERO,
+                realized_pnl_micro: 0,
+            },
+        );
+        assert!(row.contains("[FILL]"));
+        assert!(row.contains("[MAKER]"));
+        assert!(row.contains("UP BUY 20 @ 48¢"));
+        assert!(row.contains("| Notional $9.60 |"));
+        assert!(row.contains("Inv 20/0 (Δ+20)"));
+        assert!(row.contains("| PnL +$0.00"));
+        assert!(!row.contains('='));
+        assert!(row.len() <= 140, "{row}");
+    }
+
+    #[test]
+    fn taker_fill_shows_taker_badge_and_down_leg() {
+        let fill = sample_fill(false, Outcome::Down, OrderSide::Sell);
+        let row = format_fill_line(
+            Theme::plain(),
+            0,
+            120,
+            RiskTier::Tier2ModerateSkew,
+            FillImpact {
+                fill: &fill,
+                q_up: SharesMicro::ZERO,
+                q_dn: SharesMicro::from_raw(1_500_000),
+                realized_pnl_micro: -250_000,
+            },
+        );
+        assert!(row.contains("[TAKER]"));
+        assert!(row.contains("DN SELL 20 @ 48¢"));
+        assert!(row.contains("Inv 0/1.5 (Δ-1.5)"));
+        assert!(row.contains("PnL -$0.25"));
+        assert!(row.len() <= 140, "{row}");
+    }
+
+    #[test]
+    fn breaker_rows_use_human_reason_and_state() {
+        let tripped = format_breaker_line(
+            Theme::plain(),
+            BreakerStatus::Tripped {
+                reason: BreakerReason::PolymarketFeedStale,
+            },
+        );
+        assert!(tripped.contains("[BREAKER]"));
+        assert!(tripped.contains("Quoting halted"));
+        assert!(tripped.contains("Polymarket feed stale"));
+        assert!(!tripped.contains('{'), "{tripped}");
+        assert!(tripped.len() <= 140, "{tripped}");
+
+        let armed = format_breaker_line(Theme::plain(), BreakerStatus::ArmActive);
+        assert!(armed.contains("Armed"));
+        assert!(armed.contains("all risk gates healthy"));
+    }
+
+    #[test]
+    fn epoch_blocks_are_double_ruled_and_free_of_debug_dumps() {
+        let rollover = format_epoch_rollover_block(
+            Theme::plain(),
+            "btc-updown-5m-1795405200",
+            Some("btc-updown-5m-1795405500"),
+            Outcome::Down,
+            0,
+            0,
+        );
+        let lines: Vec<&str> = rollover.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].chars().all(|c| c == '='));
+        assert!(lines[2].chars().all(|c| c == '='));
+        assert!(lines[1].contains("* EPOCH ROLLOVER"));
+        assert!(lines[1].contains("btc-updown-5m-1795405200 -> 1795405500"));
+        assert!(lines[1].contains("Winner: DOWN"));
+        assert!(lines[1].contains("Settle: +$0.00"));
+        assert!(lines[1].contains("CumPnL: +$0.00"));
+        assert!(!lines[1].contains("winner="), "{}", lines[1]);
+
+        let banner = format_epoch_banner(
+            Theme::plain(),
+            2,
+            "btc-updown-5m-1795405200",
+            Some(61_295.92),
+            0,
+            300_000,
+        );
+        let blines: Vec<&str> = banner.lines().collect();
+        assert_eq!(blines.len(), 3);
+        assert!(blines[0].chars().all(|c| c == '='));
+        assert!(blines[2].chars().all(|c| c == '='));
+        assert!(blines[1].contains("+ EPOCH #2"));
+        assert!(blines[1].contains("Strike: $61,295.92"));
+        assert!(blines[1].contains("(300s)"));
+        for line in blines.iter().chain(lines.iter()) {
+            assert!(line.len() <= 140, "{line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    fn lat(p99_ns: u64) -> LatencySummary {
+        LatencySummary {
+            count: 10,
+            zero_ns_samples: 0,
+            min_ns: 1_000,
+            p50_ns: 12_000,
+            p95_ns: 20_000,
+            p99_ns,
+            p999_ns: 30_000,
+            max_ns: 30_000,
+        }
+    }
+
+    fn sample_stats() -> LifecycleReportStats {
+        LifecycleReportStats {
+            ticks_evaluated: 1_234,
+            orders_submitted: 340,
+            orders_replaced: 88,
+            orders_canceled: 41,
+            orders_held: 12,
+            flattens_executed: 1,
+            phase_transitions: 3,
+            breaker_trips: 2,
+            fills_count: 120,
+            merges_count: 58,
+            total_pairs_merged: SharesMicro::from_raw(58_000_000),
+            realized_pnl_micro: 120_000,
+            unrealized_pnl_micro: -20_000,
+            settlement_pnl_micro: 50_000,
+            fees_paid_micro: 10_000,
+            estimated_rebate_micro: 2_500,
+            epochs_completed: 1,
+            epoch_rollovers: 0,
+            final_q_up: SharesMicro::from_raw(20_000_000),
+            final_q_dn: SharesMicro::from_raw(18_000_000),
+            rpm_60s: 4,
+            fill_ratio: 0.42,
+            markout_1s_bps: 1.2,
+            markout_5s_bps: -0.4,
+            baseline_pnl_micro: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn summary_is_framed_grouped_and_free_of_key_values() {
+        let stats = sample_stats();
+        let block = format_lifecycle_summary(
+            Theme::plain(),
+            &stats,
+            &lat(12_000),
+            &lat(9_000),
+            &lat(24_000),
+        );
+        assert!(block.contains("■ LIFECYCLE SUMMARY") || block.contains("LIFECYCLE SUMMARY"));
+        assert!(block.contains("EXECUTION & FILLS"));
+        assert!(block.contains("INVENTORY & PNL"));
+        assert!(block.contains("RISK & BREAKERS"));
+        assert!(block.contains("COMPUTE LATENCY HDR"));
+        assert!(block.contains('+') && block.contains('|'));
+        assert!(!block.contains("key="));
+        assert!(!block.contains("Orders (Sub/Rep/Cxl):"));
+        for line in block.lines() {
+            assert!(line.chars().count() <= 140, "{line}");
+        }
+    }
+
+    #[test]
+    fn summary_marks_breaker_counts_and_latency_breaches() {
+        let stats = sample_stats();
+        let block = format_lifecycle_summary(
+            Theme::plain(),
+            &stats,
+            &lat(12_000),
+            &lat(9_000),
+            &lat(24_000),
+        );
+        assert!(block.contains("Breakers"));
+        assert!(block.contains("2"));
+
+        let styled = format_lifecycle_summary(
+            Theme::styled(),
+            &stats,
+            &lat(30_000),
+            &lat(9_000),
+            &lat(120_000),
+        );
+        // Breaker count and the two breached P99 cells all render in alarm colors.
+        assert!(
+            styled.contains("\x1b[1;31m"),
+            "no breach highlight in summary"
+        );
+        assert!(styled.contains("\x1b[33m"), "breaker count not highlighted");
     }
 }
