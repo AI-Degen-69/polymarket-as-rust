@@ -2450,64 +2450,71 @@ fn finalize_and_report_session(
 /// Prints the effective engine tuning that will drive this epoch (live/replay).
 fn print_engine_config_banner(cfg: &EngineConfig) {
     let t = theme::current();
-    println!("{}", t.section("Engine Config (effective):"));
-    println!(
-        "{}",
-        t.kv(
-            "Gamma / Variance / Kappa / SG:",
-            &format!(
-                "gamma={}  variance={:?}  kappa={:?}  sg={:?}  include_var={}",
-                cfg.gamma,
-                cfg.variance_mode,
-                cfg.kappa_mode,
-                cfg.sg_mode,
-                cfg.include_variance_spread
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Spread / Bids / Guards:",
-            &format!(
-                "min_spread={}t(${:.2})  max_bid=${:.2}  cross_tick_loss={}  max_entry_prob={}",
-                cfg.min_spread_ticks,
+    println!("{}", t.section("Active Config's Parameters"));
+
+    let rows: [(&str, String); 17] = [
+        ("Gamma", cfg.gamma.to_string()),
+        ("Variance Mode", format!("{:?}", cfg.variance_mode)),
+        ("Kappa Mode", format!("{:?}", cfg.kappa_mode)),
+        ("SG Mode", format!("{:?}", cfg.sg_mode)),
+        (
+            "Include Variance Spread",
+            cfg.include_variance_spread.to_string(),
+        ),
+        (
+            "Min Combined Spread",
+            format!(
+                "${:.2} ({} tick)",
                 cfg.min_combined_spread_micro.0 as f64 / 1e6,
-                cfg.max_combined_bid_micro.0 as f64 / 1e6,
-                cfg.max_cross_tick_loss_micro
-                    .map(|m| format!("{m}"))
-                    .unwrap_or_else(|| "off".to_string()),
-                cfg.max_entry_prob
-                    .map(|p| format!("{p}"))
-                    .unwrap_or_else(|| "off".to_string()),
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Lead-lag / Hedge:",
-            &format!(
-                "threshold={}  window={}ms  cooldown={}ms  directional={}  hedge_skew={}  cap_tier1={}",
-                cfg.lead_lag_cancel_threshold,
-                cfg.lead_lag_window_ms,
-                cfg.lead_lag_cooldown_ms,
-                cfg.lead_lag_directional,
-                cfg.hedge_skew_mult,
-                cfg.cap_tier1_reducing_to_delta,
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Mode:",
-            &format!(
-                "execution={:?}  dry_run={}",
-                cfg.execution_mode, cfg.dry_run
-            )
-        )
-    );
+                cfg.min_spread_ticks
+            ),
+        ),
+        (
+            "Max Combined Bid",
+            format!("${:.2}", cfg.max_combined_bid_micro.0 as f64 / 1e6),
+        ),
+        (
+            "Cross Tick Loss Cap",
+            match cfg.max_cross_tick_loss_micro {
+                Some(m) => format!("{m} micro-USDC"),
+                None => "off".to_string(),
+            },
+        ),
+        (
+            "Max Entry Prob",
+            cfg.max_entry_prob
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "off".to_string()),
+        ),
+        (
+            "Lead/Lag Threshold",
+            cfg.lead_lag_cancel_threshold.to_string(),
+        ),
+        ("Lead/Lag Window", format!("{} ms", cfg.lead_lag_window_ms)),
+        (
+            "Lead/Lag Cooldown",
+            format!("{} ms", cfg.lead_lag_cooldown_ms),
+        ),
+        ("Lead/Lag Directional", cfg.lead_lag_directional.to_string()),
+        ("Hedge Skew Multiplier", cfg.hedge_skew_mult.to_string()),
+        (
+            "Cap Tier-1 Reducing",
+            cfg.cap_tier1_reducing_to_delta.to_string(),
+        ),
+        ("Execution Mode", format!("{:?}", cfg.execution_mode)),
+        ("Dry Run", cfg.dry_run.to_string()),
+    ];
+
+    let label_w = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(10);
+    let val_w = rows.iter().map(|(_, v)| v.len()).max().unwrap_or(10);
+
+    let row = |label: &str, val: &str| format!("  {label:<label_w$} | {val:<val_w$}");
+    println!("{}", row("Parameter", "Value"));
+    println!("{}", "-".repeat(label_w + val_w + 6));
+
+    for (label, val) in rows {
+        println!("{}", row(label, &val));
+    }
 }
 
 async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(), Box<dyn Error>> {
