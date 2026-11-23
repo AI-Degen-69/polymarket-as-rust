@@ -100,3 +100,7 @@ Every engine calibration touches five files. Edit all five in one change, or the
 | `.env.example` | Documented operator values |
 
 `.env.example` must mirror the `EngineConfig::default()` values in `config.rs`. A mismatch is drift: fix it in the same change.
+
+## 8. Windows Grep Alternation
+
+On Windows, `rtk grep "a\|b"` returns exit 1 and needs a retry. Use PowerShell `Select-String -Pattern "a\|b"` (or `rtk rg`) for alternation patterns in files.
