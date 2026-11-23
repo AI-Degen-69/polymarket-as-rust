@@ -5,7 +5,9 @@ use core_types::{
 };
 use math_engine::{QuoteOutput, SuppressionReason};
 use paper_sim::{MergeEvent, SimFill};
-use risk_lifecycle::{BreakerStatus, EpochPhase, OrderAction, RiskActorTrace, RiskTier};
+use risk_lifecycle::{
+    BreakerReason, BreakerStatus, EpochPhase, OrderAction, RiskActorTrace, RiskTier,
+};
 use serde::Serialize;
 
 use crate::theme::{self, Badge, Theme};
@@ -31,6 +33,8 @@ const LATENCY_VALUE_WIDTH: usize = 10;
 const LATENCY_PERIOD_MS: u64 = 10_000;
 /// Width budget for phase and order rows; longer trailing text is ellipsized.
 const ROW_WIDTH_BUDGET: usize = 130;
+/// Label column for the framed epoch block (`★ EPOCH ROLLOVER`, `◆ EPOCH #2`).
+const EPOCH_LABEL_WIDTH: usize = 19;
 
 /// Content of the middle badge column: epoch phase, or any other badge such as `[MAKER]`.
 #[derive(Debug, Clone, Copy)]
@@ -415,7 +419,7 @@ fn format_stream_header(t: Theme) -> String {
     ))
 }
 
-/// Prints a prominent banner at the start of an epoch or upon rollover.
+/// Prints a framed banner anchoring a new epoch in the scrollback.
 pub(crate) fn print_epoch_banner(
     epoch_num: usize,
     slug: &str,
@@ -423,22 +427,98 @@ pub(crate) fn print_epoch_banner(
     start_ts_ms: u64,
     expiry_ts_ms: u64,
 ) {
-    let t = theme::current();
-    let strike_str = strike_usd.map_or_else(|| "pending".to_string(), |s| format!("${s:.2}"));
+    println!();
+    println!(
+        "{}",
+        format_epoch_banner(
+            theme::current(),
+            epoch_num,
+            slug,
+            strike_usd,
+            start_ts_ms,
+            expiry_ts_ms,
+        )
+    );
+}
+
+fn format_epoch_banner(
+    t: Theme,
+    epoch_num: usize,
+    slug: &str,
+    strike_usd: Option<f64>,
+    start_ts_ms: u64,
+    expiry_ts_ms: u64,
+) -> String {
+    let strike_str = strike_usd.map_or_else(
+        || "pending".to_string(),
+        |s| format!("${}", fmt_usd_grouped(s)),
+    );
     let start_utc = format_utc_hms(start_ts_ms);
     let end_utc = format_utc_hms(expiry_ts_ms);
     let span_secs = expiry_ts_ms.saturating_sub(start_ts_ms) / 1_000;
-    println!();
-    println!("{}", t.section(&format!("EPOCH #{epoch_num} :: {slug}")));
-    println!(
-        "  {} {}  {}  {} {} -> {} ({span_secs}s)",
+    let label = format!("  {} EPOCH #{epoch_num}", t.epoch_icon(false));
+    let label = format!(
+        "{}{}",
+        t.bold_cyan(&label),
+        " ".repeat(EPOCH_LABEL_WIDTH.saturating_sub(theme::visible_width(&label)))
+    );
+    let bar = t.bar();
+    let rule = t.epoch_rule();
+    format!(
+        "{rule}\n{label}{bar} {} {bar} {} {} {bar} {} {} {} {} ({span_secs}s)\n{rule}",
+        t.cyan(slug),
         t.muted("Strike:"),
         t.bold(&strike_str),
-        t.muted("|"),
         t.muted("Window:"),
         t.cyan(&start_utc),
+        t.arrow(),
         t.cyan(&end_utc),
-    );
+    )
+}
+
+/// Groups the integer part of a USD amount with thousands separators (`$61,295.92`).
+fn fmt_usd_grouped(value: f64) -> String {
+    let raw = format!("{value:.2}");
+    let (whole, cents) = raw.split_once('.').unwrap_or((raw.as_str(), "00"));
+    let mut grouped = String::new();
+    for (idx, ch) in whole.chars().enumerate() {
+        if idx > 0 && (whole.len() - idx).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    format!("{grouped}.{cents}")
+}
+
+/// `UP` / `DOWN` label for epoch winners.
+fn outcome_label(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Up => "UP",
+        Outcome::Down => "DOWN",
+    }
+}
+
+fn short_epoch_transition(t: Theme, expired: &str, next: &str) -> String {
+    match (expired.rsplit_once('-'), next.rsplit_once('-')) {
+        (Some((expired_prefix, _)), Some((next_prefix, next_tail)))
+            if expired_prefix == next_prefix =>
+        {
+            format!("{} {} {}", t.cyan(expired), t.arrow(), t.cyan(next_tail))
+        }
+        _ => format!("{} {} {}", t.cyan(expired), t.arrow(), t.cyan(next)),
+    }
+}
+
+/// Human text for a breaker trip reason (never Rust enum debug output).
+fn breaker_reason_text(reason: BreakerReason) -> &'static str {
+    match reason {
+        BreakerReason::ConsecutiveApiErrors => "consecutive API errors exceeded the limit",
+        BreakerReason::PolymarketFeedStale => "Polymarket feed stale (>3s without a message)",
+        BreakerReason::BinanceFeedStale => "Binance BTC feed stale (>2s without a message)",
+        BreakerReason::ClockDriftExceeded => "clock drift beyond the 1s tolerance",
+        BreakerReason::TickSizeChangeFreeze => "tick size changed; awaiting pricing sync",
+        BreakerReason::SupervisorKillSwitch => "supervisor kill-switch engaged",
+    }
 }
 
 /// Data for a single lifecycle terminal evaluation tick.
@@ -753,15 +833,15 @@ impl LifecycleStreamReporter {
             if breach {
                 let mut breaches = Vec::new();
                 if pricing_breach {
-                    breaches.push(format!("Pricing > {PRICING_BUDGET_US}µs"));
+                    breaches.push(format!("Pricing >{PRICING_BUDGET_US}µs"));
                 }
                 if risk_breach {
-                    breaches.push(format!("Risk > {RISK_BUDGET_US}µs"));
+                    breaches.push(format!("Risk >{RISK_BUDGET_US}µs"));
                 }
                 if total_breach {
-                    breaches.push(format!("Total > {TOTAL_BUDGET_US}µs"));
+                    breaches.push(format!("Total >{TOTAL_BUDGET_US}µs"));
                 }
-                line.push_str(&format!(" {bar} {}", t.bold_yellow(&breaches.join("; "))));
+                line.push_str(&format!(" {bar} {}", t.bold_yellow(&breaches.join(", "))));
             }
             lines.push(line);
         }
@@ -1055,21 +1135,82 @@ pub(crate) fn print_tier_transition(to: RiskTier, u_e6: u64, heavy: Option<Outco
 }
 
 pub(crate) fn print_breaker_trip(status: BreakerStatus) {
-    let t = theme::current();
     println!();
-    println!(
-        "  {} Circuit breaker tripped: {}",
+    println!("{}", format_breaker_line(theme::current(), status));
+}
+
+fn format_breaker_line(t: Theme, status: BreakerStatus) -> String {
+    let (tripped, state, reason) = match status {
+        BreakerStatus::ArmActive => (false, "Armed", "all risk gates healthy".to_string()),
+        BreakerStatus::Tripped { reason } => (
+            true,
+            "Quoting halted",
+            breaker_reason_text(reason).to_string(),
+        ),
+    };
+    let bar = t.bar();
+    format!(
+        "  {} {} {} {} {} {}",
+        t.breaker_icon(tripped),
         t.badge(Badge::Breaker),
-        t.bold_red(&format!("{status:?}"))
+        bar,
+        t.bold(state),
+        bar,
+        t.gray(&reason),
+    )
+}
+
+pub(crate) fn print_lifecycle_fill(
+    now_ms: u64,
+    tau_secs: u64,
+    tier: RiskTier,
+    fill: &SimFill,
+    q_up: SharesMicro,
+    q_dn: SharesMicro,
+    realized_pnl_micro: i64,
+) {
+    println!(
+        "{}",
+        format_fill_line(
+            theme::current(),
+            now_ms,
+            tau_secs,
+            tier,
+            FillImpact {
+                fill,
+                q_up,
+                q_dn,
+                realized_pnl_micro,
+            },
+        )
     );
 }
 
-pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, fill: &SimFill) {
-    let t = theme::current();
+/// Post-fill context rendered after the fill itself.
+struct FillImpact<'a> {
+    fill: &'a SimFill,
+    q_up: SharesMicro,
+    q_dn: SharesMicro,
+    realized_pnl_micro: i64,
+}
+
+fn format_fill_line(
+    t: Theme,
+    now_ms: u64,
+    tau_secs: u64,
+    tier: RiskTier,
+    impact: FillImpact<'_>,
+) -> String {
+    let FillImpact {
+        fill,
+        q_up,
+        q_dn,
+        realized_pnl_micro,
+    } = impact;
     let utc = format_utc_hms(now_ms);
     let leg = match fill.outcome {
         Outcome::Up => t.bold_green("UP"),
-        Outcome::Down => t.bold_red("DN"),
+        Outcome::Down => t.bold_cyan("DN"),
     };
     let side = match fill.side {
         OrderSide::Buy => t.bold_green("BUY"),
@@ -1080,8 +1221,13 @@ pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, f
     } else {
         Badge::Taker
     };
-    println!(
-        "{}#{} {} {} {} @ {}",
+    let notional_micro =
+        (u128::from(fill.price.0) * u128::from(fill.filled_shares.0)) / u128::from(1_000_000u64);
+    let notional = format!("${}", fmt_usd_grouped(notional_micro as f64 / 1_000_000.0));
+    let net_delta = i128::from(q_up.0) - i128::from(q_dn.0);
+    let bar = t.bar();
+    format!(
+        "{}#{} {} {} {} @ {} {bar} {} {} {bar} Inv {}/{} (Δ{}) {bar} {} {}",
         row_prefix(
             t,
             &utc,
@@ -1091,11 +1237,18 @@ pub(crate) fn print_lifecycle_fill(now_ms: u64, tau_secs: u64, tier: RiskTier, f
             Some(tier)
         ),
         fill.sim_id,
-        side,
         leg,
+        side,
         fmt_shares_3dp(fill.filled_shares),
         Theme::fmt_cents(Some(fill.price)),
-    );
+        t.muted("Notional"),
+        t.bold(&notional),
+        fmt_shares_2dp(q_up.0),
+        fmt_shares_2dp(q_dn.0),
+        fmt_signed_shares_2dp(net_delta),
+        t.muted("PnL"),
+        t.fmt_pnl(realized_pnl_micro),
+    )
 }
 
 pub(crate) fn print_lifecycle_merge(
@@ -1108,8 +1261,9 @@ pub(crate) fn print_lifecycle_merge(
 ) {
     let t = theme::current();
     let utc = format_utc_hms(now_ms);
+    let bar = t.bar();
     println!(
-        "{}pairs {} {} pair cost {} (UP {}, DN {}) {} PnL {} (total {})",
+        "{}pairs {} {bar} pair cost {} {bar} UP {} {} DN {} {bar} PnL {} {bar} total {}",
         row_prefix(
             t,
             &utc,
@@ -1119,11 +1273,10 @@ pub(crate) fn print_lifecycle_merge(
             Some(tier),
         ),
         merge.merged_pairs,
-        t.bar(),
         Theme::fmt_cents(Some(merge.pair_cost)),
         Theme::fmt_cents(Some(merge.avg_cost_up)),
+        t.dot(),
         Theme::fmt_cents(Some(merge.avg_cost_dn)),
-        t.bar(),
         t.fmt_pnl(merge.realized_gain_micro),
         total_merged
     );
@@ -1165,17 +1318,54 @@ pub(crate) fn print_epoch_rollover(
     settlement_pnl_delta_micro: i64,
     total_realized_pnl_micro: i64,
 ) {
-    let t = theme::current();
     println!();
     println!(
-        "  {} {} -> {} | winner={:?} | settle_delta={} | cumulative_realized={}",
-        t.badge(Badge::Epoch),
-        t.muted(expired_slug),
-        t.cyan(next_slug.unwrap_or("awaiting-next")),
-        winning_outcome,
-        t.fmt_pnl(settlement_pnl_delta_micro),
-        t.fmt_pnl(total_realized_pnl_micro)
+        "{}",
+        format_epoch_rollover_block(
+            theme::current(),
+            expired_slug,
+            next_slug,
+            winning_outcome,
+            settlement_pnl_delta_micro,
+            total_realized_pnl_micro,
+        )
     );
+}
+
+fn format_epoch_rollover_block(
+    t: Theme,
+    expired_slug: &str,
+    next_slug: Option<&str>,
+    winning_outcome: Outcome,
+    settlement_pnl_delta_micro: i64,
+    total_realized_pnl_micro: i64,
+) -> String {
+    let bar = t.bar();
+    let label = format!("  {} EPOCH ROLLOVER", t.epoch_icon(true));
+    let label = format!(
+        "{}{}",
+        t.bold_cyan(&label),
+        " ".repeat(EPOCH_LABEL_WIDTH.saturating_sub(theme::visible_width(&label)))
+    );
+    let next = match next_slug {
+        Some(next) => short_epoch_transition(t, expired_slug, next),
+        None => format!(
+            "{} {} {}",
+            t.cyan(expired_slug),
+            t.arrow(),
+            t.muted("awaiting-next")
+        ),
+    };
+    let rule = t.epoch_rule();
+    format!(
+        "{rule}\n{label}{bar} {next} {bar} {} {} {bar} {} {} {bar} {} {}\n{rule}",
+        t.muted("Winner:"),
+        t.bold(outcome_label(winning_outcome)),
+        t.muted("Settle:"),
+        t.fmt_pnl(settlement_pnl_delta_micro),
+        t.muted("CumPnL:"),
+        t.fmt_pnl(total_realized_pnl_micro),
+    )
 }
 
 pub(crate) fn print_lifecycle_summary(
@@ -1184,153 +1374,296 @@ pub(crate) fn print_lifecycle_summary(
     risk_lat: &LatencySummary,
     total_lat: &LatencySummary,
 ) {
-    let t = theme::current();
-    let net_pnl_micro = stats
-        .realized_pnl_micro
-        .saturating_add(stats.unrealized_pnl_micro);
     println!();
     println!(
         "{}",
-        t.banner("PHASE 4 LIFECYCLE & RISK EXECUTION SUMMARY", None)
+        format_lifecycle_summary(theme::current(), stats, pricing_lat, risk_lat, total_lat)
     );
-    println!("{}", t.section("EXECUTION & ORDERS"));
-    println!(
-        "{}",
-        t.kv("Ticks Evaluated:", &stats.ticks_evaluated.to_string())
-    );
-    println!(
-        "{}",
-        t.kv("Phase Transitions:", &stats.phase_transitions.to_string())
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Orders (Sub/Rep/Cxl):",
-            &format!(
-                "{} / {} / {} (held FIFO: {})",
-                stats.orders_submitted,
-                stats.orders_replaced,
-                stats.orders_canceled,
-                stats.orders_held
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Flattens / Breakers:",
-            &format!("{} / {}", stats.flattens_executed, stats.breaker_trips)
-        )
-    );
+}
 
-    println!("{}", t.section("INVENTORY & PNL"));
-    println!(
-        "{}",
-        t.kv(
-            "Paper Fills / Merges:",
-            &format!(
-                "{} fills | {} merges ({} pairs)",
-                stats.fills_count, stats.merges_count, stats.total_pairs_merged
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Final Inventory:",
-            &format!(
-                "UP={} | DN={} | Net={:+.6} sh",
-                stats.final_q_up,
-                stats.final_q_dn,
-                stats.resolved_net_delta_micro() as f64 / MICRO_SCALE as f64
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "PnL (Real / Unreal):",
-            &format!(
-                "{} / {} | Net={}",
-                t.fmt_pnl(stats.realized_pnl_micro),
-                t.fmt_pnl(stats.unrealized_pnl_micro),
-                t.fmt_pnl(net_pnl_micro)
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Settle / Fees / Reb:",
-            &format!(
-                "Settle={} | Fees=${} | EstRebate=${}",
-                t.fmt_pnl(stats.settlement_pnl_micro),
-                MicroUsdc(stats.fees_paid_micro),
-                MicroUsdc(stats.estimated_rebate_micro)
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Epochs / Telemetry:",
-            &format!(
-                "epochs={} rollovers={} | RPM={} | Fill={:.2}% | MO(1s/5s)={:+.1}/{:+.1}bps | Base={}",
-                stats.epochs_completed,
-                stats.epoch_rollovers,
-                stats.rpm_60s,
-                stats.fill_ratio * 100.0,
-                stats.markout_1s_bps,
-                stats.markout_5s_bps,
-                t.fmt_pnl(stats.baseline_pnl_micro)
-            )
-        )
-    );
+/// Label column and right-aligned value column for the summary blocks.
+const SUMMARY_LABEL_WIDTH: usize = 16;
+const SUMMARY_VALUE_WIDTH: usize = 12;
 
-    println!(
-        "{}",
-        t.section("COMPUTE LATENCY HDR (P50 / P95 / P99 / MAX)")
+fn fmt_count(n: u64) -> String {
+    let raw = n.to_string();
+    let mut out = String::new();
+    for (idx, ch) in raw.chars().enumerate() {
+        if idx > 0 && (raw.len() - idx).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn pad_left(text: &str, width: usize) -> String {
+    let pad = width.saturating_sub(theme::visible_width(text));
+    format!("{}{text}", " ".repeat(pad))
+}
+
+/// One `label value` cell with a fixed-width right-aligned number.
+fn summary_cell(t: Theme, label: &str, value: &str) -> String {
+    format!(
+        "{} {}",
+        t.muted(&format!("{label:<width$}", width = SUMMARY_LABEL_WIDTH)),
+        pad_left(value, SUMMARY_VALUE_WIDTH)
+    )
+}
+
+fn summary_row(t: Theme, cells: &[(&str, &str)]) -> String {
+    let bar = t.bar();
+    let body = cells
+        .iter()
+        .map(|(label, value)| summary_cell(t, label, value))
+        .collect::<Vec<_>>()
+        .join(&format!(" {bar} "));
+    format!("    {body}")
+}
+
+fn signed_bps(bps: f64) -> String {
+    format!("{bps:+.1}bp")
+}
+
+fn format_lifecycle_summary(
+    t: Theme,
+    stats: &LifecycleReportStats,
+    pricing_lat: &LatencySummary,
+    risk_lat: &LatencySummary,
+    total_lat: &LatencySummary,
+) -> String {
+    let net_pnl_micro = stats
+        .realized_pnl_micro
+        .saturating_add(stats.unrealized_pnl_micro);
+    let rule = t.epoch_rule();
+    let mut out = String::new();
+
+    out.push_str(&rule);
+    out.push('\n');
+    out.push_str(&format!(
+        "  {} {} {}",
+        t.bold_cyan("■ LIFECYCLE SUMMARY"),
+        t.muted("│"),
+        t.gray("execution, risk and telemetry totals for this run")
+    ));
+    out.push('\n');
+    out.push_str(&rule);
+
+    // Execution & fills
+    let ticks = fmt_count(stats.ticks_evaluated as u64);
+    let phases = fmt_count(stats.phase_transitions as u64);
+    let submitted = fmt_count(stats.orders_submitted as u64);
+    let replaced = fmt_count(stats.orders_replaced as u64);
+    let canceled = fmt_count(stats.orders_canceled as u64);
+    let held = fmt_count(stats.orders_held as u64);
+    let fills = fmt_count(stats.fills_count);
+    let merges = fmt_count(stats.merges_count);
+    let pairs = fmt_shares_2dp(stats.total_pairs_merged.0);
+    let epochs = fmt_count(stats.epochs_completed as u64);
+    let rollovers = fmt_count(stats.epoch_rollovers as u64);
+    let rpm = fmt_count(stats.rpm_60s as u64);
+    out.push_str(&format!("\n  {}\n", t.bold_cyan("EXECUTION & FILLS")));
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Ticks", &ticks),
+            ("Phase shifts", &phases),
+            ("Orders", &submitted),
+        ],
+    ));
+    out.push('\n');
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Replaced", &replaced),
+            ("Canceled", &canceled),
+            ("Held (FIFO)", &held),
+        ],
+    ));
+    out.push('\n');
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Fills", &fills),
+            ("Merges", &merges),
+            ("Pairs merged", &pairs),
+        ],
+    ));
+    out.push('\n');
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Epochs", &epochs),
+            ("Rollovers", &rollovers),
+            ("RPM (60s)", &rpm),
+        ],
+    ));
+
+    // Inventory & PnL
+    let q_up = fmt_shares_2dp(stats.final_q_up.0);
+    let q_dn = fmt_shares_2dp(stats.final_q_dn.0);
+    let net_delta = fmt_signed_shares_2dp(i128::from(stats.resolved_net_delta_micro()));
+    let realized = t.fmt_pnl(stats.realized_pnl_micro);
+    let unrealized = t.fmt_pnl(stats.unrealized_pnl_micro);
+    let net_pnl = t.fmt_pnl(net_pnl_micro);
+    let settlement = t.fmt_pnl(stats.settlement_pnl_micro);
+    let fees = format!("${:.2}", stats.fees_paid_micro as f64 / MICRO_SCALE as f64);
+    let rebate = format!(
+        "${:.2}",
+        stats.estimated_rebate_micro as f64 / MICRO_SCALE as f64
     );
-    println!(
-        "{}",
-        t.kv(
-            "Pricing Pipeline:",
-            &format!(
-                "{}us / {}us / {} / {}us (Target P99 < {PRICING_BUDGET_US}us)",
-                pricing_lat.p50_ns / 1_000,
-                pricing_lat.p95_ns / 1_000,
-                t.fmt_latency_us(pricing_lat.p99_ns, PRICING_BUDGET_US),
-                pricing_lat.max_ns / 1_000
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Risk & Hysteresis:",
-            &format!(
-                "{}us / {}us / {} / {}us (Target P99 < {RISK_BUDGET_US}us)",
-                risk_lat.p50_ns / 1_000,
-                risk_lat.p95_ns / 1_000,
-                t.fmt_latency_us(risk_lat.p99_ns, RISK_BUDGET_US),
-                risk_lat.max_ns / 1_000
-            )
-        )
-    );
-    println!(
-        "{}",
-        t.kv(
-            "Total Internal Path:",
-            &format!(
-                "{}us / {}us / {} / {}us (Target P99 < {TOTAL_BUDGET_US}us)",
-                total_lat.p50_ns / 1_000,
-                total_lat.p95_ns / 1_000,
-                t.fmt_latency_us(total_lat.p99_ns, TOTAL_BUDGET_US),
-                total_lat.max_ns / 1_000
-            )
-        )
-    );
-    println!("{}", t.divider());
+    let fill_ratio = format!("{:.1}%", stats.fill_ratio * 100.0);
+    let markout_1s = signed_bps(stats.markout_1s_bps);
+    let markout_5s = signed_bps(stats.markout_5s_bps);
+    out.push_str(&format!("\n  {}\n", t.bold_cyan("INVENTORY & PNL")));
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Inventory UP", &q_up),
+            ("Inventory DN", &q_dn),
+            ("Net delta", &net_delta),
+        ],
+    ));
+    out.push('\n');
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Realized", &realized),
+            ("Unrealized", &unrealized),
+            ("Net PnL", &net_pnl),
+        ],
+    ));
+    out.push('\n');
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Settlement", &settlement),
+            ("Fees paid", &fees),
+            ("Est rebate", &rebate),
+        ],
+    ));
+    out.push('\n');
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Fill ratio", &fill_ratio),
+            ("Markout 1s", &markout_1s),
+            ("Markout 5s", &markout_5s),
+        ],
+    ));
+
+    // Risk & breakers
+    let breakers_raw = fmt_count(stats.breaker_trips as u64);
+    let breakers = if stats.breaker_trips > 0 {
+        t.bold_red(&breakers_raw)
+    } else {
+        t.muted(&breakers_raw)
+    };
+    let flattens_raw = fmt_count(stats.flattens_executed as u64);
+    let flattens = if stats.flattens_executed > 0 {
+        t.yellow(&flattens_raw)
+    } else {
+        t.muted(&flattens_raw)
+    };
+    let baseline = t.fmt_pnl(stats.baseline_pnl_micro);
+    out.push_str(&format!("\n  {}\n", t.bold_cyan("RISK & BREAKERS")));
+    out.push_str(&summary_row(
+        t,
+        &[
+            ("Breakers", &breakers),
+            ("Flattens", &flattens),
+            ("Baseline PnL", &baseline),
+        ],
+    ));
+
+    out.push_str("\n\n");
+    out.push_str(&format!(
+        "  {} {}\n",
+        t.bold_cyan("COMPUTE LATENCY HDR"),
+        t.gray("(microseconds; P99 vs budget)")
+    ));
+    out.push_str(&format_latency_table(
+        t,
+        &[
+            ("Pricing", pricing_lat, PRICING_BUDGET_US),
+            ("Risk", risk_lat, RISK_BUDGET_US),
+            ("Total", total_lat, TOTAL_BUDGET_US),
+        ],
+    ));
+    out
+}
+
+fn format_latency_table(t: Theme, rows: &[(&str, &LatencySummary, u64)]) -> String {
+    const STAGE_W: usize = 18;
+    const NUM_W: usize = 8;
+    const TARGET_W: usize = 9;
+    let cols = [STAGE_W, NUM_W, NUM_W, NUM_W, NUM_W, TARGET_W];
+    let (h, v, cross) = if t.box_drawing() {
+        ("─", "│", "┼")
+    } else {
+        ("-", "|", "+")
+    };
+    let (top_left, top_right, mid_left, mid_right, bot_left, bot_right) = if t.box_drawing() {
+        ("┌", "┐", "├", "┤", "└", "┘")
+    } else {
+        ("+", "+", "+", "+", "+", "+")
+    };
+
+    let border = |left: &str, mid: &str, right: &str| {
+        let mut s = String::from("  ");
+        s.push_str(left);
+        for (idx, width) in cols.iter().enumerate() {
+            s.push_str(&h.repeat(width + 2));
+            s.push_str(if idx + 1 == cols.len() { right } else { mid });
+        }
+        s
+    };
+    let row = |cells: &[String]| {
+        let mut s = String::from("  ");
+        s.push_str(v);
+        for (idx, (text, width)) in cells.iter().zip(cols.iter()).enumerate() {
+            let pad = width.saturating_sub(theme::visible_width(text));
+            s.push(' ');
+            if idx == 0 {
+                s.push_str(text);
+                s.push_str(&" ".repeat(pad));
+            } else {
+                s.push_str(&" ".repeat(pad));
+                s.push_str(text);
+            }
+            s.push(' ');
+            s.push_str(v);
+        }
+        s
+    };
+
+    let mut out = String::new();
+    out.push_str(&border(top_left, cross, top_right));
+    out.push('\n');
+    out.push_str(&row(&[
+        t.muted(&format!("{:<width$}", "Stage", width = STAGE_W)),
+        pad_left(&t.muted("P50"), NUM_W),
+        pad_left(&t.muted("P95"), NUM_W),
+        pad_left(&t.muted("P99"), NUM_W),
+        pad_left(&t.muted("MAX"), NUM_W),
+        pad_left(&t.muted("Target"), TARGET_W),
+    ]));
+    out.push('\n');
+    out.push_str(&border(mid_left, cross, mid_right));
+    for (name, lat, budget) in rows {
+        out.push('\n');
+        out.push_str(&row(&[
+            format!("{name:<width$}", width = STAGE_W),
+            pad_left(&format!("{}", lat.p50_ns / 1_000), NUM_W),
+            pad_left(&format!("{}", lat.p95_ns / 1_000), NUM_W),
+            t.fmt_latency_us_width(lat.p99_ns, *budget, NUM_W),
+            pad_left(&format!("{}", lat.max_ns / 1_000), NUM_W),
+            pad_left(&format!("<{budget}µs"), TARGET_W),
+        ]));
+    }
+    out.push('\n');
+    out.push_str(&border(bot_left, cross, bot_right));
+    out
 }
 
 pub(crate) fn record_phase_transition_jsonl(
@@ -2209,7 +2542,7 @@ mod tests {
         breach.risk_ns = RISK_BUDGET_US * 1_000 + 1;
         let breach_lines = rep.format_step(&breach);
         assert_eq!(breach_lines.len(), 1);
-        assert!(breach_lines[0].contains("Risk > 10µs"));
+        assert!(breach_lines[0].contains("Risk >10µs"));
 
         // `--verbose-latency` restores per-tick rows.
         let mut verbose =
@@ -2269,5 +2602,230 @@ mod tests {
             assert!(theme::strip_ansi(&suppr_lines[0]).contains("Quoting paused"));
             assert_eq!(theme::visible_width(&theme.phase_rule()), 124);
         }
+    }
+}
+
+#[cfg(test)]
+mod row_grammar_tests {
+    use super::*;
+    use core_types::MicroUsdc;
+
+    fn sample_fill(maker: bool, outcome: Outcome, side: OrderSide) -> SimFill {
+        SimFill {
+            sim_id: 12,
+            outcome,
+            side,
+            price: MicroUsdc(480_000),
+            filled_shares: SharesMicro::from_raw(20_000_000),
+            fill_ts_ms: 0,
+            is_maker: maker,
+        }
+    }
+
+    #[test]
+    fn fill_row_reads_as_columns_without_key_values() {
+        let fill = sample_fill(true, Outcome::Up, OrderSide::Buy);
+        let row = format_fill_line(
+            Theme::plain(),
+            0,
+            300,
+            RiskTier::Tier1Normal,
+            FillImpact {
+                fill: &fill,
+                q_up: SharesMicro::from_raw(20_000_000),
+                q_dn: SharesMicro::ZERO,
+                realized_pnl_micro: 0,
+            },
+        );
+        assert!(row.contains("[FILL]"));
+        assert!(row.contains("[MAKER]"));
+        assert!(row.contains("UP BUY 20 @ 48¢"));
+        assert!(row.contains("| Notional $9.60 |"));
+        assert!(row.contains("Inv 20/0 (Δ+20)"));
+        assert!(row.contains("| PnL +$0.00"));
+        assert!(!row.contains('='));
+        assert!(row.len() <= 140, "{row}");
+    }
+
+    #[test]
+    fn taker_fill_shows_taker_badge_and_down_leg() {
+        let fill = sample_fill(false, Outcome::Down, OrderSide::Sell);
+        let row = format_fill_line(
+            Theme::plain(),
+            0,
+            120,
+            RiskTier::Tier2ModerateSkew,
+            FillImpact {
+                fill: &fill,
+                q_up: SharesMicro::ZERO,
+                q_dn: SharesMicro::from_raw(1_500_000),
+                realized_pnl_micro: -250_000,
+            },
+        );
+        assert!(row.contains("[TAKER]"));
+        assert!(row.contains("DN SELL 20 @ 48¢"));
+        assert!(row.contains("Inv 0/1.5 (Δ-1.5)"));
+        assert!(row.contains("PnL -$0.25"));
+        assert!(row.len() <= 140, "{row}");
+    }
+
+    #[test]
+    fn breaker_rows_use_human_reason_and_state() {
+        let tripped = format_breaker_line(
+            Theme::plain(),
+            BreakerStatus::Tripped {
+                reason: BreakerReason::PolymarketFeedStale,
+            },
+        );
+        assert!(tripped.contains("[BREAKER]"));
+        assert!(tripped.contains("Quoting halted"));
+        assert!(tripped.contains("Polymarket feed stale"));
+        assert!(!tripped.contains('{'), "{tripped}");
+        assert!(tripped.len() <= 140, "{tripped}");
+
+        let armed = format_breaker_line(Theme::plain(), BreakerStatus::ArmActive);
+        assert!(armed.contains("Armed"));
+        assert!(armed.contains("all risk gates healthy"));
+    }
+
+    #[test]
+    fn epoch_blocks_are_double_ruled_and_free_of_debug_dumps() {
+        let rollover = format_epoch_rollover_block(
+            Theme::plain(),
+            "btc-updown-5m-1795405200",
+            Some("btc-updown-5m-1795405500"),
+            Outcome::Down,
+            0,
+            0,
+        );
+        let lines: Vec<&str> = rollover.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].chars().all(|c| c == '='));
+        assert!(lines[2].chars().all(|c| c == '='));
+        assert!(lines[1].contains("* EPOCH ROLLOVER"));
+        assert!(lines[1].contains("btc-updown-5m-1795405200 -> 1795405500"));
+        assert!(lines[1].contains("Winner: DOWN"));
+        assert!(lines[1].contains("Settle: +$0.00"));
+        assert!(lines[1].contains("CumPnL: +$0.00"));
+        assert!(!lines[1].contains("winner="), "{}", lines[1]);
+
+        let banner = format_epoch_banner(
+            Theme::plain(),
+            2,
+            "btc-updown-5m-1795405200",
+            Some(61_295.92),
+            0,
+            300_000,
+        );
+        let blines: Vec<&str> = banner.lines().collect();
+        assert_eq!(blines.len(), 3);
+        assert!(blines[0].chars().all(|c| c == '='));
+        assert!(blines[2].chars().all(|c| c == '='));
+        assert!(blines[1].contains("+ EPOCH #2"));
+        assert!(blines[1].contains("Strike: $61,295.92"));
+        assert!(blines[1].contains("(300s)"));
+        for line in blines.iter().chain(lines.iter()) {
+            assert!(line.len() <= 140, "{line}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod summary_tests {
+    use super::*;
+
+    fn lat(p99_ns: u64) -> LatencySummary {
+        LatencySummary {
+            count: 10,
+            zero_ns_samples: 0,
+            min_ns: 1_000,
+            p50_ns: 12_000,
+            p95_ns: 20_000,
+            p99_ns,
+            p999_ns: 30_000,
+            max_ns: 30_000,
+        }
+    }
+
+    fn sample_stats() -> LifecycleReportStats {
+        LifecycleReportStats {
+            ticks_evaluated: 1_234,
+            orders_submitted: 340,
+            orders_replaced: 88,
+            orders_canceled: 41,
+            orders_held: 12,
+            flattens_executed: 1,
+            phase_transitions: 3,
+            breaker_trips: 2,
+            fills_count: 120,
+            merges_count: 58,
+            total_pairs_merged: SharesMicro::from_raw(58_000_000),
+            realized_pnl_micro: 120_000,
+            unrealized_pnl_micro: -20_000,
+            settlement_pnl_micro: 50_000,
+            fees_paid_micro: 10_000,
+            estimated_rebate_micro: 2_500,
+            epochs_completed: 1,
+            epoch_rollovers: 0,
+            final_q_up: SharesMicro::from_raw(20_000_000),
+            final_q_dn: SharesMicro::from_raw(18_000_000),
+            rpm_60s: 4,
+            fill_ratio: 0.42,
+            markout_1s_bps: 1.2,
+            markout_5s_bps: -0.4,
+            baseline_pnl_micro: 0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn summary_is_framed_grouped_and_free_of_key_values() {
+        let stats = sample_stats();
+        let block = format_lifecycle_summary(
+            Theme::plain(),
+            &stats,
+            &lat(12_000),
+            &lat(9_000),
+            &lat(24_000),
+        );
+        assert!(block.contains("■ LIFECYCLE SUMMARY") || block.contains("LIFECYCLE SUMMARY"));
+        assert!(block.contains("EXECUTION & FILLS"));
+        assert!(block.contains("INVENTORY & PNL"));
+        assert!(block.contains("RISK & BREAKERS"));
+        assert!(block.contains("COMPUTE LATENCY HDR"));
+        assert!(block.contains('+') && block.contains('|'));
+        assert!(!block.contains("key="));
+        assert!(!block.contains("Orders (Sub/Rep/Cxl):"));
+        for line in block.lines() {
+            assert!(line.chars().count() <= 140, "{line}");
+        }
+    }
+
+    #[test]
+    fn summary_marks_breaker_counts_and_latency_breaches() {
+        let stats = sample_stats();
+        let block = format_lifecycle_summary(
+            Theme::plain(),
+            &stats,
+            &lat(12_000),
+            &lat(9_000),
+            &lat(24_000),
+        );
+        assert!(block.contains("Breakers"));
+        assert!(block.contains("2"));
+
+        let styled = format_lifecycle_summary(
+            Theme::styled(),
+            &stats,
+            &lat(30_000),
+            &lat(9_000),
+            &lat(120_000),
+        );
+        // Breaker count and the two breached P99 cells all render in alarm colors.
+        assert!(
+            styled.contains("\x1b[1;31m"),
+            "no breach highlight in summary"
+        );
+        assert!(styled.contains("\x1b[33m"), "breaker count not highlighted");
     }
 }

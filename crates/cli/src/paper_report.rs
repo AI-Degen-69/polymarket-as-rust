@@ -5,7 +5,7 @@ use core_types::{
     JsonlWriter, LatencySummary, MarketDescriptor, MicroUsdc, MonotonicClock, SharesMicro,
     SignedSharesMicro,
 };
-use paper_sim::{MergeEvent, SimFill, SimOrder, TrajectorySnapshot};
+use paper_sim::{MergeEvent, SimFill, SimOrder, SimOrderStatus, TrajectorySnapshot};
 use serde::Serialize;
 
 use crate::theme::{self, Badge, Theme};
@@ -159,7 +159,10 @@ pub(crate) fn print_paper_header(
 }
 
 pub(crate) fn print_order_event(action: &str, order: &SimOrder) {
-    let t = theme::current();
+    println!("{}", format_order_event(theme::current(), action, order));
+}
+
+fn format_order_event(t: Theme, action: &str, order: &SimOrder) -> String {
     let outcome_str = match order.outcome {
         core_types::Outcome::Up => t.bold_green("UP"),
         core_types::Outcome::Down => t.bold_cyan("DN"),
@@ -168,19 +171,50 @@ pub(crate) fn print_order_event(action: &str, order: &SimOrder) {
         "CANCEL" | "CANCELLED" => t.yellow(&format!("{action:<7}")),
         _ => t.cyan(&format!("{action:<7}")),
     };
-    let side_str = order.side.as_str();
-    println!(
-        "  {} #{:<4} {} | {} {:<4} @ {} | sz={:<6} | vol_ahead={:<7} | status={}",
+    let status = match order.status {
+        SimOrderStatus::Cancelled => t.yellow("Cancelled"),
+        SimOrderStatus::Filled => t.green("Filled"),
+        SimOrderStatus::Live => t.green("Live"),
+        other => t.gray(status_label(other)),
+    };
+    let bar = t.bar();
+    format!(
+        "  {} #{:<4} {action_styled} {bar} {outcome_str} {} {} @ {} {bar} {} {} {bar} {}",
         t.badge(Badge::Order),
         order.sim_id,
-        action_styled,
-        outcome_str,
-        side_str,
+        order.side.as_str(),
+        fmt_shares(order.original_size),
         Theme::fmt_cents(Some(order.price)),
-        order.original_size,
-        order.volume_ahead,
-        order.status.as_str()
-    );
+        t.muted("Ahead"),
+        fmt_shares(order.volume_ahead),
+        status,
+    )
+}
+
+/// Human status text for a simulated order (no CamelCase debug names).
+fn status_label(status: SimOrderStatus) -> &'static str {
+    match status {
+        SimOrderStatus::PendingPlace { .. } => "Pending place",
+        SimOrderStatus::PendingPlaceThenCancel { .. } => "Place+cancel in flight",
+        SimOrderStatus::Live => "Live",
+        SimOrderStatus::PendingCancel { .. } => "Cancel in flight",
+        SimOrderStatus::Filled => "Filled",
+        SimOrderStatus::Cancelled => "Cancelled",
+    }
+}
+
+/// Whole-share quantity (`20`, `1.5`) from micro-shares.
+fn fmt_shares(shares: SharesMicro) -> String {
+    let raw = shares.as_u64();
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{frac:06}")
+            .trim_end_matches('0')
+            .to_string()
+    }
 }
 
 pub(crate) fn print_trade_eval(
@@ -192,54 +226,114 @@ pub(crate) fn print_trade_eval(
     reachable: SharesMicro,
     filled: SharesMicro,
 ) {
-    let t = theme::current();
-    let outcome_str = match outcome {
-        core_types::Outcome::Up => "UP",
-        core_types::Outcome::Down => "DN",
-    };
     println!(
-        "  {} {:<2} | px={} | sz={:<6} | vol_ahead: {:<6} -> {:<6} | reachable: {:<6} | filled: {:<6}",
-        t.badge(Badge::Trade),
-        outcome_str,
-        Theme::fmt_cents(Some(price)),
+        "{}",
+        format_trade_eval(
+            theme::current(),
+            TradeEval {
+                outcome,
+                price,
+                size,
+                vol_ahead_before,
+                vol_ahead_after,
+                reachable,
+                filled,
+            },
+        )
+    );
+}
+
+/// One public-trade evaluation against the resting queue.
+struct TradeEval {
+    outcome: core_types::Outcome,
+    price: MicroUsdc,
+    size: SharesMicro,
+    vol_ahead_before: SharesMicro,
+    vol_ahead_after: SharesMicro,
+    reachable: SharesMicro,
+    filled: SharesMicro,
+}
+
+fn format_trade_eval(t: Theme, eval: TradeEval) -> String {
+    let TradeEval {
+        outcome,
+        price,
         size,
         vol_ahead_before,
         vol_ahead_after,
         reachable,
-        filled
-    );
+        filled,
+    } = eval;
+    let outcome_str = match outcome {
+        core_types::Outcome::Up => t.green("UP"),
+        core_types::Outcome::Down => t.cyan("DN"),
+    };
+    let filled_str = if filled.as_u64() > 0 {
+        t.bold_green(&fmt_shares(filled))
+    } else {
+        t.muted(&fmt_shares(filled))
+    };
+    let bar = t.bar();
+    format!(
+        "  {} {outcome_str} {bar} {} @ {} {bar} {} {} {} {} {bar} {} {} {bar} {} {filled_str}",
+        t.badge(Badge::Trade),
+        fmt_shares(size),
+        Theme::fmt_cents(Some(price)),
+        t.muted("Ahead"),
+        fmt_shares(vol_ahead_before),
+        t.arrow(),
+        fmt_shares(vol_ahead_after),
+        t.muted("Reach"),
+        fmt_shares(reachable),
+        t.muted("Filled"),
+    )
 }
 
 pub(crate) fn print_fill_event(fill: &SimFill) {
-    let t = theme::current();
+    println!("{}", format_fill_event(theme::current(), fill));
+}
+
+fn format_fill_event(t: Theme, fill: &SimFill) -> String {
     let outcome_str = match fill.outcome {
         core_types::Outcome::Up => t.bold_green("UP"),
         core_types::Outcome::Down => t.bold_cyan("DN"),
     };
-    println!(
-        "  {} #{:<4} {} {:<4} | {:<7} @ {} (maker={})",
+    let liquidity = if fill.is_maker {
+        t.badge(Badge::Maker)
+    } else {
+        t.badge(Badge::Taker)
+    };
+    format!(
+        "  {} #{:<4} {outcome_str} {} {} @ {} {} {liquidity}",
         t.badge(Badge::Fill),
         fill.sim_id,
-        outcome_str,
         fill.side.as_str(),
-        fill.filled_shares,
+        fmt_shares(fill.filled_shares),
         Theme::fmt_cents(Some(fill.price)),
-        fill.is_maker
-    );
+        t.bar(),
+    )
 }
 
 pub(crate) fn print_merge_event(merge: &MergeEvent, total_merged: SharesMicro) {
-    let t = theme::current();
     println!(
-        "  {} {:<6} pairs | pair_cost={} (UP={}, DN={}) -> PnL={} (total_merged={})",
+        "{}",
+        format_merge_event(theme::current(), merge, total_merged)
+    );
+}
+
+fn format_merge_event(t: Theme, merge: &MergeEvent, total_merged: SharesMicro) -> String {
+    let bar = t.bar();
+    format!(
+        "  {} {} pairs {bar} cost {} (UP {} {} DN {}) {bar} PnL {} {bar} total {}",
         t.badge(Badge::Merge),
-        merge.merged_pairs,
+        fmt_shares(merge.merged_pairs),
         Theme::fmt_cents(Some(merge.pair_cost)),
         Theme::fmt_cents(Some(merge.avg_cost_up)),
+        t.dot(),
         Theme::fmt_cents(Some(merge.avg_cost_dn)),
         t.fmt_pnl(merge.realized_gain_micro),
-        total_merged
-    );
+        fmt_shares(total_merged),
+    )
 }
 
 /// Aggregated display variables for printing and recording paper simulation summaries.
@@ -463,4 +557,64 @@ pub(crate) fn record_tick_jsonl(
     };
     jsonl.write_event(now_ms, clock.now_ns()?, "tick", &rec)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod row_tests {
+    use super::*;
+    use core_types::{MicroUsdc, OrderSide, Outcome, SharesMicro};
+    use paper_sim::{MergeEvent, SimFill};
+
+    #[test]
+    fn paper_fill_row_is_columnar() {
+        let fill = SimFill {
+            sim_id: 3,
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(480_000),
+            filled_shares: SharesMicro::from_raw(20_000_000),
+            fill_ts_ms: 0,
+            is_maker: false,
+        };
+        let row = format_fill_event(Theme::plain(), &fill);
+        assert!(row.contains("[FILL] #3"));
+        assert!(row.contains("UP BUY 20 @ 48¢"));
+        assert!(row.contains("[TAKER]"));
+        assert!(!row.contains("maker="));
+        assert!(row.len() <= 140, "{row}");
+    }
+
+    #[test]
+    fn paper_merge_and_trade_rows_drop_key_values() {
+        let merge = MergeEvent {
+            merged_pairs: SharesMicro::from_raw(10_000_000),
+            avg_cost_up: MicroUsdc(470_000),
+            avg_cost_dn: MicroUsdc(480_000),
+            pair_cost: MicroUsdc(950_000),
+            realized_gain_micro: 500_000,
+        };
+        let row = format_merge_event(Theme::plain(), &merge, SharesMicro::from_raw(10_000_000));
+        assert!(row.contains("10 pairs"));
+        assert!(row.contains("cost 95¢"));
+        assert!(row.contains("PnL +$0.50"));
+        assert!(!row.contains("pair_cost="));
+
+        let trade = format_trade_eval(
+            Theme::plain(),
+            TradeEval {
+                outcome: Outcome::Up,
+                price: MicroUsdc(480_000),
+                size: SharesMicro::from_raw(20_000_000),
+                vol_ahead_before: SharesMicro::ZERO,
+                vol_ahead_after: SharesMicro::from_raw(5_000_000),
+                reachable: SharesMicro::from_raw(15_000_000),
+                filled: SharesMicro::from_raw(10_000_000),
+            },
+        );
+        assert!(trade.contains("| Ahead 0 -> 5 |"));
+        assert!(trade.contains("Reach 15"));
+        assert!(trade.contains("Filled 10"));
+        assert!(!trade.contains('='));
+        assert!(trade.len() <= 140, "{trade}");
+    }
 }

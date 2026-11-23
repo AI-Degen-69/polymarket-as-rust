@@ -16,6 +16,8 @@ const STATE_STYLED: u8 = 2;
 const RULE_WIDTH: usize = 82;
 /// Width of the frame drawn around phase transitions (fits a standard terminal).
 const PHASE_RULE_WIDTH: usize = 124;
+/// Epoch blocks use the same width so both frames line up in scrollback.
+const EPOCH_RULE_WIDTH: usize = PHASE_RULE_WIDTH;
 
 static THEME_STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 
@@ -300,6 +302,37 @@ impl Theme {
     pub(crate) fn phase_rule(self) -> String {
         let ch = if self.unicode { "─" } else { "-" };
         self.muted(&ch.repeat(PHASE_RULE_WIDTH))
+    }
+
+    /// True when the terminal can render Unicode box-drawing glyphs.
+    pub(crate) const fn box_drawing(self) -> bool {
+        self.unicode
+    }
+
+    /// Full-width double rule anchoring an epoch boundary (`═`), ASCII `=` fallback.
+    pub(crate) fn epoch_rule(self) -> String {
+        let ch = if self.unicode { "═" } else { "=" };
+        self.muted(&ch.repeat(EPOCH_RULE_WIDTH))
+    }
+
+    /// Single-character icon used by the epoch block: `◆` header, `★` rollover.
+    pub(crate) const fn epoch_icon(self, rollover: bool) -> &'static str {
+        match (self.unicode, rollover) {
+            (true, true) => "★",
+            (true, false) => "◆",
+            (false, true) => "*",
+            (false, false) => "+",
+        }
+    }
+
+    /// Circuit-breaker icon: `⚡` when tripped, `✔` when armed.
+    pub(crate) fn breaker_icon(self, tripped: bool) -> String {
+        match (self.unicode, tripped) {
+            (true, true) => self.bold_red("⚡"),
+            (true, false) => self.bold_green("✔"),
+            (false, true) => self.bold_red("!"),
+            (false, false) => self.bold_green("+"),
+        }
     }
 
     /// Short upper-case phase label (`QUOTE`, `LOCKOUT`, `FLATTEN`, `TERMINAL`).

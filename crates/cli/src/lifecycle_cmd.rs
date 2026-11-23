@@ -1321,7 +1321,28 @@ impl LivePaperSimulator {
     ) -> Result<(), Box<dyn Error>> {
         self.stats.fills_count = self.stats.fills_count.saturating_add(1);
         let tau_secs = self.desc.expiry_ts_ms.saturating_sub(now_ms) / 1000;
-        print_lifecycle_fill(now_ms, tau_secs, self.current_tier, fill);
+        let (mut q_up, mut q_dn) = (self.ledger.filled_up, self.ledger.filled_dn);
+        match (fill.outcome, fill.side) {
+            (Outcome::Up, OrderSide::Buy) => {
+                q_up =
+                    SharesMicro::from_raw(q_up.as_u64().saturating_add(fill.filled_shares.as_u64()))
+            }
+            (Outcome::Up, OrderSide::Sell) => q_up = q_up.saturating_sub(fill.filled_shares),
+            (Outcome::Down, OrderSide::Buy) => {
+                q_dn =
+                    SharesMicro::from_raw(q_dn.as_u64().saturating_add(fill.filled_shares.as_u64()))
+            }
+            (Outcome::Down, OrderSide::Sell) => q_dn = q_dn.saturating_sub(fill.filled_shares),
+        }
+        print_lifecycle_fill(
+            now_ms,
+            tau_secs,
+            self.current_tier,
+            fill,
+            q_up,
+            q_dn,
+            self.ledger.realized_pnl_micro,
+        );
         record_lifecycle_fill_jsonl(jsonl, now_ms, now_ns, &self.desc.slug, fill)?;
 
         let inv_before = self.ledger.net_inventory();
