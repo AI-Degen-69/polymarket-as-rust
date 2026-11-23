@@ -945,4 +945,81 @@ mod tests {
         bad_cd.insert("LEAD_LAG_COOLDOWN_MS", "10001");
         assert!(EngineConfig::from_lookup(lookup_map(&bad_cd)).is_err());
     }
+
+    /// `.env.example` is operator-facing, so it must mirror `EngineConfig::default()`.
+    #[test]
+    fn env_example_tuning_matches_defaults() {
+        let raw =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.env.example"))
+                .expect("read .env.example");
+        let map: HashMap<&str, &str> = raw
+            .lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.trim(), value.trim()))
+            .collect();
+
+        const TUNING_KEYS: [&str; 19] = [
+            "EXECUTION_MODE",
+            "DRY_RUN",
+            "ENGINE_GAMMA",
+            "MAX_NOTIONAL_PER_LEG_USD",
+            "BASE_ORDER_SIZE_SHARES",
+            "MIN_COMBINED_SPREAD_USD",
+            "MAX_COMBINED_BID_USD",
+            "HYSTERESIS_TICK_BUFFER",
+            "VARIANCE_MODE",
+            "KAPPA_MODE",
+            "SG_MODE",
+            "INCLUDE_VARIANCE_SPREAD",
+            "MAX_ENTRY_PROB",
+            "MAX_CROSS_TICK_LOSS_MICRO",
+            "LEAD_LAG_CANCEL_THRESHOLD",
+            "LEAD_LAG_WINDOW_MS",
+            "LEAD_LAG_COOLDOWN_MS",
+            "LEAD_LAG_DIRECTIONAL",
+            "CLOCK_DRIFT_MAX_MS",
+        ];
+        for key in TUNING_KEYS {
+            assert!(map.contains_key(key), ".env.example is missing {key}");
+        }
+
+        let parsed =
+            EngineConfig::from_lookup(|key| Ok(map.get(key).map(|value| (*value).to_string())))
+                .unwrap();
+        let def = EngineConfig::default();
+        macro_rules! assert_same {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    assert_eq!(
+                        parsed.$field,
+                        def.$field,
+                        ".env.example drifts from default on {}",
+                        stringify!($field)
+                    );
+                )+
+            };
+        }
+        assert_same!(
+            execution_mode,
+            dry_run,
+            gamma,
+            max_notional_per_leg_micro,
+            base_order_size_shares,
+            min_combined_spread_micro,
+            max_combined_bid_micro,
+            hysteresis_tick_buffer,
+            variance_mode,
+            kappa_mode,
+            sg_mode,
+            include_variance_spread,
+            max_entry_prob,
+            max_cross_tick_loss_micro,
+            lead_lag_cancel_threshold,
+            lead_lag_window_ms,
+            lead_lag_cooldown_ms,
+            lead_lag_directional,
+            clock_drift_max_ms,
+        );
+    }
 }
