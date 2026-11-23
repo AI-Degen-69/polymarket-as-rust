@@ -1,0 +1,15 @@
+#!/bin/sh
+# Tracked pre-commit guard. Enable once per clone:
+#   git config core.hooksPath .githooks
+
+set -e
+
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+if printf '%s\n' "$staged" | grep -Eq '^(.*/)?\.env$|^logs/'; then
+    echo "pre-commit: staged .env or logs/ file is prohibited" >&2
+    printf '%s\n' "$staged" | grep -E '^(.*/)?\.env$|^logs/' >&2
+    exit 1
+fi
+
+cargo fmt --all -- --check
