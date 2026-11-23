@@ -988,7 +988,7 @@ mod tests {
             .map(|(key, value)| (key.trim(), value.trim()))
             .collect();
 
-        const TUNING_KEYS: [&str; 19] = [
+        const TUNING_KEYS: [&str; 21] = [
             "EXECUTION_MODE",
             "DRY_RUN",
             "ENGINE_GAMMA",
@@ -1007,6 +1007,8 @@ mod tests {
             "LEAD_LAG_WINDOW_MS",
             "LEAD_LAG_COOLDOWN_MS",
             "LEAD_LAG_DIRECTIONAL",
+            "HEDGE_SKEW_MULT",
+            "CAP_TIER1_REDUCING_TO_DELTA",
             "CLOCK_DRIFT_MAX_MS",
         ];
         for key in TUNING_KEYS {
@@ -1048,6 +1050,8 @@ mod tests {
             lead_lag_window_ms,
             lead_lag_cooldown_ms,
             lead_lag_directional,
+            hedge_skew_mult,
+            cap_tier1_reducing_to_delta,
             clock_drift_max_ms,
         );
     }
