@@ -1,6 +1,6 @@
 use core_types::{
-    FeeSchedule, FinitePosF64, MathError, MicroUsdc, MonotonicClock, ONE_DOLLAR_MICRO,
-    SignedSharesMicro, TickPrecision, floor_to_tick,
+    EngineConfig, FeeSchedule, FinitePosF64, MathError, MicroUsdc, MonotonicClock,
+    ONE_DOLLAR_MICRO, SignedSharesMicro, TickPrecision, floor_to_tick,
 };
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use crate::safe_clamp;
 /// Configuration for Stations 4–6 (`s*`, reservation price `r_i`, dual bids, Post-Only guards).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PricerConfig {
-    /// Strictly positive CARA risk aversion parameter `gamma` (`0.15` `USD^-1` default).
+    /// Strictly positive CARA risk aversion parameter `gamma` (`0.12` `USD^-1` default).
     pub gamma: FinitePosF64,
     /// Whether Station 4 adds `gamma * V_rem` to `(2/gamma) * ln(1 + gamma/kappa)` (`true` default).
     pub include_variance_spread: bool,
@@ -46,10 +46,24 @@ impl PricerConfig {
         }
     }
 
-    /// Constructs the locked default configuration (`gamma = 0.15`, `spread >= $0.01`, `pair <= $0.98`, `max_entry_prob = 0.80`).
+    /// Constructs the default configuration from `EngineConfig::default()` (same sources as the engine).
     pub fn try_default() -> Result<Self, MathError> {
-        let gamma = FinitePosF64::try_new(0.15)?;
-        Ok(Self::from_gamma(gamma))
+        Self::from_engine_config(&EngineConfig::default())
+    }
+
+    /// Builds a `PricerConfig` from validated runtime `EngineConfig`.
+    pub fn from_engine_config(cfg: &EngineConfig) -> Result<Self, MathError> {
+        Ok(Self {
+            gamma: FinitePosF64::try_new(cfg.gamma)?,
+            include_variance_spread: cfg.include_variance_spread,
+            enforce_fee_floor: cfg.enforce_fee_floor,
+            min_combined_spread_micro: cfg.min_combined_spread_micro,
+            min_spread_ticks: cfg.min_spread_ticks,
+            max_combined_bid_micro: cfg.max_combined_bid_micro,
+            max_cross_tick_loss_micro: cfg.max_cross_tick_loss_micro,
+            max_entry_prob: cfg.max_entry_prob,
+            hedge_skew_mult: cfg.hedge_skew_mult,
+        })
     }
 
     /// Validates spread floor and maximum combined bid invariants.
@@ -708,6 +722,7 @@ mod tests {
     fn vector4_stations_4_to_6_zero_and_positive_inventory_exact() {
         let clock = MonotonicClock::start();
         let mut cfg = PricerConfig::try_default().unwrap();
+        cfg.gamma = FinitePosF64::try_new(0.15).unwrap();
         cfg.include_variance_spread = false;
         let pricer_no_var = DualBidPricer::new(cfg).unwrap();
 
@@ -740,7 +755,9 @@ mod tests {
             }
         );
 
-        let pricer_with_var = DualBidPricer::new(PricerConfig::try_default().unwrap()).unwrap();
+        let mut var_cfg = PricerConfig::try_default().unwrap();
+        var_cfg.gamma = FinitePosF64::try_new(0.15).unwrap();
+        let pricer_with_var = DualBidPricer::new(var_cfg).unwrap();
         let t_var = pricer_with_var
             .price(&make_input(0, 10_000, base_bounds()), &clock)
             .unwrap();
@@ -937,11 +954,13 @@ mod tests {
     fn cross_tick_pair_cap_clamps_symmetrically_and_respects_override_and_underflow() {
         let clock = MonotonicClock::start();
         let mut base_cfg = PricerConfig::try_default().unwrap();
+        base_cfg.gamma = FinitePosF64::try_new(0.15).unwrap();
         base_cfg.include_variance_spread = false;
         base_cfg.enforce_fee_floor = false;
         base_cfg.min_combined_spread_micro = MicroUsdc(20_000);
         base_cfg.min_spread_ticks = 2;
         base_cfg.max_combined_bid_micro = MicroUsdc(980_000);
+        base_cfg.max_cross_tick_loss_micro = None;
 
         // Input with q=+20 (heavy UP), s_i=0.80, v_rem=0.04, gamma=0.15 =>
         // r_i = 0.80 - 20 * 0.15 * 0.04 = 0.68, s* ~ 0.0399 => bid_up=$0.66, bid_dn=$0.30 (or similar).
@@ -1167,6 +1186,7 @@ mod tests {
     fn asymmetric_hedge_skew_mult_damps_reducing_leg_and_restores_on_override() {
         let clock = MonotonicClock::start();
         let mut base_cfg = PricerConfig::try_default().unwrap();
+        base_cfg.gamma = FinitePosF64::try_new(0.15).unwrap();
         base_cfg.include_variance_spread = false;
         let base_pricer = DualBidPricer::new(base_cfg).unwrap();
 

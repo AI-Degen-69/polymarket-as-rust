@@ -26,32 +26,14 @@ pub struct MathPipelineConfig {
 }
 
 impl MathPipelineConfig {
-    /// Constructs locked operator defaults (`BinaryCara`, `Causal`, `TradeNormalizedDepth`, `gamma=0.15`).
+    /// Constructs the default configuration from `EngineConfig::default()` (same sources as the engine).
     pub fn try_default() -> Result<Self, MathError> {
-        let cfg = Self {
-            sg_mode: SgMode::Causal,
-            station2: Station2Config::default(),
-            kappa: KappaConfig::default(),
-            pricer: PricerConfig::try_default()?,
-        };
-        cfg.validate()?;
-        Ok(cfg)
+        Self::from_engine_config(&EngineConfig::default())
     }
 
     /// Maps validated runtime `EngineConfig` into `MathPipelineConfig`.
     pub fn from_engine_config(cfg: &EngineConfig) -> Result<Self, MathError> {
-        let gamma = FinitePosF64::try_new(cfg.gamma)?;
-        let pricer = PricerConfig {
-            gamma,
-            include_variance_spread: cfg.include_variance_spread,
-            enforce_fee_floor: cfg.enforce_fee_floor,
-            min_combined_spread_micro: cfg.min_combined_spread_micro,
-            min_spread_ticks: cfg.min_spread_ticks,
-            max_combined_bid_micro: cfg.max_combined_bid_micro,
-            max_cross_tick_loss_micro: cfg.max_cross_tick_loss_micro,
-            max_entry_prob: cfg.max_entry_prob,
-            hedge_skew_mult: cfg.hedge_skew_mult,
-        };
+        let pricer = PricerConfig::from_engine_config(cfg)?;
         let station2 = Station2Config {
             variance_mode: cfg.variance_mode,
             lead_lag_cancel_threshold: cfg.lead_lag_cancel_threshold,
