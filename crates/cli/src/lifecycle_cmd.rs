@@ -23,9 +23,9 @@ use paper_sim::{
     NewOrderParams, PaperLedger, SimFill, SimOrderStatus, TrajectorySnapshot,
 };
 use risk_lifecycle::{
-    ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerStatus, CancelReason,
-    CircuitBreakers, CorePinning, DollarNotionalRiskEngine, EpochLifecycleController, EpochPhase,
-    ExecutionCommand, FaultInjection, FlattenAction, HysteresisConfig, HysteresisGate,
+    ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerReason, BreakerStatus,
+    CancelReason, CircuitBreakers, CorePinning, DollarNotionalRiskEngine, EpochLifecycleController,
+    EpochPhase, ExecutionCommand, FaultInjection, FlattenAction, HysteresisConfig, HysteresisGate,
     LifecycleConfig, OrderAction, OrderRegistrySnapshot, OrderSlotState, QuoteProposal, RiskActor,
     RiskActorTrace, RiskConfig, RiskTier,
 };
@@ -1037,6 +1037,7 @@ struct LivePaperSimulator {
     step_count: u64,
     current_phase: Option<EpochPhase>,
     current_tier: RiskTier,
+    last_breaker: BreakerStatus,
     market_resolved_flag: bool,
     epoch_settled: bool,
     pending_settlement: Option<PendingEpochSettlement>,
@@ -1095,6 +1096,7 @@ impl LivePaperSimulator {
             step_count: 0,
             current_phase: None,
             current_tier: RiskTier::Tier1Normal,
+            last_breaker: BreakerStatus::ArmActive,
             market_resolved_flag: false,
             epoch_settled: false,
             pending_settlement: None,
@@ -2031,9 +2033,25 @@ impl LivePaperSimulator {
                 self.current_tier = r_trace.tier;
             }
 
-            if let BreakerStatus::Tripped { .. } = r_trace.breaker {
-                self.stats.breaker_trips = self.stats.breaker_trips.saturating_add(1);
+            if r_trace.breaker != self.last_breaker {
+                self.last_breaker = r_trace.breaker;
                 print_breaker_trip(r_trace.breaker);
+                if let BreakerStatus::Tripped { .. } = r_trace.breaker {
+                    self.stats.breaker_trips = self.stats.breaker_trips.saturating_add(1);
+                }
+                if matches!(
+                    r_trace.breaker,
+                    BreakerStatus::Tripped {
+                        reason: BreakerReason::ClockDriftExceeded
+                    }
+                ) {
+                    println!(
+                        "  {} Host clock offset {}ms exceeds tolerance; in an elevated shell run `{}`",
+                        theme::current().badge(Badge::Warn),
+                        clock_offset_ms,
+                        crate::preflight::CLOCK_FIX_HINT
+                    );
+                }
                 record_breaker_jsonl(jsonl, now_ms, now_ns, r_trace.breaker, clock_offset_ms)?;
             }
 
@@ -2630,6 +2648,17 @@ async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<()
         desc,
         ..
     } = fresh;
+
+    if offset_est.is_drift_exceeded() {
+        let drift_ms = offset_est.offset_ms().unwrap_or_default();
+        return Err(format!(
+            "host clock drift {drift_ms}ms exceeds the {}ms tolerance; in an elevated shell run \
+             `{}`, then rerun",
+            cfg.clock_drift_max_ms,
+            crate::preflight::CLOCK_FIX_HINT
+        )
+        .into());
+    }
 
     let mut jsonl = JsonlWriter::create(&args.jsonl)?;
     let mut pricing_lat = LatencyTracker::new()?;

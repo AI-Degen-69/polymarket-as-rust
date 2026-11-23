@@ -21,6 +21,7 @@ mod lifecycle_report;
 mod log_paths;
 mod paper_cmd;
 mod paper_report;
+mod preflight;
 mod sandbox_cmd;
 mod sandbox_report;
 mod theme;
@@ -548,6 +549,21 @@ enum Commands {
     },
 }
 
+impl Commands {
+    /// `true` when the command spends real time against the exchange and needs a trustworthy
+    /// host clock. Offline replay and diagnostics do not.
+    fn needs_host_clock(&self) -> bool {
+        match self {
+            Self::Feeds { discover, .. } => *discover,
+            Self::Trace { source, .. } => matches!(source, CliTraceSource::Live),
+            Self::Paper { source, .. } => matches!(source, CliTraceSource::Live),
+            Self::Lifecycle { source, .. } => matches!(source, CliLifecycleSource::Live),
+            Self::Exec { mode, .. } => matches!(mode, CliExecMode::CanaryLive),
+            Self::Doctor { .. } | Self::Sandbox { .. } => false,
+        }
+    }
+}
+
 fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     theme::init(cli.color);
     match cli.command {
@@ -751,7 +767,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     theme::init(cli.color);
-    match dispatch_cli(cli) {
+    match run_cli(cli) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             let t = theme::current();
@@ -764,6 +780,14 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Runs the host clock preflight for live commands, then dispatches.
+fn run_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.command.needs_host_clock() {
+        preflight::check_host_clock(&core_types::EngineConfig::from_env()?)?;
+    }
+    dispatch_cli(cli)
 }
 
 #[cfg(test)]
