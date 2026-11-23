@@ -108,6 +108,26 @@ impl From<CliQueueDecay> for paper_sim::QueueDecayPolicy {
     }
 }
 
+/// CLI override value for `--max-cross-tick-loss-micro` supporting either micro-USDC or `off`/`none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaxCrossTickLossOverride {
+    Off,
+    Value(u64),
+}
+
+fn parse_max_cross_tick_loss_override(raw: &str) -> Result<MaxCrossTickLossOverride, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(MaxCrossTickLossOverride::Off);
+    }
+    let val = trimmed.parse::<u64>().map_err(|_| {
+        format!(
+            "invalid --max-cross-tick-loss-micro '{raw}': expected non-negative integer or 'off'"
+        )
+    })?;
+    Ok(MaxCrossTickLossOverride::Value(val))
+}
+
 /// CLI override value for `--max-entry-prob` supporting either a probability bound or `off`/`none`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum MaxEntryProbOverride {
@@ -132,7 +152,7 @@ fn parse_max_entry_prob_override(raw: &str) -> Result<MaxEntryProbOverride, Stri
 /// Optional Stations 4–6 math competitiveness overrides for live/replay A/B testing.
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub(crate) struct MathOverrides {
-    /// Override CARA risk aversion parameter `gamma` (`0.15` default).
+    /// Override CARA risk aversion parameter `gamma` (`0.12` default).
     #[arg(long)]
     pub(crate) gamma: Option<f64>,
     /// Override maximum combined UP+DOWN bid in micro-USDC (`<= 990000`, `980000` default).
@@ -147,13 +167,13 @@ pub(crate) struct MathOverrides {
     /// Override whether Station 4 enforces taker-fee spread floor (`false` default; auto-disabled when `--min-spread-ticks 1` unless set).
     #[arg(long)]
     pub(crate) fee_spread_floor: Option<bool>,
-    /// Optional maximum allowed cross-tick pair loss in micro-USDC (`0` enforces `cost_old + bid_new <= max_combined_bid_micro`).
-    #[arg(long)]
-    pub(crate) max_cross_tick_loss_micro: Option<u64>,
+    /// Optional maximum allowed cross-tick pair loss in micro-USDC (`80000` default; pass `off` or `none` to disable; `0` enforces `cost_old + bid_new <= max_combined_bid_micro`).
+    #[arg(long, value_parser = parse_max_cross_tick_loss_override)]
+    pub(crate) max_cross_tick_loss_micro: Option<MaxCrossTickLossOverride>,
     /// Override extreme-probability entry guard in `(0.5, 1.0)` (`0.80` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_prob_override)]
     pub(crate) max_entry_prob: Option<MaxEntryProbOverride>,
-    /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.02` default).
+    /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.015` default).
     #[arg(long)]
     pub(crate) lead_lag_threshold: Option<f64>,
     /// Override rolling Binance lead-lag lookback window in ms (`0..=6000`, `1000` default).
@@ -213,7 +233,10 @@ impl MathOverrides {
             cfg.max_combined_bid_micro = core_types::MicroUsdc(max_bid);
         }
         if let Some(loss) = self.max_cross_tick_loss_micro {
-            cfg.max_cross_tick_loss_micro = Some(loss);
+            cfg.max_cross_tick_loss_micro = match loss {
+                MaxCrossTickLossOverride::Off => None,
+                MaxCrossTickLossOverride::Value(v) => Some(v),
+            };
         }
         if let Some(entry_prob) = self.max_entry_prob {
             match entry_prob {
@@ -1111,12 +1134,13 @@ mod tests {
                 assert_eq!(queue_decay, CliQueueDecay::Conservative);
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
-                assert_eq!(cfg.gamma, 0.15);
+                assert_eq!(cfg.gamma, 0.12);
                 assert!(cfg.include_variance_spread);
                 assert_eq!(cfg.min_spread_ticks, 1);
                 assert_eq!(cfg.min_combined_spread_micro, core_types::MicroUsdc(10_000));
                 assert_eq!(cfg.max_combined_bid_micro, core_types::MicroUsdc(980_000));
                 assert!(!cfg.enforce_fee_floor);
+                assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
                 assert_eq!(cfg.max_entry_prob, Some(0.80));
             }
             _ => panic!("expected Paper"),
@@ -1277,7 +1301,10 @@ mod tests {
         match parsed.command {
             Commands::Lifecycle { math, .. } => {
                 assert!(math.is_any_set());
-                assert_eq!(math.max_cross_tick_loss_micro, Some(20_000));
+                assert_eq!(
+                    math.max_cross_tick_loss_micro,
+                    Some(MaxCrossTickLossOverride::Value(20_000))
+                );
                 assert_eq!(math.max_entry_prob, Some(MaxEntryProbOverride::Value(0.85)));
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
@@ -1300,14 +1327,26 @@ mod tests {
         }
 
         for off_flag in ["off", "none"] {
-            let parsed_off =
-                Cli::try_parse_from(["poly-as", "paper", "--max-entry-prob", off_flag]).unwrap();
+            let parsed_off = Cli::try_parse_from([
+                "poly-as",
+                "paper",
+                "--max-cross-tick-loss-micro",
+                off_flag,
+                "--max-entry-prob",
+                off_flag,
+            ])
+            .unwrap();
             match parsed_off.command {
                 Commands::Paper { math, .. } => {
                     assert!(math.is_any_set());
+                    assert_eq!(
+                        math.max_cross_tick_loss_micro,
+                        Some(MaxCrossTickLossOverride::Off)
+                    );
                     assert_eq!(math.max_entry_prob, Some(MaxEntryProbOverride::Off));
                     let mut cfg = core_types::EngineConfig::default();
                     math.apply_to(&mut cfg).unwrap();
+                    assert_eq!(cfg.max_cross_tick_loss_micro, None);
                     assert_eq!(cfg.max_entry_prob, None);
                 }
                 _ => panic!("expected Paper"),
