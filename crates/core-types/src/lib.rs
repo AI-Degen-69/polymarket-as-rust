@@ -235,7 +235,8 @@ mod tests {
         assert!(!cfg.polybolt_enabled);
         assert!(cfg.include_variance_spread);
         assert!(!cfg.enforce_fee_floor);
-        assert_eq!(cfg.max_cross_tick_loss_micro, None);
+        assert_eq!(cfg.gamma, 0.12);
+        assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
         assert_eq!(cfg.max_entry_prob, Some(0.80));
 
         let json = serde_json::to_string(&cfg).unwrap();

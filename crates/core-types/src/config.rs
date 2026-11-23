@@ -112,7 +112,7 @@ pub struct EngineConfig {
     pub gasless_relayer_enabled: bool,
     /// Enable optional PolyBolt TWAP socket (`false` default).
     pub polybolt_enabled: bool,
-    /// CARA inventory risk aversion parameter `gamma` (`0.15` default).
+    /// CARA inventory risk aversion parameter `gamma` (`0.12` default).
     pub gamma: f64,
     /// Maximum unhedged dollar notional allowed per leg (`$50.00` default).
     pub max_notional_per_leg_micro: MicroUsdc,
@@ -136,7 +136,7 @@ pub struct EngineConfig {
     pub include_variance_spread: bool,
     /// Whether Station 4 enforces taker-fee profitability floor (`false` default).
     pub enforce_fee_floor: bool,
-    /// Optional cross-tick pair-cost loss budget in micro-USDC (`None` disables cross-tick cap).
+    /// Optional cross-tick pair-cost loss budget in micro-USDC (`Some(80_000)` default; `None` disables cross-tick cap).
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
@@ -315,7 +315,7 @@ impl Default for EngineConfig {
             relayer_url: "https://relayer-v2.polymarket.com/submit".to_string(),
             gasless_relayer_enabled: true,
             polybolt_enabled: false,
-            gamma: 0.15,
+            gamma: 0.12,
             max_notional_per_leg_micro: MicroUsdc(50_000_000),
             base_order_size_shares: SharesMicro(20_000_000),
             min_combined_spread_micro: MicroUsdc(10_000),
@@ -327,7 +327,7 @@ impl Default for EngineConfig {
             sg_mode: SgMode::Causal,
             include_variance_spread: true,
             enforce_fee_floor: false,
-            max_cross_tick_loss_micro: None,
+            max_cross_tick_loss_micro: Some(80_000),
             max_entry_prob: Some(0.80),
             lead_lag_cancel_threshold: 0.015,
             lead_lag_window_ms: 1_000,

@@ -37,7 +37,7 @@ param(
 
     [string[]]$MinSpreadTicks = @("1"),
 
-    [string[]]$MaxCrossTickLossMicros = @("off"),
+    [string[]]$MaxCrossTickLossMicros = @("80000"),
 
     [string[]]$MaxEntryProbs = @("off"),
 
