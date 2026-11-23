@@ -2461,17 +2461,17 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
         (
             "Variance Mode",
             format!("{:?}", cfg.variance_mode),
-            "Remaining-variance model used in spread",
+            "Remaining-variance estimate into expiry",
         ),
         (
             "Kappa Mode",
             format!("{:?}", cfg.kappa_mode),
-            "Liquidity arrival-intensity estimator",
+            "How quickly order depth thins away from best price",
         ),
         (
             "SG Mode",
             format!("{:?}", cfg.sg_mode),
-            "Savitzky-Golay denoising filter mode",
+            "Smooths tick noise using past prices only (no look-ahead)",
         ),
         (
             "Include Variance Spread",
@@ -2530,7 +2530,7 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
         (
             "Hedge Skew Multiplier",
             cfg.hedge_skew_mult.to_string(),
-            "Asymmetric reducing-leg skew damping (0-1)",
+            "Reduce-side skew strength: 1=full, 0=passive",
         ),
         (
             "Cap Tier-1 Reducing",
@@ -2554,7 +2554,7 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
     let desc_w = rows.iter().map(|(_, _, d)| d.len()).max().unwrap_or(20);
 
     let row = |label: &str, val: &str, desc: &str| {
-        format!("  {label:<label_w$} | {val:<val_w$} | {desc:<desc_w$}")
+        format!("  {label:<label_w$} | {val:>val_w$} | {desc:<desc_w$}")
     };
     println!("{}", row("Parameter", "Value", "Description"));
     println!("{}", "-".repeat(label_w + val_w + desc_w + 8));
