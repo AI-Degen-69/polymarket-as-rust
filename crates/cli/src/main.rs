@@ -185,6 +185,12 @@ pub(crate) struct MathOverrides {
     /// Override whether Binance lead-lag cancels only the endangered leg (`true` default).
     #[arg(long)]
     pub(crate) lead_lag_directional: Option<bool>,
+    /// Override asymmetric reducing-leg skew multiplier in `[0.0, 1.0]` (`1.0` default).
+    #[arg(long)]
+    pub(crate) hedge_skew_mult: Option<f64>,
+    /// Override whether Tier-1 caps reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (`false` default).
+    #[arg(long)]
+    pub(crate) cap_tier1_hedge: Option<bool>,
 }
 
 impl MathOverrides {
@@ -200,6 +206,8 @@ impl MathOverrides {
             || self.lead_lag_window_ms.is_some()
             || self.lead_lag_cooldown_ms.is_some()
             || self.lead_lag_directional.is_some()
+            || self.hedge_skew_mult.is_some()
+            || self.cap_tier1_hedge.is_some()
     }
 
     pub(crate) fn apply_to(
@@ -272,6 +280,15 @@ impl MathOverrides {
         }
         if let Some(dir) = self.lead_lag_directional {
             cfg.lead_lag_directional = dir;
+        }
+        if let Some(mult) = self.hedge_skew_mult {
+            if !mult.is_finite() || !(0.0..=1.0).contains(&mult) {
+                return Err("`--hedge-skew-mult` must be finite in [0.0, 1.0]".into());
+            }
+            cfg.hedge_skew_mult = mult;
+        }
+        if let Some(cap) = self.cap_tier1_hedge {
+            cfg.cap_tier1_reducing_to_delta = cap;
         }
         cfg.validate()?;
         Ok(())
@@ -1440,5 +1457,83 @@ mod tests {
             .apply_to(&mut cfg)
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_parses_and_validates_hedge_skew_and_tier1_cap_overrides() {
+        let parsed = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--hedge-skew-mult",
+            "0.25",
+            "--cap-tier1-hedge",
+            "true",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Lifecycle { math, .. } => {
+                assert!(math.is_any_set());
+                assert_eq!(math.hedge_skew_mult, Some(0.25));
+                assert_eq!(math.cap_tier1_hedge, Some(true));
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.hedge_skew_mult, 0.25);
+                assert!(cfg.cap_tier1_reducing_to_delta);
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        for (mult_str, cap_str) in [("0.0", "false"), ("1.0", "true")] {
+            let cli = Cli::try_parse_from([
+                "poly-as",
+                "paper",
+                "--hedge-skew-mult",
+                mult_str,
+                "--cap-tier1-hedge",
+                cap_str,
+            ])
+            .unwrap();
+            match cli.command {
+                Commands::Paper { math, .. } => {
+                    let mut cfg = core_types::EngineConfig::default();
+                    math.apply_to(&mut cfg).unwrap();
+                    assert_eq!(cfg.hedge_skew_mult, mult_str.parse::<f64>().unwrap());
+                    assert_eq!(cfg.cap_tier1_reducing_to_delta, cap_str == "true");
+                }
+                _ => panic!("expected Paper"),
+            }
+        }
+
+        for bad_mult in [-0.1, 1.5, f64::NAN, f64::INFINITY] {
+            let mut cfg = core_types::EngineConfig::default();
+            let err = MathOverrides {
+                hedge_skew_mult: Some(bad_mult),
+                ..Default::default()
+            }
+            .apply_to(&mut cfg);
+            assert!(
+                err.is_err(),
+                "expected error for hedge_skew_mult={bad_mult}"
+            );
+        }
+
+        let too_high = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--hedge-skew-mult",
+            "1.5",
+        ])
+        .unwrap();
+        match too_high.command {
+            Commands::Lifecycle { math, .. } => {
+                let mut cfg = core_types::EngineConfig::default();
+                assert!(math.apply_to(&mut cfg).is_err());
+            }
+            _ => panic!("expected Lifecycle"),
+        }
     }
 }
