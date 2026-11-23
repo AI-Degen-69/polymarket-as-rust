@@ -38,6 +38,12 @@ Run all four checks before every commit:
 3. `rtk cargo test --workspace`
 4. Inspect `git diff --cached` and confirm zero `.env` files, secrets, private keys, or `logs/` artifacts are staged.
 
+The tracked hook automates checks 1 and 4. Enable it once per clone:
+
+```powershell
+git config core.hooksPath .githooks
+```
+
 ## 5. Push, Pull Request, CI & Merge Gate
 
 1. Push your branch early (`rtk git push -u origin <branch>`) and after verified milestones.
