@@ -2447,6 +2447,17 @@ fn finalize_and_report_session(
     Ok(())
 }
 
+/// Formats a micro-USDC amount as dollars, keeping at least 2 decimals but showing
+/// sub-cent precision when present (e.g. `$0.98`, `$0.981`, `$0.015`).
+fn fmt_usd_full(micro: u64) -> String {
+    let dollars = micro / 1_000_000;
+    let mut frac = format!("{:06}", micro % 1_000_000);
+    while frac.len() > 2 && frac.ends_with('0') {
+        frac.pop();
+    }
+    format!("${dollars}.{frac}")
+}
+
 /// Prints the effective engine tuning that will drive this epoch (live/replay).
 fn print_engine_config_banner(cfg: &EngineConfig) {
     let t = theme::current();
@@ -2456,7 +2467,7 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
         (
             "Gamma",
             cfg.gamma.to_string(),
-            "Risk aversion strength; higher tightens spread",
+            "Risk aversion strength; scales the variance spread term",
         ),
         (
             "Variance Mode",
@@ -2481,15 +2492,15 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
         (
             "Min Combined Spread",
             format!(
-                "${:.2} ({} tick)",
-                cfg.min_combined_spread_micro.0 as f64 / 1e6,
+                "{} ({} tick)",
+                fmt_usd_full(cfg.min_combined_spread_micro.0),
                 cfg.min_spread_ticks
             ),
             "Floor on combined quote spread",
         ),
         (
             "Max Combined Bid",
-            format!("${:.2}", cfg.max_combined_bid_micro.0 as f64 / 1e6),
+            fmt_usd_full(cfg.max_combined_bid_micro.0),
             "Cap on UP+DOWN bid sum",
         ),
         (
