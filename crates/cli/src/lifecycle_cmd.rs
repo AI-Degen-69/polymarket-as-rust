@@ -77,6 +77,7 @@ impl From<CliFaultMode> for FaultInjection {
 pub(crate) struct LifecycleArgs {
     pub(crate) source: LifecycleSourceMode,
     pub(crate) display: LifecycleDisplayMode,
+    pub(crate) verbose_latency: bool,
     pub(crate) input: Option<PathBuf>,
     pub(crate) duration: String,
     pub(crate) allow_mid_window: bool,
@@ -476,7 +477,8 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
     let start_ms = 1_700_000_000_000u64;
     let expiry_ms = start_ms + 300_000; // 300s horizon
     print_epoch_banner(1, "sim-epoch", None, start_ms, expiry_ms);
-    let mut reporter = LifecycleStreamReporter::new(args.display, theme::current());
+    let mut reporter = LifecycleStreamReporter::new(args.display, theme::current())
+        .with_verbose_latency(args.verbose_latency);
     let mut resting_bid_up: Option<MicroUsdc> = None;
     let mut resting_bid_dn: Option<MicroUsdc> = None;
 
@@ -1052,6 +1054,7 @@ impl LivePaperSimulator {
         base_size_shares: u64,
         max_entry_prob: Option<f64>,
         display: LifecycleDisplayMode,
+        verbose_latency: bool,
         harness: ActorPipelineHarness,
         priority_rx: mpsc::Receiver<ExecutionCommand>,
         routine_rx: mpsc::Receiver<ExecutionCommand>,
@@ -1096,7 +1099,8 @@ impl LivePaperSimulator {
             epoch_settled: false,
             pending_settlement: None,
             epoch_num: 1,
-            reporter: LifecycleStreamReporter::new(display, theme::current()),
+            reporter: LifecycleStreamReporter::new(display, theme::current())
+                .with_verbose_latency(verbose_latency),
             stats: LifecycleReportStats::default(),
         };
         let _ = sim.publish_registry_snapshot();
@@ -2384,6 +2388,7 @@ fn spawn_managed_session(
         args.base_size,
         cfg.max_entry_prob,
         args.display,
+        args.verbose_latency,
         harness.clone(),
         priority_rx,
         routine_rx,
@@ -3361,6 +3366,7 @@ mod tests {
             base_size,
             cfg.max_entry_prob,
             LifecycleDisplayMode::Stream,
+            false,
             harness.clone(),
             priority_rx,
             routine_rx,
@@ -4223,6 +4229,7 @@ mod tests {
         let err = run(LifecycleArgs {
             source: LifecycleSourceMode::SimEpoch,
             display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
             input: None,
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4438,6 +4445,7 @@ mod tests {
         let err_live = run(LifecycleArgs {
             source: LifecycleSourceMode::Live,
             display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4457,6 +4465,7 @@ mod tests {
         let err_overwrite = run(LifecycleArgs {
             source: LifecycleSourceMode::Replay,
             display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4479,6 +4488,7 @@ mod tests {
         let ok_res = run(LifecycleArgs {
             source: LifecycleSourceMode::Replay,
             display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4514,6 +4524,7 @@ mod tests {
         let make_args = |jsonl: PathBuf| LifecycleArgs {
             source: LifecycleSourceMode::Replay,
             display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,
@@ -4569,6 +4580,7 @@ mod tests {
         run(LifecycleArgs {
             source: LifecycleSourceMode::Replay,
             display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
             input: Some(fixture.clone()),
             duration: "10s".to_string(),
             allow_mid_window: false,

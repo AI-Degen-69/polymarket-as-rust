@@ -483,6 +483,9 @@ enum Commands {
         /// Terminal display mode (`stream` events + 5s/1s heartbeats, or `raw` 10 Hz tick lines).
         #[arg(long, value_enum, default_value_t = CliLifecycleDisplay::Stream)]
         display: CliLifecycleDisplay,
+        /// Print every latency row, disabling the 10s nominal health-check throttle.
+        #[arg(long, default_value_t = false)]
+        verbose_latency: bool,
         /// Input JSONL path used when `--source replay` (defaults to newest capture in `logs/captures/`).
         #[arg(long)]
         input: Option<PathBuf>,
@@ -631,6 +634,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Commands::Lifecycle {
             source,
             display,
+            verbose_latency,
             input,
             duration,
             allow_mid_window,
@@ -653,6 +657,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 CliLifecycleDisplay::Stream => lifecycle_report::LifecycleDisplayMode::Stream,
                 CliLifecycleDisplay::Raw => lifecycle_report::LifecycleDisplayMode::Raw,
             },
+            verbose_latency,
             input,
             duration,
             allow_mid_window,
