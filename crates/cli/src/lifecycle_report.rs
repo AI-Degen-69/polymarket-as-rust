@@ -406,7 +406,7 @@ pub(crate) fn print_lifecycle_header(
 }
 
 fn format_stream_header(t: Theme) -> String {
-    let prefix = "UTC       Tau    Event     Phase      Tier   Util";
+    let prefix = "UTC       Tau    Event     Phase      Tier   util     ";
     let btc = theme::pad_visible_right("BTC vs Strike", HB_BTC_WIDTH);
     let book = theme::pad_visible_right("Book (UP / DN)", HB_BOOK_WIDTH);
     let quote = theme::pad_visible_right("Quote (Pair)", HB_QUOTE_WIDTH);
@@ -678,8 +678,13 @@ impl LifecycleStreamReporter {
                 (None, None) => {}
             }
             if let Some(reason) = row.cancel_all_reason {
+                let flat_note = if row.flatten_in_flight {
+                    " - all quotes canceled"
+                } else {
+                    ""
+                };
                 action_line.push_str(&format!(
-                    " | fif={} UP={} DN={} reason={}",
+                    " | FIF={} UP={} DN={} reason={}{flat_note}",
                     row.flatten_in_flight,
                     Theme::fmt_bbo(row.best_bid_up, row.best_ask_up),
                     Theme::fmt_bbo(row.best_bid_dn, row.best_ask_dn),
@@ -704,15 +709,24 @@ impl LifecycleStreamReporter {
             || row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000)
             || total_ns > TOTAL_BUDGET_US.saturating_mul(1_000)
         {
-            let ideal = t.muted(&format!(
-                "(Ideal: Total < {TOTAL_BUDGET_US}us | Pricing < {PRICING_BUDGET_US}us AND Risk < {RISK_BUDGET_US}us)"
-            ));
+            let pricing =
+                t.fmt_latency_us_width(row.pricing_ns, PRICING_BUDGET_US, LATENCY_VALUE_WIDTH);
+            let risk = t.fmt_latency_us_width(row.risk_ns, RISK_BUDGET_US, LATENCY_VALUE_WIDTH);
+            let total = t.fmt_latency_us_width(total_ns, TOTAL_BUDGET_US, LATENCY_VALUE_WIDTH);
+            let mut breaches = Vec::new();
+            if row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000) {
+                breaches.push(format!("Pricing > {PRICING_BUDGET_US}µs"));
+            }
+            if row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000) {
+                breaches.push(format!("Risk > {RISK_BUDGET_US}µs"));
+            }
+            if total_ns > TOTAL_BUDGET_US.saturating_mul(1_000) {
+                breaches.push(format!("Total > {TOTAL_BUDGET_US}µs"));
+            }
+            let note = format!("  {}", t.bold_yellow(&breaches.join("; ")));
+            let prefix = row_prefix(t, &utc, row.tau_secs, Some(Badge::Latency), None, None);
             lines.push(format!(
-                "{}{} Pricing + {} Risk = {} Total | {ideal}",
-                row_prefix(t, &utc, row.tau_secs, Some(Badge::Latency), None, None),
-                t.fmt_latency_us_width(row.pricing_ns, PRICING_BUDGET_US, LATENCY_VALUE_WIDTH),
-                t.fmt_latency_us_width(row.risk_ns, RISK_BUDGET_US, LATENCY_VALUE_WIDTH),
-                t.fmt_latency_us_width(total_ns, TOTAL_BUDGET_US, LATENCY_VALUE_WIDTH),
+                "{prefix} Pricing {pricing} | Risk {risk} | Total {total}{note}",
             ));
         }
 
@@ -762,7 +776,7 @@ impl LifecycleStreamReporter {
         let pnl_col = format!("PnL {pnl}");
 
         format!(
-            "{}{:>5.1}% {sep} {btc_col} {sep} {book_col} {sep} {quote_col} {sep} {inv_col} {sep} {pnl_col}",
+            "{}util {:>5.1}% {sep} {btc_col} {sep} {book_col} {sep} {quote_col} {sep} {inv_col} {sep} {pnl_col}",
             row_prefix(
                 t,
                 utc,
@@ -791,7 +805,9 @@ fn format_action_styled(
         Outcome::Down => t.bold_red("DN"),
     };
     match action {
-        OrderAction::Hold => format!("{leg_plain} {}", t.muted("Hold")),
+        OrderAction::Hold => {
+            format!("{leg_plain}: {} ({})", t.muted("hold"), t.muted("resting"))
+        }
         OrderAction::SubmitNew { price, size, .. } => format!(
             "{} {} @ {}",
             fmt_shares_3dp(*size),
@@ -876,13 +892,20 @@ pub(crate) fn print_phase_transition(
 ) {
     let t = theme::current();
     let from_label = from.map_or_else(|| "Init".to_string(), |p| format!("{p:?}"));
+    let meaning = match to {
+        EpochPhase::ActiveQuoting => "quoting active; normal entry",
+        EpochPhase::PreExpiryLockout => "no new entries; reduce risk",
+        EpochPhase::MandatoryFlatten => "unwind inventory before expiry",
+        EpochPhase::TerminalLockout => "settlement imminent; all quoting ceased",
+    };
     println!();
     println!(
-        "  {} {} -> {} (T-{tau_secs}s) | {}",
+        "  {} {} -> {} (T-{tau_secs}s) | {} — {}",
         t.badge(Badge::Phase),
         t.muted(&from_label),
         t.phase_badge(to),
-        reason
+        reason,
+        t.muted(meaning),
     );
 }
 
@@ -1574,7 +1597,7 @@ mod tests {
         assert!(l0[0].contains("Quote 50¢/47¢ (97¢)"));
         assert!(l0[0].contains("Inv 20U/0D (Δ+20)"));
         assert!(l0[0].contains("PnL +$0.20"));
-        assert!(l0[0].chars().count() <= 195);
+        assert!(l0[0].chars().count() <= 205);
 
         // 100ms..4900ms idle Hold ticks emit nothing.
         for offset in (100..5_000).step_by(100) {
@@ -1665,7 +1688,10 @@ mod tests {
         };
         let rep_lines = rep.format_step(&sample_row(base_ms + 650, 299, &hold, &replace));
         assert_eq!(rep_lines.len(), 1);
-        assert!(rep_lines[0].contains("UP Hold | Requote 20 DN @ ~47¢~ -> 37¢ | (DeadbandDrift)"));
+        assert!(
+            rep_lines[0]
+                .contains("UP: hold (resting) | Requote 20 DN @ ~47¢~ -> 37¢ | (DeadbandDrift)")
+        );
 
         // Paired requote tracks prior SubmitNew prices in both plain and styled modes.
         for (mode_idx, theme) in [Theme::plain(), Theme::styled()].into_iter().enumerate() {
@@ -1728,7 +1754,9 @@ mod tests {
         let resize_lines =
             size_only_rep.format_step(&sample_row(base_ms + 100, 299, &resize_up, &hold));
         assert_eq!(resize_lines.len(), 1);
-        assert!(resize_lines[0].contains("Requote 10 UP @ 50¢ | DN Hold | (ExcessiveSize)"));
+        assert!(
+            resize_lines[0].contains("Requote 10 UP @ 50¢ | DN: hold (resting) | (ExcessiveSize)")
+        );
         assert!(!resize_lines[0].contains("~50¢~"));
 
         // Epoch rollover reset clears cached prior quote prices so stale prices do not leak.
@@ -1744,7 +1772,9 @@ mod tests {
         next_epoch_row.resting_bid_up = None;
         let post_reset = size_only_rep.format_step(&next_epoch_row);
         assert_eq!(post_reset.len(), 2);
-        assert!(post_reset[0].contains("Requote 10 UP @ 48¢ | DN Hold | (ExcessiveSize)"));
+        assert!(
+            post_reset[0].contains("Requote 10 UP @ 48¢ | DN: hold (resting) | (ExcessiveSize)")
+        );
         assert!(!post_reset[0].contains("~"));
 
         // Latency breach emits immediately.
@@ -1768,7 +1798,7 @@ mod tests {
         assert_eq!(p1.len(), 1);
         assert_eq!(p2.len(), 1);
         assert!(!p1[0].contains('\x1b'));
-        assert!(p1[0].contains("Hold"));
+        assert!(p1[0].contains("hold"));
 
         let mut styled_raw =
             LifecycleStreamReporter::new(LifecycleDisplayMode::Raw, Theme::styled());
