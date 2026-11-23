@@ -153,7 +153,7 @@ pub(crate) struct MathOverrides {
     /// Override extreme-probability entry guard in `(0.5, 1.0)` (`0.80` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_prob_override)]
     pub(crate) max_entry_prob: Option<MaxEntryProbOverride>,
-    /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.02` default).
+    /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.015` default).
     #[arg(long)]
     pub(crate) lead_lag_threshold: Option<f64>,
     /// Override rolling Binance lead-lag lookback window in ms (`0..=6000`, `1000` default).

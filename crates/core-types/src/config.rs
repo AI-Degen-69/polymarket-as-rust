@@ -140,7 +140,7 @@ pub struct EngineConfig {
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
-    /// Binance lead-lag fair-probability shift triggering defensive cancel (`0.02` default).
+    /// Binance lead-lag fair-probability shift triggering defensive cancel (`0.015` default).
     pub lead_lag_cancel_threshold: f64,
     /// Rolling Binance lead-lag lookback window in ms (`1000ms` default; `0` = legacy tick-to-tick).
     pub lead_lag_window_ms: u64,
@@ -329,7 +329,7 @@ impl Default for EngineConfig {
             enforce_fee_floor: false,
             max_cross_tick_loss_micro: None,
             max_entry_prob: Some(0.80),
-            lead_lag_cancel_threshold: 0.02,
+            lead_lag_cancel_threshold: 0.015,
             lead_lag_window_ms: 1_000,
             lead_lag_cooldown_ms: 1_000,
             lead_lag_directional: true,
@@ -899,18 +899,18 @@ mod tests {
     #[test]
     fn lead_lag_config_defaults_env_and_bounds() {
         let def = EngineConfig::from_lookup(|_| Ok(None)).unwrap();
-        assert!((def.lead_lag_cancel_threshold - 0.02).abs() < 1e-12);
+        assert!((def.lead_lag_cancel_threshold - 0.015).abs() < 1e-12);
         assert_eq!(def.lead_lag_window_ms, 1_000);
         assert_eq!(def.lead_lag_cooldown_ms, 1_000);
         assert!(def.lead_lag_directional);
 
         let mut env_ok = HashMap::new();
-        env_ok.insert("LEAD_LAG_CANCEL_THRESHOLD", "0.015");
+        env_ok.insert("LEAD_LAG_CANCEL_THRESHOLD", "0.02");
         env_ok.insert("LEAD_LAG_WINDOW_MS", "1000");
         env_ok.insert("LEAD_LAG_COOLDOWN_MS", "500");
         env_ok.insert("LEAD_LAG_DIRECTIONAL", "true");
         let parsed = EngineConfig::from_lookup(lookup_map(&env_ok)).unwrap();
-        assert!((parsed.lead_lag_cancel_threshold - 0.015).abs() < 1e-12);
+        assert!((parsed.lead_lag_cancel_threshold - 0.02).abs() < 1e-12);
         assert_eq!(parsed.lead_lag_window_ms, 1_000);
         assert_eq!(parsed.lead_lag_cooldown_ms, 500);
         assert!(parsed.lead_lag_directional);

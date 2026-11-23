@@ -41,7 +41,7 @@ param(
 
     [string[]]$MaxEntryProbs = @("off"),
 
-    [string[]]$LeadLagThresholds = @("0.02"),
+    [string[]]$LeadLagThresholds = @("0.015"),
 
     [string[]]$LeadLagWindows = @("1000"),
 
@@ -128,7 +128,7 @@ if ($parsedLLThresholds.Count -eq 0 -or $parsedLLWindows.Count -eq 0 -or $parsed
 }
 $showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
 $showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
-$showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.02 }).Count -gt 0)
+$showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.015 }).Count -gt 0)
 $showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 1000 }).Count -gt 0)
 $showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 1000 }).Count -gt 0)
 $showLLDir = ($parsedLLDirectionals.Count -gt 1) -or (@($parsedLLDirectionals | Where-Object { $_ -ne "true" }).Count -gt 0)
