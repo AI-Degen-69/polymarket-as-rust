@@ -406,7 +406,7 @@ pub(crate) fn print_lifecycle_header(
 }
 
 fn format_stream_header(t: Theme) -> String {
-    let prefix = "UTC       Tau    Event     Phase      Tier   Util     ";
+    let prefix = "UTC       Tau    Event     Phase      Tier   util     ";
     let btc = theme::pad_visible_right("BTC vs Strike", HB_BTC_WIDTH);
     let book = theme::pad_visible_right("Book (UP / DN)", HB_BOOK_WIDTH);
     let quote = theme::pad_visible_right("Quote (Pair)", HB_QUOTE_WIDTH);
@@ -723,11 +723,7 @@ impl LifecycleStreamReporter {
             if total_ns > TOTAL_BUDGET_US.saturating_mul(1_000) {
                 breaches.push(format!("Total > {TOTAL_BUDGET_US}µs"));
             }
-            let note = if breaches.is_empty() {
-                String::new()
-            } else {
-                format!("  {}", t.bold_yellow(&breaches.join("; ")))
-            };
+            let note = format!("  {}", t.bold_yellow(&breaches.join("; ")));
             let prefix = row_prefix(t, &utc, row.tau_secs, Some(Badge::Latency), None, None);
             lines.push(format!(
                 "{prefix} Pricing {pricing} | Risk {risk} | Total {total}{note}",
