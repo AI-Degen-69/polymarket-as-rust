@@ -2447,9 +2447,138 @@ fn finalize_and_report_session(
     Ok(())
 }
 
+/// Formats a micro-USDC amount as dollars, keeping at least 2 decimals but showing
+/// sub-cent precision when present (e.g. `$0.98`, `$0.981`, `$0.015`).
+fn fmt_usd_full(micro: u64) -> String {
+    let dollars = micro / 1_000_000;
+    let mut frac = format!("{:06}", micro % 1_000_000);
+    while frac.len() > 2 && frac.ends_with('0') {
+        frac.pop();
+    }
+    format!("${dollars}.{frac}")
+}
+
+/// Prints the effective engine tuning that will drive this epoch (live/replay).
+fn print_engine_config_banner(cfg: &EngineConfig) {
+    let t = theme::current();
+    println!("{}", t.section("Active Config's Parameters"));
+
+    let rows: [(&str, String, &str); 17] = [
+        (
+            "Gamma",
+            cfg.gamma.to_string(),
+            "Risk aversion strength; scales the variance spread term",
+        ),
+        (
+            "Variance Mode",
+            format!("{:?}", cfg.variance_mode),
+            "Remaining-variance estimate into expiry",
+        ),
+        (
+            "Kappa Mode",
+            format!("{:?}", cfg.kappa_mode),
+            "How quickly order depth thins away from best price",
+        ),
+        (
+            "SG Mode",
+            format!("{:?}", cfg.sg_mode),
+            "Smooths tick noise using past prices only (no look-ahead)",
+        ),
+        (
+            "Include Variance Spread",
+            cfg.include_variance_spread.to_string(),
+            "Adds gamma*V_rem variance term to spread",
+        ),
+        (
+            "Min Combined Spread",
+            format!(
+                "{} ({} tick)",
+                fmt_usd_full(cfg.min_combined_spread_micro.0),
+                cfg.min_spread_ticks
+            ),
+            "Floor on combined quote spread",
+        ),
+        (
+            "Max Combined Bid",
+            fmt_usd_full(cfg.max_combined_bid_micro.0),
+            "Cap on UP+DOWN bid sum",
+        ),
+        (
+            "Cross Tick Loss Cap",
+            match cfg.max_cross_tick_loss_micro {
+                Some(m) => format!("{m} micro-USDC"),
+                None => "off".to_string(),
+            },
+            "Maximum loss absorbed to close a cross-tick pair",
+        ),
+        (
+            "Max Entry Prob",
+            cfg.max_entry_prob
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "off".to_string()),
+            "Blocks fresh entries outside [1-p, p]",
+        ),
+        (
+            "Lead/Lag Threshold",
+            cfg.lead_lag_cancel_threshold.to_string(),
+            "Defensive-cancel trigger on lead/lag shift",
+        ),
+        (
+            "Lead/Lag Window",
+            format!("{} ms", cfg.lead_lag_window_ms),
+            "Lookback window for the lead/lag signal",
+        ),
+        (
+            "Lead/Lag Cooldown",
+            format!("{} ms", cfg.lead_lag_cooldown_ms),
+            "Minimum time between defensive cancels",
+        ),
+        (
+            "Lead/Lag Directional",
+            cfg.lead_lag_directional.to_string(),
+            "Cancel only the endangered side",
+        ),
+        (
+            "Hedge Skew Multiplier",
+            cfg.hedge_skew_mult.to_string(),
+            "Reduce-side skew strength: 1=full, 0=passive",
+        ),
+        (
+            "Cap Tier-1 Reducing",
+            cfg.cap_tier1_reducing_to_delta.to_string(),
+            "Limit Tier-1 reduce size to |delta q|",
+        ),
+        (
+            "Execution Mode",
+            format!("{:?}", cfg.execution_mode),
+            "Paper / dry-run / canary-live safety mode",
+        ),
+        (
+            "Dry Run",
+            cfg.dry_run.to_string(),
+            "Order gates armed; no live dispatch",
+        ),
+    ];
+
+    let label_w = rows.iter().map(|(l, _, _)| l.len()).max().unwrap_or(10);
+    let val_w = rows.iter().map(|(_, v, _)| v.len()).max().unwrap_or(10);
+    let desc_w = rows.iter().map(|(_, _, d)| d.len()).max().unwrap_or(20);
+
+    let row = |label: &str, val: &str, desc: &str| {
+        format!("  {label:<label_w$} | {val:>val_w$} | {desc:<desc_w$}")
+    };
+    println!("{}", row("Parameter", "Value", "Description"));
+    println!("{}", "-".repeat(label_w + val_w + desc_w + 8));
+
+    for (label, val, desc) in rows {
+        println!("{}", row(label, &val, desc));
+    }
+}
+
 async fn run_live_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(), Box<dyn Error>> {
     let mut cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut cfg)?;
+    print_engine_config_banner(&cfg);
     feeds::install_tls_provider();
 
     let duration_limit = parse_duration_arg(&args.duration)?;
@@ -2681,6 +2810,7 @@ async fn run_replay_epoch(
 ) -> Result<(), Box<dyn Error>> {
     let mut cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut cfg)?;
+    print_engine_config_banner(&cfg);
     let mut jsonl = JsonlWriter::create(&args.jsonl)?;
     let mut pricing_lat = LatencyTracker::new()?;
     let mut risk_lat = LatencyTracker::new()?;
