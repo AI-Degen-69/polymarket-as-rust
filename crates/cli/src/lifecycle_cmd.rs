@@ -2033,12 +2033,13 @@ impl LivePaperSimulator {
                 self.current_tier = r_trace.tier;
             }
 
+            // Counter keeps ticking per tripped tick; output fires on transitions only.
+            if let BreakerStatus::Tripped { .. } = r_trace.breaker {
+                self.stats.breaker_trips = self.stats.breaker_trips.saturating_add(1);
+            }
             if r_trace.breaker != self.last_breaker {
                 self.last_breaker = r_trace.breaker;
                 print_breaker_trip(r_trace.breaker);
-                if let BreakerStatus::Tripped { .. } = r_trace.breaker {
-                    self.stats.breaker_trips = self.stats.breaker_trips.saturating_add(1);
-                }
                 if matches!(
                     r_trace.breaker,
                     BreakerStatus::Tripped {
