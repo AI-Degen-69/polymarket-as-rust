@@ -42,7 +42,7 @@ use crate::lifecycle_report::{
     print_tier_transition, record_breaker_jsonl, record_cancel_all_jsonl,
     record_epoch_rollover_jsonl, record_lifecycle_fill_jsonl, record_lifecycle_flatten_jsonl,
     record_lifecycle_merge_jsonl, record_lifecycle_summary_jsonl, record_order_action_jsonl,
-    record_phase_transition_jsonl, record_risk_tier_jsonl,
+    record_phase_transition_jsonl, record_risk_tier_jsonl, record_window_end_jsonl,
 };
 use crate::theme::{self, Badge};
 
@@ -1069,6 +1069,12 @@ struct LivePaperSimulator {
     epoch_settled: bool,
     pending_settlement: Option<PendingEpochSettlement>,
     epoch_num: usize,
+    window_start_realized_micro: i64,
+    window_start_fees_micro: u64,
+    window_start_rebate_micro: u64,
+    window_start_pairs_micro: u64,
+    window_start_fills: u64,
+    window_start_merges: u64,
     reporter: LifecycleStreamReporter,
     stats: LifecycleReportStats,
 }
@@ -1130,6 +1136,12 @@ impl LivePaperSimulator {
             epoch_settled: false,
             pending_settlement: None,
             epoch_num: 1,
+            window_start_realized_micro: 0,
+            window_start_fees_micro: 0,
+            window_start_rebate_micro: 0,
+            window_start_pairs_micro: 0,
+            window_start_fills: 0,
+            window_start_merges: 0,
             reporter: LifecycleStreamReporter::new(display, theme::current())
                 .with_verbose_latency(verbose_latency),
             stats: LifecycleReportStats::default(),
@@ -2213,6 +2225,61 @@ impl LivePaperSimulator {
             self.stats.settlement_pnl_micro.saturating_add(settle_delta);
         self.stats.realized_pnl_micro = self.ledger.realized_pnl_micro;
         self.epoch_settled = true;
+        // Per-window net PnL: delta since this window started (settlement locks
+        // realized, so window net = post-settle realized - window start realized).
+        // Fees/rebate/pairs/fills are cumulative on ledger/stats; diff them too.
+        let window_net = self
+            .ledger
+            .realized_pnl_micro
+            .saturating_sub(self.window_start_realized_micro);
+        let window_realized = window_net;
+        let window_fees = self
+            .ledger
+            .fees_paid_micro
+            .saturating_sub(self.window_start_fees_micro);
+        let window_rebate = self
+            .ledger
+            .estimated_rebate_micro
+            .saturating_sub(self.window_start_rebate_micro);
+        let window_pairs = self
+            .ledger
+            .total_pairs_merged
+            .0
+            .saturating_sub(self.window_start_pairs_micro);
+        let window_fills = self
+            .stats
+            .fills_count
+            .saturating_sub(self.window_start_fills);
+        let window_merges = self
+            .stats
+            .merges_count
+            .saturating_sub(self.window_start_merges);
+        let expired_slug = self.desc.slug.clone();
+        let window_index = self.epoch_num;
+        record_window_end_jsonl(
+            jsonl,
+            now_ms,
+            now_ns,
+            &expired_slug,
+            window_index,
+            true,
+            Some(winning_outcome),
+            window_net,
+            window_realized,
+            0,
+            settle_delta,
+            window_fees,
+            window_rebate,
+            window_fills,
+            window_merges,
+            window_pairs,
+        )?;
+        self.window_start_realized_micro = self.ledger.realized_pnl_micro;
+        self.window_start_fees_micro = self.ledger.fees_paid_micro;
+        self.window_start_rebate_micro = self.ledger.estimated_rebate_micro;
+        self.window_start_pairs_micro = self.ledger.total_pairs_merged.0;
+        self.window_start_fills = self.stats.fills_count;
+        self.window_start_merges = self.stats.merges_count;
         self.pending_settlement = Some(PendingEpochSettlement {
             expired_slug: self.desc.slug.clone(),
             winning_outcome,
@@ -2355,6 +2422,59 @@ impl LivePaperSimulator {
             .as_ref()
             .and_then(fixed_book_mid)
             .unwrap_or(MicroUsdc(500_000));
+
+        // Incomplete trailing window (replay ended before expiry): still emit a
+        // `window_end` with `complete=false` so sweeps can use actual per-window
+        // results instead of prorating the capture total.
+        if !self.epoch_settled {
+            let unreal = self.ledger.unrealized_pnl_micro(mid_up, mid_dn);
+            let window_realized = self
+                .ledger
+                .realized_pnl_micro
+                .saturating_sub(self.window_start_realized_micro);
+            let window_net = window_realized.saturating_add(unreal);
+            let window_fees = self
+                .ledger
+                .fees_paid_micro
+                .saturating_sub(self.window_start_fees_micro);
+            let window_rebate = self
+                .ledger
+                .estimated_rebate_micro
+                .saturating_sub(self.window_start_rebate_micro);
+            let window_pairs = self
+                .ledger
+                .total_pairs_merged
+                .0
+                .saturating_sub(self.window_start_pairs_micro);
+            let window_fills = self
+                .stats
+                .fills_count
+                .saturating_sub(self.window_start_fills);
+            let window_merges = self
+                .stats
+                .merges_count
+                .saturating_sub(self.window_start_merges);
+            let slug = self.desc.slug.clone();
+            let window_index = self.epoch_num;
+            record_window_end_jsonl(
+                jsonl,
+                now_ms,
+                now_ns,
+                &slug,
+                window_index,
+                false,
+                None,
+                window_net,
+                window_realized,
+                unreal,
+                0,
+                window_fees,
+                window_rebate,
+                window_fills,
+                window_merges,
+                window_pairs,
+            )?;
+        }
 
         self.stats.realized_pnl_micro = self.ledger.realized_pnl_micro;
         self.stats.unrealized_pnl_micro = self.ledger.unrealized_pnl_micro(mid_up, mid_dn);
