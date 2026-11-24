@@ -300,6 +300,86 @@ function Format-WinRateCell {
     }
 }
 
+function Format-GateCell {
+    param([string]$RawText, [bool]$Pass, [bool]$IsNA, [int]$Width = 10)
+    if ($IsNA) { return (Format-ColorText -Text ('n/a'.PadLeft($Width)) -Code $AnsiGray) }
+    $code = if ($Pass) { $AnsiGreen } else { $AnsiBoldRed }
+    return (Format-ColorText -Text $RawText.PadLeft($Width) -Code $code)
+}
+
+function Format-GateMoneyText {
+    param([double]$Value, [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture)
+    $sign = if ($Value -lt -1e-9) { "-" } else { "+" }
+    return ("{0}`${1}" -f $sign, [Math]::Abs($Value).ToString("0.00", $Culture))
+}
+
+function Format-VerdictCell {
+    param([string]$Verdict, [int]$Width = 10)
+    $raw = $Verdict.PadLeft($Width)
+    $code = switch -Wildcard ($Verdict) { "APPROVED" { $AnsiBoldGreen; break } "FAIL*" { $AnsiBoldRed; break } "NEEDS-*" { $AnsiBoldYellow; break } default { $AnsiGray } }
+    return (Format-ColorText -Text $raw -Code $code)
+}
+
+function Get-SurvivalInputs {
+    param($CapRuns, [int]$TotalWindows, [bool]$IsMultiCapture, [int]$CaptureCount, [double]$SumVolIn, [double]$SumGross, [double]$SumSettle, [double]$SumUnreal)
+    $out = @{ IS = [double]::NaN; OOS = [double]::NaN; Retain = [double]::NaN; MaxDD = [double]::NaN; Drag = 0.0; ISWin = 0; OOSWin = 0 }
+    if ($IsMultiCapture -and $CaptureCount -ge 2 -and $TotalWindows -ge 4) {
+        $isTarget = [int][Math]::Floor($TotalWindows * 0.7)
+        $cumW = 0; $isAcc = 0.0; $oosAcc = 0.0
+        foreach ($c in $CapRuns) {
+            $w = [int]$c.Windows
+            if (($cumW + $w) -le $isTarget) { $isAcc += $c.NetPlusRebNum }
+            elseif ($cumW -ge $isTarget) { $oosAcc += $c.NetPlusRebNum }
+            else {
+                $perW = $c.NetPlusRebNum / [Math]::Max(1, $w)
+                $isAcc += $perW * ($isTarget - $cumW); $oosAcc += $perW * ($w - ($isTarget - $cumW))
+            }
+            $cumW += $w
+        }
+        $out.IS = $isAcc; $out.OOS = $oosAcc; $out.ISWin = $isTarget; $out.OOSWin = $TotalWindows - $isTarget
+        if ($isAcc -gt 1e-9) { $out.Retain = ($oosAcc / $isAcc) * 100.0 }
+        elseif ($oosAcc -gt 1e-9) { $out.Retain = [double]::PositiveInfinity }
+    }
+    if ($CapRuns.Count -ge 2) {
+        $peak = 0.0; $maxDD = 0.0; $eq = 0.0
+        foreach ($c in $CapRuns) { $eq += $c.NetPlusRebNum; if ($eq -gt $peak) { $peak = $eq }; $maxDD = [Math]::Max($maxDD, $peak - $eq) }
+        $out.MaxDD = ($maxDD / [Math]::Max($SumVolIn, 1.0)) * 100.0
+    }
+    $loss = [Math]::Max(0.0, -($SumSettle + [Math]::Min($SumUnreal, 0.0)))
+    $gains = [Math]::Max($SumGross, 0.0)
+    if ($gains -gt 1e-9) { $out.Drag = ($loss / $gains) * 100.0 }
+    elseif ($loss -gt 1e-9) { $out.Drag = 100.0 }
+    return $out
+}
+
+function Update-SurvivalVerdicts {
+    param($Sorted)
+    $axes = @("Gamma", "VarSpr", "MinT", "XTick", "MaxP", "MaxPx", "LLTh", "LLWin", "LLCd", "LLDir", "HSkew", "T1Cap")
+    foreach ($grow in $Sorted) {
+        $tot = 0; $prof = 0
+        if ($Sorted.Count -gt 1) {
+            foreach ($other in $Sorted) {
+                if ($other -eq $grow) { continue }
+                $diffs = 0; foreach ($ax in $axes) { if ([string]$other.$ax -ne [string]$grow.$ax) { $diffs++ } }
+                if ($diffs -eq 1) { $tot++; if ([double]$other.NetPlusRebNum -gt 0.0) { $prof++ } }
+            }
+        }
+        $grow.NbrNum = if ($tot -gt 0) { ($prof / $tot) * 100.0 } else { [double]::NaN }
+        $grow.G1 = if ([double]::IsNaN($grow.ISNum)) { "N/A" } elseif ($grow.ISNum -gt 0.0) { "PASS" } else { "FAIL" }
+        $grow.G2 = if ([double]::IsNaN($grow.OOSNum)) { "N/A" } elseif ($grow.OOSNum -gt 0.0) { "PASS" } else { "FAIL" }
+        $grow.G3 = if ([double]::IsNaN($grow.RetainNum) -or [double]::IsInfinity($grow.RetainNum)) { "N/A" } elseif ($grow.RetainNum -ge 40.0) { "PASS" } else { "FAIL" }
+        $grow.G4 = if ([double]::IsNaN($grow.MaxDDNum)) { "N/A" } elseif ($grow.MaxDDNum -le 25.0) { "PASS" } else { "FAIL" }
+        $grow.G5 = if ($grow.DragNum -le 30.0) { "PASS" } else { "FAIL" }
+        $grow.G6 = if ([double]::IsNaN($grow.NbrNum)) { "N/A" } elseif ($grow.NbrNum -ge 60.0) { "PASS" } else { "FAIL" }
+        $failGate = ""
+        foreach ($g in @("G1", "G2", "G3", "G4", "G5", "G6")) { if ($grow.$g -eq "FAIL") { $failGate = $g; break } }
+        if ($failGate -ne "") { $grow.Verdict = "FAIL($failGate)" }
+        elseif ($grow.G1 -eq "N/A" -or $grow.G2 -eq "N/A" -or $grow.G3 -eq "N/A") { $grow.Verdict = "NEEDS-OOS" }
+        elseif ($grow.G4 -eq "N/A" -or $grow.G6 -eq "N/A") { $grow.Verdict = "N/A" }
+        else { $grow.Verdict = "APPROVED" }
+    }
+}
+
 function Test-EntryPriceSwept {
     param(
         [string[]]$Prices,
@@ -365,17 +445,17 @@ function Write-ConfigBanner {
     $pipe = Format-ColorText -Text " |  " -Code $AnsiGray
 
     $highLevelPairs = @(
-        @("V-Max",    "BaseSize"),
-        @("MaxPair",  "QueueDecay")
+        @("V Max",      "Base Size"),
+        @("Max Pair",   "Queue Decay")
     )
 
     $sweptPairs = @(
-        @("Gamma",     "VarSpread"),
-        @("MinTicks",  "XTick"),
-        @("MaxP",      "MaxPx"),
-        @("LL-Thresh", "LL-WinMs"),
-        @("LL-CdMs",   "LL-Dir"),
-        @("HedgeSkew", "CapTier1")
+        @("Gamma",      "Variance"),
+        @("Min Ticks",  "Cross Loss"),
+        @("Entry Prob", "Entry Price"),
+        @("Threshold",  "Window Ms"),
+        @("Cooldown Ms", "Direction"),
+        @("Hedge Skew", "Tier 1 Cap")
     )
 
     Write-Host ""
@@ -710,22 +790,22 @@ try {
                                             foreach ($capT1 in $parsedCapTier1) {
                                                 $runIdx++
                                                 $currParamMap = @{
-                                                    "V-Max"      = "`$$VMax"
-                                                    "BaseSize"   = "${BaseSize}sh"
-                                                    "MaxPair"    = "`$$maxPairFormatted"
-                                                    "QueueDecay" = $QueueDecay
-                                                    "Gamma"      = $gammaStr
-                                                    "VarSpread"  = $varStr
-                                                    "MinTicks"   = $minTicks.ToString($inv)
-                                                    "XTick"      = $crossLoss
-                                                    "MaxP"       = $entryProb
-                                                    "MaxPx"      = $entryPrice
-                                                    "LL-Thresh"  = $llThresh
-                                                    "LL-WinMs"   = $llWin.ToString($inv)
-                                                    "LL-CdMs"    = $llCd.ToString($inv)
-                                                    "LL-Dir"     = $llDir
-                                                    "HedgeSkew"  = $hsStr
-                                                    "CapTier1"   = $capT1
+                                                    "V Max"       = "`$$VMax"
+                                                    "Base Size"   = "${BaseSize}sh"
+                                                    "Max Pair"    = "`$$maxPairFormatted"
+                                                    "Queue Decay" = $QueueDecay
+                                                    "Gamma"       = $gammaStr
+                                                    "Variance"    = $varStr
+                                                    "Min Ticks"   = $minTicks.ToString($inv)
+                                                    "Cross Loss"  = $crossLoss
+                                                    "Entry Prob"  = $entryProb
+                                                    "Entry Price" = $entryPrice
+                                                    "Threshold"   = $llThresh
+                                                    "Window Ms"   = $llWin.ToString($inv)
+                                                    "Cooldown Ms" = $llCd.ToString($inv)
+                                                    "Direction"   = $llDir
+                                                    "Hedge Skew"  = $hsStr
+                                                    "Tier 1 Cap"  = $capT1
                                                 }
 
                                                 # Level 1 Hierarchy: Config Set Banner (High-Level + Swept Params with Diff Highlighting)
@@ -866,6 +946,10 @@ try {
                                                     $rpm = [int]$payload.rpm_60s
                                                     $mo1s = [double]$payload.markout_1s_bps
                                                     $mo5s = [double]$payload.markout_5s_bps
+                                                    $settle = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("settlement_pnl_micro") -Scale 1e6 -DefaultValue 0.0
+                                                    $breakers = [int](Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("breaker_trips") -Scale 1.0 -DefaultValue 0.0)
+                                                    $flattens = [int](Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("flattens_executed") -Scale 1.0 -DefaultValue 0.0)
+                                                    $epochsDone = [int](Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("epochs_completed") -Scale 1.0 -DefaultValue ([double]$cap.Windows))
 
                                                     # Quantity (UP+DN shares bought)
                                                     $qtyBought = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @(
@@ -966,7 +1050,7 @@ try {
                                                     $winRateCell  = "% Win: " + (Format-WinRateCell -Pct $winPctCap -Width 4 -Bold $false -Culture $inv)
                                                     $volInCell    = "Deployed: " + ("`${0:F2}" -f $volumeIn).PadLeft(9)
                                                     $closeVolCell = "Returned: " + ("`${0:F2}" -f $closeVolume).PadLeft(9)
-                                                    $roiCell      = "ROI: " + (Format-SignedPctCell -Ratio $roiCap -Width 8 -Bold $false -Culture $inv)
+                                                    $roiCell      = "Return: " + (Format-SignedPctCell -Ratio $roiCap -Width 8 -Bold $false -Culture $inv)
 
                                                     $pnlLabelCell = (Format-ColorText -Text "P&L Breakdown" -Code $AnsiGray).PadRight(13)
                                                     $grossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $grossPnl -Pct $grossPct -Width 20 -Bold $false -IncludeDollar $true -Culture $inv)
@@ -1002,6 +1086,10 @@ try {
                                                         NetPlusRebNum  = $netPlusReb
                                                         BasePnLNum     = $basePnl
                                                         AlphaEdgeNum   = $alphaEdge
+                                                        SettlementNum  = $settle
+                                                        Breakers       = $breakers
+                                                        Flattens       = $flattens
+                                                        EpochsDone     = $epochsDone
                                                         RPM            = $rpm
                                                         MO1sNum        = $mo1s
                                                         MO5sNum        = $mo5s
@@ -1026,6 +1114,10 @@ try {
                                                 $sumFeesPaid = 0.0
                                                 $sumBasePnl = 0.0
                                                 $sumAlphaEdge = 0.0
+                                                $sumSettlement = 0.0
+                                                $sumBreakers = 0
+                                                $sumFlattens = 0
+                                                $sumEpochs = 0
                                                 $maxRpm = 0
                                                 $weightedMo1s = 0.0
                                                 $weightedMo5s = 0.0
@@ -1046,11 +1138,20 @@ try {
                                                     $sumFeesPaid += $c.FeesNum
                                                     $sumBasePnl += $c.BasePnLNum
                                                     $sumAlphaEdge += $c.AlphaEdgeNum
+                                                    $sumSettlement += $c.SettlementNum
+                                                    $sumBreakers += $c.Breakers
+                                                    $sumFlattens += $c.Flattens
+                                                    $sumEpochs += $c.EpochsDone
                                                     if ($c.RPM -gt $maxRpm) { $maxRpm = $c.RPM }
                                                     $weightedMo1s += ($c.Fills * $c.MO1sNum)
                                                     $weightedMo5s += ($c.Fills * $c.MO5sNum)
                                                     if ($c.NetPlusRebNum -gt 0.0) { $winCaps++ }
                                                 }
+
+                                                # ---- Verification inputs via shared helper (70/30 IS/OOS walk-forward; MaxDD/Drag capture-level proxies) ----
+                                                $surv = Get-SurvivalInputs -CapRuns $capRuns -TotalWindows $totalWindows -IsMultiCapture $isMultiCapture -CaptureCount $captures.Count -SumVolIn $sumVolIn -SumGross $sumGrossPnl -SumSettle $sumSettlement -SumUnreal $sumUnreal
+                                                $isNet = $surv.IS; $oosNet = $surv.OOS; $retainPct = $surv.Retain; $maxDDPct = $surv.MaxDD; $dragPct = $surv.Drag
+                                                $isWinCount = $surv.ISWin; $oosWinCount = $surv.OOSWin
 
                                                 $sumNetPlusReb = $sumNetPnl + $sumRebate
                                                 $sumGrossPct = if ($sumVolIn -gt 1e-6) { ($sumCloseVol / $sumVolIn) - 1.0 } else { [double]::NaN }
@@ -1072,7 +1173,7 @@ try {
                                                 $subWinRateCell  = "% Win: " + (Format-WinRateCell -Pct $winRatePct -Width 4 -Bold $true -Culture $inv)
                                                 $subVolInCell    = "Deployed: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
                                                 $subCloseVolCell = "Returned: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
-                                                $subRoiCell        = "ROI: " + (Format-SignedPctCell -Ratio $sumRoi -Width 8 -Bold $true -Culture $inv)
+                                                $subRoiCell        = "Return: " + (Format-SignedPctCell -Ratio $sumRoi -Width 8 -Bold $true -Culture $inv)
 
                                                 $subPnlLabelCell = Format-ColorText -Text ("P&L Subtotal".PadRight(13)) -Code $AnsiBoldCyan
                                                 $subGrossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $sumGrossPnl -Pct $sumGrossPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
@@ -1151,6 +1252,22 @@ try {
                                                     WinRatePct    = $winRatePct
                                                     WinRate       = ("{0:F0}%" -f $winRatePct)
                                                     WinCaps       = $winCaps
+                                                    ISNum         = $isNet
+                                                    OOSNum        = $oosNet
+                                                    RetainNum     = $retainPct
+                                                    MaxDDNum      = $maxDDPct
+                                                    DragNum       = $dragPct
+                                                    NbrNum        = [double]::NaN
+                                                    G1            = "N/A"
+                                                    G2            = "N/A"
+                                                    G3            = "N/A"
+                                                    G4            = "N/A"
+                                                    G5            = "N/A"
+                                                    G6            = "N/A"
+                                                    Verdict       = "N/A"
+                                                    ISWindows     = $isWinCount
+                                                    OOSWindows    = $oosWinCount
+                                                    SettleNum     = $sumSettlement
                                                 })
                                             }
                                         }
@@ -1177,44 +1294,56 @@ try {
     # -----------------------------------------------------------------------
     $sorted = @($results | Sort-Object -Property NetPlusRebNum -Descending)
 
+    # -----------------------------------------------------------------------
+    # Phase 3b: G1-G6 survival-gate evaluation (verification process)
+    # Thresholds match docs/strategy-verification-spec.md and
+    # docs/explanations/verification-and-survival-gates.html:
+    # G1 IS>0 | G2 OOS>0 | G3 Ret>=40% | G4 MaxDD<=25% | G5 Drag<=30% | G6 Nbr>=60%.
+    # IS/OOS use a 70/30 capture-level walk-forward split by windows (multi-capture
+    # only); MaxDD/Drag are capture-level proxies from per-capture Net+Reb,
+    # settlement and unrealized summaries. Single-capture runs report N/A.
+    # -----------------------------------------------------------------------
+    Update-SurvivalVerdicts -Sorted $sorted
+
     # Build Leaderboard Column Metadata
     $cols = [System.Collections.Generic.List[hashtable]]::new()
-    $cols.Add(@{ Name = "Rank";      Dash = "----";      Width = 4;  Prop = "Rank";      Kind = "rank" })
-    $cols.Add(@{ Name = "Gamma";     Dash = "-----";     Width = -6; Prop = "Gamma";     Kind = "param" })
-    $cols.Add(@{ Name = "VarSpr";    Dash = "------";    Width = -6; Prop = "VarSpr";    Kind = "param" })
-    $cols.Add(@{ Name = "MinT";      Dash = "----";      Width = 4;  Prop = "MinT";      Kind = "param" })
-    if ($showCrossLoss)  { $cols.Add(@{ Name = "XTick"; Dash = "-----"; Width = 7; Prop = "XTick"; Kind = "param" }) }
-    if ($showEntryProb)  { $cols.Add(@{ Name = "MaxP";  Dash = "----";  Width = 5; Prop = "MaxP";  Kind = "param" }) }
-    if ($showEntryPrice) { $cols.Add(@{ Name = "MaxPx"; Dash = "-----"; Width = 5; Prop = "MaxPx"; Kind = "param" }) }
-    if ($showLLThresh)   { $cols.Add(@{ Name = "LLTh";  Dash = "-----"; Width = 5; Prop = "LLTh";  Kind = "param" }) }
-    if ($showLLWin)      { $cols.Add(@{ Name = "LLWin"; Dash = "-----"; Width = 5; Prop = "LLWin"; Kind = "param" }) }
-    if ($showLLCd)       { $cols.Add(@{ Name = "LLCd";  Dash = "----";  Width = 4; Prop = "LLCd";  Kind = "param" }) }
-    if ($showLLDir)      { $cols.Add(@{ Name = "LLDir"; Dash = "-----"; Width = 5; Prop = "LLDir"; Kind = "param" }) }
-    if ($showHedgeSkew)  { $cols.Add(@{ Name = "HSkew"; Dash = "-----"; Width = 5; Prop = "HSkew"; Kind = "param" }) }
-    if ($showCapTier1)   { $cols.Add(@{ Name = "T1Cap"; Dash = "-----"; Width = 5; Prop = "T1Cap"; Kind = "param" }) }
+    $cols.Add(@{ Name = "Rank";      Width = 4;  Prop = "Rank";      Kind = "rank" })
+    $cols.Add(@{ Name = "Gamma";     Width = -6; Prop = "Gamma";     Kind = "param" })
+    $cols.Add(@{ Name = "Variance";  Width = -8; Prop = "VarSpr";    Kind = "param" })
+    $cols.Add(@{ Name = "Min Ticks"; Width = 9;  Prop = "MinT";      Kind = "param" })
+    if ($showCrossLoss)  { $cols.Add(@{ Name = "Cross Loss";  Width = 10; Prop = "XTick"; Kind = "param" }) }
+    if ($showEntryProb)  { $cols.Add(@{ Name = "Entry Prob";  Width = 10; Prop = "MaxP";  Kind = "param" }) }
+    if ($showEntryPrice) { $cols.Add(@{ Name = "Entry Price"; Width = 11; Prop = "MaxPx"; Kind = "param" }) }
+    if ($showLLThresh)   { $cols.Add(@{ Name = "Threshold";   Width = 9;  Prop = "LLTh";  Kind = "param" }) }
+    if ($showLLWin)      { $cols.Add(@{ Name = "Window Ms";   Width = 9;  Prop = "LLWin"; Kind = "param" }) }
+    if ($showLLCd)       { $cols.Add(@{ Name = "Cooldown Ms"; Width = 11; Prop = "LLCd";  Kind = "param" }) }
+    if ($showLLDir)      { $cols.Add(@{ Name = "Direction";   Width = 9;  Prop = "LLDir"; Kind = "param" }) }
+    if ($showHedgeSkew)  { $cols.Add(@{ Name = "Hedge Skew";  Width = 10; Prop = "HSkew"; Kind = "param" }) }
+    if ($showCapTier1)   { $cols.Add(@{ Name = "Tier 1 Cap";  Width = 10; Prop = "T1Cap"; Kind = "param" }) }
 
-    $cols.Add(@{ Name = "Fills";     Dash = "-----";                  Width = 5;  Prop = "Fills";      NumProp = "Fills";          Kind = "int" })
-    $cols.Add(@{ Name = "Merges";    Dash = "------";                 Width = 6;  Prop = "Merges";     NumProp = "Merges";         Kind = "int" })
-    $cols.Add(@{ Name = "Quantity";  Dash = "--------";               Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
-    $cols.Add(@{ Name = "Pairs";     Dash = "-------";                Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
-    $cols.Add(@{ Name = "Win Rate";  Dash = "--------";               Width = 8;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
-    $cols.Add(@{ Name = "Deployed";  Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
-    $cols.Add(@{ Name = "ROI";       Dash = "--------";               Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
-    $cols.Add(@{ Name = "Returned";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
-    $cols.Add(@{ Name = "Gross P&L"; Dash = "--------------------";  Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
-    $cols.Add(@{ Name = "Rebates";   Dash = "---------";              Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
-    $cols.Add(@{ Name = "Fees";      Dash = "---------";              Width = 9;  Prop = "Fees";       NumProp = "FeesNum";        Kind = "fee" })
-    $cols.Add(@{ Name = "Net P&L";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
-    $cols.Add(@{ Name = "Base P&L";  Dash = "--------";               Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
-    $cols.Add(@{ Name = "Alpha Edge"; Dash = "----------";             Width = 10; Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
-    $cols.Add(@{ Name = "RPM";       Dash = "---";                    Width = 4;  Prop = "RPM";        NumProp = "RPM";            Kind = "rpm" })
-    $cols.Add(@{ Name = "MO1s";      Dash = "-----";                  Width = 6;  Prop = "MO1s";       NumProp = "MO1sNum";        Kind = "markout" })
-    $cols.Add(@{ Name = "MO5s";      Dash = "-----";                  Width = 6;  Prop = "MO5s";       NumProp = "MO5sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "Fills";     Width = 5;  Prop = "Fills";      NumProp = "Fills";          Kind = "int" })
+    $cols.Add(@{ Name = "Merges";    Width = 6;  Prop = "Merges";     NumProp = "Merges";         Kind = "int" })
+    $cols.Add(@{ Name = "Quantity";  Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
+    $cols.Add(@{ Name = "Pairs";     Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
+    $cols.Add(@{ Name = "Win Rate";  Width = 8;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
+    $cols.Add(@{ Name = "Deployed";  Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
+    $cols.Add(@{ Name = "Return";    Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
+    $cols.Add(@{ Name = "Returned";  Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
+    $cols.Add(@{ Name = "Gross P&L"; Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
+    $cols.Add(@{ Name = "Rebates";   Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
+    $cols.Add(@{ Name = "Fees";      Width = 9;  Prop = "Fees";       NumProp = "FeesNum";        Kind = "fee" })
+    $cols.Add(@{ Name = "Net P&L";   Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
+    $cols.Add(@{ Name = "Base P&L";  Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
+    $cols.Add(@{ Name = "Alpha Edge"; Width = 10; Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
+    $cols.Add(@{ Name = "Cancels Per Min"; Width = 15; Prop = "RPM";  NumProp = "RPM";            Kind = "rpm" })
+    $cols.Add(@{ Name = "Markout 1s"; Width = 10; Prop = "MO1s";      NumProp = "MO1sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "Markout 5s"; Width = 10; Prop = "MO5s";      NumProp = "MO5sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "Verdict";   Width = 10; Prop = "Verdict";    NumProp = "Verdict";        Kind = "verdict" })
 
     $fmtParts = for ($ci = 0; $ci -lt $cols.Count; $ci++) { "{$ci,$($cols[$ci].Width)}" }
     $plainRowFmt = $fmtParts -join " "
     $headers = @($cols | ForEach-Object { $_.Name })
-    $dashes = @($cols | ForEach-Object { $_.Dash })
+    $dashes = @($cols | ForEach-Object { "-" * [Math]::Abs($_.Width) })
 
     $summaryPath = Join-Path $sweepDir "summary.txt"
 
@@ -1317,6 +1446,13 @@ try {
                         $cells.Add(([string]$Row.WinRate).PadLeft($w))
                     }
                 }
+                "verdict" {
+                    if ($Colorize) {
+                        $cells.Add((Format-VerdictCell -Verdict ([string]$Row.Verdict) -Width $w))
+                    } else {
+                        $cells.Add(([string]$Row.Verdict).PadLeft($w))
+                    }
+                }
             }
         }
         return ($cells -join " ")
@@ -1349,6 +1485,32 @@ try {
         $plainSummary.Add((Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $false))
     }
     $plainSummary.Add(($plainRowFmt -f $dashes))
+    $plainSummary.Add("")
+    $plainSummary.Add("STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (In Sample / Out Sample 70/30 by windows; Drawdown / Expiry Drag capture-level proxies)")
+    $plainSummary.Add("G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60% | QueueDecay=$QueueDecay (promotion requires conservative)")
+    if (-not $isMultiCapture) {
+        $plainSummary.Add("NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures (or multi -InputPath) for full walk-forward verdicts.")
+    }
+    $vWidths = @(4, 10, 10, 9, 12, 11, 9, 10)
+    $vFmtParts = for ($vi = 0; $vi -lt $vWidths.Count; $vi++) { "{$vi,$($vWidths[$vi])}" }
+    $vFmt = $vFmtParts -join " "
+    $vHeaders = @("Rank", "In Sample", "Out Sample", "Retention", "Max Drawdown", "Expiry Drag", "Neighbors", "Verdict")
+    $vDashes = @($vWidths | ForEach-Object { "-" * $_ })
+    $plainSummary.Add(($vFmt -f $vHeaders))
+    $plainSummary.Add(($vFmt -f $vDashes))
+    for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
+        $r = $sorted[$ri]
+        $isS = if ([double]::IsNaN($r.ISNum)) { 'n/a'.PadLeft(10) } else { (Format-GateMoneyText -Value ([double]$r.ISNum) -Culture $inv).PadLeft(10) }
+        $oosS = if ([double]::IsNaN($r.OOSNum)) { 'n/a'.PadLeft(10) } else { (Format-GateMoneyText -Value ([double]$r.OOSNum) -Culture $inv).PadLeft(10) }
+        $retS = if ([double]::IsNaN($r.RetainNum) -or [double]::IsInfinity($r.RetainNum)) { 'n/a'.PadLeft(9) } else { (("{0:F0}%" -f $r.RetainNum).PadLeft(9)) }
+        $ddS = if ([double]::IsNaN($r.MaxDDNum)) { 'n/a'.PadLeft(12) } else { (("{0:F0}%" -f $r.MaxDDNum).PadLeft(12)) }
+        $dragS = (("{0:F0}%" -f $r.DragNum).PadLeft(11))
+        $nbrS = if ([double]::IsNaN($r.NbrNum)) { 'n/a'.PadLeft(9) } else { (("{0:F0}%" -f $r.NbrNum).PadLeft(9)) }
+        $plainSummary.Add(($vFmt -f @(($ri + 1).ToString($inv).PadLeft(4), $isS, $oosS, $retS, $ddS, $dragS, $nbrS, ([string]$r.Verdict).PadLeft(10))))
+    }
+    $plainSummary.Add(($vFmt -f $vDashes))
+    $approvedCount = @($sorted | Where-Object { $_.Verdict -eq "APPROVED" }).Count
+    $plainSummary.Add(("Verdicts: {0}/{1} APPROVED | FAIL(Gx) = first failed gate | NEEDS-OOS = re-run multi-capture | N/A = under-powered proxy" -f $approvedCount, $sorted.Count))
     # Write the leaderboard before printing, so an interrupted console dump still leaves the ranked artifact.
     $plainSummary | Set-Content -LiteralPath $summaryPath -Encoding utf8
 
@@ -1368,6 +1530,34 @@ try {
         Write-Host (Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $true)
     }
     Write-Host (Format-ColorText -Text ($plainRowFmt -f $dashes) -Code $AnsiGray)
+
+    # Print Strategy Verification table (same fixed-width contract: static columns, padded badges)
+    Write-Host ""
+    Write-Host (Format-ColorText -Text "🛡️  STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES" -Code $AnsiBoldCyan)
+    Write-Host (Format-ColorText -Text "G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60%" -Code $AnsiGray)
+    if ($QueueDecay -ne "conservative") {
+        Write-Host (Format-ColorText -Text ("NOTE: QueueDecay={0} (exploratory) - promotion requires -QueueDecay conservative." -f $QueueDecay) -Code $AnsiBoldYellow)
+    }
+    if (-not $isMultiCapture) {
+        Write-Host (Format-ColorText -Text "NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures for full walk-forward verdicts." -Code $AnsiYellow)
+    }
+    Write-Host (Format-ColorText -Text ($vFmt -f $vHeaders) -Code $AnsiBoldWhite)
+    Write-Host (Format-ColorText -Text ($vFmt -f $vDashes) -Code $AnsiGray)
+    for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
+        $r = $sorted[$ri]
+        $rkRaw = (($ri + 1).ToString($inv)).PadLeft(4)
+        $isCell = Format-GateCell -RawText (Format-GateMoneyText -Value ([double]$r.ISNum) -Culture $inv) -Pass ($r.G1 -eq "PASS") -IsNA ($r.G1 -eq "N/A") -Width 10
+        $oosCell = Format-GateCell -RawText (Format-GateMoneyText -Value ([double]$r.OOSNum) -Culture $inv) -Pass ($r.G2 -eq "PASS") -IsNA ($r.G2 -eq "N/A") -Width 10
+        $retCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.RetainNum)) -Pass ($r.G3 -eq "PASS") -IsNA (($r.G3 -eq "N/A")) -Width 9
+        $ddCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.MaxDDNum)) -Pass ($r.G4 -eq "PASS") -IsNA ($r.G4 -eq "N/A") -Width 12
+        $dragCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.DragNum)) -Pass ($r.G5 -eq "PASS") -IsNA $false -Width 11
+        $nbrCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.NbrNum)) -Pass ($r.G6 -eq "PASS") -IsNA ($r.G6 -eq "N/A") -Width 9
+        $verCell = Format-VerdictCell -Verdict ([string]$r.Verdict) -Width 10
+        Write-Host ("{0} {1} {2} {3} {4} {5} {6} {7}" -f $rkRaw, $isCell, $oosCell, $retCell, $ddCell, $dragCell, $nbrCell, $verCell)
+    }
+    Write-Host (Format-ColorText -Text ($vFmt -f $vDashes) -Code $AnsiGray)
+    $approvedCon = @($sorted | Where-Object { $_.Verdict -eq "APPROVED" }).Count
+    Write-Host ("Verdicts: {0}/{1} APPROVED  |  FAIL(Gx) = first failed gate  |  NEEDS-OOS = re-run multi-capture" -f $approvedCon, $sorted.Count)
 
     Write-Host ""
 }
