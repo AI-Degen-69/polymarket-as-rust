@@ -36,13 +36,13 @@ use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
 use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent};
 use crate::lifecycle_report::{
     CancelAllRecord, LifecycleDisplayMode, LifecycleReportStats, LifecycleStepRow,
-    LifecycleStreamReporter, OrderActionTelemetry, print_breaker_trip, print_epoch_banner,
-    print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten, print_lifecycle_header,
-    print_lifecycle_merge, print_lifecycle_summary, print_phase_transition, print_tier_transition,
-    record_breaker_jsonl, record_cancel_all_jsonl, record_epoch_rollover_jsonl,
-    record_lifecycle_fill_jsonl, record_lifecycle_flatten_jsonl, record_lifecycle_merge_jsonl,
-    record_lifecycle_summary_jsonl, record_order_action_jsonl, record_phase_transition_jsonl,
-    record_risk_tier_jsonl,
+    LifecycleStreamReporter, OrderActionTelemetry, SuppressionContext, print_breaker_trip,
+    print_epoch_banner, print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten,
+    print_lifecycle_header, print_lifecycle_merge, print_lifecycle_summary, print_phase_transition,
+    print_tier_transition, record_breaker_jsonl, record_cancel_all_jsonl,
+    record_epoch_rollover_jsonl, record_lifecycle_fill_jsonl, record_lifecycle_flatten_jsonl,
+    record_lifecycle_merge_jsonl, record_lifecycle_summary_jsonl, record_order_action_jsonl,
+    record_phase_transition_jsonl, record_risk_tier_jsonl,
 };
 use crate::theme::{self, Badge};
 
@@ -113,6 +113,7 @@ struct PricingJob {
 
 struct PricingAck {
     quote: QuoteOutput,
+    suppression_ctx: Option<SuppressionContext>,
     s_star: f64,
     r_i: f64,
     bid_up_raw: f64,
@@ -252,8 +253,23 @@ fn pricing_actor_loop(
                     defensive_cancel_dn: trace.flags.defensive_cancel_dn,
                     total_compute_ns: trace.timings.total_compute_ns,
                 });
+                let suppression_ctx = trace.pricer.map(|p| SuppressionContext {
+                    bid_up_floored: p.bid_up_floored,
+                    bid_dn_floored: p.bid_dn_floored,
+                    entry_guard_suppressed_up: p.entry_guard_suppressed_up,
+                    entry_guard_suppressed_dn: p.entry_guard_suppressed_dn,
+                    post_only_clamped_up: p.post_only_clamped_up,
+                    post_only_clamped_dn: p.post_only_clamped_dn,
+                    post_only_suppressed_up: p.post_only_suppressed_up,
+                    post_only_suppressed_dn: p.post_only_suppressed_dn,
+                    cross_tick_clamped_up: p.cross_tick_clamped_up,
+                    cross_tick_clamped_dn: p.cross_tick_clamped_dn,
+                    max_entry_prob,
+                    max_entry_price,
+                });
                 PricingAck {
                     quote: trace.quote,
+                    suppression_ctx,
                     s_star,
                     r_i,
                     bid_up_raw,
@@ -264,6 +280,7 @@ fn pricing_actor_loop(
             }
             Err(err) => PricingAck {
                 quote: QuoteOutput::Suppressed(SuppressionReason::EmptyOrderBook),
+                suppression_ctx: None,
                 s_star: 0.0,
                 r_i: 0.50,
                 bid_up_raw: 0.0,
@@ -604,6 +621,9 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
             // Track tier transitions
             if current_tier != trace.tier {
                 print_tier_transition(
+                    now_ms,
+                    tau_secs,
+                    trace.phase,
                     trace.tier,
                     trace.utilization_u_e6,
                     trace.flatten_action.outcome(),
@@ -703,7 +723,9 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                             }
 
                             print_lifecycle_flatten(
-                                "sim-epoch",
+                                now_ms,
+                                tau_secs,
+                                trace.tier,
                                 outcome,
                                 side,
                                 price,
@@ -811,10 +833,13 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                 q_dn: sim_q_dn,
                 net_delta: net_delta / 1_000_000,
                 quote: step_quote,
+                suppression_ctx: None,
                 spot_usd: None,
                 strike_usd: None,
                 resting_bid_up,
                 resting_bid_dn,
+                avg_cost_up: None,
+                avg_cost_dn: None,
                 net_pnl_micro: 0,
                 action_up: &trace.action_up,
                 action_dn: &trace.action_dn,
@@ -850,7 +875,7 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
 
             if let BreakerStatus::Tripped { .. } = trace.breaker {
                 stats.breaker_trips += 1;
-                print_breaker_trip(trace.breaker);
+                print_breaker_trip(now_ms, tau_secs, trace.breaker);
                 record_breaker_jsonl(&mut jsonl, now_ms, now_ns, trace.breaker, 0)?;
             }
 
@@ -1712,7 +1737,9 @@ impl LivePaperSimulator {
                             self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
                         }
                         print_lifecycle_flatten(
-                            &self.desc.slug,
+                            now_ms,
+                            tau_secs,
+                            self.current_tier,
                             outcome,
                             side,
                             price,
@@ -2020,6 +2047,9 @@ impl LivePaperSimulator {
 
             if self.current_tier != r_trace.tier {
                 print_tier_transition(
+                    now_ms,
+                    tau_secs,
+                    r_trace.phase,
                     r_trace.tier,
                     r_trace.utilization_u_e6,
                     r_trace.flatten_action.outcome(),
@@ -2041,7 +2071,7 @@ impl LivePaperSimulator {
             }
             if r_trace.breaker != self.last_breaker {
                 self.last_breaker = r_trace.breaker;
-                print_breaker_trip(r_trace.breaker);
+                print_breaker_trip(now_ms, tau_secs, r_trace.breaker);
                 if matches!(
                     r_trace.breaker,
                     BreakerStatus::Tripped {
@@ -2080,10 +2110,13 @@ impl LivePaperSimulator {
                 q_dn: self.ledger.filled_dn,
                 net_delta,
                 quote: pricing_ack.quote,
+                suppression_ctx: pricing_ack.suppression_ctx,
                 spot_usd: self.latest_spot,
                 strike_usd: self.strike_usd,
                 resting_bid_up,
                 resting_bid_dn,
+                avg_cost_up: self.ledger.avg_cost_up(),
+                avg_cost_dn: self.ledger.avg_cost_dn(),
                 net_pnl_micro,
                 action_up: &r_trace.action_up,
                 action_dn: &r_trace.action_dn,

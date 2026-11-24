@@ -296,16 +296,6 @@ impl Theme {
         }
     }
 
-    /// Circuit-breaker icon: `⚡` when tripped, `✔` when armed.
-    pub(crate) fn breaker_icon(self, tripped: bool) -> String {
-        match (self.unicode, tripped) {
-            (true, true) => self.bold_red("⚡"),
-            (true, false) => self.bold_green("✔"),
-            (false, true) => self.bold_red("!"),
-            (false, false) => self.bold_green("+"),
-        }
-    }
-
     /// Short upper-case phase label (`QUOTE`, `LOCKOUT`, `FLATTEN`, `TERMINAL`).
     pub(crate) const fn phase_tag(phase: EpochPhase) -> &'static str {
         match phase {
@@ -402,18 +392,19 @@ impl Theme {
     }
 
     /// Formats a signed PnL amount in micro-USDC (`+$0.20` green, `-$0.15` red, `+$0.00` muted).
-    /// Preserves sub-cent precision when non-zero beyond 2 decimal places.
+    /// Rounds to 2 decimals once `|PnL| >= $0.01`, keeping sub-cent precision only below a cent.
     pub(crate) fn fmt_pnl(self, micro: i64) -> String {
         let sign = if micro < 0 { "-" } else { "+" };
         let abs = micro.unsigned_abs();
-        let dollars = abs / 1_000_000;
-        let rem = abs % 1_000_000;
-        let raw = if rem.is_multiple_of(10_000) {
-            format!("{sign}${dollars}.{:02}", rem / 10_000)
-        } else if rem.is_multiple_of(100) {
-            format!("{sign}${dollars}.{:04}", rem / 100)
+        let raw = if abs >= 10_000 {
+            let cents = abs.saturating_add(5_000) / 10_000;
+            format!("{sign}${}.{:02}", cents / 100, cents % 100)
+        } else if abs == 0 {
+            "+$0.00".to_string()
+        } else if abs.is_multiple_of(100) {
+            format!("{sign}$0.{:04}", abs / 100)
         } else {
-            format!("{sign}${dollars}.{rem:06}")
+            format!("{sign}$0.{abs:06}")
         };
 
         if micro > 0 {
@@ -681,6 +672,8 @@ mod tests {
         assert_eq!(plain.fmt_pnl(0), "+$0.00");
         assert_eq!(plain.fmt_pnl(4_000), "+$0.0040");
         assert_eq!(plain.fmt_pnl(-123), "-$0.000123");
+        assert_eq!(plain.fmt_pnl(14_966_170), "+$14.97");
+        assert_eq!(plain.fmt_pnl(-6_175_670), "-$6.18");
 
         let styled = Theme::styled();
         assert_eq!(styled.fmt_pnl(200_000), "\x1b[32m+$0.20\x1b[0m");
