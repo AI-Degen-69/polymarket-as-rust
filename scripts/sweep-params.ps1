@@ -1050,7 +1050,7 @@ try {
                                                     $winRateCell  = "% Win: " + (Format-WinRateCell -Pct $winPctCap -Width 4 -Bold $false -Culture $inv)
                                                     $volInCell    = "Deployed: " + ("`${0:F2}" -f $volumeIn).PadLeft(9)
                                                     $closeVolCell = "Returned: " + ("`${0:F2}" -f $closeVolume).PadLeft(9)
-                                                    $roiCell      = "ROI: " + (Format-SignedPctCell -Ratio $roiCap -Width 8 -Bold $false -Culture $inv)
+                                                    $roiCell      = "Return: " + (Format-SignedPctCell -Ratio $roiCap -Width 8 -Bold $false -Culture $inv)
 
                                                     $pnlLabelCell = (Format-ColorText -Text "P&L Breakdown" -Code $AnsiGray).PadRight(13)
                                                     $grossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $grossPnl -Pct $grossPct -Width 20 -Bold $false -IncludeDollar $true -Culture $inv)
@@ -1173,7 +1173,7 @@ try {
                                                 $subWinRateCell  = "% Win: " + (Format-WinRateCell -Pct $winRatePct -Width 4 -Bold $true -Culture $inv)
                                                 $subVolInCell    = "Deployed: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
                                                 $subCloseVolCell = "Returned: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
-                                                $subRoiCell        = "ROI: " + (Format-SignedPctCell -Ratio $sumRoi -Width 8 -Bold $true -Culture $inv)
+                                                $subRoiCell        = "Return: " + (Format-SignedPctCell -Ratio $sumRoi -Width 8 -Bold $true -Culture $inv)
 
                                                 $subPnlLabelCell = Format-ColorText -Text ("P&L Subtotal".PadRight(13)) -Code $AnsiBoldCyan
                                                 $subGrossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $sumGrossPnl -Pct $sumGrossPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
@@ -1309,17 +1309,17 @@ try {
     $cols = [System.Collections.Generic.List[hashtable]]::new()
     $cols.Add(@{ Name = "Rank";      Dash = "----";      Width = 4;  Prop = "Rank";      Kind = "rank" })
     $cols.Add(@{ Name = "Gamma";     Dash = "-----";     Width = -6; Prop = "Gamma";     Kind = "param" })
-    $cols.Add(@{ Name = "VarSpr";    Dash = "------";    Width = -6; Prop = "VarSpr";    Kind = "param" })
-    $cols.Add(@{ Name = "MinT";      Dash = "----";      Width = 4;  Prop = "MinT";      Kind = "param" })
-    if ($showCrossLoss)  { $cols.Add(@{ Name = "XTick"; Dash = "-----"; Width = 7; Prop = "XTick"; Kind = "param" }) }
-    if ($showEntryProb)  { $cols.Add(@{ Name = "MaxP";  Dash = "----";  Width = 5; Prop = "MaxP";  Kind = "param" }) }
-    if ($showEntryPrice) { $cols.Add(@{ Name = "MaxPx"; Dash = "-----"; Width = 5; Prop = "MaxPx"; Kind = "param" }) }
-    if ($showLLThresh)   { $cols.Add(@{ Name = "LLTh";  Dash = "-----"; Width = 5; Prop = "LLTh";  Kind = "param" }) }
-    if ($showLLWin)      { $cols.Add(@{ Name = "LLWin"; Dash = "-----"; Width = 5; Prop = "LLWin"; Kind = "param" }) }
-    if ($showLLCd)       { $cols.Add(@{ Name = "LLCd";  Dash = "----";  Width = 4; Prop = "LLCd";  Kind = "param" }) }
-    if ($showLLDir)      { $cols.Add(@{ Name = "LLDir"; Dash = "-----"; Width = 5; Prop = "LLDir"; Kind = "param" }) }
-    if ($showHedgeSkew)  { $cols.Add(@{ Name = "HSkew"; Dash = "-----"; Width = 5; Prop = "HSkew"; Kind = "param" }) }
-    if ($showCapTier1)   { $cols.Add(@{ Name = "T1Cap"; Dash = "-----"; Width = 5; Prop = "T1Cap"; Kind = "param" }) }
+    $cols.Add(@{ Name = "Var Spread"; Dash = "----------"; Width = -10; Prop = "VarSpr"; Kind = "param" })
+    $cols.Add(@{ Name = "Min Ticks"; Dash = "---------"; Width = 9;  Prop = "MinT";      Kind = "param" })
+    if ($showCrossLoss)  { $cols.Add(@{ Name = "Cross Loss"; Dash = "----------"; Width = 10; Prop = "XTick"; Kind = "param" }) }
+    if ($showEntryProb)  { $cols.Add(@{ Name = "Max Prob";  Dash = "--------";  Width = 8; Prop = "MaxP";  Kind = "param" }) }
+    if ($showEntryPrice) { $cols.Add(@{ Name = "Max Price"; Dash = "---------"; Width = 9; Prop = "MaxPx"; Kind = "param" }) }
+    if ($showLLThresh)   { $cols.Add(@{ Name = "Lead Lag Threshold";  Dash = "------------------"; Width = 18; Prop = "LLTh";  Kind = "param" }) }
+    if ($showLLWin)      { $cols.Add(@{ Name = "Lead Lag Window"; Dash = "---------------"; Width = 15; Prop = "LLWin"; Kind = "param" }) }
+    if ($showLLCd)       { $cols.Add(@{ Name = "Lead Lag Cooldown";  Dash = "-----------------";  Width = 17; Prop = "LLCd";  Kind = "param" }) }
+    if ($showLLDir)      { $cols.Add(@{ Name = "Lead Lag Direction"; Dash = "------------------"; Width = 18; Prop = "LLDir"; Kind = "param" }) }
+    if ($showHedgeSkew)  { $cols.Add(@{ Name = "Hedge Skew"; Dash = "----------"; Width = 10; Prop = "HSkew"; Kind = "param" }) }
+    if ($showCapTier1)   { $cols.Add(@{ Name = "Tier 1 Cap"; Dash = "----------"; Width = 10; Prop = "T1Cap"; Kind = "param" }) }
 
     $cols.Add(@{ Name = "Fills";     Dash = "-----";                  Width = 5;  Prop = "Fills";      NumProp = "Fills";          Kind = "int" })
     $cols.Add(@{ Name = "Merges";    Dash = "------";                 Width = 6;  Prop = "Merges";     NumProp = "Merges";         Kind = "int" })
@@ -1327,7 +1327,7 @@ try {
     $cols.Add(@{ Name = "Pairs";     Dash = "-------";                Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
     $cols.Add(@{ Name = "Win Rate";  Dash = "--------";               Width = 8;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
     $cols.Add(@{ Name = "Deployed";  Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
-    $cols.Add(@{ Name = "ROI";       Dash = "--------";               Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
+    $cols.Add(@{ Name = "Return";    Dash = "--------";               Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
     $cols.Add(@{ Name = "Returned";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
     $cols.Add(@{ Name = "Gross P&L"; Dash = "--------------------";  Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
     $cols.Add(@{ Name = "Rebates";   Dash = "---------";              Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
@@ -1335,9 +1335,9 @@ try {
     $cols.Add(@{ Name = "Net P&L";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
     $cols.Add(@{ Name = "Base P&L";  Dash = "--------";               Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
     $cols.Add(@{ Name = "Alpha Edge"; Dash = "----------";             Width = 10; Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
-    $cols.Add(@{ Name = "RPM";       Dash = "---";                    Width = 4;  Prop = "RPM";        NumProp = "RPM";            Kind = "rpm" })
-    $cols.Add(@{ Name = "MO1s";      Dash = "-----";                  Width = 6;  Prop = "MO1s";       NumProp = "MO1sNum";        Kind = "markout" })
-    $cols.Add(@{ Name = "MO5s";      Dash = "-----";                  Width = 6;  Prop = "MO5s";       NumProp = "MO5sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "Per Minute"; Dash = "----------";            Width = 10; Prop = "RPM";        NumProp = "RPM";            Kind = "rpm" })
+    $cols.Add(@{ Name = "Markout 1s"; Dash = "----------";            Width = 10; Prop = "MO1s";       NumProp = "MO1sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "Markout 5s"; Dash = "----------";            Width = 10; Prop = "MO5s";       NumProp = "MO5sNum";        Kind = "markout" })
     $cols.Add(@{ Name = "Verdict";   Dash = "----------";             Width = 10; Prop = "Verdict";    NumProp = "Verdict";          Kind = "verdict" })
 
     $fmtParts = for ($ci = 0; $ci -lt $cols.Count; $ci++) { "{$ci,$($cols[$ci].Width)}" }
@@ -1486,24 +1486,24 @@ try {
     }
     $plainSummary.Add(($plainRowFmt -f $dashes))
     $plainSummary.Add("")
-    $plainSummary.Add("STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (IS/OOS 70/30 by windows; DD/Drag capture-level proxies)")
-    $plainSummary.Add("G1 IS>0 | G2 OOS>0 | G3 Ret>=40% | G4 MaxDD<=25% | G5 Drag<=30% | G6 Nbr>=60% | QueueDecay=$QueueDecay (promotion requires conservative)")
+    $plainSummary.Add("STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (In Sample / Out Sample 70/30 by windows; Drawdown / Expiry Drag capture-level proxies)")
+    $plainSummary.Add("G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60% | QueueDecay=$QueueDecay (promotion requires conservative)")
     if (-not $isMultiCapture) {
-        $plainSummary.Add("NOTE: single-capture run - IS/OOS + MaxDD report N/A. Re-run with -AllCaptures (or multi -InputPath) for full walk-forward verdicts.")
+        $plainSummary.Add("NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures (or multi -InputPath) for full walk-forward verdicts.")
     }
-    $vFmt = "{0,4} {1,10} {2,10} {3,7} {4,7} {5,7} {6,7} {7,10}"
-    $vHeaders = @("Rank", "IS", "OOS", "Ret%", "MaxDD", "Drag", "Nbr%", "Verdict")
-    $vDashes = @("----", "----------", "----------", "-------", "-------", "-------", "-------", "----------")
+    $vFmt = "{0,4} {1,10} {2,10} {3,9} {4,12} {5,11} {6,9} {7,10}"
+    $vHeaders = @("Rank", "In Sample", "Out Sample", "Retention", "Max Drawdown", "Expiry Drag", "Neighbors", "Verdict")
+    $vDashes = @("----", "----------", "----------", "---------", "------------", "-----------", "---------", "----------")
     $plainSummary.Add(($vFmt -f $vHeaders))
     $plainSummary.Add(($vFmt -f $vDashes))
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
         $r = $sorted[$ri]
         $isS = if ([double]::IsNaN($r.ISNum)) { 'n/a'.PadLeft(10) } else { (Format-GateMoneyText -Value ([double]$r.ISNum) -Culture $inv).PadLeft(10) }
         $oosS = if ([double]::IsNaN($r.OOSNum)) { 'n/a'.PadLeft(10) } else { (Format-GateMoneyText -Value ([double]$r.OOSNum) -Culture $inv).PadLeft(10) }
-        $retS = if ([double]::IsNaN($r.RetainNum) -or [double]::IsInfinity($r.RetainNum)) { 'n/a'.PadLeft(7) } else { (("{0:F0}%" -f $r.RetainNum).PadLeft(7)) }
-        $ddS = if ([double]::IsNaN($r.MaxDDNum)) { 'n/a'.PadLeft(7) } else { (("{0:F0}%" -f $r.MaxDDNum).PadLeft(7)) }
-        $dragS = (("{0:F0}%" -f $r.DragNum).PadLeft(7))
-        $nbrS = if ([double]::IsNaN($r.NbrNum)) { 'n/a'.PadLeft(7) } else { (("{0:F0}%" -f $r.NbrNum).PadLeft(7)) }
+        $retS = if ([double]::IsNaN($r.RetainNum) -or [double]::IsInfinity($r.RetainNum)) { 'n/a'.PadLeft(9) } else { (("{0:F0}%" -f $r.RetainNum).PadLeft(9)) }
+        $ddS = if ([double]::IsNaN($r.MaxDDNum)) { 'n/a'.PadLeft(12) } else { (("{0:F0}%" -f $r.MaxDDNum).PadLeft(12)) }
+        $dragS = (("{0:F0}%" -f $r.DragNum).PadLeft(11))
+        $nbrS = if ([double]::IsNaN($r.NbrNum)) { 'n/a'.PadLeft(9) } else { (("{0:F0}%" -f $r.NbrNum).PadLeft(9)) }
         $plainSummary.Add(($vFmt -f @(($ri + 1).ToString($inv).PadLeft(4), $isS, $oosS, $retS, $ddS, $dragS, $nbrS, ([string]$r.Verdict).PadLeft(10))))
     }
     $plainSummary.Add(($vFmt -f $vDashes))
@@ -1532,12 +1532,12 @@ try {
     # Print Strategy Verification table (same fixed-width contract: static columns, padded badges)
     Write-Host ""
     Write-Host (Format-ColorText -Text "🛡️  STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES" -Code $AnsiBoldCyan)
-    Write-Host (Format-ColorText -Text "G1 IS>0 | G2 OOS>0 | G3 Ret>=40% | G4 MaxDD<=25% | G5 Drag<=30% | G6 Nbr>=60%" -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text "G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60%" -Code $AnsiGray)
     if ($QueueDecay -ne "conservative") {
         Write-Host (Format-ColorText -Text ("NOTE: QueueDecay={0} (exploratory) - promotion requires -QueueDecay conservative." -f $QueueDecay) -Code $AnsiBoldYellow)
     }
     if (-not $isMultiCapture) {
-        Write-Host (Format-ColorText -Text "NOTE: single-capture run - IS/OOS + MaxDD report N/A. Re-run with -AllCaptures for full walk-forward verdicts." -Code $AnsiYellow)
+        Write-Host (Format-ColorText -Text "NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures for full walk-forward verdicts." -Code $AnsiYellow)
     }
     Write-Host (Format-ColorText -Text ($vFmt -f $vHeaders) -Code $AnsiBoldWhite)
     Write-Host (Format-ColorText -Text ($vFmt -f $vDashes) -Code $AnsiGray)
@@ -1546,10 +1546,10 @@ try {
         $rkRaw = (($ri + 1).ToString($inv)).PadLeft(4)
         $isCell = Format-GateCell -RawText (Format-GateMoneyText -Value ([double]$r.ISNum) -Culture $inv) -Pass ($r.G1 -eq "PASS") -IsNA ($r.G1 -eq "N/A") -Width 10
         $oosCell = Format-GateCell -RawText (Format-GateMoneyText -Value ([double]$r.OOSNum) -Culture $inv) -Pass ($r.G2 -eq "PASS") -IsNA ($r.G2 -eq "N/A") -Width 10
-        $retCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.RetainNum)) -Pass ($r.G3 -eq "PASS") -IsNA (($r.G3 -eq "N/A")) -Width 7
-        $ddCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.MaxDDNum)) -Pass ($r.G4 -eq "PASS") -IsNA ($r.G4 -eq "N/A") -Width 7
-        $dragCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.DragNum)) -Pass ($r.G5 -eq "PASS") -IsNA $false -Width 7
-        $nbrCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.NbrNum)) -Pass ($r.G6 -eq "PASS") -IsNA ($r.G6 -eq "N/A") -Width 7
+        $retCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.RetainNum)) -Pass ($r.G3 -eq "PASS") -IsNA (($r.G3 -eq "N/A")) -Width 9
+        $ddCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.MaxDDNum)) -Pass ($r.G4 -eq "PASS") -IsNA ($r.G4 -eq "N/A") -Width 12
+        $dragCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.DragNum)) -Pass ($r.G5 -eq "PASS") -IsNA $false -Width 11
+        $nbrCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.NbrNum)) -Pass ($r.G6 -eq "PASS") -IsNA ($r.G6 -eq "N/A") -Width 9
         $verCell = Format-VerdictCell -Verdict ([string]$r.Verdict) -Width 10
         Write-Host ("{0} {1} {2} {3} {4} {5} {6} {7}" -f $rkRaw, $isCell, $oosCell, $retCell, $ddCell, $dragCell, $nbrCell, $verCell)
     }
