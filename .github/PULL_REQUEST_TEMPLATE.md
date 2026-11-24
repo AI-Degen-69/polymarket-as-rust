@@ -2,7 +2,7 @@
 
 - Phase / Scope:
 - Why this change exists:
-- Issue: `Closes #<id>`
+- Issue: Closes #<id>
 
 ## Atomic Commits / Key Changes
 
