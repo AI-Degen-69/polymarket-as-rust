@@ -84,6 +84,16 @@ try {
     Assert-True ((Get-VisibleText $pctNaN) -eq '     n/a') "NaN pct renders n/a"
     Assert-True ($pctNaN.Contains("$esc[90m")) "NaN pct is muted"
 
+    # --- Trading ROI ratio (single definition) -----------------------------
+    $roiBasic = Get-TradingRoiRatio -Deployed 1000.0 -Returned 1020.0 -FeesPaid 5.0
+    Assert-True ($roiBasic -eq 0.015) "ROI deducts fees: (1020-1000-5)/1000"
+    $roiNeg = Get-TradingRoiRatio -Deployed 1000.0 -Returned 990.0 -FeesPaid 5.0
+    Assert-True ($roiNeg -eq -0.015) "ROI goes negative when trading loses"
+    $roiEmpty = Get-TradingRoiRatio -Deployed 0.0 -Returned 0.0 -FeesPaid 0.0
+    Assert-True ([double]::IsNaN($roiEmpty)) "ROI is NaN when nothing deployed"
+    $roiSample = Get-TradingRoiRatio -Deployed 523.10 -Returned 531.25 -FeesPaid 0.41
+    Assert-True ([Math]::Abs($roiSample - 0.014797) -lt 1e-6) "ROI matches the leaderboard sample figure"
+
     # --- Fee cells & Dollar formatting ----------------------------------
     $zeroFee = Format-FeeCell -FeePaidPositive 0.0 -Width 9 -IncludeDollar $true
     Assert-True ((Get-VisibleText $zeroFee) -eq " -`$0.0000") "zero fee has single minus and dollar sign"

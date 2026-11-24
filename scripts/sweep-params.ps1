@@ -218,6 +218,21 @@ function Format-SignedPctCell {
     }
 }
 
+function Get-TradingRoiRatio {
+    param(
+        [double]$Deployed,
+        [double]$Returned,
+        [double]$FeesPaid
+    )
+    # Single definition of trading ROI: (Returned - Deployed - Fees) / Deployed.
+    # Rebates are a separate income source and are intentionally excluded.
+    # Returns NaN when nothing was deployed (avoids divide-by-zero).
+    if ($Deployed -gt 1e-6) {
+        return (($Returned - $Deployed - $FeesPaid) / $Deployed)
+    }
+    return [double]::NaN
+}
+
 function Format-RebateCell {
     param(
         [double]$Value,
@@ -908,7 +923,7 @@ try {
                                                     $grossPct = if ($volumeIn -gt 1e-6) { ($closeVolume / $volumeIn) - 1.0 } else { [double]::NaN }
                                                     $finalNetUsd = $netPlusReb
                                                     $netPct = if ($volumeIn -gt 1e-6) { $finalNetUsd / $volumeIn } else { [double]::NaN }
-                                                    $roiCap = if ($volumeIn -gt 1e-6) { ($closeVolume - $volumeIn - $feesPaid) / $volumeIn } else { [double]::NaN }
+                                                    $roiCap = Get-TradingRoiRatio -Deployed $volumeIn -Returned $closeVolume -FeesPaid $feesPaid
 
                                                     # % Win across windows in this capture
                                                     $winPctCap = [double]::NaN
@@ -1041,7 +1056,7 @@ try {
                                                 $sumNetPlusReb = $sumNetPnl + $sumRebate
                                                 $sumGrossPct = if ($sumVolIn -gt 1e-6) { ($sumCloseVol / $sumVolIn) - 1.0 } else { [double]::NaN }
                                                 $sumNetPct = if ($sumVolIn -gt 1e-6) { $sumNetPlusReb / $sumVolIn } else { [double]::NaN }
-                                                $sumRoi = if ($sumVolIn -gt 1e-6) { ($sumCloseVol - $sumVolIn - $sumFeesPaid) / $sumVolIn } else { [double]::NaN }
+                                                $sumRoi = Get-TradingRoiRatio -Deployed $sumVolIn -Returned $sumCloseVol -FeesPaid $sumFeesPaid
                                                 $roiPlain = if ([double]::IsNaN($sumRoi)) { 'n/a' } else { $sumRoi.ToString('+0.00%;-0.00%;+0.00%', $inv) }
                                                 $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
                                                 $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
