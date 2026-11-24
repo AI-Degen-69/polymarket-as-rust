@@ -4,7 +4,7 @@ use std::error::Error;
 use std::io::{IsTerminal, Write};
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use core_types::{ClockOffsetEstimator, EngineConfig, MarketDescriptor, MonotonicClock};
 use feeds::{ClockSyncReport, GammaDiscoveryClient};
 
@@ -81,6 +81,35 @@ pub(crate) fn format_utc_hms(unix_ms: u64) -> String {
         .map_or_else(
             || format!("{unix_ms}ms"),
             |dt| dt.format("%H:%M:%SZ").to_string(),
+        )
+}
+
+/// Formats a Unix millisecond timestamp as `HH:MM:SS` in local time.
+pub(crate) fn format_local_hms(unix_ms: u64) -> String {
+    i64::try_from(unix_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map_or_else(
+            || format!("{unix_ms}ms"),
+            |dt| {
+                let local = dt.with_timezone(&Local);
+                local.format("%H:%M:%S").to_string()
+            },
+        )
+}
+
+/// Formats a Unix millisecond timestamp as `YYYY-MM-DD HH:MM:SS (HH:MM:SSZ UTC)` in local time.
+pub(crate) fn format_local_datetime(unix_ms: u64) -> String {
+    i64::try_from(unix_ms)
+        .ok()
+        .and_then(DateTime::<Utc>::from_timestamp_millis)
+        .map_or_else(
+            || format!("{unix_ms}ms"),
+            |dt| {
+                let local = dt.with_timezone(&Local);
+                let utc_hms = dt.format("%H:%M:%SZ").to_string();
+                format!("{} ({utc_hms} UTC)", local.format("%Y-%m-%d %H:%M:%S"))
+            },
         )
 }
 
@@ -370,6 +399,18 @@ mod tests {
     fn format_utc_hms_formats_known_timestamp() {
         assert_eq!(format_utc_hms(1_795_345_200_000), "11:00:00Z");
         assert_eq!(format_utc_hms(1_795_345_500_000), "11:05:00Z");
+    }
+
+    #[test]
+    fn format_local_hms_and_datetime_format_valid_strings() {
+        let hms = format_local_hms(1_795_345_200_000);
+        assert_eq!(hms.len(), 8);
+        assert_eq!(&hms[2..3], ":");
+        assert_eq!(&hms[5..6], ":");
+
+        let dt = format_local_datetime(1_795_345_200_000);
+        assert!(dt.contains("11:00:00Z UTC"));
+        assert!(dt.contains("2026-11-22"));
     }
 
     #[test]
