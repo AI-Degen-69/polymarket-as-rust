@@ -37,7 +37,8 @@ pub use station2_twap::{
 pub use station3_kappa::{KappaConfig, KappaEstimator, KappaOutput};
 pub use station4_6_pricer::{
     CostContext, DualBidPricer, PostOnlyBounds, PricerConfig, PricerInput, PricerTrace,
-    QuoteOutput, SuppressionReason, exceeds_entry_prob_bounds,
+    QuoteOutput, SuppressionReason, exceeds_entry_price_cap, exceeds_entry_prob_bounds,
+    is_entry_guarded,
 };
 
 /// Clamps `val` to `[lo, hi]` after verifying all inputs are finite and `lo <= hi`.

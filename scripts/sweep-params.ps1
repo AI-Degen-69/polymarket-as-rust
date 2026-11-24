@@ -41,6 +41,8 @@ param(
 
     [string[]]$MaxEntryProbs = @("off"),
 
+    [string[]]$MaxEntryPrices = @("off"),
+
     [string[]]$LeadLagThresholds = @("0.015"),
 
     [string[]]$LeadLagWindows = @("1000"),
@@ -96,9 +98,20 @@ $parsedMaxEntryProbs = @($MaxEntryProbs | ForEach-Object { $_ -split ',' } | For
         $p.ToString("R", $inv)
     }
 })
+$parsedMaxEntryPrices = @($MaxEntryPrices | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
+    if ($_.Equals("off", [System.StringComparison]::OrdinalIgnoreCase)) {
+        "off"
+    } else {
+        $p = [double]::Parse($_, $inv)
+        if ([double]::IsNaN($p) -or [double]::IsInfinity($p) -or $p -le 0.0 -or $p -ge 1.0) {
+            throw "Invalid MaxEntryPrices entry '$_' (expected 'off' or finite number in (0.0, 1.0))"
+        }
+        $p.ToString("R", $inv)
+    }
+})
 
-if ($parsedGammas.Count -eq 0 -or $parsedVarSpreads.Count -eq 0 -or $parsedMinTicks.Count -eq 0 -or $parsedCrossLosses.Count -eq 0 -or $parsedMaxEntryProbs.Count -eq 0) {
-    throw "Gammas, VarianceSpreads, MinSpreadTicks, MaxCrossTickLossMicros, and MaxEntryProbs must each contain at least one value"
+if ($parsedGammas.Count -eq 0 -or $parsedVarSpreads.Count -eq 0 -or $parsedMinTicks.Count -eq 0 -or $parsedCrossLosses.Count -eq 0 -or $parsedMaxEntryProbs.Count -eq 0 -or $parsedMaxEntryPrices.Count -eq 0) {
+    throw "Gammas, VarianceSpreads, MinSpreadTicks, MaxCrossTickLossMicros, MaxEntryProbs, and MaxEntryPrices must each contain at least one value"
 }
 $parsedLLThresholds = @($LeadLagThresholds | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' } | ForEach-Object {
     $t = [double]::Parse($_, $inv)
@@ -148,6 +161,7 @@ if ($parsedHedgeSkews.Count -eq 0 -or $parsedCapTier1.Count -eq 0) {
 }
 $showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
 $showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
+$showEntryPrice = @($parsedMaxEntryPrices | Where-Object { $_ -ne "off" }).Count -gt 0
 $showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.015 }).Count -gt 0)
 $showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 1000 }).Count -gt 0)
 $showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 1000 }).Count -gt 0)
@@ -282,7 +296,7 @@ try {
         }
     }
 
-    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count * $parsedLLThresholds.Count * $parsedLLWindows.Count * $parsedLLCooldowns.Count * $parsedLLDirectionals.Count * $parsedHedgeSkews.Count * $parsedCapTier1.Count
+    $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count * $parsedMaxEntryPrices.Count * $parsedLLThresholds.Count * $parsedLLWindows.Count * $parsedLLCooldowns.Count * $parsedLLDirectionals.Count * $parsedHedgeSkews.Count * $parsedCapTier1.Count
     $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
     $sweepBase = Join-Path $repoRoot "logs/sweeps"
     if (-not (Test-Path -LiteralPath $sweepBase)) {
@@ -330,6 +344,7 @@ try {
             foreach ($minTicks in $parsedMinTicks) {
                 foreach ($crossLoss in $parsedCrossLosses) {
                     foreach ($entryProb in $parsedMaxEntryProbs) {
+                        foreach ($entryPrice in $parsedMaxEntryPrices) {
                         foreach ($llThresh in $parsedLLThresholds) {
                             foreach ($llWin in $parsedLLWindows) {
                                 foreach ($llCd in $parsedLLCooldowns) {
@@ -346,6 +361,10 @@ try {
                                                 if ($showEntryProb) {
                                                     $epTag = $entryProb.Replace(".", "p")
                                                     $stem += "_ep-${epTag}"
+                                                }
+                                                if ($showEntryPrice) {
+                                                    $epxTag = $entryPrice.Replace(".", "p")
+                                                    $stem += "_epx-${epxTag}"
                                                 }
                                                 if ($showLLThresh) {
                                                     $lltTag = $llThresh.Replace(".", "p")
@@ -370,6 +389,7 @@ try {
                                                 $extraProgress = ""
                                                 if ($showCrossLoss) { $extraProgress += " xtick=$crossLoss" }
                                                 if ($showEntryProb) { $extraProgress += " max_p=$entryProb" }
+                                                if ($showEntryPrice) { $extraProgress += " max_px=$entryPrice" }
                                                 if ($showLLThresh) { $extraProgress += " ll_th=$llThresh" }
                                                 if ($showLLWin) { $extraProgress += " ll_win=$llWin" }
                                                 if ($showLLCd) { $extraProgress += " ll_cd=$llCd" }
@@ -416,9 +436,13 @@ try {
                                     if ($entryProb -ne "off") {
                                         $cliArgs += @("--max-entry-prob", $entryProb)
                                     }
+                                    if ($entryPrice -ne "off") {
+                                        $cliArgs += @("--max-entry-price", $entryPrice)
+                                    }
 
                                     $prevCrossLossEnv = $env:MAX_CROSS_TICK_LOSS_MICRO
                                     $prevEntryProbEnv = $env:MAX_ENTRY_PROB
+                                    $prevEntryPriceEnv = $env:MAX_ENTRY_PRICE
                                     $prevLLThreshEnv = $env:LEAD_LAG_CANCEL_THRESHOLD
                                     $prevLLWinEnv = $env:LEAD_LAG_WINDOW_MS
                                     $prevLLCdEnv = $env:LEAD_LAG_COOLDOWN_MS
@@ -431,6 +455,11 @@ try {
                                         }
                                         if ($entryProb -eq "off") {
                                             $env:MAX_ENTRY_PROB = "off"
+                                        }
+                                        if ($entryPrice -eq "off") {
+                                            $env:MAX_ENTRY_PRICE = "off"
+                                        } else {
+                                            $env:MAX_ENTRY_PRICE = $entryPrice
                                         }
                                         $env:LEAD_LAG_CANCEL_THRESHOLD = $llThresh
                                         $env:LEAD_LAG_WINDOW_MS = $llWin.ToString($inv)
@@ -453,6 +482,11 @@ try {
                                             Remove-Item Env:MAX_ENTRY_PROB -ErrorAction SilentlyContinue
                                         } else {
                                             $env:MAX_ENTRY_PROB = $prevEntryProbEnv
+                                        }
+                                        if ($null -eq $prevEntryPriceEnv) {
+                                            Remove-Item Env:MAX_ENTRY_PRICE -ErrorAction SilentlyContinue
+                                        } else {
+                                            $env:MAX_ENTRY_PRICE = $prevEntryPriceEnv
                                         }
                                         if ($null -eq $prevLLThreshEnv) {
                                             Remove-Item Env:LEAD_LAG_CANCEL_THRESHOLD -ErrorAction SilentlyContinue
@@ -538,6 +572,7 @@ try {
                                         MinT       = $minTicks
                                         XTick      = $crossLoss
                                         MaxP       = $entryProb
+                                        MaxPx      = $entryPrice
                                         LLTh       = $llThresh
                                         LLWin      = $llWin
                                         LLCd       = $llCd
@@ -599,6 +634,7 @@ try {
                                         MinT       = $minTicks
                                         XTick      = $crossLoss
                                         MaxP       = $entryProb
+                                        MaxPx      = $entryPrice
                                         LLTh       = $llThresh
                                         LLWin      = $llWin
                                         LLCd       = $llCd
@@ -625,6 +661,7 @@ try {
                                 }
                                             }
                                         }
+                                        }
                                     }
                                 }
                             }
@@ -645,6 +682,9 @@ try {
     }
     if ($showEntryProb) {
         $cols.Add(@{ Name = "MaxP"; Dash = "----"; Width = 5; Prop = "MaxP" })
+    }
+    if ($showEntryPrice) {
+        $cols.Add(@{ Name = "MaxPx"; Dash = "-----"; Width = 5; Prop = "MaxPx" })
     }
     if ($showLLThresh) {
         $cols.Add(@{ Name = "LLTh"; Dash = "-----"; Width = 5; Prop = "LLTh" })

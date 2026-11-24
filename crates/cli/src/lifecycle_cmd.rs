@@ -223,11 +223,12 @@ fn pricing_actor_loop(
                     bid_dn_raw
                 };
                 let max_entry_prob = pipeline.config().pricer.max_entry_prob;
-                let hedge_only_up = max_entry_prob.is_some_and(|p_max| {
-                    bid_up_auth.is_some_and(|p| math_engine::exceeds_entry_prob_bounds(p, p_max))
+                let max_entry_price = pipeline.config().pricer.max_entry_price;
+                let hedge_only_up = bid_up_auth.is_some_and(|p| {
+                    math_engine::is_entry_guarded(p, max_entry_prob, max_entry_price)
                 });
-                let hedge_only_dn = max_entry_prob.is_some_and(|p_max| {
-                    bid_dn_auth.is_some_and(|p| math_engine::exceeds_entry_prob_bounds(p, p_max))
+                let hedge_only_dn = bid_dn_auth.is_some_and(|p| {
+                    math_engine::is_entry_guarded(p, max_entry_prob, max_entry_price)
                 });
                 let twap_60s = trace.station2.and_then(|s| s.twap_60s_usd);
                 harness.publish_quote(QuoteProposal {
@@ -1033,6 +1034,7 @@ struct LivePaperSimulator {
     v_max_micro: MicroUsdc,
     base_size_shares: u64,
     max_entry_prob: Option<f64>,
+    max_entry_price: Option<f64>,
     cumulative_merged_cost_micro: u64,
     step_count: u64,
     current_phase: Option<EpochPhase>,
@@ -1054,6 +1056,7 @@ impl LivePaperSimulator {
         v_max_micro: MicroUsdc,
         base_size_shares: u64,
         max_entry_prob: Option<f64>,
+        max_entry_price: Option<f64>,
         display: LifecycleDisplayMode,
         verbose_latency: bool,
         harness: ActorPipelineHarness,
@@ -1092,6 +1095,7 @@ impl LivePaperSimulator {
             v_max_micro,
             base_size_shares,
             max_entry_prob,
+            max_entry_price,
             cumulative_merged_cost_micro: 0,
             step_count: 0,
             current_phase: None,
@@ -1457,14 +1461,12 @@ impl LivePaperSimulator {
         let remaining_q_cap =
             SharesMicro::from_raw(q_max.as_u64().saturating_sub(unhedged_leg.as_u64()));
 
-        let hedge_only_cap = if self
-            .max_entry_prob
-            .is_some_and(|p_max| math_engine::exceeds_entry_prob_bounds(price, p_max))
-        {
-            SharesMicro::from_raw(unhedged_opp.as_u64().saturating_sub(unhedged_leg.as_u64()))
-        } else {
-            requested
-        };
+        let hedge_only_cap =
+            if math_engine::is_entry_guarded(price, self.max_entry_prob, self.max_entry_price) {
+                SharesMicro::from_raw(unhedged_opp.as_u64().saturating_sub(unhedged_leg.as_u64()))
+            } else {
+                requested
+            };
 
         let capped = requested
             .min(max_base)
@@ -2427,6 +2429,7 @@ fn spawn_managed_session(
         v_max_micro,
         args.base_size,
         cfg.max_entry_prob,
+        cfg.max_entry_price,
         args.display,
         args.verbose_latency,
         harness.clone(),
@@ -2508,7 +2511,7 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
     let t = theme::current();
     println!("{}", t.section("Active Config's Parameters"));
 
-    let rows: [(&str, String, &str); 17] = [
+    let rows: [(&str, String, &str); 18] = [
         (
             "Gamma",
             cfg.gamma.to_string(),
@@ -2562,6 +2565,13 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
                 .map(|p| p.to_string())
                 .unwrap_or_else(|| "off".to_string()),
             "Blocks fresh entries outside [1-p, p]",
+        ),
+        (
+            "Max Entry Price",
+            cfg.max_entry_price
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "off".to_string()),
+            "Blocks fresh entries strictly above p",
         ),
         (
             "Lead/Lag Threshold",
@@ -3416,6 +3426,7 @@ mod tests {
             v_max_micro,
             base_size,
             cfg.max_entry_prob,
+            cfg.max_entry_price,
             LifecycleDisplayMode::Stream,
             false,
             harness.clone(),

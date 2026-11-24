@@ -238,6 +238,7 @@ mod tests {
         assert_eq!(cfg.gamma, 0.12);
         assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
         assert_eq!(cfg.max_entry_prob, Some(0.80));
+        assert_eq!(cfg.max_entry_price, None);
         assert_eq!(cfg.hedge_skew_mult, 1.0);
         assert!(!cfg.cap_tier1_reducing_to_delta);
 
@@ -691,9 +692,29 @@ mod tests {
         let mut off_map = HashMap::new();
         off_map.insert("MAX_CROSS_TICK_LOSS_MICRO", "off");
         off_map.insert("MAX_ENTRY_PROB", "OFF");
+        off_map.insert("MAX_ENTRY_PRICE", "OFF");
         let off_cfg = EngineConfig::from_lookup(lookup_map(&off_map)).unwrap();
         assert_eq!(off_cfg.max_cross_tick_loss_micro, None);
         assert_eq!(off_cfg.max_entry_prob, None);
+        assert_eq!(off_cfg.max_entry_price, None);
+
+        let mut cap_map = HashMap::new();
+        cap_map.insert("MAX_ENTRY_PRICE", "0.60");
+        let cap_cfg = EngineConfig::from_lookup(lookup_map(&cap_map)).unwrap();
+        assert_eq!(cap_cfg.max_entry_price, Some(0.60));
+
+        let cap_json = serde_json::to_string(&cap_cfg).unwrap();
+        let cap_roundtrip: EngineConfig = serde_json::from_str(&cap_json).unwrap();
+        assert_eq!(cap_roundtrip.max_entry_price, Some(0.60));
+
+        for bad_cap in ["0.0", "-0.1", "1.0", "1.2", "NaN", "inf"] {
+            let mut m = HashMap::new();
+            m.insert("MAX_ENTRY_PRICE", bad_cap);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&m)).is_err(),
+                "expected error for MAX_ENTRY_PRICE={bad_cap}"
+            );
+        }
     }
 
     #[test]

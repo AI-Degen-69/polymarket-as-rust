@@ -707,11 +707,10 @@ fn effective_order_size(
     base_size: SharesMicro,
     inventory_q: core_types::SignedSharesMicro,
     max_entry_prob: Option<f64>,
+    max_entry_price: Option<f64>,
     min_order_size_micro: SharesMicro,
 ) -> Option<SharesMicro> {
-    if let Some(p_max) = max_entry_prob
-        && math_engine::exceeds_entry_prob_bounds(target_price, p_max)
-    {
+    if math_engine::is_entry_guarded(target_price, max_entry_prob, max_entry_price) {
         let offset = match outcome {
             Outcome::Up if inventory_q.0 < 0 => inventory_q.0.unsigned_abs(),
             Outcome::Down if inventory_q.0 > 0 => inventory_q.0.unsigned_abs(),
@@ -801,6 +800,7 @@ fn eval_sim_step(
             base_size,
             inventory_q,
             cfg.max_entry_prob,
+            cfg.max_entry_price,
             desc.min_order_size_micro,
         )
         .map(|sz| (target_price, sz))
@@ -859,6 +859,7 @@ fn eval_sim_step(
             base_size,
             inventory_q,
             cfg.max_entry_prob,
+            cfg.max_entry_price,
             desc.min_order_size_micro,
         )
         .map(|sz| (target_price, sz))
@@ -2209,6 +2210,7 @@ mod tests {
                 base_size,
                 core_types::SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
                 Some(0.80),
+                None,
                 min_size,
             ),
             Some(SharesMicro(5 * ONE_SHARE_MICRO))
@@ -2222,6 +2224,7 @@ mod tests {
                 base_size,
                 core_types::SignedSharesMicro(3 * ONE_SHARE_MICRO as i64),
                 Some(0.80),
+                None,
                 min_size,
             ),
             None
@@ -2235,6 +2238,33 @@ mod tests {
                 base_size,
                 core_types::SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
                 Some(0.80),
+                None,
+                min_size,
+            ),
+            Some(base_size)
+        );
+
+        // Upper-only cap 0.60 caps reducing DN bid at $0.65 to offsetting UP shares (5), while preserving cheap $0.30 entries.
+        assert_eq!(
+            effective_order_size(
+                Outcome::Down,
+                MicroUsdc(650_000),
+                base_size,
+                core_types::SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
+                Some(0.80),
+                Some(0.60),
+                min_size,
+            ),
+            Some(SharesMicro(5 * ONE_SHARE_MICRO))
+        );
+        assert_eq!(
+            effective_order_size(
+                Outcome::Down,
+                MicroUsdc(300_000),
+                base_size,
+                core_types::SignedSharesMicro(0),
+                Some(0.80),
+                Some(0.60),
                 min_size,
             ),
             Some(base_size)

@@ -140,6 +140,8 @@ pub struct EngineConfig {
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
+    /// Optional upper-only favorite entry price cap in `(0.0, 1.0)` (`None` default; suppresses fresh entries strictly above cap while preserving cheap legs and hedges).
+    pub max_entry_price: Option<f64>,
     /// Binance lead-lag fair-probability shift triggering defensive cancel (`0.015` default).
     pub lead_lag_cancel_threshold: f64,
     /// Rolling Binance lead-lag lookback window in ms (`1000ms` default; `0` = legacy tick-to-tick).
@@ -185,6 +187,7 @@ struct RawEngineConfig {
     enforce_fee_floor: bool,
     max_cross_tick_loss_micro: Option<u64>,
     max_entry_prob: Option<f64>,
+    max_entry_price: Option<f64>,
     lead_lag_cancel_threshold: f64,
     lead_lag_window_ms: u64,
     lead_lag_cooldown_ms: u64,
@@ -221,6 +224,7 @@ impl Default for RawEngineConfig {
             enforce_fee_floor: d.enforce_fee_floor,
             max_cross_tick_loss_micro: d.max_cross_tick_loss_micro,
             max_entry_prob: d.max_entry_prob,
+            max_entry_price: d.max_entry_price,
             lead_lag_cancel_threshold: d.lead_lag_cancel_threshold,
             lead_lag_window_ms: d.lead_lag_window_ms,
             lead_lag_cooldown_ms: d.lead_lag_cooldown_ms,
@@ -260,6 +264,7 @@ impl TryFrom<RawEngineConfig> for EngineConfig {
             enforce_fee_floor: raw.enforce_fee_floor,
             max_cross_tick_loss_micro: raw.max_cross_tick_loss_micro,
             max_entry_prob: raw.max_entry_prob,
+            max_entry_price: raw.max_entry_price,
             lead_lag_cancel_threshold: raw.lead_lag_cancel_threshold,
             lead_lag_window_ms: raw.lead_lag_window_ms,
             lead_lag_cooldown_ms: raw.lead_lag_cooldown_ms,
@@ -303,6 +308,7 @@ impl fmt::Debug for EngineConfig {
             .field("enforce_fee_floor", &self.enforce_fee_floor)
             .field("max_cross_tick_loss_micro", &self.max_cross_tick_loss_micro)
             .field("max_entry_prob", &self.max_entry_prob)
+            .field("max_entry_price", &self.max_entry_price)
             .field("lead_lag_cancel_threshold", &self.lead_lag_cancel_threshold)
             .field("lead_lag_window_ms", &self.lead_lag_window_ms)
             .field("lead_lag_cooldown_ms", &self.lead_lag_cooldown_ms)
@@ -344,6 +350,7 @@ impl Default for EngineConfig {
             enforce_fee_floor: false,
             max_cross_tick_loss_micro: Some(80_000),
             max_entry_prob: Some(0.80),
+            max_entry_price: None,
             lead_lag_cancel_threshold: 0.015,
             lead_lag_window_ms: 1_000,
             lead_lag_cooldown_ms: 1_000,
@@ -492,6 +499,13 @@ where
             cfg.max_entry_prob = None;
         } else {
             cfg.max_entry_prob = Some(parse_f64("MAX_ENTRY_PROB", &v)?);
+        }
+    }
+    if let Some(v) = non_empty(lookup, "MAX_ENTRY_PRICE")? {
+        if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            cfg.max_entry_price = None;
+        } else {
+            cfg.max_entry_price = Some(parse_f64("MAX_ENTRY_PRICE", &v)?);
         }
     }
     if let Some(v) = non_empty(lookup, "HEDGE_SKEW_MULT")? {
@@ -732,6 +746,13 @@ fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
     {
         return Err(invariant(format!(
             "max_entry_prob must be finite in (0.5, 1.0), got {p_max}"
+        )));
+    }
+    if let Some(p_cap) = cfg.max_entry_price
+        && (!p_cap.is_finite() || p_cap <= 0.0 || p_cap >= 1.0)
+    {
+        return Err(invariant(format!(
+            "max_entry_price must be finite in (0.0, 1.0), got {p_cap}"
         )));
     }
     if !cfg.lead_lag_cancel_threshold.is_finite()
@@ -988,7 +1009,7 @@ mod tests {
             .map(|(key, value)| (key.trim(), value.trim()))
             .collect();
 
-        const TUNING_KEYS: [&str; 21] = [
+        const TUNING_KEYS: [&str; 22] = [
             "EXECUTION_MODE",
             "DRY_RUN",
             "ENGINE_GAMMA",
@@ -1002,6 +1023,7 @@ mod tests {
             "SG_MODE",
             "INCLUDE_VARIANCE_SPREAD",
             "MAX_ENTRY_PROB",
+            "MAX_ENTRY_PRICE",
             "MAX_CROSS_TICK_LOSS_MICRO",
             "LEAD_LAG_CANCEL_THRESHOLD",
             "LEAD_LAG_WINDOW_MS",
@@ -1045,6 +1067,7 @@ mod tests {
             sg_mode,
             include_variance_spread,
             max_entry_prob,
+            max_entry_price,
             max_cross_tick_loss_micro,
             lead_lag_cancel_threshold,
             lead_lag_window_ms,
