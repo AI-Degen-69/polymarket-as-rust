@@ -87,6 +87,12 @@ try {
     Assert-True ((Get-DisplayWidth $leftChanged) -eq (Get-DisplayWidth $leftUnchanged)) "diff badge does not shift the left column separator"
     Assert-True ((Get-DisplayWidth $leftUnchanged) -eq ((Get-VisibleText $leftUnchanged).Length)) "unchanged left cell has no double-width glyphs"
 
+    # --- Entry-price sweep detection -------------------------------------
+    Assert-True (-not (Test-EntryPriceSwept -Prices @("off"))) "single 'off' entry price hides the MaxPx column"
+    Assert-True (-not (Test-EntryPriceSwept -Prices @("0.6"))) "default 0.6 entry price hides the MaxPx column"
+    Assert-True (Test-EntryPriceSwept -Prices @("0.7")) "non-default entry price shows the MaxPx column"
+    Assert-True (Test-EntryPriceSwept -Prices @("off", "0.6")) "two entry prices show the MaxPx column"
+
     # --- Plain mode ------------------------------------------------------
     $script:UseAnsi = $false
     $plainPnl = Format-SignedPnlCell -Value 1.2345 -Width 9

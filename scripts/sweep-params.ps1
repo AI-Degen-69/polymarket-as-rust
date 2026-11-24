@@ -184,6 +184,18 @@ function Format-WinRateCell {
     }
 }
 
+function Test-EntryPriceSwept {
+    param(
+        [string[]]$Prices,
+        [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
+    )
+    if ($Prices.Count -gt 1) { return $true }
+    return (@($Prices | Where-Object {
+        -not $_.Equals("off", [System.StringComparison]::OrdinalIgnoreCase) -and
+        [double]::Parse($_, $Culture) -ne 0.60
+    }).Count -gt 0)
+}
+
 function Format-ParamCell {
     param(
         [string]$Label,
@@ -343,7 +355,7 @@ if ($parsedHedgeSkews.Count -eq 0 -or $parsedCapTier1.Count -eq 0) {
 
 $showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
 $showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
-$showEntryPrice = ($parsedMaxEntryPrices.Count -gt 1) -or (@($parsedMaxEntryPrices | Where-Object { [double]::Parse($_, $inv) -ne 0.60 }).Count -gt 0)
+$showEntryPrice = Test-EntryPriceSwept -Prices $parsedMaxEntryPrices -Culture $inv
 $showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.015 }).Count -gt 0)
 $showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 1000 }).Count -gt 0)
 $showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 1000 }).Count -gt 0)
@@ -432,17 +444,22 @@ try {
 
     $captures = [System.Collections.Generic.List[PSCustomObject]]::new()
     $totalWindows = 0
+    $seenLabels = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     foreach ($capPath in $resolvedInputs) {
+        # Identity stays raw (output paths, result matching); only the displayed label is sanitized.
         $capName = [System.IO.Path]::GetFileName($capPath)
         $capStem = [System.IO.Path]::GetFileNameWithoutExtension($capPath)
-        $capName = $capName -replace '[\x00-\x1F\x7F]', '?'
-        $capStem = $capStem -replace '[\x00-\x1F\x7F]', '?'
+        $capLabel = $capStem -replace '[\x00-\x1F\x7F]', '?'
+        if (-not $seenLabels.Add($capLabel)) {
+            $capLabel = "{0} #{1}" -f $capLabel, ($captures.Count + 1)
+        }
         $capWindows = if ($capName -match '_(\d+)w\.jsonl$') { [int]$Matches[1] } else { 0 }
         $totalWindows += $capWindows
         $captures.Add([PSCustomObject]@{
             Path    = $capPath
             Name    = $capName
             Stem    = $capStem
+            Label   = $capLabel
             Windows = $capWindows
         })
     }
@@ -601,7 +618,8 @@ try {
                                                     $winLabel = if ($cap.Windows -eq 1) { "1 window" } else { "{0} windows" -f $cap.Windows }
                                                     $fileTag = Format-ColorText -Text ("[FILE {0} / {1}]" -f ($capIdx + 1), $captures.Count) -Code $AnsiCyan
                                                     $winTagMuted = Format-ColorText -Text ("({0})" -f $winLabel) -Code $AnsiGray
-                                                    Write-Host ("  📄 {0} {1} {2}" -f $fileTag, $cap.Name, $winTagMuted)
+                                                    $capDisplayName = "{0}.jsonl" -f $cap.Label
+                                                    Write-Host ("  📄 {0} {1} {2}" -f $fileTag, $capDisplayName, $winTagMuted)
                                                     try { [Console]::Out.Flush() } catch {}
 
                                                     $capStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1089,7 +1107,7 @@ try {
         for ($ci = 0; $ci -lt $captures.Count; $ci++) {
             $c = $captures[$ci]
             $winTag = if ($c.Windows -gt 0) { "{0}w" -f $c.Windows } else { "?w" }
-            $plainSummary.Add(("  [{0}] {1} ({2})" -f ($ci + 1), $c.Name, $winTag))
+            $plainSummary.Add(("  [{0}] {1}.jsonl ({2})" -f ($ci + 1), $c.Label, $winTag))
         }
     } else {
         $plainSummary.Add(("Input: {0}" -f $captures[0].Path))
@@ -1128,7 +1146,7 @@ try {
 
     # Cross-Config Per-Capture Summary Table (Multi-Capture Runs)
     if ($isMultiCapture) {
-        $capStemMaxLen = ($captures | ForEach-Object { $_.Stem.Length } | Measure-Object -Maximum).Maximum
+        $capStemMaxLen = ($captures | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum
         $capColWidth = [Math]::Max(28, $capStemMaxLen)
 
         $capHeaderLine = "{0} {1,4} {2,5} {3,6} {4,7} {5,9} {6,9} {7,9} {8,7} {9,9} {10,9} {11,9} {12,4} {13,6} {14,6}" -f `
@@ -1198,7 +1216,7 @@ try {
             $grandWeightedMo5s += ($cFills * $cAvgMo5s)
 
             $plainCapLine = "{0} {1,4} {2,5} {3,6} {4,7} {5,9} {6,9} {7,9} {8,7} {9,9} {10,9} {11,9} {12,4} {13,6} {14,6}" -f `
-                $cap.Stem.PadRight($capColWidth),
+                $cap.Label.PadRight($capColWidth),
                 $wTag,
                 $cFills,
                 $cMerges,
@@ -1219,7 +1237,7 @@ try {
             $cRpmCol = if ($cAvgRpm -le 1e-6) { Format-ColorText -Text $cRpmStr -Code $AnsiGray } else { $cRpmStr }
 
             $colorCapLine = "{0} {1} {2,5} {3,6} {4,7} {5} {6} {7} {8} {9} {10} {11} {12} {13} {14}" -f `
-                $cap.Stem.PadRight($capColWidth),
+                $cap.Label.PadRight($capColWidth),
                 (Format-ColorText -Text $wTag.PadLeft(4) -Code $AnsiGray),
                 $cFills,
                 $cMerges,
