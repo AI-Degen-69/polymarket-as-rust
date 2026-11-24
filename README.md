@@ -6,15 +6,19 @@ Pure-Rust, terminal-first Avellaneda-Stoikov dual-bid market maker for Polymarke
 
 | Phase | Scope | Status |
 | :--- | :--- | :--- |
-| Phase 0 | `core-types` and `poly-as doctor` | Complete |
-| Phase 1 | `feeds` and `poly-as feeds` | Complete |
+| Phase 0 | `core-types` and `poly-as doctor` | Complete — tagged `phase-0-complete` |
+| Phase 1 | `feeds` and `poly-as feeds` | Complete — tagged `phase-1-complete` |
 | Phases 2–5 | `math-engine`, `paper-sim`, `risk-lifecycle`, and `execution` | Complete — tagged `phase-2-complete` through `phase-5-complete` |
 
 ## Workspace Crates
 
 - `crates/core-types` — Fixed-point monetary types (`MicroUsdc`, `SharesMicro`), env/secret config, Windows high-resolution clock, and HDR/JSONL telemetry.
 - `crates/feeds` — Gamma market discovery, Binance Spot, Polymarket CLOB, and PolyBolt WebSocket actors with lock-free `rtrb` rings.
-- `crates/cli` — Unified `poly-as` CLI binary (`doctor` and `feeds` subcommands).
+- `crates/math-engine` — Zero-allocation quantitative math engine (Stations 1–6).
+- `crates/paper-sim` — Event-driven FIFO queue-aware paper simulator and replay harness.
+- `crates/risk-lifecycle` — Risk, multi-tier inventory limits, continuous hysteresis, and 300s epoch lifecycle.
+- `crates/execution` — Polymarket CLOB execution, EIP-712 signing, heartbeats, and settlement.
+- `crates/cli` — Unified `poly-as` CLI binary (`doctor`, `feeds`, and the later phase subcommands).
 
 ## Quick Start (PowerShell)
 
