@@ -195,7 +195,7 @@ pub(crate) struct MathOverrides {
     /// Override extreme-probability entry guard in `(0.5, 1.0)` (`0.80` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_prob_override)]
     pub(crate) max_entry_prob: Option<MaxEntryProbOverride>,
-    /// Override upper-only favorite entry price cap in `(0.0, 1.0)` (`off` default; blocks fresh entries strictly above cap while preserving cheap legs and hedges).
+    /// Override upper-only favorite entry price cap in `(0.0, 1.0)` (`0.60` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_price_override)]
     pub(crate) max_entry_price: Option<MaxEntryPriceOverride>,
     /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.015` default).
@@ -1224,6 +1224,7 @@ mod tests {
                 assert!(!cfg.enforce_fee_floor);
                 assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
                 assert_eq!(cfg.max_entry_prob, Some(0.80));
+                assert_eq!(cfg.max_entry_price, Some(0.60));
             }
             _ => panic!("expected Paper"),
         }
@@ -1459,17 +1460,17 @@ mod tests {
         );
 
         let parsed_cap =
-            Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-price", "0.60"]).unwrap();
+            Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-price", "0.65"]).unwrap();
         match parsed_cap.command {
             Commands::Lifecycle { math, .. } => {
                 assert!(math.is_any_set());
                 assert_eq!(
                     math.max_entry_price,
-                    Some(MaxEntryPriceOverride::Value(0.60))
+                    Some(MaxEntryPriceOverride::Value(0.65))
                 );
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
-                assert_eq!(cfg.max_entry_price, Some(0.60));
+                assert_eq!(cfg.max_entry_price, Some(0.65));
             }
             _ => panic!("expected Lifecycle"),
         }

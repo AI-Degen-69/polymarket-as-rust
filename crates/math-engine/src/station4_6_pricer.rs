@@ -25,7 +25,7 @@ pub struct PricerConfig {
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
-    /// Optional upper-only favorite entry price cap in `(0.0, 1.0)` (`None` default; blocks fresh entries strictly above cap while preserving cheap legs and hedges).
+    /// Optional upper-only favorite entry price cap in `(0.0, 1.0)` (`Some(0.60)` default; `None` disables upper cap, blocks fresh entries strictly above cap while preserving cheap legs and hedges).
     pub max_entry_price: Option<f64>,
     /// Asymmetric reducing-leg skew multiplier in `[0.0, 1.0]` (`1.0` default).
     pub hedge_skew_mult: f64,
@@ -44,7 +44,7 @@ impl PricerConfig {
             max_combined_bid_micro: MicroUsdc(980_000),
             max_cross_tick_loss_micro: None,
             max_entry_prob: Some(0.80),
-            max_entry_price: None,
+            max_entry_price: Some(0.60),
             hedge_skew_mult: 1.0,
         }
     }
@@ -834,6 +834,7 @@ mod tests {
         // Disable entry guard for this sub-case so flat tail tick alignment is exercised directly.
         let mut tail_cfg = PricerConfig::try_default().unwrap();
         tail_cfg.max_entry_prob = None;
+        tail_cfg.max_entry_price = None;
         let tail_pricer = DualBidPricer::new(tail_cfg).unwrap();
         let mut inp_tail = make_input(0, 1_000, base_bounds());
         inp_tail.s_i = 0.02;
@@ -993,6 +994,7 @@ mod tests {
         base_cfg.min_spread_ticks = 2;
         base_cfg.max_combined_bid_micro = MicroUsdc(980_000);
         base_cfg.max_cross_tick_loss_micro = None;
+        base_cfg.max_entry_price = None;
 
         // Input with q=+20 (heavy UP), s_i=0.80, v_rem=0.04, gamma=0.15 =>
         // r_i = 0.80 - 20 * 0.15 * 0.04 = 0.68, s* ~ 0.0399 => bid_up=$0.66, bid_dn=$0.30 (or similar).
@@ -1119,6 +1121,7 @@ mod tests {
         cfg.include_variance_spread = false;
         cfg.enforce_fee_floor = false;
         cfg.max_entry_prob = Some(0.85);
+        cfg.max_entry_price = None;
         let pricer = DualBidPricer::new(cfg).unwrap();
 
         // Bounds with wide ask so Post-Only never suppresses $0.91.

@@ -41,7 +41,7 @@ param(
 
     [string[]]$MaxEntryProbs = @("off"),
 
-    [string[]]$MaxEntryPrices = @("off"),
+    [string[]]$MaxEntryPrices = @("0.60"),
 
     [string[]]$LeadLagThresholds = @("0.015"),
 
@@ -161,7 +161,7 @@ if ($parsedHedgeSkews.Count -eq 0 -or $parsedCapTier1.Count -eq 0) {
 }
 $showCrossLoss = @($parsedCrossLosses | Where-Object { $_ -ne "off" }).Count -gt 0
 $showEntryProb = @($parsedMaxEntryProbs | Where-Object { $_ -ne "off" }).Count -gt 0
-$showEntryPrice = @($parsedMaxEntryPrices | Where-Object { $_ -ne "off" }).Count -gt 0
+$showEntryPrice = ($parsedMaxEntryPrices.Count -gt 1) -or (@($parsedMaxEntryPrices | Where-Object { $_ -ne "0.60" }).Count -gt 0)
 $showLLThresh = ($parsedLLThresholds.Count -gt 1) -or (@($parsedLLThresholds | Where-Object { [double]::Parse($_, $inv) -ne 0.015 }).Count -gt 0)
 $showLLWin = ($parsedLLWindows.Count -gt 1) -or (@($parsedLLWindows | Where-Object { $_ -ne 1000 }).Count -gt 0)
 $showLLCd = ($parsedLLCooldowns.Count -gt 1) -or (@($parsedLLCooldowns | Where-Object { $_ -ne 1000 }).Count -gt 0)
@@ -430,15 +430,11 @@ try {
                                         "--cap-tier1-hedge", $capT1,
                                         "--jsonl", $outJsonl
                                     )
-                                    if ($crossLoss -ne "off") {
-                                        $cliArgs += @("--max-cross-tick-loss-micro", $crossLoss)
-                                    }
-                                    if ($entryProb -ne "off") {
-                                        $cliArgs += @("--max-entry-prob", $entryProb)
-                                    }
-                                    if ($entryPrice -ne "off") {
-                                        $cliArgs += @("--max-entry-price", $entryPrice)
-                                    }
+                                    $cliArgs += @(
+                                        "--max-cross-tick-loss-micro", $crossLoss,
+                                        "--max-entry-prob", $entryProb,
+                                        "--max-entry-price", $entryPrice
+                                    )
 
                                     $prevCrossLossEnv = $env:MAX_CROSS_TICK_LOSS_MICRO
                                     $prevEntryProbEnv = $env:MAX_ENTRY_PROB
@@ -627,6 +623,7 @@ try {
                                     $sumNetPlusReb = $sumNetPnl + $sumRebate
                                     $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
                                     $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
+                                    $winRatePct = if ($captures.Count -gt 0) { ($winCaps / $captures.Count) * 100.0 } else { 0.0 }
 
                                     $results.Add([PSCustomObject]@{
                                         Gamma      = $gammaStr
@@ -654,7 +651,7 @@ try {
                                         RPM        = $maxRpm
                                         MO1s       = $avgMo1s.ToString("+0.0;-0.0;+0.0", $inv)
                                         MO5s       = $avgMo5s.ToString("+0.0;-0.0;+0.0", $inv)
-                                        WinCap     = ("{0}/{1}" -f $winCaps, $captures.Count)
+                                        WinRate    = ("{0:F0}%" -f $winRatePct)
                                         NetPnLNum  = $sumNetPnl
                                         CapRuns    = $capRuns
                                     })
@@ -720,7 +717,7 @@ try {
     $cols.Add(@{ Name = "MO1s"; Dash = "-----"; Width = 6; Prop = "MO1s" })
     $cols.Add(@{ Name = "MO5s"; Dash = "-----"; Width = 6; Prop = "MO5s" })
     if ($isMultiCapture) {
-        $cols.Add(@{ Name = "WinCap"; Dash = "------"; Width = 6; Prop = "WinCap" })
+        $cols.Add(@{ Name = "WinRate"; Dash = "-------"; Width = 7; Prop = "WinRate" })
     }
 
     $fmtParts = for ($ci = 0; $ci -lt $cols.Count; $ci++) { "{$ci,$($cols[$ci].Width)}" }
@@ -766,13 +763,14 @@ try {
             $comboDesc = "gamma={0} var={1} min_t={2}" -f $r.Gamma, $r.VarSpr, $r.MinT
             if ($showCrossLoss) { $comboDesc += " xtick=$($r.XTick)" }
             if ($showEntryProb) { $comboDesc += " max_p=$($r.MaxP)" }
+            if ($showEntryPrice) { $comboDesc += " max_px=$($r.MaxPx)" }
             if ($showLLThresh) { $comboDesc += " ll_th=$($r.LLTh)" }
             if ($showLLWin) { $comboDesc += " ll_win=$($r.LLWin)" }
             if ($showLLCd) { $comboDesc += " ll_cd=$($r.LLCd)" }
             if ($showLLDir) { $comboDesc += " ll_dir=$($r.LLDir)" }
             if ($showHedgeSkew) { $comboDesc += " hskew=$($r.HSkew)" }
             if ($showCapTier1) { $comboDesc += " t1cap=$($r.T1Cap)" }
-            $summaryLines.Add(("[{0} | NetPnL={1} Net+Reb={2} WinCap={3}]" -f $comboDesc, $r.NetPnL, $r.NetPlusReb, $r.WinCap))
+            $summaryLines.Add(("[{0} | NetPnL={1} Net+Reb={2} WinRate={3}]" -f $comboDesc, $r.NetPnL, $r.NetPlusReb, $r.WinRate))
             $summaryLines.Add(($capFmt -f "Capture", "Win", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "Net+Reb", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s"))
             foreach ($cr in $r.CapRuns) {
                 $wTag = if ($cr.Windows -gt 0) { "{0}w" -f $cr.Windows } else { "?w" }
