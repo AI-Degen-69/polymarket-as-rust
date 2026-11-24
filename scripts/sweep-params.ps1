@@ -1307,43 +1307,43 @@ try {
 
     # Build Leaderboard Column Metadata
     $cols = [System.Collections.Generic.List[hashtable]]::new()
-    $cols.Add(@{ Name = "Rank";      Dash = "----";      Width = 4;  Prop = "Rank";      Kind = "rank" })
-    $cols.Add(@{ Name = "Gamma";     Dash = "-----";     Width = -6; Prop = "Gamma";     Kind = "param" })
-    $cols.Add(@{ Name = "Var Spread"; Dash = "----------"; Width = -10; Prop = "VarSpr"; Kind = "param" })
-    $cols.Add(@{ Name = "Min Ticks"; Dash = "---------"; Width = 9;  Prop = "MinT";      Kind = "param" })
-    if ($showCrossLoss)  { $cols.Add(@{ Name = "Cross Loss"; Dash = "----------"; Width = 10; Prop = "XTick"; Kind = "param" }) }
-    if ($showEntryProb)  { $cols.Add(@{ Name = "Max Prob";  Dash = "--------";  Width = 8; Prop = "MaxP";  Kind = "param" }) }
-    if ($showEntryPrice) { $cols.Add(@{ Name = "Max Price"; Dash = "---------"; Width = 9; Prop = "MaxPx"; Kind = "param" }) }
-    if ($showLLThresh)   { $cols.Add(@{ Name = "Lead Lag Threshold";  Dash = "------------------"; Width = 18; Prop = "LLTh";  Kind = "param" }) }
-    if ($showLLWin)      { $cols.Add(@{ Name = "Lead Lag Window"; Dash = "---------------"; Width = 15; Prop = "LLWin"; Kind = "param" }) }
-    if ($showLLCd)       { $cols.Add(@{ Name = "Lead Lag Cooldown";  Dash = "-----------------";  Width = 17; Prop = "LLCd";  Kind = "param" }) }
-    if ($showLLDir)      { $cols.Add(@{ Name = "Lead Lag Direction"; Dash = "------------------"; Width = 18; Prop = "LLDir"; Kind = "param" }) }
-    if ($showHedgeSkew)  { $cols.Add(@{ Name = "Hedge Skew"; Dash = "----------"; Width = 10; Prop = "HSkew"; Kind = "param" }) }
-    if ($showCapTier1)   { $cols.Add(@{ Name = "Tier 1 Cap"; Dash = "----------"; Width = 10; Prop = "T1Cap"; Kind = "param" }) }
+    $cols.Add(@{ Name = "Rank";      Width = 4;  Prop = "Rank";      Kind = "rank" })
+    $cols.Add(@{ Name = "Gamma";     Width = -6; Prop = "Gamma";     Kind = "param" })
+    $cols.Add(@{ Name = "Variance";  Width = -8; Prop = "VarSpr";    Kind = "param" })
+    $cols.Add(@{ Name = "Min Ticks"; Width = 9;  Prop = "MinT";      Kind = "param" })
+    if ($showCrossLoss)  { $cols.Add(@{ Name = "Cross Loss";  Width = 10; Prop = "XTick"; Kind = "param" }) }
+    if ($showEntryProb)  { $cols.Add(@{ Name = "Entry Prob";  Width = 10; Prop = "MaxP";  Kind = "param" }) }
+    if ($showEntryPrice) { $cols.Add(@{ Name = "Entry Price"; Width = 11; Prop = "MaxPx"; Kind = "param" }) }
+    if ($showLLThresh)   { $cols.Add(@{ Name = "Threshold";   Width = 9;  Prop = "LLTh";  Kind = "param" }) }
+    if ($showLLWin)      { $cols.Add(@{ Name = "Window Ms";   Width = 9;  Prop = "LLWin"; Kind = "param" }) }
+    if ($showLLCd)       { $cols.Add(@{ Name = "Cooldown Ms"; Width = 11; Prop = "LLCd";  Kind = "param" }) }
+    if ($showLLDir)      { $cols.Add(@{ Name = "Direction";   Width = 9;  Prop = "LLDir"; Kind = "param" }) }
+    if ($showHedgeSkew)  { $cols.Add(@{ Name = "Hedge Skew";  Width = 10; Prop = "HSkew"; Kind = "param" }) }
+    if ($showCapTier1)   { $cols.Add(@{ Name = "Tier 1 Cap";  Width = 10; Prop = "T1Cap"; Kind = "param" }) }
 
-    $cols.Add(@{ Name = "Fills";     Dash = "-----";                  Width = 5;  Prop = "Fills";      NumProp = "Fills";          Kind = "int" })
-    $cols.Add(@{ Name = "Merges";    Dash = "------";                 Width = 6;  Prop = "Merges";     NumProp = "Merges";         Kind = "int" })
-    $cols.Add(@{ Name = "Quantity";  Dash = "--------";               Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
-    $cols.Add(@{ Name = "Pairs";     Dash = "-------";                Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
-    $cols.Add(@{ Name = "Win Rate";  Dash = "--------";               Width = 8;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
-    $cols.Add(@{ Name = "Deployed";  Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
-    $cols.Add(@{ Name = "Return";    Dash = "--------";               Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
-    $cols.Add(@{ Name = "Returned";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
-    $cols.Add(@{ Name = "Gross P&L"; Dash = "--------------------";  Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
-    $cols.Add(@{ Name = "Rebates";   Dash = "---------";              Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
-    $cols.Add(@{ Name = "Fees";      Dash = "---------";              Width = 9;  Prop = "Fees";       NumProp = "FeesNum";        Kind = "fee" })
-    $cols.Add(@{ Name = "Net P&L";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
-    $cols.Add(@{ Name = "Base P&L";  Dash = "--------";               Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
-    $cols.Add(@{ Name = "Alpha Edge"; Dash = "----------";             Width = 10; Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
-    $cols.Add(@{ Name = "Per Minute"; Dash = "----------";            Width = 10; Prop = "RPM";        NumProp = "RPM";            Kind = "rpm" })
-    $cols.Add(@{ Name = "Markout 1s"; Dash = "----------";            Width = 10; Prop = "MO1s";       NumProp = "MO1sNum";        Kind = "markout" })
-    $cols.Add(@{ Name = "Markout 5s"; Dash = "----------";            Width = 10; Prop = "MO5s";       NumProp = "MO5sNum";        Kind = "markout" })
-    $cols.Add(@{ Name = "Verdict";   Dash = "----------";             Width = 10; Prop = "Verdict";    NumProp = "Verdict";          Kind = "verdict" })
+    $cols.Add(@{ Name = "Fills";     Width = 5;  Prop = "Fills";      NumProp = "Fills";          Kind = "int" })
+    $cols.Add(@{ Name = "Merges";    Width = 6;  Prop = "Merges";     NumProp = "Merges";         Kind = "int" })
+    $cols.Add(@{ Name = "Quantity";  Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
+    $cols.Add(@{ Name = "Pairs";     Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
+    $cols.Add(@{ Name = "Win Rate";  Width = 8;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
+    $cols.Add(@{ Name = "Deployed";  Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
+    $cols.Add(@{ Name = "Return";    Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
+    $cols.Add(@{ Name = "Returned";  Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
+    $cols.Add(@{ Name = "Gross P&L"; Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
+    $cols.Add(@{ Name = "Rebates";   Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
+    $cols.Add(@{ Name = "Fees";      Width = 9;  Prop = "Fees";       NumProp = "FeesNum";        Kind = "fee" })
+    $cols.Add(@{ Name = "Net P&L";   Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
+    $cols.Add(@{ Name = "Base P&L";  Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
+    $cols.Add(@{ Name = "Alpha Edge"; Width = 10; Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
+    $cols.Add(@{ Name = "Cancels Per Min"; Width = 15; Prop = "RPM";  NumProp = "RPM";            Kind = "rpm" })
+    $cols.Add(@{ Name = "Markout 1s"; Width = 10; Prop = "MO1s";      NumProp = "MO1sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "Markout 5s"; Width = 10; Prop = "MO5s";      NumProp = "MO5sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "Verdict";   Width = 10; Prop = "Verdict";    NumProp = "Verdict";        Kind = "verdict" })
 
     $fmtParts = for ($ci = 0; $ci -lt $cols.Count; $ci++) { "{$ci,$($cols[$ci].Width)}" }
     $plainRowFmt = $fmtParts -join " "
     $headers = @($cols | ForEach-Object { $_.Name })
-    $dashes = @($cols | ForEach-Object { $_.Dash })
+    $dashes = @($cols | ForEach-Object { "-" * [Math]::Abs($_.Width) })
 
     $summaryPath = Join-Path $sweepDir "summary.txt"
 
@@ -1491,9 +1491,11 @@ try {
     if (-not $isMultiCapture) {
         $plainSummary.Add("NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures (or multi -InputPath) for full walk-forward verdicts.")
     }
-    $vFmt = "{0,4} {1,10} {2,10} {3,9} {4,12} {5,11} {6,9} {7,10}"
+    $vWidths = @(4, 10, 10, 9, 12, 11, 9, 10)
+    $vFmtParts = for ($vi = 0; $vi -lt $vWidths.Count; $vi++) { "{$vi,$($vWidths[$vi])}" }
+    $vFmt = $vFmtParts -join " "
     $vHeaders = @("Rank", "In Sample", "Out Sample", "Retention", "Max Drawdown", "Expiry Drag", "Neighbors", "Verdict")
-    $vDashes = @("----", "----------", "----------", "---------", "------------", "-----------", "---------", "----------")
+    $vDashes = @($vWidths | ForEach-Object { "-" * $_ })
     $plainSummary.Add(($vFmt -f $vHeaders))
     $plainSummary.Add(($vFmt -f $vDashes))
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
