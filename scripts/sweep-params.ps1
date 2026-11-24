@@ -196,6 +196,43 @@ function Format-SignedMarkoutCell {
     }
 }
 
+function Format-SignedPctCell {
+    param(
+        [double]$Ratio,
+        [int]$Width = 8,
+        [bool]$Bold = $false,
+        [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
+    )
+    if ([double]::IsNaN($Ratio) -or [double]::IsInfinity($Ratio)) {
+        return (Format-ColorText -Text ('n/a'.PadLeft($Width)) -Code $AnsiGray)
+    }
+    $raw = $Ratio.ToString('+0.00%;-0.00%;+0.00%', $Culture).PadLeft($Width)
+    if ($Ratio -gt 1e-9) {
+        $code = if ($Bold) { $AnsiBoldGreen } else { $AnsiGreen }
+        return (Format-ColorText -Text $raw -Code $code)
+    } elseif ($Ratio -lt -1e-9) {
+        $code = if ($Bold) { $AnsiBoldRed } else { $AnsiRed }
+        return (Format-ColorText -Text $raw -Code $code)
+    } else {
+        return (Format-ColorText -Text $raw -Code $AnsiGray)
+    }
+}
+
+function Get-TradingRoiRatio {
+    param(
+        [double]$Deployed,
+        [double]$Returned,
+        [double]$FeesPaid
+    )
+    # Single definition of trading ROI: (Returned - Deployed - Fees) / Deployed.
+    # Rebates are a separate income source and are intentionally excluded.
+    # Returns NaN when nothing was deployed (avoids divide-by-zero).
+    if ($Deployed -gt 1e-6) {
+        return (($Returned - $Deployed - $FeesPaid) / $Deployed)
+    }
+    return [double]::NaN
+}
+
 function Format-RebateCell {
     param(
         [double]$Value,
@@ -886,6 +923,7 @@ try {
                                                     $grossPct = if ($volumeIn -gt 1e-6) { ($closeVolume / $volumeIn) - 1.0 } else { [double]::NaN }
                                                     $finalNetUsd = $netPlusReb
                                                     $netPct = if ($volumeIn -gt 1e-6) { $finalNetUsd / $volumeIn } else { [double]::NaN }
+                                                    $roiCap = Get-TradingRoiRatio -Deployed $volumeIn -Returned $closeVolume -FeesPaid $feesPaid
 
                                                     # % Win across windows in this capture
                                                     $winPctCap = [double]::NaN
@@ -916,7 +954,7 @@ try {
                                                     }
 
                                                     # Level 2 Hierarchy: Vertically Aligned & Color-Coded Per-Capture Summary (2 Lines)
-                                                    # Line 1: Activity & Volume (Shares, Pairs, WinRate, Volume-In, Close Volume)
+                                                    # Line 1: Activity & Volume (Shares, Pairs, WinRate, Deployed, Returned, ROI)
                                                     # Line 2: P&L Waterfall (Gross P&L -> Rebates -> Fees -> Net P&L)
                                                     $treeBranch1  = Format-ColorText -Text "     ├─" -Code $AnsiGray
                                                     $treeBranch2  = Format-ColorText -Text "     └─" -Code $AnsiGray
@@ -927,8 +965,9 @@ try {
                                                     $qtyCell      = ("Quantity: {0,7:F2}" -f $qtyBought)
                                                     $pairsCell    = ("Pairs: {0,7:F2}" -f $pairs)
                                                     $winRateCell  = "% Win: " + (Format-WinRateCell -Pct $winPctCap -Width 4 -Bold $false -Culture $inv)
-                                                    $volInCell    = "Volume-In: " + ("`${0:F2}" -f $volumeIn).PadLeft(9)
-                                                    $closeVolCell = "Close Volume: " + ("`${0:F2}" -f $closeVolume).PadLeft(9)
+                                                    $volInCell    = "Deployed: " + ("`${0:F2}" -f $volumeIn).PadLeft(9)
+                                                    $closeVolCell = "Returned: " + ("`${0:F2}" -f $closeVolume).PadLeft(9)
+                                                    $roiCell      = "ROI: " + (Format-SignedPctCell -Ratio $roiCap -Width 8 -Bold $false -Culture $inv)
 
                                                     $pnlLabelCell = (Format-ColorText -Text "P&L Breakdown" -Code $AnsiGray).PadRight(13)
                                                     $grossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $grossPnl -Pct $grossPct -Width 20 -Bold $false -IncludeDollar $true -Culture $inv)
@@ -937,8 +976,8 @@ try {
                                                     $netCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $finalNetUsd -Pct $netPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
 
                                                     # Line 1: Activity & Volume
-                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}" -f `
-                                                        $treeBranch1, $doneCell, $sepBar, $qtyCell, $pairsCell, $winRateCell, $volInCell, $closeVolCell)
+                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
+                                                        $treeBranch1, $doneCell, $sepBar, $qtyCell, $pairsCell, $winRateCell, $volInCell, $closeVolCell, $roiCell)
 
                                                     # Line 2: P&L Accounting Waterfall
                                                     Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
@@ -1017,6 +1056,8 @@ try {
                                                 $sumNetPlusReb = $sumNetPnl + $sumRebate
                                                 $sumGrossPct = if ($sumVolIn -gt 1e-6) { ($sumCloseVol / $sumVolIn) - 1.0 } else { [double]::NaN }
                                                 $sumNetPct = if ($sumVolIn -gt 1e-6) { $sumNetPlusReb / $sumVolIn } else { [double]::NaN }
+                                                $sumRoi = Get-TradingRoiRatio -Deployed $sumVolIn -Returned $sumCloseVol -FeesPaid $sumFeesPaid
+                                                $roiPlain = if ([double]::IsNaN($sumRoi)) { 'n/a' } else { $sumRoi.ToString('+0.00%;-0.00%;+0.00%', $inv) }
                                                 $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
                                                 $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
                                                 $winRatePct = if ($captures.Count -gt 0) { ($winCaps / $captures.Count) * 100.0 } else { 0.0 }
@@ -1030,8 +1071,9 @@ try {
                                                 $subQtyCell      = ("Quantity: {0,7:F2}" -f $sumQty)
                                                 $subPairsCell    = ("Pairs: {0,7:F2}" -f $sumPairs)
                                                 $subWinRateCell  = "% Win: " + (Format-WinRateCell -Pct $winRatePct -Width 4 -Bold $true -Culture $inv)
-                                                $subVolInCell    = "Volume-In: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
-                                                $subCloseVolCell = "Close Volume: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
+                                                $subVolInCell    = "Deployed: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
+                                                $subCloseVolCell = "Returned: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
+                                                $subRoiCell        = "ROI: " + (Format-SignedPctCell -Ratio $sumRoi -Width 8 -Bold $true -Culture $inv)
 
                                                 $subPnlLabelCell = Format-ColorText -Text ("P&L Subtotal".PadRight(13)) -Code $AnsiBoldCyan
                                                 $subGrossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $sumGrossPnl -Pct $sumGrossPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
@@ -1042,8 +1084,8 @@ try {
                                                 Write-Host ""
                                                 Write-Host $subHeader
                                                 # Line 1: Activity & Volume
-                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}" -f `
-                                                    $treeBranch1, $subDoneCell, $sepBar, $subQtyCell, $subPairsCell, $subWinRateCell, $subVolInCell, $subCloseVolCell)
+                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
+                                                    $treeBranch1, $subDoneCell, $sepBar, $subQtyCell, $subPairsCell, $subWinRateCell, $subVolInCell, $subCloseVolCell, $subRoiCell)
                                                 # Line 2: P&L Accounting Waterfall
                                                 Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
                                                     $treeBranch2, $subPnlLabelCell, $sepBar, $subGrossCell, $subRebateCell, $subFeesCell, $arrowSep, $subNetCell)
@@ -1080,6 +1122,8 @@ try {
                                                     VolumeIn      = ("`$" + $sumVolIn.ToString("F2", $inv))
                                                     CloseVolumeNum = $sumCloseVol
                                                     CloseVol      = ("`$" + $sumCloseVol.ToString("F2", $inv))
+                                                    RoiNum        = $sumRoi
+                                                    Roi           = $roiPlain
                                                     RealizedNum   = $sumRealized
                                                     Realized      = $sumRealized.ToString("+0.0000;-0.0000;+0.0000", $inv)
                                                     UnrealNum     = $sumUnreal
@@ -1152,17 +1196,18 @@ try {
 
     $cols.Add(@{ Name = "Fills";     Dash = "-----";                  Width = 5;  Prop = "Fills";      NumProp = "Fills";          Kind = "int" })
     $cols.Add(@{ Name = "Merges";    Dash = "------";                 Width = 6;  Prop = "Merges";     NumProp = "Merges";         Kind = "int" })
-    $cols.Add(@{ Name = "Qty";       Dash = "--------";               Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
+    $cols.Add(@{ Name = "Quantity";  Dash = "--------";               Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
     $cols.Add(@{ Name = "Pairs";     Dash = "-------";                Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
-    $cols.Add(@{ Name = "WinRate";   Dash = "-------";                Width = 7;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
-    $cols.Add(@{ Name = "Vol-In";    Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
-    $cols.Add(@{ Name = "CloseVol";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
-    $cols.Add(@{ Name = "Gross";     Dash = "--------------------";  Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
-    $cols.Add(@{ Name = "Rebate";    Dash = "---------";              Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
+    $cols.Add(@{ Name = "Win Rate";  Dash = "--------";               Width = 8;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
+    $cols.Add(@{ Name = "Deployed";  Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
+    $cols.Add(@{ Name = "ROI";       Dash = "--------";               Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
+    $cols.Add(@{ Name = "Returned";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
+    $cols.Add(@{ Name = "Gross P&L"; Dash = "--------------------";  Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
+    $cols.Add(@{ Name = "Rebates";   Dash = "---------";              Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
     $cols.Add(@{ Name = "Fees";      Dash = "---------";              Width = 9;  Prop = "Fees";       NumProp = "FeesNum";        Kind = "fee" })
-    $cols.Add(@{ Name = "Net+Reb";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
-    $cols.Add(@{ Name = "BasePnL";   Dash = "--------";               Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
-    $cols.Add(@{ Name = "AlphaEdge"; Dash = "---------";              Width = 9;  Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
+    $cols.Add(@{ Name = "Net P&L";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
+    $cols.Add(@{ Name = "Base P&L";  Dash = "--------";               Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
+    $cols.Add(@{ Name = "Alpha Edge"; Dash = "----------";             Width = 10; Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
     $cols.Add(@{ Name = "RPM";       Dash = "---";                    Width = 4;  Prop = "RPM";        NumProp = "RPM";            Kind = "rpm" })
     $cols.Add(@{ Name = "MO1s";      Dash = "-----";                  Width = 6;  Prop = "MO1s";       NumProp = "MO1sNum";        Kind = "markout" })
     $cols.Add(@{ Name = "MO5s";      Dash = "-----";                  Width = 6;  Prop = "MO5s";       NumProp = "MO5sNum";        Kind = "markout" })
@@ -1255,6 +1300,13 @@ try {
                 "markout" {
                     if ($Colorize) {
                         $cells.Add((Format-SignedMarkoutCell -Value ([double]$Row.($col.NumProp)) -Width $w -Bold $false -Culture $inv))
+                    } else {
+                        $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
+                    }
+                }
+                "roi" {
+                    if ($Colorize) {
+                        $cells.Add((Format-SignedPctCell -Ratio ([double]$Row.($col.NumProp)) -Width $w -Bold $false -Culture $inv))
                     } else {
                         $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
                     }

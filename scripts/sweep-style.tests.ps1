@@ -70,6 +70,30 @@ try {
     Assert-True ((Format-RebateCell -Value 0.0 -Width 7).Contains("$esc[90m")) "zero rebate is muted"
     Assert-True ((Format-RebateCell -Value -0.42 -Width 7).Contains("$esc[31m")) "negative rebate is red"
 
+    # --- Signed percent cells (ROI) ----------------------------------------
+    $pctPos = Format-SignedPctCell -Ratio 0.0155 -Width 8
+    Assert-True ((Get-VisibleText $pctPos) -eq '  +1.55%') "positive pct shows +1.55%"
+    Assert-True ((Get-VisibleText $pctPos).Length -eq 8) "pct cell width is 8"
+    Assert-True ($pctPos.Contains("$esc[32m")) "positive pct is green"
+    $pctNeg = Format-SignedPctCell -Ratio -0.0044 -Width 8
+    Assert-True ((Get-VisibleText $pctNeg) -eq '  -0.44%') "negative pct shows -0.44%"
+    Assert-True ($pctNeg.Contains("$esc[31m")) "negative pct is red"
+    $pctZero = Format-SignedPctCell -Ratio 0.0 -Width 8
+    Assert-True ($pctZero.Contains("$esc[90m")) "zero pct is muted"
+    $pctNaN = Format-SignedPctCell -Ratio ([double]::NaN) -Width 8
+    Assert-True ((Get-VisibleText $pctNaN) -eq '     n/a') "NaN pct renders n/a"
+    Assert-True ($pctNaN.Contains("$esc[90m")) "NaN pct is muted"
+
+    # --- Trading ROI ratio (single definition) -----------------------------
+    $roiBasic = Get-TradingRoiRatio -Deployed 1000.0 -Returned 1020.0 -FeesPaid 5.0
+    Assert-True ($roiBasic -eq 0.015) "ROI deducts fees: (1020-1000-5)/1000"
+    $roiNeg = Get-TradingRoiRatio -Deployed 1000.0 -Returned 990.0 -FeesPaid 5.0
+    Assert-True ($roiNeg -eq -0.015) "ROI goes negative when trading loses"
+    $roiEmpty = Get-TradingRoiRatio -Deployed 0.0 -Returned 0.0 -FeesPaid 0.0
+    Assert-True ([double]::IsNaN($roiEmpty)) "ROI is NaN when nothing deployed"
+    $roiSample = Get-TradingRoiRatio -Deployed 523.10 -Returned 531.25 -FeesPaid 0.41
+    Assert-True ([Math]::Abs($roiSample - 0.014797) -lt 1e-6) "ROI matches the leaderboard sample figure"
+
     # --- Fee cells & Dollar formatting ----------------------------------
     $zeroFee = Format-FeeCell -FeePaidPositive 0.0 -Width 9 -IncludeDollar $true
     Assert-True ((Get-VisibleText $zeroFee) -eq " -`$0.0000") "zero fee has single minus and dollar sign"
