@@ -1739,7 +1739,7 @@ impl LivePaperSimulator {
                         print_lifecycle_flatten(
                             now_ms,
                             tau_secs,
-                            self.current_tier,
+                            r_trace.map_or(self.current_tier, |trace| trace.tier),
                             outcome,
                             side,
                             price,
