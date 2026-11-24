@@ -559,7 +559,6 @@ try {
             $matchedFiles = @(Get-ChildItem -LiteralPath $capturesDir -Filter "*.jsonl" -File |
                 Where-Object {
                     -not $_.Name.EndsWith(".inprogress.jsonl", [System.StringComparison]::OrdinalIgnoreCase) -and
-                    -not $_.Name.StartsWith("polybacktest_", [System.StringComparison]::OrdinalIgnoreCase) -and
                     $_.Name -match '_(\d+)w\.jsonl$' -and
                     [int]$Matches[1] -ge $MinWindows
                 } |
