@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Offline parameter sweep runner over recorded Polymarket feed captures.
 .DESCRIPTION
@@ -897,22 +897,34 @@ try {
                                                         }
                                                     }
 
-                                                    # Level 2 Hierarchy: Vertically Aligned & Color-Coded Per-Capture Summary Line
-                                                    $treeBranch   = Format-ColorText -Text "     └─" -Code $AnsiGray
+                                                    # Level 2 Hierarchy: Vertically Aligned & Color-Coded Per-Capture Summary (2 Lines)
+                                                    # Line 1: Activity & Volume (Shares, Pairs, WinRate, Volume-In, Close Volume)
+                                                    # Line 2: P&L Waterfall (Gross P&L -> Rebates -> Fees -> Net P&L)
+                                                    $treeBranch1  = Format-ColorText -Text "     ├─" -Code $AnsiGray
+                                                    $treeBranch2  = Format-ColorText -Text "     └─" -Code $AnsiGray
                                                     $sepBar       = Format-ColorText -Text " | " -Code $AnsiGray
+                                                    $arrowSep     = Format-ColorText -Text "  ->  " -Code $AnsiGray
+
                                                     $doneCell     = ("Done ({0,5:F2}s)" -f $capElapsedSec).PadRight(13)
                                                     $qtyCell      = ("Quantity: {0,7:F2}" -f $qtyBought)
                                                     $pairsCell    = ("Pairs: {0,7:F2}" -f $pairs)
                                                     $winRateCell  = "% Win: " + (Format-WinRateCell -Pct $winPctCap -Width 4 -Bold $false -Culture $inv)
                                                     $volInCell    = ("Volume-In: {0,8:F2}" -f $volumeIn)
                                                     $closeVolCell = ("Close Volume: {0,8:F2}" -f $closeVolume)
+
+                                                    $pnlLabelCell = (Format-ColorText -Text "P&L Breakdown" -Code $AnsiGray).PadRight(13)
                                                     $grossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $grossPnl -Pct $grossPct -Width 18 -Bold $false -Culture $inv)
                                                     $rebateCell   = "Rebates: " + (Format-RebateCell -Value $rebate -Width 7 -Bold $false -Culture $inv)
                                                     $feesCell     = "Fees: " + (Format-FeeCell -FeePaidPositive $feesPaid -Width 8 -Bold $false -Culture $inv)
                                                     $netCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $finalNetUsd -Pct $netPct -Width 18 -Bold $true -Culture $inv)
 
-                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}{2}{9}{2}{10}{2}{11}" -f `
-                                                        $treeBranch, $doneCell, $sepBar, $qtyCell, $pairsCell, $winRateCell, $volInCell, $closeVolCell, $grossCell, $rebateCell, $feesCell, $netCell)
+                                                    # Line 1: Activity & Volume
+                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}" -f `
+                                                        $treeBranch1, $doneCell, $sepBar, $qtyCell, $pairsCell, $winRateCell, $volInCell, $closeVolCell)
+
+                                                    # Line 2: P&L Accounting Waterfall
+                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
+                                                        $treeBranch2, $pnlLabelCell, $sepBar, $grossCell, $rebateCell, $feesCell, $arrowSep, $netCell)
 
                                                     $capRuns.Add([PSCustomObject]@{
                                                         CaptureName    = $cap.Name
