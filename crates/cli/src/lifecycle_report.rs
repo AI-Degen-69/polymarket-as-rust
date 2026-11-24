@@ -356,7 +356,7 @@ pub(crate) fn print_lifecycle_header(
     println!(
         "{}",
         t.banner(
-            "POLY-AS PHASE 4 :: RISK & 300s LIFECYCLE ACTORS",
+            "POLY-AS RISK & LIFECYCLE :: 300s EPOCH ENGINE",
             Some(&format!("Source: {source}  |  Display: {display_label}"))
         )
     );

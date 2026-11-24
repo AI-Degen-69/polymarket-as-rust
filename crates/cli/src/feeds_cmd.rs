@@ -499,11 +499,12 @@ async fn maybe_rollover_capture(
         println!();
     }
     println!(
-        "  [{}] {} Window {} -> Window {} | {} -> {} (window #{win_num})",
+        "\n  [{}] {} Window {} -> Window {} {} {} -> {} (window #{win_num})\n",
         crate::theme::current().muted(&now_local),
         crate::theme::current().badge(crate::theme::Badge::Window),
         rollover.rollovers,
         win_num,
+        crate::theme::current().bar(),
         crate::theme::current().muted(&old_w),
         crate::theme::current().cyan(&new_w)
     );

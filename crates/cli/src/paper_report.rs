@@ -119,10 +119,7 @@ pub(crate) fn print_paper_header(
     println!();
     println!(
         "{}",
-        t.banner(
-            &format!("POLY-AS PHASE 3 :: FIFO PAPER SIMULATOR ({source})"),
-            None
-        )
+        t.banner(&format!("POLY-AS FIFO PAPER SIMULATOR ({source})"), None)
     );
     println!(
         "{}",
@@ -359,10 +356,7 @@ pub(crate) fn print_summary_table(disp: &PaperSummaryDisplay<'_>) {
     let edge_pnl = net_pnl - disp.baseline_pnl;
 
     println!();
-    println!(
-        "{}",
-        t.banner("PHASE 3 PAPER SIMULATOR ROLLING SUMMARY", None)
-    );
+    println!("{}", t.banner("FIFO PAPER SIMULATOR ROLLING SUMMARY", None));
     println!("{}", t.section("INVENTORY & PNL"));
     println!(
         "{}",

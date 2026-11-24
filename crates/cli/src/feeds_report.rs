@@ -124,7 +124,7 @@ pub(crate) fn print_header_and_market(
     println!(
         "{}",
         t.banner(
-            "POLY-AS PHASE 1 FEEDS :: DISCOVERY, L2 BOOK & WS INGESTION TRACE",
+            "POLY-AS FEEDS & CAPTURE :: MARKET DISCOVERY, L2 BOOK & WS TELEMETRY",
             None
         )
     );
@@ -165,20 +165,6 @@ pub(crate) fn print_header_and_market(
         t.kv(
             "Asset Up / Down:",
             &format!("{asset_up_trunc} (Up) / {asset_dn_trunc} (Down) [ERC-1155 tokens]")
-        )
-    );
-
-    let tick_f64 = (desc.tick_size_micro.0 as f64) / 1_000_000.0;
-    let min_size_f64 = (desc.min_order_size_micro.0 as f64) / 1_000_000.0;
-    let fee_rate_f64 = (desc.fee_schedule.fee_rate_e6 as f64) / 1_000_000.0;
-    println!(
-        "{}",
-        t.kv(
-            "Params & Fees:",
-            &format!(
-                "tick=${:.2} | min_size={:.2} | feeRate={:.2} | taker_delay={}ms",
-                tick_f64, min_size_f64, fee_rate_f64, desc.taker_delay_ms
-            )
         )
     );
 
@@ -257,57 +243,43 @@ pub(crate) fn format_feeds_progress_line(
     let expiry_local = format_local_hms(desc.expiry_ts_ms);
 
     let win_str = match max_windows {
-        Some(max) => format!("Win {window_idx}/{max}"),
-        None => format!("Win #{window_idx}"),
+        Some(max) => format!("Win {:>2}/{:<2}", window_idx, max),
+        None => format!("Win #{:>3}", window_idx),
     };
 
     let clob_ev = data.poly_books + data.poly_price_changes + data.poly_trades + data.poly_bba;
     let bin_ev = data.binance_tickers + data.binance_trades;
 
-    let bbo_str = match (&data.latest_up_book, &data.latest_dn_book) {
-        (Some(up), Some(dn)) => {
-            let up_bid = up.bids_slice().first().map(|l| l.price);
-            let up_ask = up.asks_slice().first().map(|l| l.price);
-            let dn_bid = dn.bids_slice().first().map(|l| l.price);
-            let dn_ask = dn.asks_slice().first().map(|l| l.price);
-            format!(
-                "Up {}/{} · Dn {}/{}",
-                Theme::fmt_cents(up_bid),
-                Theme::fmt_cents(up_ask),
-                Theme::fmt_cents(dn_bid),
-                Theme::fmt_cents(dn_ask),
-            )
-        }
-        (Some(up), None) => {
-            let up_bid = up.bids_slice().first().map(|l| l.price);
-            let up_ask = up.asks_slice().first().map(|l| l.price);
-            format!(
-                "Up {}/{} · Dn --/--",
-                Theme::fmt_cents(up_bid),
-                Theme::fmt_cents(up_ask)
-            )
-        }
-        (None, Some(dn)) => {
-            let dn_bid = dn.bids_slice().first().map(|l| l.price);
-            let dn_ask = dn.asks_slice().first().map(|l| l.price);
-            format!(
-                "Up --/-- · Dn {}/{}",
-                Theme::fmt_cents(dn_bid),
-                Theme::fmt_cents(dn_ask)
-            )
-        }
-        _ => "BBO: --/--".to_string(),
+    let bbo_str = {
+        let (up_bid, up_ask) = match &data.latest_up_book {
+            Some(up) => (
+                Theme::fmt_cents(up.bids_slice().first().map(|l| l.price)),
+                Theme::fmt_cents(up.asks_slice().first().map(|l| l.price)),
+            ),
+            None => ("--".to_string(), "--".to_string()),
+        };
+        let (dn_bid, dn_ask) = match &data.latest_dn_book {
+            Some(dn) => (
+                Theme::fmt_cents(dn.bids_slice().first().map(|l| l.price)),
+                Theme::fmt_cents(dn.asks_slice().first().map(|l| l.price)),
+            ),
+            None => ("--".to_string(), "--".to_string()),
+        };
+        format!(
+            "Up {:>5}/{:<5} · Dn {:>5}/{:<5}",
+            up_bid, up_ask, dn_bid, dn_ask
+        )
     };
 
     let btc_str = match data.latest_binance_px_e8 {
-        Some(px) => format!("BTC ${:.2}", (px as f64) / 1e8),
-        None => "BTC --".to_string(),
+        Some(px) => format!("BTC ${:>8.2}", (px as f64) / 1e8),
+        None => format!("{:>13}", "BTC --"),
     };
 
     format!(
-        "  {} [{}] {} (ends {}, {:>3}s left) {} CLOB: {:>5} {} Bin: {:>5} {} {} {} {}",
-        t.badge(Badge::Live),
+        "  [{}] {}  {} (ends {}, {:>3}s left) {} CLOB: {:>8} {} Bin: {:>7} {} {} {} {}",
         t.muted(&now_local),
+        t.badge(Badge::Live),
         t.cyan(&win_str),
         expiry_local,
         rem_s,
@@ -1559,9 +1531,11 @@ mod tests {
 
         let line = format_feeds_progress_line(Theme::plain(), 1_100_000, &desc, 1, Some(3), &data);
         assert!(line.contains("[LIVE]"));
-        assert!(line.contains("Win 1/3"));
-        assert!(line.contains("CLOB:    10"));
-        assert!(line.contains("Bin:    25"));
+        assert!(line.starts_with("  ["));
+        assert!(line.contains("] [LIVE]"));
+        assert!(line.contains("Win  1/3"));
+        assert!(line.contains("CLOB:       10"));
+        assert!(line.contains("Bin:      25"));
         assert!(line.contains("BTC $98450.50"));
     }
 }

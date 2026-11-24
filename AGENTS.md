@@ -104,3 +104,12 @@ Every engine calibration touches five files. Edit all five in one change, or the
 ## 8. Windows Grep Alternation
 
 On Windows, `rtk grep "a\|b"` returns exit 1 and needs a retry. Use PowerShell `Select-String -Pattern "a\|b"` (or `rtk rg`) for alternation patterns in files.
+
+## 9. Terminal Output Alignment & Fixed-Width Contract
+
+All live progress tickers, status lines, and multi-line console output must follow strict static column alignment:
+- **Left-Aligned Timestamps**: Pin timestamps to the far left of the row (`[{local_time}]`).
+- **Equal Badge Widths**: Pad badges to equal visual width so following columns align (e.g., `[LIVE]  ` and `[WINDOW]` both occupy 8 columns).
+- **Fixed-Width Numeric Columns**: Use explicit format widths for all counters, window identifiers, and financial figures (e.g., `Win {:>2}/{:<2}`, `CLOB: {:>8}`, `Bin: {:>7}`, `BTC ${:>8.2}`) to prevent horizontal jitter as numbers grow.
+- **Fixed-Width Sub-Elements**: Pad composite fields such as bid/ask quotes (`Up {:>5}/{:<5} · Dn {:>5}/{:<5}`) to fixed width so delimiters (`│`) remain vertically aligned across ticks.
+- **Visual Breathing Room**: Insert clean blank lines before and after window transitions to visually segment distinct phases and windows.
