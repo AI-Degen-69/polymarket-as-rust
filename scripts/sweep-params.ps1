@@ -300,59 +300,83 @@ function Format-WinRateCell {
     }
 }
 
-function Format-GateMoneyCell {
-    param(
-        [double]$Value,
-        [bool]$Pass,
-        [bool]$IsNA,
-        [int]$Width = 10,
-        [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
-    )
-    if ($IsNA) {
-        return (Format-ColorText -Text ('n/a'.PadLeft($Width)) -Code $AnsiGray)
-    }
-    $sign = if ($Value -gt 1e-9) { "+" } elseif ($Value -lt -1e-9) { "-" } else { "+" }
-    $raw = ("{0}`${1}" -f $sign, [Math]::Abs($Value).ToString("0.00", $Culture)).PadLeft($Width)
-    if ($Pass) {
-        return (Format-ColorText -Text $raw -Code $AnsiGreen)
-    } else {
-        return (Format-ColorText -Text $raw -Code $AnsiBoldRed)
-    }
+function Format-GateCell {
+    param([string]$RawText, [bool]$Pass, [bool]$IsNA, [int]$Width = 10)
+    if ($IsNA) { return (Format-ColorText -Text ('n/a'.PadLeft($Width)) -Code $AnsiGray) }
+    $code = if ($Pass) { $AnsiGreen } else { $AnsiBoldRed }
+    return (Format-ColorText -Text $RawText.PadLeft($Width) -Code $code)
 }
 
-function Format-GatePctCell {
-    param(
-        [double]$Pct,
-        [bool]$Pass,
-        [bool]$IsNA,
-        [int]$Width = 7,
-        [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
-    )
-    if ($IsNA) {
-        return (Format-ColorText -Text ('n/a'.PadLeft($Width)) -Code $AnsiGray)
-    }
-    $raw = ("{0:F0}%" -f $Pct).PadLeft($Width)
-    if ($Pass) {
-        return (Format-ColorText -Text $raw -Code $AnsiGreen)
-    } else {
-        return (Format-ColorText -Text $raw -Code $AnsiBoldRed)
-    }
+function Format-GateMoneyText {
+    param([double]$Value, [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture)
+    $sign = if ($Value -lt -1e-9) { "-" } else { "+" }
+    return ("{0}`${1}" -f $sign, [Math]::Abs($Value).ToString("0.00", $Culture))
 }
 
 function Format-VerdictCell {
-    param(
-        [string]$Verdict,
-        [int]$Width = 10
-    )
+    param([string]$Verdict, [int]$Width = 10)
     $raw = $Verdict.PadLeft($Width)
-    if ($Verdict -eq "APPROVED") {
-        return (Format-ColorText -Text $raw -Code $AnsiBoldGreen)
-    } elseif ($Verdict -like "FAIL*") {
-        return (Format-ColorText -Text $raw -Code $AnsiBoldRed)
-    } elseif ($Verdict -like "NEEDS-*") {
-        return (Format-ColorText -Text $raw -Code $AnsiBoldYellow)
-    } else {
-        return (Format-ColorText -Text $raw -Code $AnsiGray)
+    $code = switch -Wildcard ($Verdict) { "APPROVED" { $AnsiBoldGreen; break } "FAIL*" { $AnsiBoldRed; break } "NEEDS-*" { $AnsiBoldYellow; break } default { $AnsiGray } }
+    return (Format-ColorText -Text $raw -Code $code)
+}
+
+function Get-SurvivalInputs {
+    param($CapRuns, [int]$TotalWindows, [bool]$IsMultiCapture, [int]$CaptureCount, [double]$SumVolIn, [double]$SumGross, [double]$SumSettle, [double]$SumUnreal)
+    $out = @{ IS = [double]::NaN; OOS = [double]::NaN; Retain = [double]::NaN; MaxDD = [double]::NaN; Drag = 0.0; ISWin = 0; OOSWin = 0 }
+    if ($IsMultiCapture -and $CaptureCount -ge 2 -and $TotalWindows -ge 4) {
+        $isTarget = [int][Math]::Floor($TotalWindows * 0.7)
+        $cumW = 0; $isAcc = 0.0; $oosAcc = 0.0
+        foreach ($c in $CapRuns) {
+            $w = [int]$c.Windows
+            if (($cumW + $w) -le $isTarget) { $isAcc += $c.NetPlusRebNum }
+            elseif ($cumW -ge $isTarget) { $oosAcc += $c.NetPlusRebNum }
+            else {
+                $perW = $c.NetPlusRebNum / [Math]::Max(1, $w)
+                $isAcc += $perW * ($isTarget - $cumW); $oosAcc += $perW * ($w - ($isTarget - $cumW))
+            }
+            $cumW += $w
+        }
+        $out.IS = $isAcc; $out.OOS = $oosAcc; $out.ISWin = $isTarget; $out.OOSWin = $TotalWindows - $isTarget
+        if ($isAcc -gt 1e-9) { $out.Retain = ($oosAcc / $isAcc) * 100.0 }
+        elseif ($oosAcc -gt 1e-9) { $out.Retain = [double]::PositiveInfinity }
+    }
+    if ($CapRuns.Count -ge 2) {
+        $peak = 0.0; $maxDD = 0.0; $eq = 0.0
+        foreach ($c in $CapRuns) { $eq += $c.NetPlusRebNum; if ($eq -gt $peak) { $peak = $eq }; $maxDD = [Math]::Max($maxDD, $peak - $eq) }
+        $out.MaxDD = ($maxDD / [Math]::Max($SumVolIn, 1.0)) * 100.0
+    }
+    $loss = [Math]::Max(0.0, -($SumSettle + [Math]::Min($SumUnreal, 0.0)))
+    $gains = [Math]::Max($SumGross, 0.0)
+    if ($gains -gt 1e-9) { $out.Drag = ($loss / $gains) * 100.0 }
+    elseif ($loss -gt 1e-9) { $out.Drag = 100.0 }
+    return $out
+}
+
+function Update-SurvivalVerdicts {
+    param($Sorted)
+    $axes = @("Gamma", "VarSpr", "MinT", "XTick", "MaxP", "MaxPx", "LLTh", "LLWin", "LLCd", "LLDir", "HSkew", "T1Cap")
+    foreach ($grow in $Sorted) {
+        $tot = 0; $prof = 0
+        if ($Sorted.Count -gt 1) {
+            foreach ($other in $Sorted) {
+                if ($other -eq $grow) { continue }
+                $diffs = 0; foreach ($ax in $axes) { if ([string]$other.$ax -ne [string]$grow.$ax) { $diffs++ } }
+                if ($diffs -eq 1) { $tot++; if ([double]$other.NetPlusRebNum -gt 0.0) { $prof++ } }
+            }
+        }
+        $grow.NbrNum = if ($tot -gt 0) { ($prof / $tot) * 100.0 } else { [double]::NaN }
+        $grow.G1 = if ([double]::IsNaN($grow.ISNum)) { "N/A" } elseif ($grow.ISNum -gt 0.0) { "PASS" } else { "FAIL" }
+        $grow.G2 = if ([double]::IsNaN($grow.OOSNum)) { "N/A" } elseif ($grow.OOSNum -gt 0.0) { "PASS" } else { "FAIL" }
+        $grow.G3 = if ([double]::IsNaN($grow.RetainNum) -or [double]::IsInfinity($grow.RetainNum)) { "N/A" } elseif ($grow.RetainNum -ge 40.0) { "PASS" } else { "FAIL" }
+        $grow.G4 = if ([double]::IsNaN($grow.MaxDDNum)) { "N/A" } elseif ($grow.MaxDDNum -le 25.0) { "PASS" } else { "FAIL" }
+        $grow.G5 = if ($grow.DragNum -le 30.0) { "PASS" } else { "FAIL" }
+        $grow.G6 = if ([double]::IsNaN($grow.NbrNum)) { "N/A" } elseif ($grow.NbrNum -ge 60.0) { "PASS" } else { "FAIL" }
+        $failGate = ""
+        foreach ($g in @("G1", "G2", "G3", "G4", "G5", "G6")) { if ($grow.$g -eq "FAIL") { $failGate = $g; break } }
+        if ($failGate -ne "") { $grow.Verdict = "FAIL($failGate)" }
+        elseif ($grow.G1 -eq "N/A" -or $grow.G2 -eq "N/A" -or $grow.G3 -eq "N/A") { $grow.Verdict = "NEEDS-OOS" }
+        elseif ($grow.G4 -eq "N/A" -or $grow.G6 -eq "N/A") { $grow.Verdict = "N/A" }
+        else { $grow.Verdict = "APPROVED" }
     }
 }
 
@@ -1124,60 +1148,10 @@ try {
                                                     if ($c.NetPlusRebNum -gt 0.0) { $winCaps++ }
                                                 }
 
-                                                # ---- Verification inputs: 70/30 IS/OOS split by windows (capture-level walk-forward) ----
-                                                $isNet = [double]::NaN
-                                                $oosNet = [double]::NaN
-                                                $retainPct = [double]::NaN
-                                                $isWindows = 0
-                                                $oosWindows = 0
-                                                if ($isMultiCapture -and $captures.Count -ge 2 -and $totalWindows -ge 4) {
-                                                    $isTarget = [int][Math]::Floor($totalWindows * 0.7)
-                                                    $cumW = 0
-                                                    $isAcc = 0.0
-                                                    $oosAcc = 0.0
-                                                    foreach ($c in $capRuns) {
-                                                        $w = [int]$c.Windows
-                                                        if (($cumW + $w) -le $isTarget) { $isAcc += $c.NetPlusRebNum }
-                                                        elseif ($cumW -ge $isTarget) { $oosAcc += $c.NetPlusRebNum }
-                                                        else {
-                                                            $isPart = $isTarget - $cumW
-                                                            $oosPart = $w - $isPart
-                                                            $perW = $c.NetPlusRebNum / [Math]::Max(1, $w)
-                                                            $isAcc += $perW * $isPart
-                                                            $oosAcc += $perW * $oosPart
-                                                        }
-                                                        $cumW += $w
-                                                    }
-                                                    $isNet = $isAcc
-                                                    $oosNet = $oosAcc
-                                                    $isWindows = $isTarget
-                                                    $oosWindows = $totalWindows - $isTarget
-                                                    if ($isNet -gt 1e-9) { $retainPct = ($oosNet / $isNet) * 100.0 }
-                                                    elseif ($oosNet -gt 1e-9) { $retainPct = [double]::PositiveInfinity }
-                                                }
-
-                                                # ---- Verification inputs: capture-level MaxDD proxy on cumulative Net+Reb ----
-                                                $maxDDPct = [double]::NaN
-                                                if ($capRuns.Count -ge 2) {
-                                                    $peak = 0.0
-                                                    $maxDD = 0.0
-                                                    $runEq = 0.0
-                                                    foreach ($c in $capRuns) {
-                                                        $runEq += $c.NetPlusRebNum
-                                                        if ($runEq -gt $peak) { $peak = $runEq }
-                                                        $dd = $peak - $runEq
-                                                        if ($dd -gt $maxDD) { $maxDD = $dd }
-                                                    }
-                                                    $capBase = [Math]::Max($sumVolIn, 1.0)
-                                                    $maxDDPct = ($maxDD / $capBase) * 100.0
-                                                }
-
-                                                # ---- Verification inputs: unhedged expiry drag proxy ----
-                                                $unhedgedLoss = [Math]::Max(0.0, -($sumSettlement + [Math]::Min($sumUnreal, 0.0)))
-                                                $grossGains = [Math]::Max($sumGrossPnl, 0.0)
-                                                if ($grossGains -gt 1e-9) { $dragPct = ($unhedgedLoss / $grossGains) * 100.0 }
-                                                elseif ($unhedgedLoss -gt 1e-9) { $dragPct = 100.0 }
-                                                else { $dragPct = 0.0 }
+                                                # ---- Verification inputs via shared helper (70/30 IS/OOS walk-forward; MaxDD/Drag capture-level proxies) ----
+                                                $surv = Get-SurvivalInputs -CapRuns $capRuns -TotalWindows $totalWindows -IsMultiCapture $isMultiCapture -CaptureCount $captures.Count -SumVolIn $sumVolIn -SumGross $sumGrossPnl -SumSettle $sumSettlement -SumUnreal $sumUnreal
+                                                $isNet = $surv.IS; $oosNet = $surv.OOS; $retainPct = $surv.Retain; $maxDDPct = $surv.MaxDD; $dragPct = $surv.Drag
+                                                $isWinCount = $surv.ISWin; $oosWinCount = $surv.OOSWin
 
                                                 $sumNetPlusReb = $sumNetPnl + $sumRebate
                                                 $sumGrossPct = if ($sumVolIn -gt 1e-6) { ($sumCloseVol / $sumVolIn) - 1.0 } else { [double]::NaN }
@@ -1291,8 +1265,8 @@ try {
                                                     G5            = "N/A"
                                                     G6            = "N/A"
                                                     Verdict       = "N/A"
-                                                    ISWindows     = $isWindows
-                                                    OOSWindows    = $oosWindows
+                                                    ISWindows     = $isWinCount
+                                                    OOSWindows    = $oosWinCount
                                                     SettleNum     = $sumSettlement
                                                 })
                                             }
@@ -1329,45 +1303,7 @@ try {
     # only); MaxDD/Drag are capture-level proxies from per-capture Net+Reb,
     # settlement and unrealized summaries. Single-capture runs report N/A.
     # -----------------------------------------------------------------------
-    $gateAxes = @("Gamma", "VarSpr", "MinT", "XTick", "MaxP", "MaxPx", "LLTh", "LLWin", "LLCd", "LLDir", "HSkew", "T1Cap")
-    for ($gi = 0; $gi -lt $sorted.Count; $gi++) {
-        $grow = $sorted[$gi]
-        $nbrTotal = 0
-        $nbrProf = 0
-        if ($sorted.Count -gt 1) {
-            foreach ($other in $sorted) {
-                if ($other -eq $grow) { continue }
-                $diffs = 0
-                foreach ($ax in $gateAxes) {
-                    if ([string]$other.$ax -ne [string]$grow.$ax) { $diffs++ }
-                }
-                if ($diffs -eq 1) {
-                    $nbrTotal++
-                    if ([double]$other.NetPlusRebNum -gt 0.0) { $nbrProf++ }
-                }
-            }
-        }
-        if ($nbrTotal -gt 0) { $grow.NbrNum = ($nbrProf / $nbrTotal) * 100.0 } else { $grow.NbrNum = [double]::NaN }
-        $g1na = [double]::IsNaN($grow.ISNum)
-        $g2na = [double]::IsNaN($grow.OOSNum)
-        $g3na = ([double]::IsNaN($grow.RetainNum) -or [double]::IsInfinity($grow.RetainNum))
-        $g4na = [double]::IsNaN($grow.MaxDDNum)
-        $g6na = [double]::IsNaN($grow.NbrNum)
-        $grow.G1 = if ($g1na) { "N/A" } elseif ($grow.ISNum -gt 0.0) { "PASS" } else { "FAIL" }
-        $grow.G2 = if ($g2na) { "N/A" } elseif ($grow.OOSNum -gt 0.0) { "PASS" } else { "FAIL" }
-        $grow.G3 = if ($g3na) { "N/A" } elseif ($grow.RetainNum -ge 40.0) { "PASS" } else { "FAIL" }
-        $grow.G4 = if ($g4na) { "N/A" } elseif ($grow.MaxDDNum -le 25.0) { "PASS" } else { "FAIL" }
-        $grow.G5 = if ($grow.DragNum -le 30.0) { "PASS" } else { "FAIL" }
-        $grow.G6 = if ($g6na) { "N/A" } elseif ($grow.NbrNum -ge 60.0) { "PASS" } else { "FAIL" }
-        $failGate = ""
-        foreach ($g in @("G1", "G2", "G3", "G4", "G5", "G6")) {
-            if ($grow.$g -eq "FAIL") { $failGate = $g; break }
-        }
-        if ($failGate -ne "") { $grow.Verdict = "FAIL($failGate)" }
-        elseif (($grow.G1 -eq "N/A") -or ($grow.G2 -eq "N/A") -or ($grow.G3 -eq "N/A")) { $grow.Verdict = "NEEDS-OOS" }
-        elseif (($grow.G4 -eq "N/A") -or ($grow.G6 -eq "N/A")) { $grow.Verdict = "N/A" }
-        else { $grow.Verdict = "APPROVED" }
-    }
+    Update-SurvivalVerdicts -Sorted $sorted
 
     # Build Leaderboard Column Metadata
     $cols = [System.Collections.Generic.List[hashtable]]::new()
@@ -1562,8 +1498,8 @@ try {
     $plainSummary.Add(($vFmt -f $vDashes))
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
         $r = $sorted[$ri]
-        $isS = if ([double]::IsNaN($r.ISNum)) { 'n/a'.PadLeft(10) } else { (("{0}`${1}" -f ($(if ($r.ISNum -lt 0) { "-" } else { "+" }), [Math]::Abs($r.ISNum).ToString("0.00", $inv))).PadLeft(10)) }
-        $oosS = if ([double]::IsNaN($r.OOSNum)) { 'n/a'.PadLeft(10) } else { (("{0}`${1}" -f ($(if ($r.OOSNum -lt 0) { "-" } else { "+" }), [Math]::Abs($r.OOSNum).ToString("0.00", $inv))).PadLeft(10)) }
+        $isS = if ([double]::IsNaN($r.ISNum)) { 'n/a'.PadLeft(10) } else { (Format-GateMoneyText -Value ([double]$r.ISNum) -Culture $inv).PadLeft(10) }
+        $oosS = if ([double]::IsNaN($r.OOSNum)) { 'n/a'.PadLeft(10) } else { (Format-GateMoneyText -Value ([double]$r.OOSNum) -Culture $inv).PadLeft(10) }
         $retS = if ([double]::IsNaN($r.RetainNum) -or [double]::IsInfinity($r.RetainNum)) { 'n/a'.PadLeft(7) } else { (("{0:F0}%" -f $r.RetainNum).PadLeft(7)) }
         $ddS = if ([double]::IsNaN($r.MaxDDNum)) { 'n/a'.PadLeft(7) } else { (("{0:F0}%" -f $r.MaxDDNum).PadLeft(7)) }
         $dragS = (("{0:F0}%" -f $r.DragNum).PadLeft(7))
@@ -1603,27 +1539,21 @@ try {
     if (-not $isMultiCapture) {
         Write-Host (Format-ColorText -Text "NOTE: single-capture run - IS/OOS + MaxDD report N/A. Re-run with -AllCaptures for full walk-forward verdicts." -Code $AnsiYellow)
     }
-    $vFmtCon = "{0,4} {1,10} {2,10} {3,7} {4,7} {5,7} {6,7} {7,10}"
-    $vHead = @("Rank", "IS", "OOS", "Ret%", "MaxDD", "Drag", "Nbr%", "Verdict")
-    $vDash = @("----", "----------", "----------", "-------", "-------", "-------", "-------", "----------")
-    Write-Host (Format-ColorText -Text ($vFmtCon -f $vHead) -Code $AnsiBoldWhite)
-    Write-Host (Format-ColorText -Text ($vFmtCon -f $vDash) -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text ($vFmt -f $vHeaders) -Code $AnsiBoldWhite)
+    Write-Host (Format-ColorText -Text ($vFmt -f $vDashes) -Code $AnsiGray)
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
         $r = $sorted[$ri]
         $rkRaw = (($ri + 1).ToString($inv)).PadLeft(4)
-        $isCell = Format-GateMoneyCell -Value ([double]$r.ISNum) -Pass ($r.G1 -eq "PASS") -IsNA ($r.G1 -eq "N/A") -Width 10 -Culture $inv
-        $oosCell = Format-GateMoneyCell -Value ([double]$r.OOSNum) -Pass ($r.G2 -eq "PASS") -IsNA ($r.G2 -eq "N/A") -Width 10 -Culture $inv
-        $retVal = if ([double]::IsNaN($r.RetainNum) -or [double]::IsInfinity($r.RetainNum)) { 0.0 } else { [double]$r.RetainNum }
-        $retCell = Format-GatePctCell -Pct $retVal -Pass ($r.G3 -eq "PASS") -IsNA ($r.G3 -eq "N/A") -Width 7 -Culture $inv
-        $ddVal = if ([double]::IsNaN($r.MaxDDNum)) { 0.0 } else { [double]$r.MaxDDNum }
-        $ddCell = Format-GatePctCell -Pct $ddVal -Pass ($r.G4 -eq "PASS") -IsNA ($r.G4 -eq "N/A") -Width 7 -Culture $inv
-        $dragCell = Format-GatePctCell -Pct ([double]$r.DragNum) -Pass ($r.G5 -eq "PASS") -IsNA $false -Width 7 -Culture $inv
-        $nbrVal = if ([double]::IsNaN($r.NbrNum)) { 0.0 } else { [double]$r.NbrNum }
-        $nbrCell = Format-GatePctCell -Pct $nbrVal -Pass ($r.G6 -eq "PASS") -IsNA ($r.G6 -eq "N/A") -Width 7 -Culture $inv
+        $isCell = Format-GateCell -RawText (Format-GateMoneyText -Value ([double]$r.ISNum) -Culture $inv) -Pass ($r.G1 -eq "PASS") -IsNA ($r.G1 -eq "N/A") -Width 10
+        $oosCell = Format-GateCell -RawText (Format-GateMoneyText -Value ([double]$r.OOSNum) -Culture $inv) -Pass ($r.G2 -eq "PASS") -IsNA ($r.G2 -eq "N/A") -Width 10
+        $retCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.RetainNum)) -Pass ($r.G3 -eq "PASS") -IsNA (($r.G3 -eq "N/A")) -Width 7
+        $ddCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.MaxDDNum)) -Pass ($r.G4 -eq "PASS") -IsNA ($r.G4 -eq "N/A") -Width 7
+        $dragCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.DragNum)) -Pass ($r.G5 -eq "PASS") -IsNA $false -Width 7
+        $nbrCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.NbrNum)) -Pass ($r.G6 -eq "PASS") -IsNA ($r.G6 -eq "N/A") -Width 7
         $verCell = Format-VerdictCell -Verdict ([string]$r.Verdict) -Width 10
         Write-Host ("{0} {1} {2} {3} {4} {5} {6} {7}" -f $rkRaw, $isCell, $oosCell, $retCell, $ddCell, $dragCell, $nbrCell, $verCell)
     }
-    Write-Host (Format-ColorText -Text ($vFmtCon -f $vDash) -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text ($vFmt -f $vDashes) -Code $AnsiGray)
     $approvedCon = @($sorted | Where-Object { $_.Verdict -eq "APPROVED" }).Count
     Write-Host ("Verdicts: {0}/{1} APPROVED  |  FAIL(Gx) = first failed gate  |  NEEDS-OOS = re-run multi-capture" -f $approvedCon, $sorted.Count)
 
