@@ -73,7 +73,7 @@ pub fn run(jsonl_path: &Path) -> Result<(), Box<dyn Error>> {
     println!(
         "{}",
         t.banner(
-            "POLY-AS PHASE 0 DOCTOR :: ENVIRONMENT, CLOCK & FIXED-POINT AUDIT",
+            "POLY-AS DOCTOR :: ENVIRONMENT, CLOCK & FIXED-POINT AUDIT",
             None
         )
     );

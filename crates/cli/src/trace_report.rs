@@ -61,10 +61,7 @@ pub(crate) fn print_trace_header(
     println!();
     println!(
         "{}",
-        t.banner(
-            &format!("POLY-AS PHASE 2 :: MATH ENGINE TRACE ({source})"),
-            None
-        )
+        t.banner(&format!("POLY-AS MATH ENGINE TRACE ({source})"), None)
     );
     println!(
         "{}",
@@ -357,7 +354,7 @@ fn print_summary_stdout(
 ) {
     let t = theme::current();
     println!();
-    println!("{}", t.banner("PHASE 2 TRACE SUMMARY", None));
+    println!("{}", t.banner("MATH ENGINE TRACE SUMMARY", None));
     println!(
         "{}",
         t.kv(

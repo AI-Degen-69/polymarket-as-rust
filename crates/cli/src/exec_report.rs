@@ -55,7 +55,7 @@ pub(crate) fn print_exec_header(mode: &str, jsonl: &Path, canary_max_usd: u64) {
     println!();
     println!(
         "{}",
-        t.banner("POLY-AS PHASE 5 :: LIVE EXECUTION (DRY-RUN TRACE)", None)
+        t.banner("POLY-AS LIVE EXECUTION :: DRY-RUN TRACE", None)
     );
     println!("{}", t.kv("Mode:", mode));
     println!("{}", t.kv("Canary Cap:", &format!("${canary_max_usd}")));
@@ -161,7 +161,7 @@ pub(crate) fn print_exec_summary(
 ) {
     let t = theme::current();
     println!();
-    println!("{}", t.section("PHASE 5 EXECUTION SUMMARY"));
+    println!("{}", t.section("LIVE EXECUTION SUMMARY"));
     println!(
         "{}",
         t.kv(
