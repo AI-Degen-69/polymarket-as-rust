@@ -25,6 +25,8 @@ pub struct PricerConfig {
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
+    /// Optional upper-only favorite entry price cap in `(0.0, 1.0)` (`Some(0.60)` default; `None` disables upper cap, blocks fresh entries strictly above cap while preserving cheap legs and hedges).
+    pub max_entry_price: Option<f64>,
     /// Asymmetric reducing-leg skew multiplier in `[0.0, 1.0]` (`1.0` default).
     pub hedge_skew_mult: f64,
 }
@@ -42,6 +44,7 @@ impl PricerConfig {
             max_combined_bid_micro: MicroUsdc(980_000),
             max_cross_tick_loss_micro: None,
             max_entry_prob: Some(0.80),
+            max_entry_price: Some(0.60),
             hedge_skew_mult: 1.0,
         }
     }
@@ -62,6 +65,7 @@ impl PricerConfig {
             max_combined_bid_micro: cfg.max_combined_bid_micro,
             max_cross_tick_loss_micro: cfg.max_cross_tick_loss_micro,
             max_entry_prob: cfg.max_entry_prob,
+            max_entry_price: cfg.max_entry_price,
             hedge_skew_mult: cfg.hedge_skew_mult,
         })
     }
@@ -88,6 +92,11 @@ impl PricerConfig {
             && (!p_max.is_finite() || p_max <= 0.5 || p_max >= 1.0)
         {
             return Err(err_desc("max_entry_prob must be finite in (0.5, 1.0)"));
+        }
+        if let Some(p_cap) = self.max_entry_price
+            && (!p_cap.is_finite() || p_cap <= 0.0 || p_cap >= 1.0)
+        {
+            return Err(err_desc("max_entry_price must be finite in (0.0, 1.0)"));
         }
         if !self.hedge_skew_mult.is_finite() || !(0.0..=1.0).contains(&self.hedge_skew_mult) {
             return Err(err_desc("hedge_skew_mult must be finite in [0.0, 1.0]"));
@@ -419,12 +428,13 @@ fn apply_pair_and_post_only(
     let mut flags = Station6Flags::default();
     let (mut up_guarded, mut dn_guarded) = (bid_up_floored, bid_dn_floored);
 
-    if let Some(p_max) = cfg.max_entry_prob {
+    if cfg.max_entry_prob.is_some() || cfg.max_entry_price.is_some() {
         apply_entry_prob_guard(
             &mut up_guarded,
             &mut dn_guarded,
             input.inventory_q,
-            p_max,
+            cfg.max_entry_prob,
+            cfg.max_entry_price,
             &mut flags,
         );
     }
@@ -492,12 +502,13 @@ fn apply_pair_and_post_only(
     flags.suppressed_up = sup_up;
     flags.suppressed_dn = sup_dn;
 
-    if let Some(p_max) = cfg.max_entry_prob {
+    if cfg.max_entry_prob.is_some() || cfg.max_entry_price.is_some() {
         apply_entry_prob_guard(
             &mut bid_up,
             &mut bid_dn,
             input.inventory_q,
-            p_max,
+            cfg.max_entry_prob,
+            cfg.max_entry_price,
             &mut flags,
         );
     }
@@ -514,23 +525,43 @@ pub fn exceeds_entry_prob_bounds(bid: MicroUsdc, p_max: f64) -> bool {
     bid.0 > max_micro || bid.0 < min_micro
 }
 
+/// Returns `true` when `bid` strictly exceeds the upper-only favorite entry cap `p_cap` in micro-USDC.
+#[must_use]
+pub fn exceeds_entry_price_cap(bid: MicroUsdc, p_cap: f64) -> bool {
+    let max_micro = ((p_cap * ONE_DOLLAR_MICRO as f64) + 1e-9).floor() as u64;
+    bid.0 > max_micro
+}
+
+/// Returns `true` when `bid` violates either the symmetric `max_entry_prob` band
+/// or the upper-only `max_entry_price` favorite cap.
+#[must_use]
+pub fn is_entry_guarded(
+    bid: MicroUsdc,
+    max_entry_prob: Option<f64>,
+    max_entry_price: Option<f64>,
+) -> bool {
+    max_entry_prob.is_some_and(|p_max| exceeds_entry_prob_bounds(bid, p_max))
+        || max_entry_price.is_some_and(|p_cap| exceeds_entry_price_cap(bid, p_cap))
+}
+
 fn apply_entry_prob_guard(
     bid_up: &mut Option<MicroUsdc>,
     bid_dn: &mut Option<MicroUsdc>,
     inventory_q: SignedSharesMicro,
-    p_max: f64,
+    max_entry_prob: Option<f64>,
+    max_entry_price: Option<f64>,
     flags: &mut Station6Flags,
 ) {
     if inventory_q.0 >= 0
         && let Some(u) = *bid_up
-        && exceeds_entry_prob_bounds(u, p_max)
+        && is_entry_guarded(u, max_entry_prob, max_entry_price)
     {
         *bid_up = None;
         flags.entry_guard_suppressed_up = true;
     }
     if inventory_q.0 <= 0
         && let Some(d) = *bid_dn
-        && exceeds_entry_prob_bounds(d, p_max)
+        && is_entry_guarded(d, max_entry_prob, max_entry_price)
     {
         *bid_dn = None;
         flags.entry_guard_suppressed_dn = true;
@@ -803,6 +834,7 @@ mod tests {
         // Disable entry guard for this sub-case so flat tail tick alignment is exercised directly.
         let mut tail_cfg = PricerConfig::try_default().unwrap();
         tail_cfg.max_entry_prob = None;
+        tail_cfg.max_entry_price = None;
         let tail_pricer = DualBidPricer::new(tail_cfg).unwrap();
         let mut inp_tail = make_input(0, 1_000, base_bounds());
         inp_tail.s_i = 0.02;
@@ -905,6 +937,7 @@ mod tests {
             max_combined_bid_micro: MicroUsdc(990_000),
             max_cross_tick_loss_micro: None,
             max_entry_prob: None,
+            max_entry_price: None,
             hedge_skew_mult: 1.0,
         };
         let pricer = DualBidPricer::new(cfg).unwrap();
@@ -961,6 +994,7 @@ mod tests {
         base_cfg.min_spread_ticks = 2;
         base_cfg.max_combined_bid_micro = MicroUsdc(980_000);
         base_cfg.max_cross_tick_loss_micro = None;
+        base_cfg.max_entry_price = None;
 
         // Input with q=+20 (heavy UP), s_i=0.80, v_rem=0.04, gamma=0.15 =>
         // r_i = 0.80 - 20 * 0.15 * 0.04 = 0.68, s* ~ 0.0399 => bid_up=$0.66, bid_dn=$0.30 (or similar).
@@ -1087,6 +1121,7 @@ mod tests {
         cfg.include_variance_spread = false;
         cfg.enforce_fee_floor = false;
         cfg.max_entry_prob = Some(0.85);
+        cfg.max_entry_price = None;
         let pricer = DualBidPricer::new(cfg).unwrap();
 
         // Bounds with wide ask so Post-Only never suppresses $0.91.
@@ -1178,6 +1213,76 @@ mod tests {
         for bad in [0.5, 0.49, 1.0, 1.01, f64::NAN, f64::INFINITY] {
             let mut bad_cfg = cfg;
             bad_cfg.max_entry_prob = Some(bad);
+            assert!(DualBidPricer::new(bad_cfg).is_err());
+        }
+    }
+
+    #[test]
+    fn upper_entry_price_cap_blocks_expensive_entries_while_preserving_cheap_and_hedge_legs() {
+        let clock = MonotonicClock::start();
+        let mut cfg = PricerConfig::try_default().unwrap();
+        cfg.include_variance_spread = false;
+        cfg.enforce_fee_floor = false;
+        cfg.max_entry_prob = Some(0.80);
+        cfg.max_entry_price = Some(0.60);
+        let pricer = DualBidPricer::new(cfg).unwrap();
+
+        let mut bounds = base_bounds();
+        bounds.best_ask_up = Some(MicroUsdc(950_000));
+        bounds.best_ask_dn = Some(MicroUsdc(950_000));
+
+        // Flat (q=0) at s_i = 0.67 => bid_up=$0.65 (> $0.60 cap, blocked) and bid_dn=$0.31 (>= $0.20, preserved!).
+        let mut inp_flat = make_input(0, 10_000, bounds);
+        inp_flat.s_i = 0.67;
+        inp_flat.v_rem = 0.0;
+        let t_flat = pricer.price(&inp_flat, &clock).unwrap();
+        assert!(t_flat.entry_guard_suppressed_up);
+        assert!(!t_flat.entry_guard_suppressed_dn);
+        assert_eq!(
+            t_flat.quote,
+            QuoteOutput::Active {
+                bid_up: None,
+                bid_dn: Some(MicroUsdc(310_000)),
+                pair_cost_micro: None,
+                gross_margin_bps: None,
+            }
+        );
+
+        // Exact boundary $0.60 allowed when s_i = 0.62 => bid_up=$0.60, bid_dn=$0.36.
+        let mut inp_edge = make_input(0, 10_000, bounds);
+        inp_edge.s_i = 0.62;
+        inp_edge.v_rem = 0.0;
+        let t_edge = pricer.price(&inp_edge, &clock).unwrap();
+        assert!(!t_edge.entry_guard_suppressed_up);
+        assert!(!t_edge.entry_guard_suppressed_dn);
+        assert_eq!(
+            t_edge.quote,
+            QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(600_000)),
+                bid_dn: Some(MicroUsdc(360_000)),
+                pair_cost_micro: Some(MicroUsdc(960_000)),
+                gross_margin_bps: Some(400),
+            }
+        );
+
+        // Long DOWN (q=-20) at s_i = 0.67 => UP bid at $0.65 IS allowed as a reducing hedge!
+        let mut inp_short = make_input(-20, 10_000, bounds);
+        inp_short.s_i = 0.67;
+        inp_short.v_rem = 0.0;
+        let t_short = pricer.price(&inp_short, &clock).unwrap();
+        assert!(!t_short.entry_guard_suppressed_up);
+        assert!(matches!(
+            t_short.quote,
+            QuoteOutput::Active {
+                bid_up: Some(p),
+                ..
+            } if p.0 > 600_000
+        ));
+
+        // Invalid max_entry_price bounds rejected cleanly.
+        for bad in [0.0, -0.05, 1.0, 1.05, f64::NAN, f64::INFINITY] {
+            let mut bad_cfg = cfg;
+            bad_cfg.max_entry_price = Some(bad);
             assert!(DualBidPricer::new(bad_cfg).is_err());
         }
     }

@@ -150,6 +150,27 @@ fn parse_max_entry_prob_override(raw: &str) -> Result<MaxEntryProbOverride, Stri
     Ok(MaxEntryProbOverride::Value(val))
 }
 
+/// CLI override value for `--max-entry-price` supporting either an upper-only cap or `off`/`none`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum MaxEntryPriceOverride {
+    Off,
+    Value(f64),
+}
+
+fn parse_max_entry_price_override(raw: &str) -> Result<MaxEntryPriceOverride, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(MaxEntryPriceOverride::Off);
+    }
+    let val = trimmed.parse::<f64>().map_err(|_| {
+        format!("invalid --max-entry-price '{raw}': expected finite float in (0.0, 1.0) or 'off'")
+    })?;
+    if !val.is_finite() || val <= 0.0 || val >= 1.0 {
+        return Err("`--max-entry-price` must be finite in (0.0, 1.0) or 'off'".to_string());
+    }
+    Ok(MaxEntryPriceOverride::Value(val))
+}
+
 /// Optional Stations 4–6 math competitiveness overrides for live/replay A/B testing.
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub(crate) struct MathOverrides {
@@ -174,6 +195,9 @@ pub(crate) struct MathOverrides {
     /// Override extreme-probability entry guard in `(0.5, 1.0)` (`0.80` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_prob_override)]
     pub(crate) max_entry_prob: Option<MaxEntryProbOverride>,
+    /// Override upper-only favorite entry price cap in `(0.0, 1.0)` (`0.60` default; pass `off` or `none` to disable).
+    #[arg(long, value_parser = parse_max_entry_price_override)]
+    pub(crate) max_entry_price: Option<MaxEntryPriceOverride>,
     /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.015` default).
     #[arg(long)]
     pub(crate) lead_lag_threshold: Option<f64>,
@@ -203,6 +227,7 @@ impl MathOverrides {
             || self.fee_spread_floor.is_some()
             || self.max_cross_tick_loss_micro.is_some()
             || self.max_entry_prob.is_some()
+            || self.max_entry_price.is_some()
             || self.lead_lag_threshold.is_some()
             || self.lead_lag_window_ms.is_some()
             || self.lead_lag_cooldown_ms.is_some()
@@ -255,6 +280,17 @@ impl MathOverrides {
                         return Err("`--max-entry-prob` must be finite in (0.5, 1.0)".into());
                     }
                     cfg.max_entry_prob = Some(p_max);
+                }
+            }
+        }
+        if let Some(entry_price) = self.max_entry_price {
+            match entry_price {
+                MaxEntryPriceOverride::Off => cfg.max_entry_price = None,
+                MaxEntryPriceOverride::Value(p_cap) => {
+                    if !p_cap.is_finite() || p_cap <= 0.0 || p_cap >= 1.0 {
+                        return Err("`--max-entry-price` must be finite in (0.0, 1.0)".into());
+                    }
+                    cfg.max_entry_price = Some(p_cap);
                 }
             }
         }
@@ -1188,6 +1224,7 @@ mod tests {
                 assert!(!cfg.enforce_fee_floor);
                 assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
                 assert_eq!(cfg.max_entry_prob, Some(0.80));
+                assert_eq!(cfg.max_entry_price, Some(0.60));
             }
             _ => panic!("expected Paper"),
         }
@@ -1421,6 +1458,57 @@ mod tests {
             Cli::try_parse_from(["poly-as", "lifecycle", "--max-cross-tick-loss-micro", "-5"])
                 .is_err()
         );
+
+        let parsed_cap =
+            Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-price", "0.65"]).unwrap();
+        match parsed_cap.command {
+            Commands::Lifecycle { math, .. } => {
+                assert!(math.is_any_set());
+                assert_eq!(
+                    math.max_entry_price,
+                    Some(MaxEntryPriceOverride::Value(0.65))
+                );
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.max_entry_price, Some(0.65));
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        for off_flag in ["off", "none"] {
+            let parsed_off =
+                Cli::try_parse_from(["poly-as", "paper", "--max-entry-price", off_flag]).unwrap();
+            match parsed_off.command {
+                Commands::Paper { math, .. } => {
+                    assert_eq!(math.max_entry_price, Some(MaxEntryPriceOverride::Off));
+                    let mut cfg = core_types::EngineConfig {
+                        max_entry_price: Some(0.60),
+                        ..Default::default()
+                    };
+                    math.apply_to(&mut cfg).unwrap();
+                    assert_eq!(cfg.max_entry_price, None);
+                }
+                _ => panic!("expected Paper"),
+            }
+        }
+
+        for bad_cap in [0.0, -0.1, 1.0, 1.1, f64::NAN, f64::INFINITY] {
+            let mut cfg = core_types::EngineConfig::default();
+            let err = MathOverrides {
+                max_entry_price: Some(MaxEntryPriceOverride::Value(bad_cap)),
+                ..Default::default()
+            }
+            .apply_to(&mut cfg);
+            assert!(err.is_err(), "expected error for max_entry_price={bad_cap}");
+        }
+
+        for bad_cli_cap in ["0.0", "-0.1", "1.0", "bogus"] {
+            assert!(
+                Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-price", bad_cli_cap])
+                    .is_err(),
+                "expected CLI parse error for --max-entry-price {bad_cli_cap}"
+            );
+        }
     }
 
     #[test]
