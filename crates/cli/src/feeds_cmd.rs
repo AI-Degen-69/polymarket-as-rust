@@ -1,4 +1,5 @@
 use std::error::Error;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -17,12 +18,12 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::feeds_report::{
-    CaptureReportData, apply_health_event, format_binance_sample, format_oracle_sample,
-    format_poly_sample, print_header_and_market, print_sections_b_to_e, push_sample, run_replay,
-    write_summary_event,
+    CaptureReportData, apply_health_event, format_binance_sample, format_feeds_progress_line,
+    format_oracle_sample, format_poly_sample, print_header_and_market, print_sections_b_to_e,
+    push_sample, run_replay, write_summary_event,
 };
 use crate::log_paths;
-use crate::window_gate::{self, FreshWindowDiscovery, GateOutcome};
+use crate::window_gate::{self, FreshWindowDiscovery, GateOutcome, format_local_hms};
 
 pub(crate) struct FeedsArgs {
     pub(crate) discover: bool,
@@ -163,7 +164,7 @@ async fn run_discover(
 
     let raw_now_ms = MonotonicClock::unix_now_ms()?;
     let adj_now_ms = offset_est.adjusted_unix_ms(raw_now_ms)?;
-    print_header_and_market(&desc, &sync_report, cfg.polybolt_enabled);
+    print_header_and_market(&desc, &sync_report, cfg.polybolt_enabled, raw_now_ms);
     let mut jsonl = JsonlWriter::create(target.write_path())?;
     jsonl.write_event(raw_now_ms, clock.now_ns()?, "market_discovered", &desc)?;
     jsonl.write_event(raw_now_ms, clock.now_ns()?, "clock_sync", &sync_report)?;
@@ -291,7 +292,7 @@ fn init_capture_data(polybolt_enabled: bool) -> CaptureReportData {
     let pb_state = if polybolt_enabled {
         "Connecting".to_string()
     } else {
-        "Disabled (local 60s TWAP fallback)".to_string()
+        "Disabled (local Binance TWAP canonical)".to_string()
     };
     CaptureReportData::new(pb_state)
 }
@@ -357,18 +358,53 @@ async fn capture_until_deadline(
     let deadline = tokio::time::sleep(duration);
     tokio::pin!(deadline);
     let mut poll_tick = tokio::time::interval(Duration::from_millis(5));
+    let mut progress_tick = tokio::time::interval(Duration::from_millis(1000));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let is_tty = std::io::stdout().is_terminal();
+    let mut non_tty_ticks: u32 = 0;
 
     loop {
         tokio::select! {
-            _ = &mut deadline => break,
+            _ = &mut deadline => {
+                if is_tty {
+                    println!();
+                }
+                break;
+            }
             _ = &mut ctrl_c => {
+                if is_tty {
+                    println!();
+                }
                 println!(
                     "  {} Ctrl-C received, shutting down feeds cleanly...",
                     crate::theme::current().badge(crate::theme::Badge::Signal)
                 );
                 break;
+            }
+            _ = progress_tick.tick() => {
+                let raw_now_ms = MonotonicClock::unix_now_ms().unwrap_or(0);
+                let adj_now_ms = rollover
+                    .offset_est
+                    .adjusted_unix_ms(raw_now_ms)
+                    .unwrap_or(raw_now_ms);
+                let line = format_feeds_progress_line(
+                    crate::theme::current(),
+                    adj_now_ms,
+                    rollover.current_desc,
+                    rollover.rollovers + 1,
+                    rollover.max_rollovers.map(|m| m + 1),
+                    data,
+                );
+                if is_tty {
+                    print!("\r\x1b[2K{line}");
+                    let _ = std::io::stdout().flush();
+                } else {
+                    non_tty_ticks = non_tty_ticks.saturating_add(1);
+                    if non_tty_ticks % 10 == 1 {
+                        println!("{line}");
+                    }
+                }
             }
             _ = poll_tick.tick() => {
                 drain_all(clock, rings, data, jsonl)?;
@@ -447,12 +483,29 @@ async fn maybe_rollover_capture(
         "market_discovered",
         &next_desc,
     )?;
+    let now_local = format_local_hms(post_rollover_ms);
+    let old_w = format!(
+        "{}-{}",
+        format_local_hms(rollover.current_desc.start_ts_ms),
+        format_local_hms(rollover.current_desc.expiry_ts_ms)
+    );
+    let new_w = format!(
+        "{}-{}",
+        format_local_hms(next_desc.start_ts_ms),
+        format_local_hms(next_desc.expiry_ts_ms)
+    );
+    let win_num = rollover.rollovers + 1;
+    if std::io::stdout().is_terminal() {
+        println!();
+    }
     println!(
-        "  {} {} -> {} (epoch={})",
-        crate::theme::current().badge(crate::theme::Badge::Epoch),
-        rollover.current_desc.slug,
-        crate::theme::current().cyan(&next_desc.slug),
-        rollover.epoch
+        "  [{}] {} Window {} -> Window {} | {} -> {} (window #{win_num})",
+        crate::theme::current().muted(&now_local),
+        crate::theme::current().badge(crate::theme::Badge::Window),
+        rollover.rollovers,
+        win_num,
+        crate::theme::current().muted(&old_w),
+        crate::theme::current().cyan(&new_w)
     );
     *rollover.current_desc = next_desc;
     rollover.last_rollover_attempt = None;
@@ -716,11 +769,13 @@ fn record_binance_event(
     jsonl: &mut JsonlWriter,
 ) -> Result<(), Box<dyn Error>> {
     match ev {
-        BinanceSpotEvent::BookTicker { .. } => {
+        BinanceSpotEvent::BookTicker { bid_e8, ask_e8, .. } => {
             data.binance_tickers = data.binance_tickers.saturating_add(1);
+            data.latest_binance_px_e8 = Some((bid_e8.saturating_add(ask_e8)) / 2);
         }
-        BinanceSpotEvent::AggTrade { .. } => {
+        BinanceSpotEvent::AggTrade { price_e8, .. } => {
             data.binance_trades = data.binance_trades.saturating_add(1);
+            data.latest_binance_px_e8 = Some(price_e8);
         }
     }
     push_sample(&mut data.samples_binance, format_binance_sample(ev));

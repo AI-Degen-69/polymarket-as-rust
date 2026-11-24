@@ -13,7 +13,8 @@ use feeds::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{self, Badge};
+use crate::theme::{self, Badge, Theme};
+use crate::window_gate::{format_local_datetime, format_local_hms, format_utc_hms};
 
 pub(crate) struct CaptureReportData {
     pub(crate) poly_books: u64,
@@ -34,6 +35,7 @@ pub(crate) struct CaptureReportData {
     pub(crate) latest_dn_book: Option<FixedBook<10>>,
     pub(crate) samples_binance: Vec<String>,
     pub(crate) samples_poly: Vec<String>,
+    pub(crate) latest_binance_px_e8: Option<u64>,
 }
 
 impl CaptureReportData {
@@ -60,6 +62,7 @@ impl CaptureReportData {
             latest_dn_book: None,
             samples_binance: Vec::new(),
             samples_poly: Vec::new(),
+            latest_binance_px_e8: None,
         }
     }
 }
@@ -97,10 +100,24 @@ struct FeedsSummaryRecord<'a> {
     polybolt_stats: &'a FeedStats,
 }
 
+pub(crate) fn truncate_token_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.len() > 14 {
+        format!(
+            "{}...{}",
+            &trimmed[..6],
+            &trimmed[trimmed.len().saturating_sub(6)..]
+        )
+    } else {
+        trimmed.to_string()
+    }
+}
+
 pub(crate) fn print_header_and_market(
     desc: &MarketDescriptor,
     sync: &ClockSyncReport,
     polybolt_enabled: bool,
+    start_unix_ms: u64,
 ) {
     let t = theme::current();
     println!();
@@ -114,46 +131,71 @@ pub(crate) fn print_header_and_market(
     println!("{}", t.section("(a) DISCOVERED 5M BTC MARKET & CLOCK SYNC"));
     println!(
         "{}",
-        t.kv(
-            "Market:",
-            &format!(
-                "{} (version={:?}, neg_risk={})",
-                t.cyan(&desc.slug),
-                desc.version,
-                desc.neg_risk
-            )
-        )
+        t.kv("Started:", &format_local_datetime(start_unix_ms))
     );
-    println!("{}", t.kv("Condition ID:", &desc.condition_id));
+
+    let type_label = match (desc.version, desc.neg_risk) {
+        (core_types::ProtocolVersion::CtfV1, false) => "Standard Binary CTF v1",
+        (core_types::ProtocolVersion::CtfV1, true) => "CTF v1 (NegRisk)",
+        (core_types::ProtocolVersion::PolyV2, false) => "Protocol v2 Binary",
+        (core_types::ProtocolVersion::PolyV2, true) => "Protocol v2 (NegRisk)",
+    };
+    let market_display = if !desc.question.trim().is_empty() {
+        format!("{} [{}] ({type_label})", desc.question, t.cyan(&desc.slug))
+    } else {
+        format!("{} ({type_label})", t.cyan(&desc.slug))
+    };
+    println!("{}", t.kv("Market:", &market_display));
+
+    let cond_display = if desc.condition_id.len() > 18 {
+        format!(
+            "{}...{} (on-chain CTF condition)",
+            &desc.condition_id[..10],
+            &desc.condition_id[desc.condition_id.len().saturating_sub(8)..]
+        )
+    } else {
+        format!("{} (on-chain CTF condition)", desc.condition_id)
+    };
+    println!("{}", t.kv("Condition ID:", &cond_display));
+
+    let asset_up_trunc = truncate_token_id(&desc.asset_id_up);
+    let asset_dn_trunc = truncate_token_id(&desc.asset_id_dn);
     println!(
         "{}",
         t.kv(
             "Asset Up / Down:",
-            &format!("{} / {}", desc.asset_id_up, desc.asset_id_dn)
+            &format!("{asset_up_trunc} (Up) / {asset_dn_trunc} (Down) [ERC-1155 tokens]")
         )
     );
+
+    let tick_f64 = (desc.tick_size_micro.0 as f64) / 1_000_000.0;
+    let min_size_f64 = (desc.min_order_size_micro.0 as f64) / 1_000_000.0;
+    let fee_rate_f64 = (desc.fee_schedule.fee_rate_e6 as f64) / 1_000_000.0;
     println!(
         "{}",
         t.kv(
             "Params & Fees:",
             &format!(
-                "tick=${} | min_size={} | feeRate={:.4} | taker_delay={}ms",
-                desc.tick_size_micro,
-                desc.min_order_size_micro,
-                (desc.fee_schedule.fee_rate_e6 as f64) / 1_000_000.0,
-                desc.taker_delay_ms
+                "tick=${:.2} | min_size={:.2} | feeRate={:.2} | taker_delay={}ms",
+                tick_f64, min_size_f64, fee_rate_f64, desc.taker_delay_ms
             )
         )
     );
+
+    let start_local = format_local_hms(desc.start_ts_ms);
+    let expiry_local = format_local_hms(desc.expiry_ts_ms);
+    let span_s = desc.expiry_ts_ms.saturating_sub(desc.start_ts_ms) / 1_000;
+    let start_utc = format_utc_hms(desc.start_ts_ms);
+    let expiry_utc = format_utc_hms(desc.expiry_ts_ms);
     println!(
         "{}",
         t.kv(
-            "Epoch Window:",
+            "Window:",
             &format!(
-                "start={}ms -> expiry={}ms (span={}s)",
-                desc.start_ts_ms,
-                desc.expiry_ts_ms,
-                desc.expiry_ts_ms.saturating_sub(desc.start_ts_ms) / 1_000
+                "{} -> {} local [{start_utc} -> {expiry_utc} UTC] ({}s span)",
+                t.cyan(&start_local),
+                t.cyan(&expiry_local),
+                span_s
             )
         )
     );
@@ -162,17 +204,22 @@ pub(crate) fn print_header_and_market(
 
 fn print_clock_sync_banner(sync: &ClockSyncReport, polybolt_enabled: bool) {
     let t = theme::current();
+    let fmt_offset = |opt: Option<i64>| match opt {
+        Some(ms) => format!("{ms}ms"),
+        None => "n/a".to_string(),
+    };
+    let drift_label = if sync.drift_exceeded { "tripped" } else { "ok" };
     println!(
         "{}",
         t.kv(
             "Clock Offset:",
             &format!(
-                "{}ms (source={}, clob={:?}ms, binance={:?}ms, drift_tripped={})",
+                "{}ms (source={}, clob={}, binance={}, drift={})",
                 sync.offset_ms,
                 sync.source,
-                sync.clob_offset_ms,
-                sync.binance_offset_ms,
-                sync.drift_exceeded
+                fmt_offset(sync.clob_offset_ms),
+                fmt_offset(sync.binance_offset_ms),
+                drift_label
             )
         )
     );
@@ -189,20 +236,90 @@ fn print_clock_sync_banner(sync: &ClockSyncReport, polybolt_enabled: bool) {
             t.badge(Badge::Warn)
         );
     }
-    println!(
-        "{}",
-        t.kv(
-            "PolyBolt Oracle:",
-            &format!(
-                "enabled={polybolt_enabled} ({})",
-                if polybolt_enabled {
-                    "connecting"
-                } else {
-                    "disabled; local Binance 60s TWAP fallback"
-                }
+    let oracle_desc = if polybolt_enabled {
+        "PolyBolt Chainlink (connecting external oracle)"
+    } else {
+        "Local Binance Spot 60s TWAP (canonical engine oracle)"
+    };
+    println!("{}", t.kv("Oracle:", oracle_desc));
+}
+
+pub(crate) fn format_feeds_progress_line(
+    t: Theme,
+    now_ms: u64,
+    desc: &MarketDescriptor,
+    window_idx: usize,
+    max_windows: Option<usize>,
+    data: &CaptureReportData,
+) -> String {
+    let now_local = format_local_hms(now_ms);
+    let rem_s = desc.expiry_ts_ms.saturating_sub(now_ms) / 1_000;
+    let expiry_local = format_local_hms(desc.expiry_ts_ms);
+
+    let win_str = match max_windows {
+        Some(max) => format!("Win {window_idx}/{max}"),
+        None => format!("Win #{window_idx}"),
+    };
+
+    let clob_ev = data.poly_books + data.poly_price_changes + data.poly_trades + data.poly_bba;
+    let bin_ev = data.binance_tickers + data.binance_trades;
+
+    let bbo_str = match (&data.latest_up_book, &data.latest_dn_book) {
+        (Some(up), Some(dn)) => {
+            let up_bid = up.bids_slice().first().map(|l| l.price);
+            let up_ask = up.asks_slice().first().map(|l| l.price);
+            let dn_bid = dn.bids_slice().first().map(|l| l.price);
+            let dn_ask = dn.asks_slice().first().map(|l| l.price);
+            format!(
+                "Up {}/{} · Dn {}/{}",
+                Theme::fmt_cents(up_bid),
+                Theme::fmt_cents(up_ask),
+                Theme::fmt_cents(dn_bid),
+                Theme::fmt_cents(dn_ask),
             )
-        )
-    );
+        }
+        (Some(up), None) => {
+            let up_bid = up.bids_slice().first().map(|l| l.price);
+            let up_ask = up.asks_slice().first().map(|l| l.price);
+            format!(
+                "Up {}/{} · Dn --/--",
+                Theme::fmt_cents(up_bid),
+                Theme::fmt_cents(up_ask)
+            )
+        }
+        (None, Some(dn)) => {
+            let dn_bid = dn.bids_slice().first().map(|l| l.price);
+            let dn_ask = dn.asks_slice().first().map(|l| l.price);
+            format!(
+                "Up --/-- · Dn {}/{}",
+                Theme::fmt_cents(dn_bid),
+                Theme::fmt_cents(dn_ask)
+            )
+        }
+        _ => "BBO: --/--".to_string(),
+    };
+
+    let btc_str = match data.latest_binance_px_e8 {
+        Some(px) => format!("BTC ${:.2}", (px as f64) / 1e8),
+        None => "BTC --".to_string(),
+    };
+
+    format!(
+        "  {} [{}] {} (ends {}, {:>3}s left) {} CLOB: {:>5} {} Bin: {:>5} {} {} {} {}",
+        t.badge(Badge::Live),
+        t.muted(&now_local),
+        t.cyan(&win_str),
+        expiry_local,
+        rem_s,
+        t.bar(),
+        clob_ev,
+        t.bar(),
+        bin_ev,
+        t.bar(),
+        bbo_str,
+        t.bar(),
+        t.bold(&btc_str)
+    )
 }
 
 pub(crate) fn push_sample(buf: &mut Vec<String>, line: String) {
@@ -1405,5 +1522,46 @@ mod tests {
         let res = run_replay(&multi, None);
         let _ = std::fs::remove_file(&multi);
         assert!(res.is_ok(), "multi-epoch replay validation failed: {res:?}");
+    }
+
+    #[test]
+    fn test_truncate_token_id() {
+        assert_eq!(truncate_token_id("123"), "123");
+        let long_id =
+            "95711136203495911997127094189614164136721183539547019195760563976669053234852";
+        assert_eq!(truncate_token_id(long_id), "957111...234852");
+    }
+
+    #[test]
+    fn test_feeds_progress_line_contains_live_and_bbo() {
+        use core_types::{FeeSchedule, ProtocolVersion};
+
+        let desc = MarketDescriptor {
+            condition_id: "0x123".to_string(),
+            slug: "btc-updown-5m-1000".to_string(),
+            question: "BTC 5m".to_string(),
+            version: ProtocolVersion::PolyV2,
+            neg_risk: false,
+            asset_id_up: "1".to_string(),
+            asset_id_dn: "2".to_string(),
+            tick_size_micro: MicroUsdc(10_000),
+            min_order_size_micro: SharesMicro(5_000_000),
+            taker_delay_ms: 50,
+            fee_schedule: FeeSchedule::btc_5m_default(),
+            start_ts_ms: 1_000_000,
+            expiry_ts_ms: 1_300_000,
+            strike_price_usd: None,
+        };
+        let mut data = CaptureReportData::new("Connected".to_string());
+        data.poly_books = 10;
+        data.binance_tickers = 25;
+        data.latest_binance_px_e8 = Some(9_845_050_000_000);
+
+        let line = format_feeds_progress_line(Theme::plain(), 1_100_000, &desc, 1, Some(3), &data);
+        assert!(line.contains("[LIVE]"));
+        assert!(line.contains("Win 1/3"));
+        assert!(line.contains("CLOB:    10"));
+        assert!(line.contains("Bin:    25"));
+        assert!(line.contains("BTC $98450.50"));
     }
 }

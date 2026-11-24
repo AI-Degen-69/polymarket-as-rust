@@ -422,6 +422,12 @@ tr.section-row td {
           </td>
         </tr>
         <tr class="data-row" data-cat="inputs">
+          <td class="c-term"><span class="term-title">Window / Market</span><span class="cat-tag">01 · Contract</span></td>
+          <td class="c-def">The active 5-minute Polymarket BTC Up/Down trading session ($T = 300\,\mathrm{s}$ span). Formerly called "Epoch". Bound by discrete $\mathrm{start\_ts\_ms} \to \mathrm{expiry\_ts\_ms}$ UTC boundaries.</td>
+          <td class="c-he">חלון מסחר / שוק פעיל — חלון המסחר הבודד בן 5 הדקות בשוק הבינארי BTC Up/Down של פולימרקט (<span class="math-inline">$T = 300\,\mathrm{s}$</span>). בעבר כונה "Epoch". תחום בין זמני פתיחה ופקיעה בדידים.</td>
+          <td class="c-ex">הרובוט מסיים חלון פעיל ומבצע <span class="en">Rollover</span> לחלון הבא בגבול 5 הדקות.</td>
+        </tr>
+        <tr class="data-row" data-cat="inputs">
           <td class="c-term"><span class="term-title">Gamma ($\gamma$)</span><span class="cat-tag">01 · Input</span></td>
           <td class="c-def">CARA risk-aversion parameter in $\mathrm{USD}^{-1}$. It sets the variance term in $s^*$ and the inventory penalty in $r_i$; must be finite and positive ($\gamma \in (0, 100]$).</td>
           <td class="c-he">פרמטר סלידה מסיכון של מודל CARA, ביחידות <span class="math-inline">$\mathrm{USD}^{-1}$</span>. הוא קובע את איבר הווריאנס במרווח ואת עונש המלאי במחיר הייחוס. הערך חייב להיות חיובי וסופי, עד <span class="math-inline">$100$</span>.</td>
