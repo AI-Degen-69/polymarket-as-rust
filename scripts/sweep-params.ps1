@@ -445,17 +445,17 @@ function Write-ConfigBanner {
     $pipe = Format-ColorText -Text " |  " -Code $AnsiGray
 
     $highLevelPairs = @(
-        @("V-Max",    "BaseSize"),
-        @("MaxPair",  "QueueDecay")
+        @("V Max",      "Base Size"),
+        @("Max Pair",   "Queue Decay")
     )
 
     $sweptPairs = @(
-        @("Gamma",     "VarSpread"),
-        @("MinTicks",  "XTick"),
-        @("MaxP",      "MaxPx"),
-        @("LL-Thresh", "LL-WinMs"),
-        @("LL-CdMs",   "LL-Dir"),
-        @("HedgeSkew", "CapTier1")
+        @("Gamma",      "Variance"),
+        @("Min Ticks",  "Cross Loss"),
+        @("Entry Prob", "Entry Price"),
+        @("Threshold",  "Window Ms"),
+        @("Cooldown Ms", "Direction"),
+        @("Hedge Skew", "Tier 1 Cap")
     )
 
     Write-Host ""
@@ -790,22 +790,22 @@ try {
                                             foreach ($capT1 in $parsedCapTier1) {
                                                 $runIdx++
                                                 $currParamMap = @{
-                                                    "V-Max"      = "`$$VMax"
-                                                    "BaseSize"   = "${BaseSize}sh"
-                                                    "MaxPair"    = "`$$maxPairFormatted"
-                                                    "QueueDecay" = $QueueDecay
-                                                    "Gamma"      = $gammaStr
-                                                    "VarSpread"  = $varStr
-                                                    "MinTicks"   = $minTicks.ToString($inv)
-                                                    "XTick"      = $crossLoss
-                                                    "MaxP"       = $entryProb
-                                                    "MaxPx"      = $entryPrice
-                                                    "LL-Thresh"  = $llThresh
-                                                    "LL-WinMs"   = $llWin.ToString($inv)
-                                                    "LL-CdMs"    = $llCd.ToString($inv)
-                                                    "LL-Dir"     = $llDir
-                                                    "HedgeSkew"  = $hsStr
-                                                    "CapTier1"   = $capT1
+                                                    "V Max"       = "`$$VMax"
+                                                    "Base Size"   = "${BaseSize}sh"
+                                                    "Max Pair"    = "`$$maxPairFormatted"
+                                                    "Queue Decay" = $QueueDecay
+                                                    "Gamma"       = $gammaStr
+                                                    "Variance"    = $varStr
+                                                    "Min Ticks"   = $minTicks.ToString($inv)
+                                                    "Cross Loss"  = $crossLoss
+                                                    "Entry Prob"  = $entryProb
+                                                    "Entry Price" = $entryPrice
+                                                    "Threshold"   = $llThresh
+                                                    "Window Ms"   = $llWin.ToString($inv)
+                                                    "Cooldown Ms" = $llCd.ToString($inv)
+                                                    "Direction"   = $llDir
+                                                    "Hedge Skew"  = $hsStr
+                                                    "Tier 1 Cap"  = $capT1
                                                 }
 
                                                 # Level 1 Hierarchy: Config Set Banner (High-Level + Swept Params with Diff Highlighting)
