@@ -1108,7 +1108,6 @@ try {
                                                     WinRatePct    = $winRatePct
                                                     WinRate       = ("{0:F0}%" -f $winRatePct)
                                                     WinCaps       = $winCaps
-                                                    CapRuns       = $capRuns
                                                 })
                                             }
                                         }
