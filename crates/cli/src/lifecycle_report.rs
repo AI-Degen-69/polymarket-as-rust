@@ -25,12 +25,14 @@ const PHASE_BADGE_WIDTH: usize = 10;
 const TIER_BADGE_WIDTH: usize = 4;
 /// Fixed leg column so `UP` / `DN` actions line up even when one side holds or cancels.
 const LEG_WIDTH: usize = 21;
-/// Fixed status column for suppression/resume notices.
-const STATUS_WIDTH: usize = 18;
+/// Fixed status column for suppression/resume notices; matches `LEG_WIDTH` so columns align with `[ORDER]` rows.
+const STATUS_WIDTH: usize = LEG_WIDTH;
 /// Fixed value width keeps `Pricing` / `Risk` / `Total` labels aligned across latency rows.
 const LATENCY_VALUE_WIDTH: usize = 10;
 /// Nominal latency rows are reported as a health check at most this often.
 const LATENCY_PERIOD_MS: u64 = 10_000;
+/// Minor latency breaches (`<= 2x` budget) share a cooldown so Windows timer jitter does not spam.
+const LATENCY_MINOR_BREACH_COOLDOWN_MS: u64 = 5_000;
 /// Width budget for phase and order rows; longer trailing text is ellipsized.
 const ROW_WIDTH_BUDGET: usize = 130;
 /// Label column for the framed epoch block (`★ EPOCH ROLLOVER`, `◆ EPOCH #2`).
@@ -513,6 +515,23 @@ fn breaker_reason_text(reason: BreakerReason) -> &'static str {
     }
 }
 
+/// Station 6 per-leg suppression flags and entry-guard bounds for explaining paused quotes.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SuppressionContext {
+    pub(crate) bid_up_floored: Option<MicroUsdc>,
+    pub(crate) bid_dn_floored: Option<MicroUsdc>,
+    pub(crate) entry_guard_suppressed_up: bool,
+    pub(crate) entry_guard_suppressed_dn: bool,
+    pub(crate) post_only_clamped_up: bool,
+    pub(crate) post_only_clamped_dn: bool,
+    pub(crate) post_only_suppressed_up: bool,
+    pub(crate) post_only_suppressed_dn: bool,
+    pub(crate) cross_tick_clamped_up: bool,
+    pub(crate) cross_tick_clamped_dn: bool,
+    pub(crate) max_entry_prob: Option<f64>,
+    pub(crate) max_entry_price: Option<f64>,
+}
+
 /// Data for a single lifecycle terminal evaluation tick.
 pub(crate) struct LifecycleStepRow<'a> {
     pub(crate) now_ms: u64,
@@ -524,10 +543,13 @@ pub(crate) struct LifecycleStepRow<'a> {
     pub(crate) q_dn: SharesMicro,
     pub(crate) net_delta: i64,
     pub(crate) quote: QuoteOutput,
+    pub(crate) suppression_ctx: Option<SuppressionContext>,
     pub(crate) spot_usd: Option<f64>,
     pub(crate) strike_usd: Option<f64>,
     pub(crate) resting_bid_up: Option<MicroUsdc>,
     pub(crate) resting_bid_dn: Option<MicroUsdc>,
+    pub(crate) avg_cost_up: Option<MicroUsdc>,
+    pub(crate) avg_cost_dn: Option<MicroUsdc>,
     pub(crate) net_pnl_micro: i64,
     pub(crate) action_up: &'a OrderAction,
     pub(crate) action_dn: &'a OrderAction,
@@ -551,6 +573,9 @@ pub(crate) struct LifecycleStreamReporter {
     last_quoted_up: Option<MicroUsdc>,
     last_quoted_dn: Option<MicroUsdc>,
     last_latency_ms: Option<u64>,
+    last_minor_breach_ms: Option<u64>,
+    last_minor_breach_kind: Option<(bool, bool)>,
+    suppressed_minor_breaches: u32,
     verbose_latency: bool,
 }
 
@@ -565,6 +590,9 @@ impl LifecycleStreamReporter {
             last_quoted_up: None,
             last_quoted_dn: None,
             last_latency_ms: None,
+            last_minor_breach_ms: None,
+            last_minor_breach_kind: None,
+            suppressed_minor_breaches: 0,
             verbose_latency: false,
         }
     }
@@ -582,6 +610,9 @@ impl LifecycleStreamReporter {
         self.last_quoted_up = None;
         self.last_quoted_dn = None;
         self.last_latency_ms = None;
+        self.last_minor_breach_ms = None;
+        self.last_minor_breach_kind = None;
+        self.suppressed_minor_breaches = 0;
     }
 
     pub(crate) fn on_step(&mut self, row: &LifecycleStepRow<'_>) {
@@ -601,11 +632,25 @@ impl LifecycleStreamReporter {
         let t = self.theme;
         let utc = format_utc_hms(row.now_ms);
         let u_pct = (row.u_e6 as f64) / 10_000.0;
-        let up_str = format_action_styled(t, Outcome::Up, row.action_up, None);
-        let dn_str = format_action_styled(t, Outcome::Down, row.action_dn, None);
+        let up_str = format_action_styled(t, Outcome::Up, row.action_up, None, row.resting_bid_up);
+        let dn_str =
+            format_action_styled(t, Outcome::Down, row.action_dn, None, row.resting_bid_dn);
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
         let bar = t.bar();
         let suppr_note = match row.quote {
+            QuoteOutput::Suppressed(SuppressionReason::BothLegsSuppressed) => {
+                let text = if let Some(ctx) = row.suppression_ctx {
+                    let up = format_leg_suppression(Outcome::Up, ctx, row.best_ask_up);
+                    let dn = format_leg_suppression(Outcome::Down, ctx, row.best_ask_dn);
+                    format!("Suppressing: {up} {bar} {dn}")
+                } else {
+                    format!(
+                        "Suppressing: {}",
+                        suppression_detail(SuppressionReason::BothLegsSuppressed)
+                    )
+                };
+                format!(" {bar} {}", t.yellow(&text))
+            }
             QuoteOutput::Suppressed(reason) => format!(
                 " {bar} {}",
                 t.yellow(&format!("Suppressing: {}", suppression_detail(reason)))
@@ -654,32 +699,49 @@ impl LifecycleStreamReporter {
         match row.quote {
             QuoteOutput::Suppressed(reason) => {
                 if self.last_suppression != Some(reason) {
-                    let detail = match self.last_suppression {
-                        Some(prev) => format!(
-                            "{} {} {}",
-                            suppression_label(prev),
-                            t.arrow(),
-                            suppression_label(reason)
-                        ),
-                        None => suppression_detail(reason).to_string(),
+                    let prefix = status_prefix(
+                        t,
+                        &utc,
+                        row.tau_secs,
+                        row.phase,
+                        Badge::Suppr,
+                        "Quoting paused",
+                    );
+                    let line = if reason == SuppressionReason::BothLegsSuppressed
+                        && let Some(ctx) = row.suppression_ctx
+                    {
+                        let up_cell = format_leg_suppression(Outcome::Up, ctx, row.best_ask_up);
+                        let dn_cell = format_leg_suppression(Outcome::Down, ctx, row.best_ask_dn);
+                        format!(
+                            "{prefix} {} {} {}",
+                            theme::pad_visible_right(&t.yellow(&up_cell), LEG_WIDTH),
+                            t.bar(),
+                            t.yellow(&dn_cell),
+                        )
+                    } else {
+                        let detail = match self.last_suppression {
+                            Some(prev) => format!(
+                                "{} {} {}",
+                                suppression_label(prev),
+                                t.arrow(),
+                                suppression_label(reason)
+                            ),
+                            None => suppression_detail(reason).to_string(),
+                        };
+                        format!("{prefix} {}", t.yellow(&detail))
                     };
-                    lines.push(format!(
-                        "{} {}",
-                        status_prefix(
-                            t,
-                            &utc,
-                            row.tau_secs,
-                            row.phase,
-                            Badge::Suppr,
-                            "Quoting paused"
-                        ),
-                        t.yellow(&detail),
-                    ));
+                    lines.push(line);
                     self.last_suppression = Some(reason);
                 }
             }
-            QuoteOutput::Active { .. } => {
+            QuoteOutput::Active { bid_up, bid_dn, .. } => {
                 if self.last_suppression.take().is_some() {
+                    let resume_detail = match (bid_up, bid_dn) {
+                        (Some(_), Some(_)) => "UP & DN active",
+                        (Some(_), None) => "UP active (DN suppressed)",
+                        (None, Some(_)) => "DN active (UP suppressed)",
+                        (None, None) => "Quoting active",
+                    };
                     lines.push(format!(
                         "{} {}",
                         status_prefix(
@@ -690,7 +752,7 @@ impl LifecycleStreamReporter {
                             Badge::Resume,
                             "Quoting resumed"
                         ),
-                        t.gray("Both legs cleared"),
+                        t.gray(resume_detail),
                     ));
                 }
             }
@@ -736,8 +798,10 @@ impl LifecycleStreamReporter {
                 };
             let prev_up = prev_price_for(self.last_quoted_up, row.resting_bid_up, row.action_up);
             let prev_dn = prev_price_for(self.last_quoted_dn, row.resting_bid_dn, row.action_dn);
-            let up_leg = format_action_styled(t, Outcome::Up, row.action_up, prev_up);
-            let dn_leg = format_action_styled(t, Outcome::Down, row.action_dn, prev_dn);
+            let up_leg =
+                format_action_styled(t, Outcome::Up, row.action_up, prev_up, row.resting_bid_up);
+            let dn_leg =
+                format_action_styled(t, Outcome::Down, row.action_dn, prev_dn, row.resting_bid_dn);
             // Widen both leg cells together so `DN` never drifts on a long requote price.
             let leg_width = LEG_WIDTH
                 .max(theme::visible_width(&up_leg))
@@ -802,17 +866,31 @@ impl LifecycleStreamReporter {
         self.last_quoted_up = next_quoted(row.action_up, row.resting_bid_up);
         self.last_quoted_dn = next_quoted(row.action_dn, row.resting_bid_dn);
 
-        // 3. Latency: breaches print immediately; nominal ticks report at most every 10s
+        // 3. Latency: severe breaches print immediately; minor breaches (<= 2x budget) cooldown for 5s; nominal ticks every 10s
         let total_ns = row.pricing_ns.saturating_add(row.risk_ns);
         let pricing_breach = row.pricing_ns > PRICING_BUDGET_US.saturating_mul(1_000);
         let risk_breach = row.risk_ns > RISK_BUDGET_US.saturating_mul(1_000);
         let total_breach = total_ns > TOTAL_BUDGET_US.saturating_mul(1_000);
         let breach = pricing_breach || risk_breach || total_breach;
+        let severe_breach = row.pricing_ns > PRICING_BUDGET_US.saturating_mul(2_000)
+            || row.risk_ns > RISK_BUDGET_US.saturating_mul(2_000)
+            || total_breach;
+        let minor_breach = breach && !severe_breach;
+        let breach_kind = (pricing_breach, risk_breach);
+        let minor_due = minor_breach
+            && (self.last_minor_breach_kind != Some(breach_kind)
+                || self.last_minor_breach_ms.is_none_or(|last| {
+                    row.now_ms.saturating_sub(last) >= LATENCY_MINOR_BREACH_COOLDOWN_MS
+                }));
         // First tick only seeds the throttle window; nominal rows report every 10s after that.
         let previous_latency = self.last_latency_ms.get_or_insert(row.now_ms);
         let periodic = row.now_ms.saturating_sub(*previous_latency) >= LATENCY_PERIOD_MS;
-        if self.verbose_latency || breach || periodic {
+        if self.verbose_latency || severe_breach || minor_due || periodic {
             self.last_latency_ms = Some(row.now_ms);
+            if minor_breach {
+                self.last_minor_breach_ms = Some(row.now_ms);
+                self.last_minor_breach_kind = Some(breach_kind);
+            }
             let pricing =
                 t.fmt_latency_us_width(row.pricing_ns, PRICING_BUDGET_US, LATENCY_VALUE_WIDTH);
             let risk = t.fmt_latency_us_width(row.risk_ns, RISK_BUDGET_US, LATENCY_VALUE_WIDTH);
@@ -822,20 +900,31 @@ impl LifecycleStreamReporter {
                 "{}Pricing {pricing} {bar} Risk {risk} {bar} Total {total}",
                 row_prefix(t, &utc, row.tau_secs, Some(Badge::Latency), None, None),
             );
+            let suppressed = std::mem::take(&mut self.suppressed_minor_breaches);
             if breach {
                 let mut breaches = Vec::new();
                 if pricing_breach {
-                    breaches.push(format!("Pricing >{PRICING_BUDGET_US}µs"));
+                    breaches.push(format!("Pricing >{PRICING_BUDGET_US}us"));
                 }
                 if risk_breach {
-                    breaches.push(format!("Risk >{RISK_BUDGET_US}µs"));
+                    breaches.push(format!("Risk >{RISK_BUDGET_US}us"));
                 }
                 if total_breach {
-                    breaches.push(format!("Total >{TOTAL_BUDGET_US}µs"));
+                    breaches.push(format!("Total >{TOTAL_BUDGET_US}us"));
                 }
                 line.push_str(&format!(" {bar} {}", t.bold_yellow(&breaches.join(", "))));
+                if suppressed > 0 {
+                    line.push_str(&t.gray(&format!(" (+{suppressed} minor)")));
+                }
+            } else if suppressed > 0 {
+                line.push_str(&format!(
+                    " {bar} {}",
+                    t.gray(&format!("+{suppressed} minor"))
+                ));
             }
             lines.push(line);
+        } else if minor_breach {
+            self.suppressed_minor_breaches = self.suppressed_minor_breaches.saturating_add(1);
         }
 
         // 4. Periodic 1-line heartbeat (1s during MandatoryFlatten/T3/T4, else 5s)
@@ -866,10 +955,30 @@ impl LifecycleStreamReporter {
         let book = compact_book(t, row);
         let quote = compact_quote(row);
         let net_delta_micro = i128::from(row.q_up.as_u64()) - i128::from(row.q_dn.as_u64());
+        let up_inv = if net_delta_micro > 0
+            && let Some(cost) = row.avg_cost_up
+        {
+            format!(
+                "{}@{}",
+                fmt_shares_2dp(row.q_up.as_u64()),
+                Theme::fmt_cents(Some(cost))
+            )
+        } else {
+            fmt_shares_2dp(row.q_up.as_u64())
+        };
+        let dn_inv = if net_delta_micro < 0
+            && let Some(cost) = row.avg_cost_dn
+        {
+            format!(
+                "{}@{}",
+                fmt_shares_2dp(row.q_dn.as_u64()),
+                Theme::fmt_cents(Some(cost))
+            )
+        } else {
+            fmt_shares_2dp(row.q_dn.as_u64())
+        };
         let inv = format!(
-            "Inv {}/{} (Δ{})",
-            fmt_shares_2dp(row.q_up.as_u64()),
-            fmt_shares_2dp(row.q_dn.as_u64()),
+            "Inv {up_inv}/{dn_inv} (Δ{})",
             fmt_signed_shares_2dp(net_delta_micro)
         );
         let bar = t.bar();
@@ -901,13 +1010,21 @@ fn compact_book(t: Theme, row: &LifecycleStepRow<'_>) -> String {
     )
 }
 
-/// Compact quote cell: our resting pair in whole cents, without the combined pair cost.
+/// Compact quote cell: our resting pair in whole cents, plus pair cost when both legs rest (`Q 50/47 (97¢)`).
 fn compact_quote(row: &LifecycleStepRow<'_>) -> String {
-    format!(
-        "Q {}/{}",
-        fmt_cents_plain(row.resting_bid_up),
-        fmt_cents_plain(row.resting_bid_dn),
-    )
+    match (row.resting_bid_up, row.resting_bid_dn) {
+        (Some(up), Some(dn)) => format!(
+            "Q {}/{} ({})",
+            fmt_cents_plain(Some(up)),
+            fmt_cents_plain(Some(dn)),
+            Theme::fmt_cents(Some(MicroUsdc(up.0.saturating_add(dn.0))))
+        ),
+        _ => format!(
+            "Q {}/{}",
+            fmt_cents_plain(row.resting_bid_up),
+            fmt_cents_plain(row.resting_bid_dn),
+        ),
+    }
 }
 
 /// Builds the shared prefix for status notices (`[SUPPR]` / `[RESUME]`): badge columns plus a
@@ -949,9 +1066,99 @@ fn suppression_label(reason: SuppressionReason) -> &'static str {
 /// Full suppression detail for the first paused notice.
 fn suppression_detail(reason: SuppressionReason) -> &'static str {
     match reason {
-        SuppressionReason::BothLegsSuppressed => "Both legs suppressed (no valid spread)",
+        SuppressionReason::BothLegsSuppressed => "Both legs suppressed",
         other => suppression_label(other),
     }
+}
+
+fn format_prob_cents(prob: f64) -> String {
+    let micro = ((prob * 1_000_000.0) + 1e-9).floor() as u64;
+    Theme::fmt_cents(Some(MicroUsdc(micro)))
+}
+
+/// Formats the exact Station 6 gate and triggering price for one suppressed leg (`<= LEG_WIDTH` chars).
+fn format_leg_suppression(
+    outcome: Outcome,
+    ctx: SuppressionContext,
+    best_ask: Option<MicroUsdc>,
+) -> String {
+    let (leg, bid_floored, entry_guarded, post_only_clamped, post_only_suppressed, cross_tick) =
+        match outcome {
+            Outcome::Up => (
+                "UP",
+                ctx.bid_up_floored,
+                ctx.entry_guard_suppressed_up,
+                ctx.post_only_clamped_up,
+                ctx.post_only_suppressed_up,
+                ctx.cross_tick_clamped_up,
+            ),
+            Outcome::Down => (
+                "DN",
+                ctx.bid_dn_floored,
+                ctx.entry_guard_suppressed_dn,
+                ctx.post_only_clamped_dn,
+                ctx.post_only_suppressed_dn,
+                ctx.cross_tick_clamped_dn,
+            ),
+        };
+
+    if entry_guarded {
+        let px = if post_only_clamped
+            && let Some(p) = bid_floored
+            && !math_engine::is_entry_guarded(p, ctx.max_entry_prob, ctx.max_entry_price)
+            && let Some(ask) = best_ask
+        {
+            Some(p.min(MicroUsdc(ask.0.saturating_sub(10_000))))
+        } else {
+            bid_floored
+        };
+        if let Some(p) = px {
+            if let Some(cap) = ctx.max_entry_price
+                && math_engine::exceeds_entry_price_cap(p, cap)
+            {
+                return format!(
+                    "{leg}: {} > {} cap",
+                    Theme::fmt_cents(Some(p)),
+                    format_prob_cents(cap)
+                );
+            }
+            if let Some(p_max) = ctx.max_entry_prob {
+                let max_micro = ((p_max * 1_000_000.0) + 1e-9).floor() as u64;
+                let min_micro = 1_000_000u64.saturating_sub(max_micro);
+                if p.0 < min_micro {
+                    return format!(
+                        "{leg}: {} < {} floor",
+                        Theme::fmt_cents(Some(p)),
+                        Theme::fmt_cents(Some(MicroUsdc(min_micro)))
+                    );
+                }
+                if p.0 > max_micro {
+                    return format!(
+                        "{leg}: {} > {} ceil",
+                        Theme::fmt_cents(Some(p)),
+                        Theme::fmt_cents(Some(MicroUsdc(max_micro)))
+                    );
+                }
+            }
+        }
+        return format!("{leg}: entry guard");
+    }
+
+    if post_only_suppressed {
+        return match bid_floored {
+            Some(p) => format!("{leg}: {} post-only", Theme::fmt_cents(Some(p))),
+            None => format!("{leg}: post-only"),
+        };
+    }
+
+    if cross_tick {
+        return match bid_floored {
+            Some(p) => format!("{leg}: {} cross-tick", Theme::fmt_cents(Some(p))),
+            None => format!("{leg}: cross-tick cap"),
+        };
+    }
+
+    format!("{leg}: <1¢ min tick")
 }
 
 /// Turns an operator reason string (`stale_feed`) into readable words (`stale feed`).
@@ -976,6 +1183,7 @@ fn format_action_styled(
     outcome: Outcome,
     action: &OrderAction,
     prev_price: Option<MicroUsdc>,
+    resting_price: Option<MicroUsdc>,
 ) -> String {
     let leg = match outcome {
         Outcome::Up => t.bold_green("UP"),
@@ -983,13 +1191,25 @@ fn format_action_styled(
     };
     let arrow = t.arrow();
     match action {
-        OrderAction::Hold => format!("{leg}: {}", t.muted("hold (resting)")),
+        OrderAction::Hold => match resting_price {
+            Some(px) => format!(
+                "{leg}: {}",
+                t.muted(&format!("hold @ {}", Theme::fmt_cents(Some(px))))
+            ),
+            None => format!("{leg}: {}", t.muted("idle")),
+        },
         OrderAction::SubmitNew { price, size, .. } => format!(
             "{leg}: {} @ {}",
             fmt_shares_3dp(*size),
             Theme::fmt_cents(Some(*price))
         ),
-        OrderAction::Cancel { .. } => format!("{leg}: {}", t.yellow("Cancel")),
+        OrderAction::Cancel { .. } => match resting_price.or(prev_price) {
+            Some(px) => format!(
+                "{leg}: {}",
+                t.yellow(&format!("Cancel ({})", Theme::fmt_cents(Some(px))))
+            ),
+            None => format!("{leg}: {}", t.yellow("Cancel")),
+        },
         OrderAction::CancelAndReplace {
             new_price,
             new_size,
@@ -1109,45 +1329,58 @@ pub(crate) fn print_phase_transition(
     println!("{rule}");
 }
 
-pub(crate) fn print_tier_transition(to: RiskTier, u_e6: u64, heavy: Option<Outcome>) {
+pub(crate) fn print_tier_transition(
+    now_ms: u64,
+    tau_secs: u64,
+    phase: EpochPhase,
+    to: RiskTier,
+    u_e6: u64,
+    heavy: Option<Outcome>,
+) {
     let t = theme::current();
+    let utc = format_utc_hms(now_ms);
     let heavy_label = match heavy {
         Some(Outcome::Up) => "UP",
         Some(Outcome::Down) => "DN",
         None => "none",
     };
+    let util_cell =
+        theme::pad_visible_right(&format!("Util {:.1}%", (u_e6 as f64) / 10_000.0), LEG_WIDTH);
     println!(
-        "  {} {} Util {:.1}% {} heavy: {}",
-        t.badge(Badge::Tier),
-        t.tier_badge(to),
-        (u_e6 as f64) / 10_000.0,
+        "{}{} {} Heavy: {heavy_label}",
+        row_prefix(
+            t,
+            &utc,
+            tau_secs,
+            Some(Badge::Tier),
+            Some(MidColumn::Phase(phase)),
+            Some(to)
+        ),
+        util_cell,
         t.bar(),
-        heavy_label
     );
 }
 
-pub(crate) fn print_breaker_trip(status: BreakerStatus) {
-    println!();
-    println!("{}", format_breaker_line(theme::current(), status));
+pub(crate) fn print_breaker_trip(now_ms: u64, tau_secs: u64, status: BreakerStatus) {
+    println!(
+        "{}",
+        format_breaker_line(theme::current(), now_ms, tau_secs, status)
+    );
 }
 
-fn format_breaker_line(t: Theme, status: BreakerStatus) -> String {
-    let (tripped, state, reason) = match status {
-        BreakerStatus::ArmActive => (false, "Armed", "all risk gates healthy".to_string()),
-        BreakerStatus::Tripped { reason } => (
-            true,
-            "Quoting halted",
-            breaker_reason_text(reason).to_string(),
-        ),
+fn format_breaker_line(t: Theme, now_ms: u64, tau_secs: u64, status: BreakerStatus) -> String {
+    let utc = format_utc_hms(now_ms);
+    let (state, reason) = match status {
+        BreakerStatus::ArmActive => ("Armed", "all risk gates healthy".to_string()),
+        BreakerStatus::Tripped { reason } => {
+            ("Quoting halted", breaker_reason_text(reason).to_string())
+        }
     };
-    let bar = t.bar();
     format!(
-        "  {} {} {} {} {} {}",
-        t.breaker_icon(tripped),
-        t.badge(Badge::Breaker),
-        bar,
-        t.bold(state),
-        bar,
+        "{}{} {} {}",
+        row_prefix(t, &utc, tau_secs, Some(Badge::Breaker), None, None),
+        theme::pad_visible_right(&t.bold(state), STATUS_WIDTH),
+        t.bar(),
         t.gray(&reason),
     )
 }
@@ -1255,7 +1488,7 @@ pub(crate) fn print_lifecycle_merge(
     let utc = format_utc_hms(now_ms);
     let bar = t.bar();
     println!(
-        "{}pairs {} {bar} pair cost {} {bar} UP {} {} DN {} {bar} PnL {} {bar} total {}",
+        "{}Pairs {} {bar} Cost {} (UP {} {} DN {}) {bar} PnL {} {bar} Total {}",
         row_prefix(
             t,
             &utc,
@@ -1264,18 +1497,21 @@ pub(crate) fn print_lifecycle_merge(
             phase.map(MidColumn::Phase),
             Some(tier),
         ),
-        merge.merged_pairs,
+        fmt_shares_2dp(merge.merged_pairs.0),
         Theme::fmt_cents(Some(merge.pair_cost)),
         Theme::fmt_cents(Some(merge.avg_cost_up)),
         t.dot(),
         Theme::fmt_cents(Some(merge.avg_cost_dn)),
         t.fmt_pnl(merge.realized_gain_micro),
-        total_merged
+        fmt_shares_2dp(total_merged.0),
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn print_lifecycle_flatten(
-    market_slug: &str,
+    now_ms: u64,
+    tau_secs: u64,
+    tier: RiskTier,
     outcome: Outcome,
     side: OrderSide,
     price: MicroUsdc,
@@ -1284,22 +1520,24 @@ pub(crate) fn print_lifecycle_flatten(
     reason: &str,
 ) {
     let t = theme::current();
+    let utc = format_utc_hms(now_ms);
     let leg = match outcome {
-        Outcome::Up => "UP",
-        Outcome::Down => "DN",
+        Outcome::Up => t.bold_green("UP"),
+        Outcome::Down => t.bold_red("DN"),
     };
-    println!(
-        "  {} {} {} {} {} {} @ {} {} fee ${fee} {} {}",
-        t.badge(Badge::Flatten),
-        t.muted(market_slug),
-        t.bar(),
-        t.bold(leg),
+    let leg_action = format!(
+        "{leg} {} {} @ {}",
         side.as_str(),
         fmt_shares_3dp(size),
-        Theme::fmt_cents(Some(price)),
-        t.bar(),
-        t.bar(),
-        t.gray(reason)
+        Theme::fmt_cents(Some(price))
+    );
+    let bar = t.bar();
+    println!(
+        "{}{} {bar} Fee ${:.2} {bar} {}",
+        row_prefix(t, &utc, tau_secs, Some(Badge::Flatten), None, Some(tier)),
+        theme::pad_visible_right(&leg_action, LEG_WIDTH),
+        fee.0 as f64 / MICRO_SCALE as f64,
+        t.gray(reason),
     );
 }
 
@@ -1970,10 +2208,13 @@ mod tests {
                 pair_cost_micro: Some(MicroUsdc(970_000)),
                 gross_margin_bps: Some(300),
             },
+            suppression_ctx: None,
             spot_usd: Some(90_014.0),
             strike_usd: Some(90_000.0),
             resting_bid_up: Some(MicroUsdc(500_000)),
             resting_bid_dn: Some(MicroUsdc(470_000)),
+            avg_cost_up: None,
+            avg_cost_dn: None,
             net_pnl_micro: 200_000,
             action_up,
             action_dn,
@@ -2128,7 +2369,7 @@ mod tests {
         assert_eq!(r1.len(), 1);
         assert!(r1[0].contains("[RESUME]"));
         assert!(r1[0].contains("Quoting resumed"));
-        assert!(r1[0].contains("Both legs cleared"));
+        assert!(r1[0].contains("UP & DN active"));
 
         // Order action emits immediately between heartbeats.
         let submit = OrderAction::SubmitNew {
@@ -2157,7 +2398,7 @@ mod tests {
         };
         let rep_lines = rep.format_step(&sample_row(base_ms + 650, 299, &hold, &replace));
         assert_eq!(rep_lines.len(), 1);
-        assert!(rep_lines[0].contains("UP: hold (resting)"));
+        assert!(rep_lines[0].contains("UP: hold @ 50¢"));
         assert!(rep_lines[0].contains("DN: 20 @ ~47¢~"));
         assert!(rep_lines[0].contains("37¢"));
         assert!(rep_lines[0].contains("DeadbandDrift"));
@@ -2226,7 +2467,7 @@ mod tests {
             size_only_rep.format_step(&sample_row(base_ms + 100, 299, &resize_up, &hold));
         assert_eq!(resize_lines.len(), 1);
         assert!(resize_lines[0].contains("UP: 10 @ 50¢"));
-        assert!(resize_lines[0].contains("DN: hold (resting)"));
+        assert!(resize_lines[0].contains("DN: hold @ 47¢"));
         assert!(resize_lines[0].contains("ExcessiveSize"));
         assert!(!resize_lines[0].contains("~50¢~"));
 
@@ -2244,7 +2485,7 @@ mod tests {
         let post_reset = size_only_rep.format_step(&next_epoch_row);
         assert_eq!(post_reset.len(), 2);
         assert!(post_reset[0].contains("UP: 10 @ 48¢"));
-        assert!(post_reset[0].contains("DN: hold (resting)"));
+        assert!(post_reset[0].contains("DN: hold @ 47¢"));
         assert!(post_reset[0].contains("ExcessiveSize"));
         assert!(!post_reset[0].contains("~"));
 
@@ -2525,12 +2766,12 @@ mod tests {
         assert!(periodic[0].contains("[LATENCY]"));
         assert!(!periodic[0].contains(">"));
 
-        // A breach is never throttled.
+        // A breach is never throttled when severe (>2x budget).
         let mut breach = sample_row(base_ms + 10_100, 289, &hold, &hold);
         breach.risk_ns = RISK_BUDGET_US * 1_000 + 1;
         let breach_lines = rep.format_step(&breach);
         assert_eq!(breach_lines.len(), 1);
-        assert!(breach_lines[0].contains("Risk >10µs"));
+        assert!(breach_lines[0].contains("Risk >10us"));
 
         // `--verbose-latency` restores per-tick rows.
         let mut verbose =
@@ -2590,6 +2831,181 @@ mod tests {
             assert!(theme::strip_ansi(&suppr_lines[0]).contains("Quoting paused"));
             assert_eq!(theme::visible_width(&theme.phase_rule()), 124);
         }
+    }
+
+    #[test]
+    fn suppression_and_resume_report_gate_price_and_align_with_order_columns() {
+        let hold = OrderAction::Hold;
+        let base_ms = 1_795_345_200_000_u64;
+        let submit_up = OrderAction::SubmitNew {
+            outcome: Outcome::Up,
+            price: MicroUsdc(200_000),
+            size: SharesMicro::from_raw(20 * 1_000_000),
+        };
+        let cancel_up = OrderAction::Cancel {
+            outcome: Outcome::Up,
+            order_id: "ord-up".to_string(),
+            reason: CancelReason::RiskSuppressed,
+        };
+
+        let ctx = SuppressionContext {
+            bid_up_floored: Some(MicroUsdc(190_000)),
+            bid_dn_floored: Some(MicroUsdc(750_000)),
+            entry_guard_suppressed_up: true,
+            entry_guard_suppressed_dn: true,
+            max_entry_prob: Some(0.80),
+            max_entry_price: Some(0.60),
+            ..Default::default()
+        };
+
+        let bar_positions = |line: &str| -> Vec<usize> {
+            line.chars()
+                .enumerate()
+                .filter_map(|(idx, ch)| (ch == '|').then_some(idx))
+                .collect()
+        };
+
+        let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let mut order_row = sample_row(base_ms, 213, &cancel_up, &hold);
+        order_row.quote = QuoteOutput::Active {
+            bid_up: Some(MicroUsdc(200_000)),
+            bid_dn: None,
+            pair_cost_micro: None,
+            gross_margin_bps: None,
+        };
+        let order_lines = rep.format_step(&order_row);
+        let order_line = order_lines
+            .iter()
+            .find(|l| l.contains("[ORDER]"))
+            .expect("expected order line");
+        let order_bars = bar_positions(order_line);
+        assert!(order_bars.len() >= 2);
+
+        let mut suppr_row = sample_row(base_ms + 1_000, 212, &cancel_up, &hold);
+        suppr_row.quote = QuoteOutput::Suppressed(SuppressionReason::BothLegsSuppressed);
+        suppr_row.suppression_ctx = Some(ctx);
+        let suppr_lines = rep.format_step(&suppr_row);
+        let suppr_line = &suppr_lines[0];
+        assert!(suppr_line.contains("[SUPPR]"));
+        assert!(suppr_line.contains("UP: 19¢ < 20¢ floor"));
+        assert!(suppr_line.contains("DN: 75¢ > 60¢ cap"));
+        let suppr_bars = bar_positions(suppr_line);
+        assert_eq!(suppr_bars.len(), 2);
+        assert_eq!(suppr_bars[0], order_bars[0]);
+        assert_eq!(suppr_bars[1], order_bars[1]);
+
+        let mut resume_row = sample_row(base_ms + 2_000, 211, &submit_up, &hold);
+        resume_row.quote = QuoteOutput::Active {
+            bid_up: Some(MicroUsdc(200_000)),
+            bid_dn: None,
+            pair_cost_micro: None,
+            gross_margin_bps: None,
+        };
+        let resume_lines = rep.format_step(&resume_row);
+        let resume_line = &resume_lines[0];
+        assert!(resume_line.contains("[RESUME]"));
+        assert!(resume_line.contains("UP active (DN suppressed)"));
+        let resume_bars = bar_positions(resume_line);
+        assert_eq!(resume_bars[0], order_bars[0]);
+
+        for theme in [Theme::plain(), Theme::styled()] {
+            let mut r = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, theme);
+            let mut s = sample_row(base_ms, 212, &hold, &hold);
+            s.quote = QuoteOutput::Suppressed(SuppressionReason::BothLegsSuppressed);
+            s.suppression_ctx = Some(ctx);
+            for line in r.format_step(&s) {
+                assert!(theme::visible_width(&line) <= 140, "{line}");
+            }
+        }
+
+        let mixed_ctx = SuppressionContext {
+            bid_up_floored: Some(MicroUsdc(500_000)),
+            post_only_suppressed_up: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            format_leg_suppression(Outcome::Up, mixed_ctx, Some(MicroUsdc(500_000))),
+            "UP: 50¢ post-only"
+        );
+        assert_eq!(
+            format_leg_suppression(Outcome::Down, mixed_ctx, None),
+            "DN: <1¢ min tick"
+        );
+    }
+
+    #[test]
+    fn order_idle_cancel_price_suppression_transition_latency_cooldown_and_heartbeat_enrichment() {
+        let hold = OrderAction::Hold;
+        let base_ms = 1_795_345_200_000_u64;
+
+        // 1. [ORDER] idle vs hold @ px and Cancel (px)
+        let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let _ = rep.format_step(&sample_row(base_ms, 300, &hold, &hold));
+
+        let cancel_up = OrderAction::Cancel {
+            outcome: Outcome::Up,
+            order_id: "ord-u".to_string(),
+            reason: CancelReason::RiskSuppressed,
+        };
+        let mut row_cancel = sample_row(base_ms + 100, 299, &cancel_up, &hold);
+        row_cancel.resting_bid_up = Some(MicroUsdc(200_000));
+        row_cancel.resting_bid_dn = None;
+        let lines = rep.format_step(&row_cancel);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("UP: Cancel (20¢)"), "{}", lines[0]);
+        assert!(lines[0].contains("DN: idle"), "{}", lines[0]);
+
+        // 2. [SUPPR] WarmingUp -> BothLegsSuppressed preserves gate + price columns
+        let mut suppr_rep =
+            LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let mut warm_row = sample_row(base_ms, 300, &hold, &hold);
+        warm_row.quote = QuoteOutput::Suppressed(SuppressionReason::WarmingUp);
+        let w = suppr_rep.format_step(&warm_row);
+        assert!(w[0].contains("Warming up"), "{}", w[0]);
+
+        let mut both_row = sample_row(base_ms + 100, 299, &hold, &hold);
+        both_row.quote = QuoteOutput::Suppressed(SuppressionReason::BothLegsSuppressed);
+        both_row.suppression_ctx = Some(SuppressionContext {
+            bid_up_floored: Some(MicroUsdc(190_000)),
+            bid_dn_floored: Some(MicroUsdc(750_000)),
+            entry_guard_suppressed_up: true,
+            entry_guard_suppressed_dn: true,
+            max_entry_prob: Some(0.80),
+            max_entry_price: Some(0.60),
+            ..Default::default()
+        });
+        let b = suppr_rep.format_step(&both_row);
+        assert!(b[0].contains("UP: 19¢ < 20¢ floor"), "{}", b[0]);
+        assert!(b[0].contains("DN: 75¢ > 60¢ cap"), "{}", b[0]);
+
+        // 3. [LATENCY] minor breach cooldown + severe breach bypass + (+N minor) rollup
+        let mut lat_rep =
+            LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let _ = lat_rep.format_step(&sample_row(base_ms, 300, &hold, &hold));
+
+        let mut minor1 = sample_row(base_ms + 500, 299, &hold, &hold);
+        minor1.risk_ns = 14_000;
+        let m1 = lat_rep.format_step(&minor1);
+        assert_eq!(m1.len(), 1);
+        assert!(m1[0].contains("Risk >10us"), "{}", m1[0]);
+
+        let mut minor2 = sample_row(base_ms + 1_500, 298, &hold, &hold);
+        minor2.risk_ns = 15_000;
+        assert!(lat_rep.format_step(&minor2).is_empty());
+
+        let mut severe = sample_row(base_ms + 2_000, 297, &hold, &hold);
+        severe.risk_ns = 25_000;
+        let sev = lat_rep.format_step(&severe);
+        assert_eq!(sev.len(), 1);
+        assert!(sev[0].contains("Risk >10us (+1 minor)"), "{}", sev[0]);
+
+        // 4. [♥ BEAT] pair cost on Q and unhedged avg cost on Inv
+        let mut hb_rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let mut hb_row = sample_row(base_ms, 300, &hold, &hold);
+        hb_row.avg_cost_up = Some(MicroUsdc(480_000));
+        let hb = hb_rep.format_step(&hb_row);
+        assert!(hb[0].contains("Q 50/47 (97¢)"), "{}", hb[0]);
+        assert!(hb[0].contains("Inv 20@48¢/0 (Δ+20)"), "{}", hb[0]);
     }
 }
 
@@ -2661,17 +3077,19 @@ mod row_grammar_tests {
     fn breaker_rows_use_human_reason_and_state() {
         let tripped = format_breaker_line(
             Theme::plain(),
+            0,
+            300,
             BreakerStatus::Tripped {
                 reason: BreakerReason::PolymarketFeedStale,
             },
         );
-        assert!(tripped.contains("[BREAKER]"));
+        assert!(tripped.contains("00:00:00Z T-300s [BREAKER]"));
         assert!(tripped.contains("Quoting halted"));
         assert!(tripped.contains("Polymarket feed stale"));
         assert!(!tripped.contains('{'), "{tripped}");
         assert!(tripped.len() <= 140, "{tripped}");
 
-        let armed = format_breaker_line(Theme::plain(), BreakerStatus::ArmActive);
+        let armed = format_breaker_line(Theme::plain(), 0, 300, BreakerStatus::ArmActive);
         assert!(armed.contains("Armed"));
         assert!(armed.contains("all risk gates healthy"));
     }
