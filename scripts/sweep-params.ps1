@@ -321,9 +321,21 @@ function Format-VerdictCell {
 }
 
 function Get-SurvivalInputs {
-    param($CapRuns, [int]$TotalWindows, [bool]$IsMultiCapture, [int]$CaptureCount, [double]$SumVolIn, [double]$SumGross, [double]$SumSettle, [double]$SumUnreal)
+    param($CapRuns, [int]$TotalWindows, [bool]$IsMultiCapture, [int]$CaptureCount, [double]$SumVolIn, [double]$SumGross, [double]$SumSettle, [double]$SumUnreal, [double[]]$WindowNets = @())
     $out = @{ IS = [double]::NaN; OOS = [double]::NaN; Retain = [double]::NaN; MaxDD = [double]::NaN; Drag = 0.0; ISWin = 0; OOSWin = 0 }
-    if ($IsMultiCapture -and $CaptureCount -ge 2 -and $TotalWindows -ge 4) {
+    # Preferred: actual per-window net PnL from Rust `window_end` events (net + rebate).
+    # Falls back to capture-level prorating only when no window_end events exist.
+    if ($null -ne $WindowNets -and $WindowNets.Count -ge 4) {
+        $isTarget = [int][Math]::Floor($WindowNets.Count * 0.7)
+        $isAcc = 0.0; $oosAcc = 0.0
+        for ($wi = 0; $wi -lt $WindowNets.Count; $wi++) {
+            if ($wi -lt $isTarget) { $isAcc += $WindowNets[$wi] } else { $oosAcc += $WindowNets[$wi] }
+        }
+        $out.IS = $isAcc; $out.OOS = $oosAcc; $out.ISWin = $isTarget; $out.OOSWin = $WindowNets.Count - $isTarget
+        if ($isAcc -gt 1e-9) { $out.Retain = ($oosAcc / $isAcc) * 100.0 }
+        elseif ($oosAcc -gt 1e-9) { $out.Retain = [double]::PositiveInfinity }
+    }
+    elseif ($IsMultiCapture -and $CaptureCount -ge 2 -and $TotalWindows -ge 4) {
         $isTarget = [int][Math]::Floor($TotalWindows * 0.7)
         $cumW = 0; $isAcc = 0.0; $oosAcc = 0.0
         foreach ($c in $CapRuns) {
@@ -1008,26 +1020,28 @@ try {
                                                     $netPct = if ($volumeIn -gt 1e-6) { $finalNetUsd / $volumeIn } else { [double]::NaN }
                                                     $roiCap = Get-TradingRoiRatio -Deployed $volumeIn -Returned $closeVolume -FeesPaid $feesPaid
 
+                                                    # Per-window nets from Rust `window_end` events (actuals, not prorated).
+                                                    # Used for % Win and for IS/OOS walk-forward via Get-SurvivalInputs.
+                                                    $winEventPnls = [System.Collections.Generic.List[double]]::new()
+                                                    for ($li = 0; $li -lt ($allLines.Count - 1); $li++) {
+                                                        $evLine = $allLines[$li]
+                                                        if ($evLine -match '"event"\s*:\s*"(window_end|window_summary|window_settled)"') {
+                                                            try {
+                                                                $evObj = $evLine | ConvertFrom-Json
+                                                                $evP = $evObj.payload
+                                                                $wNet = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("net_pnl_micro", "window_net_pnl_micro", "realized_pnl_micro") -Scale 1e6 -DefaultValue 0.0
+                                                                $wReb = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("estimated_rebate_micro", "rebate_micro") -Scale 1e6 -DefaultValue 0.0
+                                                                $winEventPnls.Add($wNet + $wReb)
+                                                            } catch {}
+                                                        }
+                                                    }
                                                     # % Win across windows in this capture
                                                     $winPctCap = [double]::NaN
                                                     $winWindowsCount = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("winning_windows", "positive_windows") -Scale 1.0
                                                     $totWindowsPayload = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("windows_count", "total_windows") -Scale 1.0 -DefaultValue ([double]$cap.Windows)
-                                                    if (-not [double]::IsNaN($winWindowsCount) -and $totWindowsPayload -gt 0) {
+                                                    if (-not [double]::IsNaN($winWindowsCount) -and $totWindowsPayload -gt 0 -and $winEventPnls.Count -eq 0) {
                                                         $winPctCap = ($winWindowsCount / $totWindowsPayload) * 100.0
                                                     } else {
-                                                        $winEventPnls = [System.Collections.Generic.List[double]]::new()
-                                                        for ($li = 0; $li -lt ($allLines.Count - 1); $li++) {
-                                                            $evLine = $allLines[$li]
-                                                            if ($evLine -match '"event"\s*:\s*"(window_end|window_summary|window_settled)"') {
-                                                                try {
-                                                                    $evObj = $evLine | ConvertFrom-Json
-                                                                    $evP = $evObj.payload
-                                                                    $wNet = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("net_pnl_micro", "window_net_pnl_micro", "realized_pnl_micro") -Scale 1e6 -DefaultValue 0.0
-                                                                    $wReb = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("estimated_rebate_micro", "rebate_micro") -Scale 1e6 -DefaultValue 0.0
-                                                                    $winEventPnls.Add($wNet + $wReb)
-                                                                } catch {}
-                                                            }
-                                                        }
                                                         if ($winEventPnls.Count -gt 0) {
                                                             $posWins = @($winEventPnls | Where-Object { $_ -gt 0.0 }).Count
                                                             $winPctCap = ($posWins / $winEventPnls.Count) * 100.0
@@ -1035,6 +1049,7 @@ try {
                                                             $winPctCap = if ($finalNetUsd -gt 0.0) { 100.0 } else { 0.0 }
                                                         }
                                                     }
+                                                    $capWindowNets = @($winEventPnls.ToArray())
 
                                                     # Level 2 Hierarchy: Vertically Aligned & Color-Coded Per-Capture Summary (2 Lines)
                                                     # Line 1: Activity & Volume (Shares, Pairs, WinRate, Deployed, Returned, ROI)
@@ -1093,6 +1108,8 @@ try {
                                                         RPM            = $rpm
                                                         MO1sNum        = $mo1s
                                                         MO5sNum        = $mo5s
+                                                        WindowNets     = $capWindowNets
+                                                        WindowCount    = $capWindowNets.Count
                                                     })
                                                 }
 
@@ -1148,8 +1165,10 @@ try {
                                                     if ($c.NetPlusRebNum -gt 0.0) { $winCaps++ }
                                                 }
 
-                                                # ---- Verification inputs via shared helper (70/30 IS/OOS walk-forward; MaxDD/Drag capture-level proxies) ----
-                                                $surv = Get-SurvivalInputs -CapRuns $capRuns -TotalWindows $totalWindows -IsMultiCapture $isMultiCapture -CaptureCount $captures.Count -SumVolIn $sumVolIn -SumGross $sumGrossPnl -SumSettle $sumSettlement -SumUnreal $sumUnreal
+                                                # ---- Verification inputs: IS/OOS from actual `window_end` nets; MaxDD/Drag capture-level proxies ----
+                                                $allWindowNets = [System.Collections.Generic.List[double]]::new()
+                                                foreach ($c in $capRuns) { if ($null -ne $c.WindowNets) { foreach ($wn in $c.WindowNets) { $allWindowNets.Add([double]$wn) } } }
+                                                $surv = Get-SurvivalInputs -CapRuns $capRuns -TotalWindows $totalWindows -IsMultiCapture $isMultiCapture -CaptureCount $captures.Count -SumVolIn $sumVolIn -SumGross $sumGrossPnl -SumSettle $sumSettlement -SumUnreal $sumUnreal -WindowNets $allWindowNets.ToArray()
                                                 $isNet = $surv.IS; $oosNet = $surv.OOS; $retainPct = $surv.Retain; $maxDDPct = $surv.MaxDD; $dragPct = $surv.Drag
                                                 $isWinCount = $surv.ISWin; $oosWinCount = $surv.OOSWin
 
@@ -1299,9 +1318,10 @@ try {
     # Thresholds match docs/strategy-verification-spec.md and
     # docs/explanations/verification-and-survival-gates.html:
     # G1 IS>0 | G2 OOS>0 | G3 Ret>=40% | G4 MaxDD<=25% | G5 Drag<=30% | G6 Nbr>=60%.
-    # IS/OOS use a 70/30 capture-level walk-forward split by windows (multi-capture
-    # only); MaxDD/Drag are capture-level proxies from per-capture Net+Reb,
-    # settlement and unrealized summaries. Single-capture runs report N/A.
+    # IS/OOS use a 70/30 walk-forward split over actual Rust `window_end` nets
+    # (any capture count, >=4 windows); MaxDD/Drag are capture-level proxies from
+    # per-capture Net+Reb, settlement and unrealized summaries. Runs without
+    # window_end events report N/A / NEEDS-OOS.
     # -----------------------------------------------------------------------
     Update-SurvivalVerdicts -Sorted $sorted
 
