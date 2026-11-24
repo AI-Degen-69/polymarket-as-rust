@@ -287,6 +287,15 @@ pub(crate) fn format_feeds_progress_line(
                 Theme::fmt_cents(up_ask)
             )
         }
+        (None, Some(dn)) => {
+            let dn_bid = dn.bids_slice().first().map(|l| l.price);
+            let dn_ask = dn.asks_slice().first().map(|l| l.price);
+            format!(
+                "Up --/-- · Dn {}/{}",
+                Theme::fmt_cents(dn_bid),
+                Theme::fmt_cents(dn_ask)
+            )
+        }
         _ => "BBO: --/--".to_string(),
     };
 

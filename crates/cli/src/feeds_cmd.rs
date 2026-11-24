@@ -397,7 +397,7 @@ async fn capture_until_deadline(
                     data,
                 );
                 if is_tty {
-                    print!("\r{line}   ");
+                    print!("\r\x1b[2K{line}");
                     let _ = std::io::stdout().flush();
                 } else {
                     non_tty_ticks = non_tty_ticks.saturating_add(1);

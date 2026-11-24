@@ -409,8 +409,12 @@ mod tests {
         assert_eq!(&hms[5..6], ":");
 
         let dt = format_local_datetime(1_795_345_200_000);
+        let expected_date = DateTime::<Utc>::from_timestamp_millis(1_795_345_200_000).map_or_else(
+            || "2026-11-22".to_string(),
+            |utc| utc.with_timezone(&Local).format("%Y-%m-%d").to_string(),
+        );
         assert!(dt.contains("11:00:00Z UTC"));
-        assert!(dt.contains("2026-11-22"));
+        assert!(dt.contains(&expected_date));
     }
 
     #[test]
