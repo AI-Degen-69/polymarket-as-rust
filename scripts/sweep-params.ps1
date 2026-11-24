@@ -976,11 +976,16 @@ try {
                                                 # Aggregate Config Set Totals
                                                 $sumFills = 0
                                                 $sumMerges = 0
+                                                $sumQty = 0.0
                                                 $sumPairs = 0.0
+                                                $sumVolIn = 0.0
+                                                $sumCloseVol = 0.0
                                                 $sumRealized = 0.0
                                                 $sumUnreal = 0.0
+                                                $sumGrossPnl = 0.0
                                                 $sumNetPnl = 0.0
                                                 $sumRebate = 0.0
+                                                $sumFeesPaid = 0.0
                                                 $sumBasePnl = 0.0
                                                 $sumAlphaEdge = 0.0
                                                 $maxRpm = 0
@@ -991,11 +996,16 @@ try {
                                                 foreach ($c in $capRuns) {
                                                     $sumFills += $c.Fills
                                                     $sumMerges += $c.Merges
+                                                    $sumQty += $c.QuantityNum
                                                     $sumPairs += $c.PairsNum
+                                                    $sumVolIn += $c.VolumeInNum
+                                                    $sumCloseVol += $c.CloseVolumeNum
                                                     $sumRealized += $c.RealizedNum
                                                     $sumUnreal += $c.UnrealNum
+                                                    $sumGrossPnl += $c.GrossPnlNum
                                                     $sumNetPnl += $c.NetPnLNum
                                                     $sumRebate += $c.RebateNum
+                                                    $sumFeesPaid += $c.FeesNum
                                                     $sumBasePnl += $c.BasePnLNum
                                                     $sumAlphaEdge += $c.AlphaEdgeNum
                                                     if ($c.RPM -gt $maxRpm) { $maxRpm = $c.RPM }
@@ -1005,24 +1015,38 @@ try {
                                                 }
 
                                                 $sumNetPlusReb = $sumNetPnl + $sumRebate
+                                                $sumGrossPct = if ($sumVolIn -gt 1e-6) { ($sumCloseVol / $sumVolIn) - 1.0 } else { [double]::NaN }
+                                                $sumNetPct = if ($sumVolIn -gt 1e-6) { $sumNetPlusReb / $sumVolIn } else { [double]::NaN }
                                                 $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
                                                 $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
                                                 $winRatePct = if ($captures.Count -gt 0) { ($winCaps / $captures.Count) * 100.0 } else { 0.0 }
 
-                                                # Config Set Subtotal Banner
+                                                # Config Set Subtotal Banner (Matches Per-Capture 2-Line Hierarchy & Style)
                                                 $subHeader = Format-ColorText -Text ("  📊 [SET {0} / {1} SUBTOTAL | {2:F2}s]" -f $runIdx, $totalRuns, $cfgElapsedSec) -Code $AnsiBoldCyan
-                                                $sepBar = Format-ColorText -Text " | " -Code $AnsiGray
-                                                $subNetPnlCol = Format-SignedPnlCell -Value $sumNetPnl -Width 1 -Bold $true -Culture $inv
-                                                $subNetRebCol = Format-SignedPnlCell -Value $sumNetPlusReb -Width 1 -Bold $true -Culture $inv
-                                                $subAlphaCol = Format-SignedPnlCell -Value $sumAlphaEdge -Width 1 -Bold $true -Culture $inv
-                                                $winCapRaw = "{0}/{1}" -f $winCaps, $captures.Count
-                                                $winCapCode = if ($winRatePct -ge 70.0) { $AnsiBoldGreen } elseif ($winRatePct -ge 40.0) { $AnsiBoldYellow } else { $AnsiBoldRed }
-                                                $winCapCol = Format-ColorText -Text $winCapRaw -Code $winCapCode
+                                                $sepBar    = Format-ColorText -Text " | " -Code $AnsiGray
+                                                $arrowSep  = Format-ColorText -Text "  ->  " -Code $AnsiGray
+
+                                                $subDoneCell     = Format-ColorText -Text (("Done ({0,5:F2}s)" -f $cfgElapsedSec).PadRight(13)) -Code $AnsiBoldCyan
+                                                $subQtyCell      = ("Quantity: {0,7:F2}" -f $sumQty)
+                                                $subPairsCell    = ("Pairs: {0,7:F2}" -f $sumPairs)
+                                                $subWinRateCell  = "% Win: " + (Format-WinRateCell -Pct $winRatePct -Width 4 -Bold $true -Culture $inv)
+                                                $subVolInCell    = "Volume-In: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
+                                                $subCloseVolCell = "Close Volume: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
+
+                                                $subPnlLabelCell = Format-ColorText -Text ("P&L Subtotal".PadRight(13)) -Code $AnsiBoldCyan
+                                                $subGrossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $sumGrossPnl -Pct $sumGrossPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
+                                                $subRebateCell   = "Rebates: " + (Format-RebateCell -Value $sumRebate -Width 8 -Bold $true -IncludeDollar $true -Culture $inv)
+                                                $subFeesCell     = "Fees: " + (Format-FeeCell -FeePaidPositive $sumFeesPaid -Width 9 -Bold $true -IncludeDollar $true -Culture $inv)
+                                                $subNetCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $sumNetPlusReb -Pct $sumNetPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
 
                                                 Write-Host ""
                                                 Write-Host $subHeader
-                                                Write-Host ("     Fills: {0}{1}Merges: {2}{1}Pairs: {3:F2}{1}NetPnL: {4}{1}Net+Reb: {5}{1}Alpha: {6}{1}WinCap: {7}" -f `
-                                                    $sumFills, $sepBar, $sumMerges, $sumPairs, $subNetPnlCol, $subNetRebCol, $subAlphaCol, $winCapCol)
+                                                # Line 1: Activity & Volume
+                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}" -f `
+                                                    $treeBranch1, $subDoneCell, $sepBar, $subQtyCell, $subPairsCell, $subWinRateCell, $subVolInCell, $subCloseVolCell)
+                                                # Line 2: P&L Accounting Waterfall
+                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
+                                                    $treeBranch2, $subPnlLabelCell, $sepBar, $subGrossCell, $subRebateCell, $subFeesCell, $arrowSep, $subNetCell)
 
                                                 $results.Add([PSCustomObject]@{
                                                     Gamma         = $gammaStr
