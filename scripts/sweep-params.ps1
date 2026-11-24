@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Offline parameter sweep runner over recorded Polymarket feed captures.
 .DESCRIPTION
