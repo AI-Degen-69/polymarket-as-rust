@@ -196,6 +196,28 @@ function Format-SignedMarkoutCell {
     }
 }
 
+function Format-SignedPctCell {
+    param(
+        [double]$Ratio,
+        [int]$Width = 8,
+        [bool]$Bold = $false,
+        [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
+    )
+    if ([double]::IsNaN($Ratio) -or [double]::IsInfinity($Ratio)) {
+        return (Format-ColorText -Text ('n/a'.PadLeft($Width)) -Code $AnsiGray)
+    }
+    $raw = $Ratio.ToString('+0.00%;-0.00%;+0.00%', $Culture).PadLeft($Width)
+    if ($Ratio -gt 1e-9) {
+        $code = if ($Bold) { $AnsiBoldGreen } else { $AnsiGreen }
+        return (Format-ColorText -Text $raw -Code $code)
+    } elseif ($Ratio -lt -1e-9) {
+        $code = if ($Bold) { $AnsiBoldRed } else { $AnsiRed }
+        return (Format-ColorText -Text $raw -Code $code)
+    } else {
+        return (Format-ColorText -Text $raw -Code $AnsiGray)
+    }
+}
+
 function Format-RebateCell {
     param(
         [double]$Value,
@@ -1017,6 +1039,8 @@ try {
                                                 $sumNetPlusReb = $sumNetPnl + $sumRebate
                                                 $sumGrossPct = if ($sumVolIn -gt 1e-6) { ($sumCloseVol / $sumVolIn) - 1.0 } else { [double]::NaN }
                                                 $sumNetPct = if ($sumVolIn -gt 1e-6) { $sumNetPlusReb / $sumVolIn } else { [double]::NaN }
+                                                $sumRoi = if ($sumVolIn -gt 1e-6) { ($sumCloseVol - $sumVolIn - $sumFeesPaid) / $sumVolIn } else { [double]::NaN }
+                                                $roiPlain = if ([double]::IsNaN($sumRoi)) { 'n/a' } else { $sumRoi.ToString('+0.00%;-0.00%;+0.00%', $inv) }
                                                 $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
                                                 $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
                                                 $winRatePct = if ($captures.Count -gt 0) { ($winCaps / $captures.Count) * 100.0 } else { 0.0 }
@@ -1030,8 +1054,8 @@ try {
                                                 $subQtyCell      = ("Quantity: {0,7:F2}" -f $sumQty)
                                                 $subPairsCell    = ("Pairs: {0,7:F2}" -f $sumPairs)
                                                 $subWinRateCell  = "% Win: " + (Format-WinRateCell -Pct $winRatePct -Width 4 -Bold $true -Culture $inv)
-                                                $subVolInCell    = "Volume-In: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
-                                                $subCloseVolCell = "Close Volume: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
+                                                $subVolInCell    = "Deployed: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
+                                                $subCloseVolCell = "Returned: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
 
                                                 $subPnlLabelCell = Format-ColorText -Text ("P&L Subtotal".PadRight(13)) -Code $AnsiBoldCyan
                                                 $subGrossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $sumGrossPnl -Pct $sumGrossPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
@@ -1080,6 +1104,8 @@ try {
                                                     VolumeIn      = ("`$" + $sumVolIn.ToString("F2", $inv))
                                                     CloseVolumeNum = $sumCloseVol
                                                     CloseVol      = ("`$" + $sumCloseVol.ToString("F2", $inv))
+                                                    RoiNum        = $sumRoi
+                                                    Roi           = $roiPlain
                                                     RealizedNum   = $sumRealized
                                                     Realized      = $sumRealized.ToString("+0.0000;-0.0000;+0.0000", $inv)
                                                     UnrealNum     = $sumUnreal
@@ -1155,12 +1181,13 @@ try {
     $cols.Add(@{ Name = "Qty";       Dash = "--------";               Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
     $cols.Add(@{ Name = "Pairs";     Dash = "-------";                Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
     $cols.Add(@{ Name = "WinRate";   Dash = "-------";                Width = 7;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
-    $cols.Add(@{ Name = "Vol-In";    Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
-    $cols.Add(@{ Name = "CloseVol";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
+    $cols.Add(@{ Name = "Deployed";  Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
+    $cols.Add(@{ Name = "ROI";       Dash = "--------";               Width = 8;  Prop = "Roi";        NumProp = "RoiNum";         Kind = "roi" })
+    $cols.Add(@{ Name = "Returned";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
     $cols.Add(@{ Name = "Gross";     Dash = "--------------------";  Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
     $cols.Add(@{ Name = "Rebate";    Dash = "---------";              Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
     $cols.Add(@{ Name = "Fees";      Dash = "---------";              Width = 9;  Prop = "Fees";       NumProp = "FeesNum";        Kind = "fee" })
-    $cols.Add(@{ Name = "Net+Reb";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
+    $cols.Add(@{ Name = "Net P&L";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
     $cols.Add(@{ Name = "BasePnL";   Dash = "--------";               Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
     $cols.Add(@{ Name = "AlphaEdge"; Dash = "---------";              Width = 9;  Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
     $cols.Add(@{ Name = "RPM";       Dash = "---";                    Width = 4;  Prop = "RPM";        NumProp = "RPM";            Kind = "rpm" })
@@ -1255,6 +1282,13 @@ try {
                 "markout" {
                     if ($Colorize) {
                         $cells.Add((Format-SignedMarkoutCell -Value ([double]$Row.($col.NumProp)) -Width $w -Bold $false -Culture $inv))
+                    } else {
+                        $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
+                    }
+                }
+                "roi" {
+                    if ($Colorize) {
+                        $cells.Add((Format-SignedPctCell -Ratio ([double]$Row.($col.NumProp)) -Width $w -Bold $false -Culture $inv))
                     } else {
                         $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
                     }

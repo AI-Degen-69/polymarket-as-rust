@@ -70,6 +70,20 @@ try {
     Assert-True ((Format-RebateCell -Value 0.0 -Width 7).Contains("$esc[90m")) "zero rebate is muted"
     Assert-True ((Format-RebateCell -Value -0.42 -Width 7).Contains("$esc[31m")) "negative rebate is red"
 
+    # --- Signed percent cells (ROI) ----------------------------------------
+    $pctPos = Format-SignedPctCell -Ratio 0.0155 -Width 8
+    Assert-True ((Get-VisibleText $pctPos) -eq '  +1.55%') "positive pct shows +1.55%"
+    Assert-True ((Get-VisibleText $pctPos).Length -eq 8) "pct cell width is 8"
+    Assert-True ($pctPos.Contains("$esc[32m")) "positive pct is green"
+    $pctNeg = Format-SignedPctCell -Ratio -0.0044 -Width 8
+    Assert-True ((Get-VisibleText $pctNeg) -eq '  -0.44%') "negative pct shows -0.44%"
+    Assert-True ($pctNeg.Contains("$esc[31m")) "negative pct is red"
+    $pctZero = Format-SignedPctCell -Ratio 0.0 -Width 8
+    Assert-True ($pctZero.Contains("$esc[90m")) "zero pct is muted"
+    $pctNaN = Format-SignedPctCell -Ratio ([double]::NaN) -Width 8
+    Assert-True ((Get-VisibleText $pctNaN) -eq '     n/a') "NaN pct renders n/a"
+    Assert-True ($pctNaN.Contains("$esc[90m")) "NaN pct is muted"
+
     # --- Fee cells & Dollar formatting ----------------------------------
     $zeroFee = Format-FeeCell -FeePaidPositive 0.0 -Width 9 -IncludeDollar $true
     Assert-True ((Get-VisibleText $zeroFee) -eq " -`$0.0000") "zero fee has single minus and dollar sign"
