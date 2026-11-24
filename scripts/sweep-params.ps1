@@ -1048,6 +1048,15 @@ try {
                                                 Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
                                                     $treeBranch2, $subPnlLabelCell, $sepBar, $subGrossCell, $subRebateCell, $subFeesCell, $arrowSep, $subNetCell)
 
+                                                $grossSign = if ($sumGrossPnl -gt 1e-9) { "+" } elseif ($sumGrossPnl -lt -1e-9) { "-" } else { "+" }
+                                                $grossPctStr = if ([double]::IsNaN($sumGrossPct) -or [double]::IsInfinity($sumGrossPct)) { "n/a" } else { $sumGrossPct.ToString("+0.00%;-0.00%;+0.00%", $inv) }
+                                                $grossPlain = ("{0}`${1} ({2})" -f $grossSign, [Math]::Abs($sumGrossPnl).ToString("0.0000", $inv), $grossPctStr)
+                                                $netSign = if ($sumNetPlusReb -gt 1e-9) { "+" } elseif ($sumNetPlusReb -lt -1e-9) { "-" } else { "+" }
+                                                $netPctStr = if ([double]::IsNaN($sumNetPct) -or [double]::IsInfinity($sumNetPct)) { "n/a" } else { $sumNetPct.ToString("+0.00%;-0.00%;+0.00%", $inv) }
+                                                $netPlusRebPlain = ("{0}`${1} ({2})" -f $netSign, [Math]::Abs($sumNetPlusReb).ToString("0.0000", $inv), $netPctStr)
+                                                $rebateSign = if ($sumRebate -ge 0.0) { "+" } else { "-" }
+                                                $rebatePlain = ("{0}`${1}" -f $rebateSign, [Math]::Abs($sumRebate).ToString("0.0000", $inv))
+                                                $feesPlain = ("-`$" + [Math]::Abs($sumFeesPaid).ToString("0.0000", $inv))
                                                 $results.Add([PSCustomObject]@{
                                                     Gamma         = $gammaStr
                                                     VarSpr        = $varStr
@@ -1063,18 +1072,30 @@ try {
                                                     T1Cap         = $capT1
                                                     Fills         = $sumFills
                                                     Merges        = $sumMerges
+                                                    QuantityNum   = $sumQty
+                                                    Quantity      = $sumQty.ToString("F2", $inv)
                                                     PairsNum      = $sumPairs
                                                     Pairs         = $sumPairs.ToString("F2", $inv)
+                                                    VolumeInNum   = $sumVolIn
+                                                    VolumeIn      = ("`$" + $sumVolIn.ToString("F2", $inv))
+                                                    CloseVolumeNum = $sumCloseVol
+                                                    CloseVol      = ("`$" + $sumCloseVol.ToString("F2", $inv))
                                                     RealizedNum   = $sumRealized
                                                     Realized      = $sumRealized.ToString("+0.0000;-0.0000;+0.0000", $inv)
                                                     UnrealNum     = $sumUnreal
                                                     Unreal        = $sumUnreal.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                                    GrossPnlNum   = $sumGrossPnl
+                                                    GrossPnl      = $grossPlain
+                                                    GrossPctNum   = $sumGrossPct
                                                     NetPnLNum     = $sumNetPnl
                                                     NetPnL        = $sumNetPnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
                                                     RebateNum     = $sumRebate
-                                                    Rebate        = $sumRebate.ToString("0.0000", $inv)
+                                                    Rebate        = $rebatePlain
+                                                    FeesNum       = $sumFeesPaid
+                                                    Fees          = $feesPlain
                                                     NetPlusRebNum = $sumNetPlusReb
-                                                    NetPlusReb    = $sumNetPlusReb.ToString("+0.0000;-0.0000;+0.0000", $inv)
+                                                    NetPlusReb    = $netPlusRebPlain
+                                                    NetPctNum     = $sumNetPct
                                                     BasePnLNum    = $sumBasePnl
                                                     BasePnL       = $sumBasePnl.ToString("+0.0000;-0.0000;+0.0000", $inv)
                                                     AlphaEdgeNum  = $sumAlphaEdge
@@ -1087,7 +1108,6 @@ try {
                                                     WinRatePct    = $winRatePct
                                                     WinRate       = ("{0:F0}%" -f $winRatePct)
                                                     WinCaps       = $winCaps
-                                                    CapRuns       = $capRuns
                                                 })
                                             }
                                         }
@@ -1110,9 +1130,9 @@ try {
     $throughputText = if ($totalWindows -gt 0) { "{0:F2} win/s" -f $throughputWinPerSec } else { "n/a (windows unknown)" }
 
     # -----------------------------------------------------------------------
-    # Phase 3: Final Aggregation, Color-Coded Leaderboard & Per-Capture Summary
+    # Phase 3: Final Aggregation, Color-Coded Leaderboard (static column widths)
     # -----------------------------------------------------------------------
-    $sorted = @($results | Sort-Object -Property NetPnLNum -Descending)
+    $sorted = @($results | Sort-Object -Property NetPlusRebNum -Descending)
 
     # Build Leaderboard Column Metadata
     $cols = [System.Collections.Generic.List[hashtable]]::new()
@@ -1130,52 +1150,22 @@ try {
     if ($showHedgeSkew)  { $cols.Add(@{ Name = "HSkew"; Dash = "-----"; Width = 5; Prop = "HSkew"; Kind = "param" }) }
     if ($showCapTier1)   { $cols.Add(@{ Name = "T1Cap"; Dash = "-----"; Width = 5; Prop = "T1Cap"; Kind = "param" }) }
 
-    $cols.Add(@{ Name = "Fills";     Dash = "-----";     Width = 5;  Prop = "Fills";         NumProp = "Fills";         Kind = "int" })
-    $cols.Add(@{ Name = "Merges";    Dash = "------";    Width = 6;  Prop = "Merges";        NumProp = "Merges";        Kind = "int" })
-    $cols.Add(@{ Name = "Pairs";     Dash = "-------";   Width = 7;  Prop = "Pairs";         NumProp = "PairsNum";      Kind = "float" })
-    $cols.Add(@{ Name = "Realized";  Dash = "--------";  Width = 9;  Prop = "Realized";      NumProp = "RealizedNum";   Kind = "pnl" })
-    $cols.Add(@{ Name = "Unreal";    Dash = "--------";  Width = 9;  Prop = "Unreal";        NumProp = "UnrealNum";     Kind = "pnl" })
-    $cols.Add(@{ Name = "NetPnL";    Dash = "--------";  Width = 9;  Prop = "NetPnL";        NumProp = "NetPnLNum";     Kind = "pnl_bold" })
-    $cols.Add(@{ Name = "Rebate";    Dash = "------";    Width = 7;  Prop = "Rebate";        NumProp = "RebateNum";     Kind = "rebate" })
-    if ($isMultiCapture) {
-        $cols.Add(@{ Name = "Net+Reb";   Dash = "--------";  Width = 9;  Prop = "NetPlusReb";    NumProp = "NetPlusRebNum"; Kind = "pnl_bold" })
-    }
-    $cols.Add(@{ Name = "BasePnL";   Dash = "--------";  Width = 9;  Prop = "BasePnL";       NumProp = "BasePnLNum";    Kind = "pnl" })
-    $cols.Add(@{ Name = "AlphaEdge"; Dash = "---------"; Width = 9;  Prop = "AlphaEdge";     NumProp = "AlphaEdgeNum";  Kind = "pnl" })
-    $cols.Add(@{ Name = "RPM";       Dash = "---";       Width = 4;  Prop = "RPM";           NumProp = "RPM";           Kind = "rpm" })
-    $cols.Add(@{ Name = "MO1s";      Dash = "-----";     Width = 6;  Prop = "MO1s";          NumProp = "MO1sNum";       Kind = "markout" })
-    $cols.Add(@{ Name = "MO5s";      Dash = "-----";     Width = 6;  Prop = "MO5s";          NumProp = "MO5sNum";       Kind = "markout" })
-    if ($isMultiCapture) {
-        $cols.Add(@{ Name = "WinRate";   Dash = "-------";   Width = 7;  Prop = "WinRate";       NumProp = "WinRatePct";    Kind = "winrate" })
-    }
-
-    # Compute Leaderboard Totals / Averages across all config runs
-    $lbTotFills = 0; $lbTotMerges = 0; $lbTotPairs = 0.0
-    $lbTotRealized = 0.0; $lbTotUnreal = 0.0; $lbTotNetPnl = 0.0
-    $lbTotRebate = 0.0; $lbTotNetPlusReb = 0.0; $lbTotBasePnl = 0.0; $lbTotAlpha = 0.0
-    $lbSumRpm = 0.0; $lbSumMo1s = 0.0; $lbSumMo5s = 0.0; $lbSumWinRate = 0.0
-
-    foreach ($r in $sorted) {
-        $lbTotFills += $r.Fills
-        $lbTotMerges += $r.Merges
-        $lbTotPairs += $r.PairsNum
-        $lbTotRealized += $r.RealizedNum
-        $lbTotUnreal += $r.UnrealNum
-        $lbTotNetPnl += $r.NetPnLNum
-        $lbTotRebate += $r.RebateNum
-        $lbTotNetPlusReb += $r.NetPlusRebNum
-        $lbTotBasePnl += $r.BasePnLNum
-        $lbTotAlpha += $r.AlphaEdgeNum
-        $lbSumRpm += $r.RPM
-        $lbSumMo1s += $r.MO1sNum
-        $lbSumMo5s += $r.MO5sNum
-        $lbSumWinRate += $r.WinRatePct
-    }
-    $nRuns = [Math]::Max(1, $sorted.Count)
-    $lbAvgRpm = $lbSumRpm / $nRuns
-    $lbAvgMo1s = $lbSumMo1s / $nRuns
-    $lbAvgMo5s = $lbSumMo5s / $nRuns
-    $lbAvgWinRate = $lbSumWinRate / $nRuns
+    $cols.Add(@{ Name = "Fills";     Dash = "-----";                  Width = 5;  Prop = "Fills";      NumProp = "Fills";          Kind = "int" })
+    $cols.Add(@{ Name = "Merges";    Dash = "------";                 Width = 6;  Prop = "Merges";     NumProp = "Merges";         Kind = "int" })
+    $cols.Add(@{ Name = "Qty";       Dash = "--------";               Width = 8;  Prop = "Quantity";   NumProp = "QuantityNum";    Kind = "qty" })
+    $cols.Add(@{ Name = "Pairs";     Dash = "-------";                Width = 7;  Prop = "Pairs";      NumProp = "PairsNum";       Kind = "float" })
+    $cols.Add(@{ Name = "WinRate";   Dash = "-------";                Width = 7;  Prop = "WinRate";    NumProp = "WinRatePct";     Kind = "winrate" })
+    $cols.Add(@{ Name = "Vol-In";    Dash = "---------";              Width = 9;  Prop = "VolumeIn";   NumProp = "VolumeInNum";    Kind = "money" })
+    $cols.Add(@{ Name = "CloseVol";  Dash = "---------";              Width = 9;  Prop = "CloseVol";   NumProp = "CloseVolumeNum"; Kind = "money" })
+    $cols.Add(@{ Name = "Gross";     Dash = "--------------------";  Width = 20; Prop = "GrossPnl";   NumProp = "GrossPnlNum";    PctProp = "GrossPctNum"; Kind = "pnl_pct" })
+    $cols.Add(@{ Name = "Rebate";    Dash = "---------";              Width = 9;  Prop = "Rebate";     NumProp = "RebateNum";      Kind = "rebate_dollar" })
+    $cols.Add(@{ Name = "Fees";      Dash = "---------";              Width = 9;  Prop = "Fees";       NumProp = "FeesNum";        Kind = "fee" })
+    $cols.Add(@{ Name = "Net+Reb";   Dash = "--------------------";  Width = 20; Prop = "NetPlusReb"; NumProp = "NetPlusRebNum";  PctProp = "NetPctNum";   Kind = "pnl_pct_bold" })
+    $cols.Add(@{ Name = "BasePnL";   Dash = "--------";               Width = 9;  Prop = "BasePnL";    NumProp = "BasePnLNum";     Kind = "pnl" })
+    $cols.Add(@{ Name = "AlphaEdge"; Dash = "---------";              Width = 9;  Prop = "AlphaEdge";  NumProp = "AlphaEdgeNum";   Kind = "pnl" })
+    $cols.Add(@{ Name = "RPM";       Dash = "---";                    Width = 4;  Prop = "RPM";        NumProp = "RPM";            Kind = "rpm" })
+    $cols.Add(@{ Name = "MO1s";      Dash = "-----";                  Width = 6;  Prop = "MO1s";       NumProp = "MO1sNum";        Kind = "markout" })
+    $cols.Add(@{ Name = "MO5s";      Dash = "-----";                  Width = 6;  Prop = "MO5s";       NumProp = "MO5sNum";        Kind = "markout" })
 
     $fmtParts = for ($ci = 0; $ci -lt $cols.Count; $ci++) { "{$ci,$($cols[$ci].Width)}" }
     $plainRowFmt = $fmtParts -join " "
@@ -1197,40 +1187,58 @@ try {
             $leftAlign = ([int]$col.Width -lt 0)
             switch ($col.Kind) {
                 "rank" {
-                    $raw = $RankNum.ToString($inv).PadLeft($w)
-                    if ($Colorize -and $RankNum -eq 1) {
-                        $cells.Add((Format-ColorText -Text $raw -Code $AnsiBoldYellow))
+                    $medal = switch ($RankNum) {
+                        1 { "🥇" }
+                        2 { "🥈" }
+                        3 { "🥉" }
+                        default { $RankNum.ToString($inv) }
+                    }
+                    $raw = $medal.PadLeft($w)
+                    if ($Colorize) {
+                        if ($RankNum -eq 1) {
+                            $cells.Add((Format-ColorText -Text $raw -Code $AnsiBoldYellow))
+                        } elseif ($RankNum -eq 2) {
+                            $cells.Add((Format-ColorText -Text $raw -Code $AnsiBoldWhite))
+                        } elseif ($RankNum -eq 3) {
+                            $cells.Add((Format-ColorText -Text $raw -Code $AnsiYellow))
+                        } else {
+                            $cells.Add($raw)
+                        }
                     } else {
                         $cells.Add($raw)
                     }
                 }
-                "param" {
+                { $_ -in @("param", "int", "float", "qty", "money") } {
                     $valStr = [string]$Row.($col.Prop)
                     $cells.Add($(if ($leftAlign) { $valStr.PadRight($w) } else { $valStr.PadLeft($w) }))
                 }
-                "int" {
-                    $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
-                }
-                "float" {
-                    $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
-                }
-                "pnl" {
+                { $_ -in @("pnl", "pnl_bold") } {
                     if ($Colorize) {
-                        $cells.Add((Format-SignedPnlCell -Value ([double]$Row.($col.NumProp)) -Width $w -Bold $false -Culture $inv))
+                        $isBold = ($col.Kind -eq "pnl_bold")
+                        $cells.Add((Format-SignedPnlCell -Value ([double]$Row.($col.NumProp)) -Width $w -Bold $isBold -Culture $inv))
                     } else {
                         $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
                     }
                 }
-                "pnl_bold" {
+                { $_ -in @("pnl_pct", "pnl_pct_bold") } {
                     if ($Colorize) {
-                        $cells.Add((Format-SignedPnlCell -Value ([double]$Row.($col.NumProp)) -Width $w -Bold $true -Culture $inv))
+                        $isBold = ($col.Kind -eq "pnl_pct_bold")
+                        $cells.Add((Format-SignedPnlWithPctCell -Value ([double]$Row.($col.NumProp)) -Pct ([double]$Row.($col.PctProp)) -Width $w -Bold $isBold -IncludeDollar $true -Culture $inv))
                     } else {
                         $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
                     }
                 }
-                "rebate" {
+                { $_ -in @("rebate", "rebate_dollar") } {
                     if ($Colorize) {
-                        $cells.Add((Format-RebateCell -Value ([double]$Row.($col.NumProp)) -Width $w -Bold $false -Culture $inv))
+                        $withDollar = ($col.Kind -eq "rebate_dollar")
+                        $cells.Add((Format-RebateCell -Value ([double]$Row.($col.NumProp)) -Width $w -Bold $false -IncludeDollar $withDollar -Culture $inv))
+                    } else {
+                        $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
+                    }
+                }
+                "fee" {
+                    if ($Colorize) {
+                        $cells.Add((Format-FeeCell -FeePaidPositive ([double]$Row.($col.NumProp)) -Width $w -Bold $false -IncludeDollar $true -Culture $inv))
                     } else {
                         $cells.Add(([string]$Row.($col.Prop)).PadLeft($w))
                     }
@@ -1263,77 +1271,6 @@ try {
         return ($cells -join " ")
     }
 
-    function Format-LeaderboardFooterRow {
-        param([bool]$Colorize)
-        $cells = [System.Collections.Generic.List[string]]::new()
-        foreach ($col in $cols) {
-            $w = [Math]::Abs([int]$col.Width)
-            $leftAlign = ([int]$col.Width -lt 0)
-            switch ($col.Kind) {
-                "rank" {
-                    $raw = "TOT".PadLeft($w)
-                    $cells.Add($(if ($Colorize) { Format-ColorText -Text $raw -Code $AnsiBoldWhite } else { $raw }))
-                }
-                "param" {
-                    $raw = if ($leftAlign) { "-".PadRight($w) } else { "-".PadLeft($w) }
-                    $cells.Add($(if ($Colorize) { Format-ColorText -Text $raw -Code $AnsiGray } else { $raw }))
-                }
-                "int" {
-                    $val = if ($col.Prop -eq "Fills") { $lbTotFills } else { $lbTotMerges }
-                    $raw = $val.ToString($inv).PadLeft($w)
-                    $cells.Add($(if ($Colorize) { Format-ColorText -Text $raw -Code $AnsiBoldWhite } else { $raw }))
-                }
-                "float" {
-                    $raw = $lbTotPairs.ToString("F2", $inv).PadLeft($w)
-                    $cells.Add($(if ($Colorize) { Format-ColorText -Text $raw -Code $AnsiBoldWhite } else { $raw }))
-                }
-                { $_ -in @("pnl", "pnl_bold") } {
-                    $numVal = switch ($col.Prop) {
-                        "Realized"   { $lbTotRealized }
-                        "Unreal"     { $lbTotUnreal }
-                        "NetPnL"     { $lbTotNetPnl }
-                        "NetPlusReb" { $lbTotNetPlusReb }
-                        "BasePnL"    { $lbTotBasePnl }
-                        "AlphaEdge"  { $lbTotAlpha }
-                        default      { 0.0 }
-                    }
-                    if ($Colorize) {
-                        $cells.Add((Format-SignedPnlCell -Value $numVal -Width $w -Bold $true -Culture $inv))
-                    } else {
-                        $cells.Add($numVal.ToString("+0.0000;-0.0000;+0.0000", $inv).PadLeft($w))
-                    }
-                }
-                "rebate" {
-                    if ($Colorize) {
-                        $cells.Add((Format-RebateCell -Value $lbTotRebate -Width $w -Bold $true -Culture $inv))
-                    } else {
-                        $cells.Add($lbTotRebate.ToString("0.0000", $inv).PadLeft($w))
-                    }
-                }
-                "rpm" {
-                    $raw = $lbAvgRpm.ToString("0.0", $inv).PadLeft($w)
-                    $cells.Add($(if ($Colorize) { Format-ColorText -Text $raw -Code $AnsiBoldWhite } else { $raw }))
-                }
-                "markout" {
-                    $mVal = if ($col.Prop -eq "MO1s") { $lbAvgMo1s } else { $lbAvgMo5s }
-                    if ($Colorize) {
-                        $cells.Add((Format-SignedMarkoutCell -Value $mVal -Width $w -Bold $true -Culture $inv))
-                    } else {
-                        $cells.Add($mVal.ToString("+0.0;-0.0;+0.0", $inv).PadLeft($w))
-                    }
-                }
-                "winrate" {
-                    if ($Colorize) {
-                        $cells.Add((Format-WinRateCell -Pct $lbAvgWinRate -Width $w -Bold $true -Culture $inv))
-                    } else {
-                        $cells.Add(("{0:F0}%" -f $lbAvgWinRate).PadLeft($w))
-                    }
-                }
-            }
-        }
-        return ($cells -join " ")
-    }
-
     # -----------------------------------------------------------------------
     # Build Plain-Text Summary Lines (for summary.txt) & Color Console Output
     # -----------------------------------------------------------------------
@@ -1354,14 +1291,13 @@ try {
     $plainSummary.Add(("Output Dir: {0}" -f $sweepDir))
     $plainSummary.Add("=" * 100)
     $plainSummary.Add("")
-    $plainSummary.Add("CONFIG LEADERBOARD (sorted by NetPnL desc)")
+    $plainSummary.Add("CONFIG LEADERBOARD (sorted by Net P&L desc)")
     $plainSummary.Add(($plainRowFmt -f $headers))
     $plainSummary.Add(($plainRowFmt -f $dashes))
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
         $plainSummary.Add((Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $false))
     }
     $plainSummary.Add(($plainRowFmt -f $dashes))
-    $plainSummary.Add((Format-LeaderboardFooterRow -Colorize $false))
     # Write the leaderboard before printing, so an interrupted console dump still leaves the ranked artifact.
     $plainSummary | Set-Content -LiteralPath $summaryPath -Encoding utf8
 
@@ -1374,170 +1310,14 @@ try {
 
     # Print Config Leaderboard to Console
     Write-Host ""
-    Write-Host (Format-ColorText -Text "🏆 CONFIG LEADERBOARD (sorted by NetPnL desc)" -Code $AnsiBoldCyan)
+    Write-Host (Format-ColorText -Text "🏆 CONFIG LEADERBOARD (sorted by Net P&L desc)" -Code $AnsiBoldCyan)
     Write-Host (Format-ColorText -Text ($plainRowFmt -f $headers) -Code $AnsiBoldWhite)
     Write-Host (Format-ColorText -Text ($plainRowFmt -f $dashes) -Code $AnsiGray)
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
         Write-Host (Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $true)
     }
     Write-Host (Format-ColorText -Text ($plainRowFmt -f $dashes) -Code $AnsiGray)
-    Write-Host (Format-LeaderboardFooterRow -Colorize $true)
 
-    # Cross-Config Per-Capture Summary Table (Multi-Capture Runs)
-    if ($isMultiCapture) {
-        $capStemMaxLen = ($captures | ForEach-Object { $_.Label.Length } | Measure-Object -Maximum).Maximum
-        $capColWidth = [Math]::Max(28, $capStemMaxLen)
-
-        $capHeaderLine = "{0} {1,4} {2,5} {3,6} {4,7} {5,9} {6,9} {7,9} {8,7} {9,9} {10,9} {11,9} {12,4} {13,6} {14,6}" -f `
-            "Capture".PadRight($capColWidth), "Win", "Fills", "Merges", "Pairs", "Realized", "Unreal", "NetPnL", "Rebate", "Net+Reb", "BasePnL", "AlphaEdge", "RPM", "MO1s", "MO5s"
-        $capDashLine = "{0} {1,4} {2,5} {3,6} {4,7} {5,9} {6,9} {7,9} {8,7} {9,9} {10,9} {11,9} {12,4} {13,6} {14,6}" -f `
-            ("-" * $capColWidth), "----", "-----", "------", "-------", "---------", "---------", "---------", "-------", "---------", "---------", "---------", "----", "------", "------"
-
-        $plainSummary.Add("")
-        $plainSummary.Add(("PER-CAPTURE SUMMARY (aggregated across {0} config(s))" -f $totalRuns))
-        $plainSummary.Add($capHeaderLine)
-        $plainSummary.Add($capDashLine)
-
-        Write-Host ""
-        Write-Host (Format-ColorText -Text ("📁 PER-CAPTURE SUMMARY (aggregated across {0} config(s))" -f $totalRuns) -Code $AnsiBoldCyan)
-        Write-Host (Format-ColorText -Text $capHeaderLine -Code $AnsiBoldWhite)
-        Write-Host (Format-ColorText -Text $capDashLine -Code $AnsiGray)
-
-        $grandFills = 0; $grandMerges = 0; $grandPairs = 0.0
-        $grandRealized = 0.0; $grandUnreal = 0.0; $grandNetPnl = 0.0
-        $grandRebate = 0.0; $grandNetPlusReb = 0.0; $grandBasePnl = 0.0; $grandAlpha = 0.0
-        $grandSumRpm = 0.0; $grandWeightedMo1s = 0.0; $grandWeightedMo5s = 0.0
-
-        foreach ($cap in $captures) {
-            $cFills = 0; $cMerges = 0; $cPairs = 0.0
-            $cRealized = 0.0; $cUnreal = 0.0; $cNetPnl = 0.0
-            $cRebate = 0.0; $cNetPlusReb = 0.0; $cBasePnl = 0.0; $cAlpha = 0.0
-            $cSumRpm = 0.0; $cWeightedMo1s = 0.0; $cWeightedMo5s = 0.0
-            $cCount = 0
-
-            foreach ($r in $sorted) {
-                $matchRun = $r.CapRuns | Where-Object { $_.CaptureStem -eq $cap.Stem } | Select-Object -First 1
-                if ($null -ne $matchRun) {
-                    $cCount++
-                    $cFills += $matchRun.Fills
-                    $cMerges += $matchRun.Merges
-                    $cPairs += $matchRun.PairsNum
-                    $cRealized += $matchRun.RealizedNum
-                    $cUnreal += $matchRun.UnrealNum
-                    $cNetPnl += $matchRun.NetPnLNum
-                    $cRebate += $matchRun.RebateNum
-                    $cNetPlusReb += $matchRun.NetPlusRebNum
-                    $cBasePnl += $matchRun.BasePnLNum
-                    $cAlpha += $matchRun.AlphaEdgeNum
-                    $cSumRpm += $matchRun.RPM
-                    $cWeightedMo1s += ($matchRun.Fills * $matchRun.MO1sNum)
-                    $cWeightedMo5s += ($matchRun.Fills * $matchRun.MO5sNum)
-                }
-            }
-
-            $cAvgRpm = if ($cCount -gt 0) { $cSumRpm / $cCount } else { 0.0 }
-            $cAvgMo1s = if ($cFills -gt 0) { $cWeightedMo1s / $cFills } else { 0.0 }
-            $cAvgMo5s = if ($cFills -gt 0) { $cWeightedMo5s / $cFills } else { 0.0 }
-            $wTag = if ($cap.Windows -gt 0) { "{0}w" -f $cap.Windows } else { "?w" }
-
-            $grandFills += $cFills
-            $grandMerges += $cMerges
-            $grandPairs += $cPairs
-            $grandRealized += $cRealized
-            $grandUnreal += $cUnreal
-            $grandNetPnl += $cNetPnl
-            $grandRebate += $cRebate
-            $grandNetPlusReb += $cNetPlusReb
-            $grandBasePnl += $cBasePnl
-            $grandAlpha += $cAlpha
-            $grandSumRpm += $cAvgRpm
-            $grandWeightedMo1s += ($cFills * $cAvgMo1s)
-            $grandWeightedMo5s += ($cFills * $cAvgMo5s)
-
-            $plainCapLine = "{0} {1,4} {2,5} {3,6} {4,7} {5,9} {6,9} {7,9} {8,7} {9,9} {10,9} {11,9} {12,4} {13,6} {14,6}" -f `
-                $cap.Label.PadRight($capColWidth),
-                $wTag,
-                $cFills,
-                $cMerges,
-                $cPairs.ToString("F2", $inv),
-                $cRealized.ToString("+0.0000;-0.0000;+0.0000", $inv),
-                $cUnreal.ToString("+0.0000;-0.0000;+0.0000", $inv),
-                $cNetPnl.ToString("+0.0000;-0.0000;+0.0000", $inv),
-                $cRebate.ToString("0.0000", $inv),
-                $cNetPlusReb.ToString("+0.0000;-0.0000;+0.0000", $inv),
-                $cBasePnl.ToString("+0.0000;-0.0000;+0.0000", $inv),
-                $cAlpha.ToString("+0.0000;-0.0000;+0.0000", $inv),
-                $cAvgRpm.ToString("0.0", $inv),
-                $cAvgMo1s.ToString("+0.0;-0.0;+0.0", $inv),
-                $cAvgMo5s.ToString("+0.0;-0.0;+0.0", $inv)
-            $plainSummary.Add($plainCapLine)
-
-            $cRpmStr = $cAvgRpm.ToString("0.0", $inv).PadLeft(4)
-            $cRpmCol = if ($cAvgRpm -le 1e-6) { Format-ColorText -Text $cRpmStr -Code $AnsiGray } else { $cRpmStr }
-
-            $colorCapLine = "{0} {1} {2,5} {3,6} {4,7} {5} {6} {7} {8} {9} {10} {11} {12} {13} {14}" -f `
-                $cap.Label.PadRight($capColWidth),
-                (Format-ColorText -Text $wTag.PadLeft(4) -Code $AnsiGray),
-                $cFills,
-                $cMerges,
-                $cPairs.ToString("F2", $inv),
-                (Format-SignedPnlCell -Value $cRealized -Width 9 -Bold $false -Culture $inv),
-                (Format-SignedPnlCell -Value $cUnreal -Width 9 -Bold $false -Culture $inv),
-                (Format-SignedPnlCell -Value $cNetPnl -Width 9 -Bold $true -Culture $inv),
-                (Format-RebateCell -Value $cRebate -Width 7 -Bold $false -Culture $inv),
-                (Format-SignedPnlCell -Value $cNetPlusReb -Width 9 -Bold $true -Culture $inv),
-                (Format-SignedPnlCell -Value $cBasePnl -Width 9 -Bold $false -Culture $inv),
-                (Format-SignedPnlCell -Value $cAlpha -Width 9 -Bold $false -Culture $inv),
-                $cRpmCol,
-                (Format-SignedMarkoutCell -Value $cAvgMo1s -Width 6 -Bold $false -Culture $inv),
-                (Format-SignedMarkoutCell -Value $cAvgMo5s -Width 6 -Bold $false -Culture $inv)
-            Write-Host $colorCapLine
-        }
-
-        $grandAvgRpm = if ($captures.Count -gt 0) { $grandSumRpm / $captures.Count } else { 0.0 }
-        $grandAvgMo1s = if ($grandFills -gt 0) { $grandWeightedMo1s / $grandFills } else { 0.0 }
-        $grandAvgMo5s = if ($grandFills -gt 0) { $grandWeightedMo5s / $grandFills } else { 0.0 }
-        $totalLabel = ("TOTAL / AVG ({0} files | {1}w)" -f $captures.Count, $totalWindows).PadRight($capColWidth)
-        $totalWinTag = ("{0}w" -f $totalWindows).PadLeft(4)
-
-        $plainSummary.Add($capDashLine)
-        $plainSummary.Add(("{0} {1} {2,5} {3,6} {4,7} {5,9} {6,9} {7,9} {8,7} {9,9} {10,9} {11,9} {12,4} {13,6} {14,6}" -f `
-            $totalLabel,
-            $totalWinTag,
-            $grandFills,
-            $grandMerges,
-            $grandPairs.ToString("F2", $inv),
-            $grandRealized.ToString("+0.0000;-0.0000;+0.0000", $inv),
-            $grandUnreal.ToString("+0.0000;-0.0000;+0.0000", $inv),
-            $grandNetPnl.ToString("+0.0000;-0.0000;+0.0000", $inv),
-            $grandRebate.ToString("0.0000", $inv),
-            $grandNetPlusReb.ToString("+0.0000;-0.0000;+0.0000", $inv),
-            $grandBasePnl.ToString("+0.0000;-0.0000;+0.0000", $inv),
-            $grandAlpha.ToString("+0.0000;-0.0000;+0.0000", $inv),
-            $grandAvgRpm.ToString("0.0", $inv),
-            $grandAvgMo1s.ToString("+0.0;-0.0;+0.0", $inv),
-            $grandAvgMo5s.ToString("+0.0;-0.0;+0.0", $inv)))
-
-        Write-Host (Format-ColorText -Text $capDashLine -Code $AnsiGray)
-        Write-Host ("{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10} {11} {12} {13} {14}" -f `
-            (Format-ColorText -Text $totalLabel -Code $AnsiBoldWhite),
-            (Format-ColorText -Text $totalWinTag -Code $AnsiBoldWhite),
-            (Format-ColorText -Text $grandFills.ToString($inv).PadLeft(5) -Code $AnsiBoldWhite),
-            (Format-ColorText -Text $grandMerges.ToString($inv).PadLeft(6) -Code $AnsiBoldWhite),
-            (Format-ColorText -Text $grandPairs.ToString("F2", $inv).PadLeft(7) -Code $AnsiBoldWhite),
-            (Format-SignedPnlCell -Value $grandRealized -Width 9 -Bold $true -Culture $inv),
-            (Format-SignedPnlCell -Value $grandUnreal -Width 9 -Bold $true -Culture $inv),
-            (Format-SignedPnlCell -Value $grandNetPnl -Width 9 -Bold $true -Culture $inv),
-            (Format-RebateCell -Value $grandRebate -Width 7 -Bold $true -Culture $inv),
-            (Format-SignedPnlCell -Value $grandNetPlusReb -Width 9 -Bold $true -Culture $inv),
-            (Format-SignedPnlCell -Value $grandBasePnl -Width 9 -Bold $true -Culture $inv),
-            (Format-SignedPnlCell -Value $grandAlpha -Width 9 -Bold $true -Culture $inv),
-            (Format-ColorText -Text $grandAvgRpm.ToString("0.0", $inv).PadLeft(4) -Code $AnsiBoldWhite),
-            (Format-SignedMarkoutCell -Value $grandAvgMo1s -Width 6 -Bold $true -Culture $inv),
-            (Format-SignedMarkoutCell -Value $grandAvgMo5s -Width 6 -Bold $true -Culture $inv))
-    }
-
-    $plainSummary | Set-Content -LiteralPath $summaryPath -Encoding utf8
     Write-Host ""
 }
 finally {
