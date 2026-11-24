@@ -908,6 +908,7 @@ try {
                                                     $grossPct = if ($volumeIn -gt 1e-6) { ($closeVolume / $volumeIn) - 1.0 } else { [double]::NaN }
                                                     $finalNetUsd = $netPlusReb
                                                     $netPct = if ($volumeIn -gt 1e-6) { $finalNetUsd / $volumeIn } else { [double]::NaN }
+                                                    $roiCap = if ($volumeIn -gt 1e-6) { ($closeVolume - $volumeIn - $feesPaid) / $volumeIn } else { [double]::NaN }
 
                                                     # % Win across windows in this capture
                                                     $winPctCap = [double]::NaN
@@ -938,7 +939,7 @@ try {
                                                     }
 
                                                     # Level 2 Hierarchy: Vertically Aligned & Color-Coded Per-Capture Summary (2 Lines)
-                                                    # Line 1: Activity & Volume (Shares, Pairs, WinRate, Volume-In, Close Volume)
+                                                    # Line 1: Activity & Volume (Shares, Pairs, WinRate, Deployed, Returned, ROI)
                                                     # Line 2: P&L Waterfall (Gross P&L -> Rebates -> Fees -> Net P&L)
                                                     $treeBranch1  = Format-ColorText -Text "     ├─" -Code $AnsiGray
                                                     $treeBranch2  = Format-ColorText -Text "     └─" -Code $AnsiGray
@@ -949,8 +950,9 @@ try {
                                                     $qtyCell      = ("Quantity: {0,7:F2}" -f $qtyBought)
                                                     $pairsCell    = ("Pairs: {0,7:F2}" -f $pairs)
                                                     $winRateCell  = "% Win: " + (Format-WinRateCell -Pct $winPctCap -Width 4 -Bold $false -Culture $inv)
-                                                    $volInCell    = "Volume-In: " + ("`${0:F2}" -f $volumeIn).PadLeft(9)
-                                                    $closeVolCell = "Close Volume: " + ("`${0:F2}" -f $closeVolume).PadLeft(9)
+                                                    $volInCell    = "Deployed: " + ("`${0:F2}" -f $volumeIn).PadLeft(9)
+                                                    $closeVolCell = "Returned: " + ("`${0:F2}" -f $closeVolume).PadLeft(9)
+                                                    $roiCell      = "ROI: " + (Format-SignedPctCell -Ratio $roiCap -Width 8 -Bold $false -Culture $inv)
 
                                                     $pnlLabelCell = (Format-ColorText -Text "P&L Breakdown" -Code $AnsiGray).PadRight(13)
                                                     $grossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $grossPnl -Pct $grossPct -Width 20 -Bold $false -IncludeDollar $true -Culture $inv)
@@ -959,8 +961,8 @@ try {
                                                     $netCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $finalNetUsd -Pct $netPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
 
                                                     # Line 1: Activity & Volume
-                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}" -f `
-                                                        $treeBranch1, $doneCell, $sepBar, $qtyCell, $pairsCell, $winRateCell, $volInCell, $closeVolCell)
+                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
+                                                        $treeBranch1, $doneCell, $sepBar, $qtyCell, $pairsCell, $winRateCell, $volInCell, $closeVolCell, $roiCell)
 
                                                     # Line 2: P&L Accounting Waterfall
                                                     Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
@@ -1056,6 +1058,7 @@ try {
                                                 $subWinRateCell  = "% Win: " + (Format-WinRateCell -Pct $winRatePct -Width 4 -Bold $true -Culture $inv)
                                                 $subVolInCell    = "Deployed: " + ("`${0:F2}" -f $sumVolIn).PadLeft(9)
                                                 $subCloseVolCell = "Returned: " + ("`${0:F2}" -f $sumCloseVol).PadLeft(9)
+                                                $subRoiCell        = "ROI: " + (Format-SignedPctCell -Ratio $sumRoi -Width 8 -Bold $true -Culture $inv)
 
                                                 $subPnlLabelCell = Format-ColorText -Text ("P&L Subtotal".PadRight(13)) -Code $AnsiBoldCyan
                                                 $subGrossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $sumGrossPnl -Pct $sumGrossPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
@@ -1066,8 +1069,8 @@ try {
                                                 Write-Host ""
                                                 Write-Host $subHeader
                                                 # Line 1: Activity & Volume
-                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}" -f `
-                                                    $treeBranch1, $subDoneCell, $sepBar, $subQtyCell, $subPairsCell, $subWinRateCell, $subVolInCell, $subCloseVolCell)
+                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
+                                                    $treeBranch1, $subDoneCell, $sepBar, $subQtyCell, $subPairsCell, $subWinRateCell, $subVolInCell, $subCloseVolCell, $subRoiCell)
                                                 # Line 2: P&L Accounting Waterfall
                                                 Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
                                                     $treeBranch2, $subPnlLabelCell, $sepBar, $subGrossCell, $subRebateCell, $subFeesCell, $arrowSep, $subNetCell)
