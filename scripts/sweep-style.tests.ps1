@@ -1,4 +1,4 @@
-# Tests for the ANSI helpers embedded in scripts/sweep-params.ps1.
+﻿# Tests for the ANSI helpers embedded in scripts/sweep-params.ps1.
 # Run: pwsh -NoProfile -File scripts/sweep-style.tests.ps1
 [CmdletBinding()]
 param()
@@ -69,6 +69,18 @@ try {
     Assert-True ((Format-RebateCell -Value 0.42 -Width 7).Contains("$esc[36m")) "positive rebate is cyan"
     Assert-True ((Format-RebateCell -Value 0.0 -Width 7).Contains("$esc[90m")) "zero rebate is muted"
     Assert-True ((Format-RebateCell -Value -0.42 -Width 7).Contains("$esc[31m")) "negative rebate is red"
+
+    # --- Fee cells & Dollar formatting ----------------------------------
+    $zeroFee = Format-FeeCell -FeePaidPositive 0.0 -Width 9 -IncludeDollar $true
+    Assert-True ((Get-VisibleText $zeroFee) -eq " -`$0.0000") "zero fee has single minus and dollar sign"
+    Assert-True (-not (Get-VisibleText $zeroFee).Contains("--")) "zero fee has no double minus"
+    $posFee = Format-FeeCell -FeePaidPositive 0.1234 -Width 9 -IncludeDollar $true
+    Assert-True ((Get-VisibleText $posFee) -eq " -`$0.1234") 'positive fee paid renders as -$0.1234'
+    Assert-True (-not (Get-VisibleText $posFee).Contains("--")) "positive fee has no double minus"
+
+    $pnlPct = Format-SignedPnlWithPctCell -Value -3.8439 -Pct -0.0145 -Width 20 -IncludeDollar $true
+    Assert-True ((Get-VisibleText $pnlPct).Contains("-`$3.8439")) 'negative PnL includes -$ sign'
+    Assert-True (-not (Get-VisibleText $pnlPct).Contains("--")) "negative PnL has no double minus"
 
     # --- Parameter diff cells -------------------------------------------
     $changed = Format-ParamCell -Label "MaxPx" -CurrVal "0.7" -PrevVal "off" -IsLeftColumn $false

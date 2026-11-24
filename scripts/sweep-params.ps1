@@ -148,11 +148,18 @@ function Format-SignedPnlWithPctCell {
     param(
         [double]$Value,
         [double]$Pct,
-        [int]$Width = 18,
+        [int]$Width = 20,
         [bool]$Bold = $false,
+        [bool]$IncludeDollar = $true,
         [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
     )
-    $valStr = $Value.ToString("+0.0000;-0.0000;+0.0000", $Culture)
+    $sign = if ($Value -gt 1e-9) { "+" } elseif ($Value -lt -1e-9) { "-" } else { "+" }
+    $absVal = [Math]::Abs($Value)
+    $valStr = if ($IncludeDollar) {
+        "{0}`${1}" -f $sign, $absVal.ToString("0.0000", $Culture)
+    } else {
+        "{0}{1}" -f $sign, $absVal.ToString("0.0000", $Culture)
+    }
     $pctStr = if ([double]::IsNaN($Pct) -or [double]::IsInfinity($Pct)) {
         "n/a"
     } else {
@@ -194,9 +201,15 @@ function Format-RebateCell {
         [double]$Value,
         [int]$Width = 7,
         [bool]$Bold = $false,
+        [bool]$IncludeDollar = $false,
         [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
     )
-    $raw = $Value.ToString("0.0000", $Culture).PadLeft($Width)
+    $raw = if ($IncludeDollar) {
+        $sign = if ($Value -ge 0.0) { "+" } else { "-" }
+        ("{0}`${1}" -f $sign, [Math]::Abs($Value).ToString("0.0000", $Culture)).PadLeft($Width)
+    } else {
+        $Value.ToString("0.0000", $Culture).PadLeft($Width)
+    }
     if ($Value -gt 1e-9) {
         $code = if ($Bold) { $AnsiBoldCyan } else { $AnsiCyan }
         return (Format-ColorText -Text $raw -Code $code)
@@ -211,16 +224,21 @@ function Format-RebateCell {
 function Format-FeeCell {
     param(
         [double]$FeePaidPositive,
-        [int]$Width = 8,
+        [int]$Width = 9,
         [bool]$Bold = $false,
+        [bool]$IncludeDollar = $true,
         [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
     )
-    $signedFee = -1.0 * [Math]::Abs($FeePaidPositive)
-    if ([Math]::Abs($signedFee) -le 1e-9) {
-        $raw = "-0.0000".PadLeft($Width)
+    $absFee = [Math]::Abs($FeePaidPositive)
+    $numStr = $absFee.ToString("0.0000", $Culture)
+    $raw = if ($IncludeDollar) {
+        ("-`$" + $numStr).PadLeft($Width)
+    } else {
+        ("-" + $numStr).PadLeft($Width)
+    }
+    if ($absFee -le 1e-9) {
         return (Format-ColorText -Text $raw -Code $AnsiGray)
     }
-    $raw = $signedFee.ToString("-0.0000", $Culture).PadLeft($Width)
     $code = if ($Bold) { $AnsiBoldRed } else { $AnsiRed }
     return (Format-ColorText -Text $raw -Code $code)
 }
@@ -909,14 +927,14 @@ try {
                                                     $qtyCell      = ("Quantity: {0,7:F2}" -f $qtyBought)
                                                     $pairsCell    = ("Pairs: {0,7:F2}" -f $pairs)
                                                     $winRateCell  = "% Win: " + (Format-WinRateCell -Pct $winPctCap -Width 4 -Bold $false -Culture $inv)
-                                                    $volInCell    = ("Volume-In: {0,8:F2}" -f $volumeIn)
-                                                    $closeVolCell = ("Close Volume: {0,8:F2}" -f $closeVolume)
+                                                    $volInCell    = "Volume-In: " + ("`${0:F2}" -f $volumeIn).PadLeft(9)
+                                                    $closeVolCell = "Close Volume: " + ("`${0:F2}" -f $closeVolume).PadLeft(9)
 
                                                     $pnlLabelCell = (Format-ColorText -Text "P&L Breakdown" -Code $AnsiGray).PadRight(13)
-                                                    $grossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $grossPnl -Pct $grossPct -Width 18 -Bold $false -Culture $inv)
-                                                    $rebateCell   = "Rebates: " + (Format-RebateCell -Value $rebate -Width 7 -Bold $false -Culture $inv)
-                                                    $feesCell     = "Fees: " + (Format-FeeCell -FeePaidPositive $feesPaid -Width 8 -Bold $false -Culture $inv)
-                                                    $netCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $finalNetUsd -Pct $netPct -Width 18 -Bold $true -Culture $inv)
+                                                    $grossCell    = "Gross P&L: " + (Format-SignedPnlWithPctCell -Value $grossPnl -Pct $grossPct -Width 20 -Bold $false -IncludeDollar $true -Culture $inv)
+                                                    $rebateCell   = "Rebates: " + (Format-RebateCell -Value $rebate -Width 8 -Bold $false -IncludeDollar $true -Culture $inv)
+                                                    $feesCell     = "Fees: " + (Format-FeeCell -FeePaidPositive $feesPaid -Width 9 -Bold $false -IncludeDollar $true -Culture $inv)
+                                                    $netCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $finalNetUsd -Pct $netPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
 
                                                     # Line 1: Activity & Volume
                                                     Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}" -f `
