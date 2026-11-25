@@ -14,6 +14,8 @@
     pwsh -File scripts/sweep-params.ps1 -InputPath logs/captures/22-11_05-56-27Z_20s_1w.jsonl -Gammas 0.02,0.08,0.15 -VarianceSpreads false
 .EXAMPLE
     pwsh -File scripts/sweep-params.ps1 -AllCaptures -Gammas 0.25 -VarianceSpreads true -MinSpreadTicks 2 -MaxCombinedBidMicro 980000
+.EXAMPLE
+    pwsh -File scripts/sweep-params.ps1 -Quick
 .NOTES
     Each single-capture invocation writes its outputs to a unique UTC-timestamped folder under
     logs/sweeps/<DD-MM_HH-MM-SSZ>_<N>runs_<capture-stem>/.
@@ -28,6 +30,8 @@ param(
     [switch]$Latest,
 
     [switch]$AllCaptures,
+
+    [switch]$Quick,
 
     [int]$MinWindows = 2,
 
@@ -287,6 +291,7 @@ function Format-WinRateCell {
         [bool]$Bold = $false,
         [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture
     )
+    if ([double]::IsNaN($Pct)) { return (Format-ColorText -Text ('n/a'.PadLeft($Width)) -Code $AnsiGray) }
     $raw = ("{0:F0}%" -f $Pct).PadLeft($Width)
     if ($Pct -ge 70.0) {
         $code = if ($Bold) { $AnsiBoldGreen } else { $AnsiGreen }
@@ -321,9 +326,30 @@ function Format-VerdictCell {
 }
 
 function Get-SurvivalInputs {
-    param($CapRuns, [int]$TotalWindows, [bool]$IsMultiCapture, [int]$CaptureCount, [double]$SumVolIn, [double]$SumGross, [double]$SumSettle, [double]$SumUnreal)
+    param($CapRuns, [int]$TotalWindows, [bool]$IsMultiCapture, [int]$CaptureCount, [double]$SumVolIn, [double]$SumGross, [double]$SumSettle, [double]$SumUnreal, [double[]]$WindowNets = @())
     $out = @{ IS = [double]::NaN; OOS = [double]::NaN; Retain = [double]::NaN; MaxDD = [double]::NaN; Drag = 0.0; ISWin = 0; OOSWin = 0 }
-    if ($IsMultiCapture -and $CaptureCount -ge 2 -and $TotalWindows -ge 4) {
+    # Preferred: actual per-window net PnL from the window lifecycle events the replay emits
+    # (`window_end` net + rebate, or `epoch_rollover` realized + rebate deltas).
+    # Capture-level prorating is only used when no window events exist.
+    if ($null -ne $WindowNets -and $WindowNets.Count -gt 0) {
+        # IS/OOS needs >= 4 windows to split; drawdown is valid on any window series.
+        if ($WindowNets.Count -ge 4) {
+            $isTarget = [int][Math]::Floor($WindowNets.Count * 0.7)
+            $isAcc = 0.0; $oosAcc = 0.0
+            for ($wi = 0; $wi -lt $WindowNets.Count; $wi++) {
+                if ($wi -lt $isTarget) { $isAcc += $WindowNets[$wi] } else { $oosAcc += $WindowNets[$wi] }
+            }
+            $out.IS = $isAcc; $out.OOS = $oosAcc; $out.ISWin = $isTarget; $out.OOSWin = $WindowNets.Count - $isTarget
+            if ($isAcc -gt 1e-9) { $out.Retain = ($oosAcc / $isAcc) * 100.0 }
+            elseif ($oosAcc -gt 1e-9) { $out.Retain = [double]::PositiveInfinity }
+        }
+        # Drawdown on the actual per-window equity curve, same deployed-volume denominator
+        # as the capture-level path below.
+        $peak = 0.0; $wDD = 0.0; $wEq = 0.0
+        foreach ($wn in $WindowNets) { $wEq += $wn; if ($wEq -gt $peak) { $peak = $wEq }; $wDD = [Math]::Max($wDD, $peak - $wEq) }
+        $out.MaxDD = ($wDD / [Math]::Max($SumVolIn, 1.0)) * 100.0
+    }
+    elseif ($IsMultiCapture -and $CaptureCount -ge 2 -and $TotalWindows -ge 4) {
         $isTarget = [int][Math]::Floor($TotalWindows * 0.7)
         $cumW = 0; $isAcc = 0.0; $oosAcc = 0.0
         foreach ($c in $CapRuns) {
@@ -340,7 +366,8 @@ function Get-SurvivalInputs {
         if ($isAcc -gt 1e-9) { $out.Retain = ($oosAcc / $isAcc) * 100.0 }
         elseif ($oosAcc -gt 1e-9) { $out.Retain = [double]::PositiveInfinity }
     }
-    if ($CapRuns.Count -ge 2) {
+    # Capture-level fallback only: keeps MaxDD at n/a on a single capture with no window nets.
+    if ($CapRuns.Count -ge 2 -and [double]::IsNaN($out.MaxDD)) {
         $peak = 0.0; $maxDD = 0.0; $eq = 0.0
         foreach ($c in $CapRuns) { $eq += $c.NetPlusRebNum; if ($eq -gt $peak) { $peak = $eq }; $maxDD = [Math]::Max($maxDD, $peak - $eq) }
         $out.MaxDD = ($maxDD / [Math]::Max($SumVolIn, 1.0)) * 100.0
@@ -603,14 +630,14 @@ foreach ($minTicks in $parsedMinTicks) {
 
 $parsedInputPaths = @($InputPath | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 
-if ($AllCaptures -and $parsedInputPaths.Count -gt 0) {
-    throw "Cannot pass both -InputPath and -AllCaptures"
-}
-if ($Latest -and $parsedInputPaths.Count -gt 0) {
-    throw "Cannot pass both -InputPath and -Latest"
-}
-if ($Latest -and $AllCaptures) {
-    throw "Cannot pass both -AllCaptures and -Latest"
+# -InputPath, -Latest, -AllCaptures and -Quick all choose the input set: at most one may be given.
+$inputSelectors = @()
+if ($parsedInputPaths.Count -gt 0) { $inputSelectors += "-InputPath" }
+if ($Latest) { $inputSelectors += "-Latest" }
+if ($AllCaptures) { $inputSelectors += "-AllCaptures" }
+if ($Quick) { $inputSelectors += "-Quick" }
+if ($inputSelectors.Count -gt 1) {
+    throw "Pass at most one input selector (got $($inputSelectors -join ' + '))"
 }
 
 $resolvedInputs = [System.Collections.Generic.List[string]]::new()
@@ -628,23 +655,44 @@ foreach ($p in $parsedInputPaths) {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$origPwd = (Get-Location).Path
 Push-Location $repoRoot
+# logs/ is gitignored and never shared by worktrees: when this script is run from another
+# checkout (e.g. a worktree script against the main repo's captures), fall back to the
+# caller's logs directory so -AllCaptures / -Latest / sweep output resolve where the data is.
+$logsRoot = Join-Path $repoRoot "logs"
+if (-not (Test-Path -LiteralPath (Join-Path $logsRoot "captures"))) {
+    $callerLogs = Join-Path $origPwd "logs"
+    if (Test-Path -LiteralPath (Join-Path $callerLogs "captures")) { $logsRoot = $callerLogs }
+}
 try {
     if ($resolvedInputs.Count -eq 0) {
-        $capturesDir = Join-Path $repoRoot "logs/captures"
+        $capturesDir = Join-Path $logsRoot "captures"
         if (-not (Test-Path -LiteralPath $capturesDir)) {
             throw "Captures directory not found: $capturesDir (pass -InputPath or run poly-as feeds --discover)"
         }
-        if ($AllCaptures) {
+        if ($Quick -or $AllCaptures) {
+            # -Quick reuses the -AllCaptures pool but keeps only the two shortest captures,
+            # floored at 5 windows so the IS/OOS split stays meaningful (a trailing partial
+            # window emits no per-window result); -MinWindows still wins if it is stricter.
+            $selectMinWindows = if ($Quick) { [Math]::Max($MinWindows, 5) } else { $MinWindows }
             $matchedFiles = @(Get-ChildItem -LiteralPath $capturesDir -Filter "*.jsonl" -File |
                 Where-Object {
                     -not $_.Name.EndsWith(".inprogress.jsonl", [System.StringComparison]::OrdinalIgnoreCase) -and
                     $_.Name -match '_(\d+)w\.jsonl$' -and
-                    [int]$Matches[1] -ge $MinWindows
+                    [int]$Matches[1] -ge $selectMinWindows
                 } |
                 Sort-Object -Property LastWriteTimeUtc)
+            if ($Quick) {
+                # Re-sort the shortest pair into time order so the IS/OOS walk-forward stays chronological.
+                $matchedFiles = @($matchedFiles |
+                    Sort-Object -Property @{ Expression = { [int]($_.Name -replace '^.*_(\d+)w\.jsonl$', '$1') } }, LastWriteTimeUtc |
+                    Select-Object -First 2 |
+                    Sort-Object -Property LastWriteTimeUtc)
+                Write-Host ("⚡ [QUICK] Captures: {0}" -f (($matchedFiles | ForEach-Object { $_.Name }) -join ", "))
+            }
             if ($matchedFiles.Count -eq 0) {
-                throw "No finalized .jsonl captures matching _<N>w.jsonl with N >= $MinWindows found in $capturesDir"
+                throw "No finalized .jsonl captures matching _<N>w.jsonl with N >= $selectMinWindows found in $capturesDir"
             }
             foreach ($f in $matchedFiles) {
                 $resolvedInputs.Add($f.FullName)
@@ -686,6 +734,7 @@ try {
 
     if ($BinPath -ne "") {
         $binPath = $BinPath
+        if (-not [System.IO.Path]::IsPathRooted($binPath)) { $binPath = Join-Path $origPwd $binPath }
         if (-not (Test-Path -LiteralPath $binPath)) {
             throw "Explicit -BinPath not found: $binPath"
         }
@@ -714,7 +763,7 @@ try {
 
     $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count * $parsedMaxEntryPrices.Count * $parsedLLThresholds.Count * $parsedLLWindows.Count * $parsedLLCooldowns.Count * $parsedLLDirectionals.Count * $parsedHedgeSkews.Count * $parsedCapTier1.Count
     $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
-    $sweepBase = Join-Path $repoRoot "logs/sweeps"
+    $sweepBase = Join-Path $logsRoot "sweeps"
     if (-not (Test-Path -LiteralPath $sweepBase)) {
         New-Item -ItemType Directory -Force -Path $sweepBase | Out-Null
     }
@@ -1008,33 +1057,73 @@ try {
                                                     $netPct = if ($volumeIn -gt 1e-6) { $finalNetUsd / $volumeIn } else { [double]::NaN }
                                                     $roiCap = Get-TradingRoiRatio -Deployed $volumeIn -Returned $closeVolume -FeesPaid $feesPaid
 
-                                                    # % Win across windows in this capture
-                                                    $winPctCap = [double]::NaN
-                                                    $winWindowsCount = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("winning_windows", "positive_windows") -Scale 1.0
-                                                    $totWindowsPayload = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("windows_count", "total_windows") -Scale 1.0 -DefaultValue ([double]$cap.Windows)
-                                                    if (-not [double]::IsNaN($winWindowsCount) -and $totWindowsPayload -gt 0) {
-                                                        $winPctCap = ($winWindowsCount / $totWindowsPayload) * 100.0
-                                                    } else {
-                                                        $winEventPnls = [System.Collections.Generic.List[double]]::new()
-                                                        for ($li = 0; $li -lt ($allLines.Count - 1); $li++) {
-                                                            $evLine = $allLines[$li]
-                                                            if ($evLine -match '"event"\s*:\s*"(window_end|window_summary|window_settled)"') {
-                                                                try {
-                                                                    $evObj = $evLine | ConvertFrom-Json
-                                                                    $evP = $evObj.payload
-                                                                    $wNet = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("net_pnl_micro", "window_net_pnl_micro", "realized_pnl_micro") -Scale 1e6 -DefaultValue 0.0
-                                                                    $wReb = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("estimated_rebate_micro", "rebate_micro") -Scale 1e6 -DefaultValue 0.0
+                                                    # Per-window nets from the window lifecycle events the replay emits (actuals,
+                                                    # not prorated from the capture total). Used for % Win and for the IS/OOS
+                                                    # walk-forward and drawdown in Get-SurvivalInputs.
+                                                    #   `epoch_rollover` -> delta(total_realized_pnl_micro) + delta(estimated_rebate_micro)
+                                                    #   `window_end`     -> net_pnl_micro + per-window rebate (phase-4 lifecycle)
+                                                    # `epoch_rollover` reports realized PnL and rebate cumulatively and fires only on
+                                                    # rollover, so both are differenced here and the trailing partial window is
+                                                    # excluded; the series then sums to the capture's net + rebate. Settlement delta
+                                                    # alone is NOT the window result (it misses PnL already realized by merges).
+                                                    # Both events name their window by slug, so a build emitting both for the same
+                                                    # window counts it once.
+                                                    $winEventPnls = [System.Collections.Generic.List[double]]::new()
+                                                    $winSeenSlugs = @{}
+                                                    $winPrevRealized = 0.0
+                                                    $winPrevRebate = 0.0
+                                                    for ($li = 0; $li -lt ($allLines.Count - 1); $li++) {
+                                                        $evLine = $allLines[$li]
+                                                        if ($evLine -match '"event"\s*:\s*"(window_end|window_summary|window_settled|epoch_rollover)"') {
+                                                            try {
+                                                                $evObj = $evLine | ConvertFrom-Json
+                                                                $evP = $evObj.payload
+                                                                $wSlug = $null
+                                                                foreach ($slugKey in @("expired_slug", "market_slug", "window_slug", "slug")) {
+                                                                    # StrictMode throws on a missing property, and the catch below would drop the event.
+                                                                    if ($null -eq $evP.PSObject.Properties[$slugKey]) { continue }
+                                                                    $slugVal = $evP.$slugKey
+                                                                    if ($null -ne $slugVal -and ([string]$slugVal) -ne "") { $wSlug = ([string]$slugVal).ToLowerInvariant(); break }
+                                                                }
+                                                                if ($null -eq $wSlug -or -not $winSeenSlugs.ContainsKey($wSlug)) {
+                                                                    if ($evObj.event -eq "epoch_rollover") {
+                                                                        $cumReal = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("total_realized_pnl_micro") -Scale 1e6 -DefaultValue ([double]::NaN)
+                                                                        $cumReb = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("estimated_rebate_micro", "rebate_micro") -Scale 1e6 -DefaultValue ([double]::NaN)
+                                                                        $wSettle = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("settlement_pnl_delta_micro") -Scale 1e6 -DefaultValue 0.0
+                                                                        $wNet = if ([double]::IsNaN($cumReal)) { $wSettle } else { $cumReal - $winPrevRealized }
+                                                                        if (-not [double]::IsNaN($cumReal)) { $winPrevRealized = $cumReal }
+                                                                        $wReb = if ([double]::IsNaN($cumReb)) { 0.0 } else { $cumReb - $winPrevRebate }
+                                                                        if (-not [double]::IsNaN($cumReb)) { $winPrevRebate = $cumReb }
+                                                                    } else {
+                                                                        $wNet = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("net_pnl_micro", "window_net_pnl_micro", "realized_pnl_micro", "settlement_pnl_delta_micro") -Scale 1e6 -DefaultValue 0.0
+                                                                        $wReb = Get-OptionalPayloadDouble -Payload $evP -CandidateKeys @("estimated_rebate_micro", "rebate_micro") -Scale 1e6 -DefaultValue 0.0
+                                                                        if ([double]::IsNaN($wReb)) { $wReb = 0.0 }
+                                                                    }
                                                                     $winEventPnls.Add($wNet + $wReb)
-                                                                } catch {}
-                                                            }
-                                                        }
-                                                        if ($winEventPnls.Count -gt 0) {
-                                                            $posWins = @($winEventPnls | Where-Object { $_ -gt 0.0 }).Count
-                                                            $winPctCap = ($posWins / $winEventPnls.Count) * 100.0
-                                                        } else {
-                                                            $winPctCap = if ($finalNetUsd -gt 0.0) { 100.0 } else { 0.0 }
+                                                                    if ($null -ne $wSlug) { $winSeenSlugs[$wSlug] = $true }
+                                                                }
+                                                            } catch {}
                                                         }
                                                     }
+                                                    # Win across windows in this capture: windows won / windows with results.
+                                                    # A capture with no per-window results reports n/a instead of collapsing the
+                                                    # whole-capture sign into a fake 100%/0% rate, so the column keeps one meaning
+                                                    # on every row, in the SET subtotal and in the leaderboard.
+                                                    $winPctCap = [double]::NaN
+                                                    $winWonCap = 0
+                                                    $winTotalCap = 0
+                                                    $winWindowsCount = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("winning_windows", "positive_windows") -Scale 1.0
+                                                    $totWindowsPayload = Get-OptionalPayloadDouble -Payload $payload -CandidateKeys @("windows_count", "total_windows") -Scale 1.0 -DefaultValue ([double]$cap.Windows)
+                                                    if ($winEventPnls.Count -gt 0) {
+                                                        $winTotalCap = $winEventPnls.Count
+                                                        $winWonCap = @($winEventPnls | Where-Object { $_ -gt 0.0 }).Count
+                                                        $winPctCap = ($winWonCap / $winTotalCap) * 100.0
+                                                    } elseif (-not [double]::IsNaN($winWindowsCount) -and $totWindowsPayload -gt 0) {
+                                                        $winTotalCap = [int]$totWindowsPayload
+                                                        $winWonCap = [int]$winWindowsCount
+                                                        $winPctCap = ($winWonCap / $winTotalCap) * 100.0
+                                                    }
+                                                    $capWindowNets = @($winEventPnls.ToArray())
 
                                                     # Level 2 Hierarchy: Vertically Aligned & Color-Coded Per-Capture Summary (2 Lines)
                                                     # Line 1: Activity & Volume (Shares, Pairs, WinRate, Deployed, Returned, ROI)
@@ -1075,6 +1164,8 @@ try {
                                                         QuantityNum    = $qtyBought
                                                         PairsNum       = $pairs
                                                         WinPctNum      = $winPctCap
+                                                        WinWonNum      = $winWonCap
+                                                        WinTotalNum    = $winTotalCap
                                                         VolumeInNum    = $volumeIn
                                                         CloseVolumeNum = $closeVolume
                                                         RealizedNum    = $realized
@@ -1093,6 +1184,8 @@ try {
                                                         RPM            = $rpm
                                                         MO1sNum        = $mo1s
                                                         MO5sNum        = $mo5s
+                                                        WindowNets     = $capWindowNets
+                                                        WindowCount    = $capWindowNets.Count
                                                     })
                                                 }
 
@@ -1121,7 +1214,8 @@ try {
                                                 $maxRpm = 0
                                                 $weightedMo1s = 0.0
                                                 $weightedMo5s = 0.0
-                                                $winCaps = 0
+                                                $sumWinWon = 0
+                                                $sumWinTotal = 0
 
                                                 foreach ($c in $capRuns) {
                                                     $sumFills += $c.Fills
@@ -1145,11 +1239,14 @@ try {
                                                     if ($c.RPM -gt $maxRpm) { $maxRpm = $c.RPM }
                                                     $weightedMo1s += ($c.Fills * $c.MO1sNum)
                                                     $weightedMo5s += ($c.Fills * $c.MO5sNum)
-                                                    if ($c.NetPlusRebNum -gt 0.0) { $winCaps++ }
+                                                    $sumWinWon += [int]$c.WinWonNum
+                                                    $sumWinTotal += [int]$c.WinTotalNum
                                                 }
 
-                                                # ---- Verification inputs via shared helper (70/30 IS/OOS walk-forward; MaxDD/Drag capture-level proxies) ----
-                                                $surv = Get-SurvivalInputs -CapRuns $capRuns -TotalWindows $totalWindows -IsMultiCapture $isMultiCapture -CaptureCount $captures.Count -SumVolIn $sumVolIn -SumGross $sumGrossPnl -SumSettle $sumSettlement -SumUnreal $sumUnreal
+                                                # ---- Verification inputs: IS/OOS/MaxDD from actual per-window nets; Drag is a capture-level proxy ----
+                                                $allWindowNets = [System.Collections.Generic.List[double]]::new()
+                                                foreach ($c in $capRuns) { if ($null -ne $c.WindowNets) { foreach ($wn in $c.WindowNets) { $allWindowNets.Add([double]$wn) } } }
+                                                $surv = Get-SurvivalInputs -CapRuns $capRuns -TotalWindows $totalWindows -IsMultiCapture $isMultiCapture -CaptureCount $captures.Count -SumVolIn $sumVolIn -SumGross $sumGrossPnl -SumSettle $sumSettlement -SumUnreal $sumUnreal -WindowNets $allWindowNets.ToArray()
                                                 $isNet = $surv.IS; $oosNet = $surv.OOS; $retainPct = $surv.Retain; $maxDDPct = $surv.MaxDD; $dragPct = $surv.Drag
                                                 $isWinCount = $surv.ISWin; $oosWinCount = $surv.OOSWin
 
@@ -1160,7 +1257,9 @@ try {
                                                 $roiPlain = if ([double]::IsNaN($sumRoi)) { 'n/a' } else { $sumRoi.ToString('+0.00%;-0.00%;+0.00%', $inv) }
                                                 $avgMo1s = if ($sumFills -gt 0) { $weightedMo1s / $sumFills } else { 0.0 }
                                                 $avgMo5s = if ($sumFills -gt 0) { $weightedMo5s / $sumFills } else { 0.0 }
-                                                $winRatePct = if ($captures.Count -gt 0) { ($winCaps / $captures.Count) * 100.0 } else { 0.0 }
+                                                # Same basis as the per-file rows: windows won / windows with results
+                                                # across every capture in this config set (n/a when none report windows).
+                                                $winRatePct = if ($sumWinTotal -gt 0) { ($sumWinWon / $sumWinTotal) * 100.0 } else { [double]::NaN }
 
                                                 # Config Set Subtotal Banner (Matches Per-Capture 2-Line Hierarchy & Style)
                                                 $subHeader = Format-ColorText -Text ("  📊 [SET {0} / {1} SUBTOTAL | {2:F2}s]" -f $runIdx, $totalRuns, $cfgElapsedSec) -Code $AnsiBoldCyan
@@ -1250,8 +1349,9 @@ try {
                                                     MO5sNum       = $avgMo5s
                                                     MO5s          = $avgMo5s.ToString("+0.0;-0.0;+0.0", $inv)
                                                     WinRatePct    = $winRatePct
-                                                    WinRate       = ("{0:F0}%" -f $winRatePct)
-                                                    WinCaps       = $winCaps
+                                                    WinRate       = if ([double]::IsNaN($winRatePct)) { 'n/a' } else { ("{0:F0}%" -f $winRatePct) }
+                                                    WinWonNum     = $sumWinWon
+                                                    WinTotalNum   = $sumWinTotal
                                                     ISNum         = $isNet
                                                     OOSNum        = $oosNet
                                                     RetainNum     = $retainPct
@@ -1299,9 +1399,11 @@ try {
     # Thresholds match docs/strategy-verification-spec.md and
     # docs/explanations/verification-and-survival-gates.html:
     # G1 IS>0 | G2 OOS>0 | G3 Ret>=40% | G4 MaxDD<=25% | G5 Drag<=30% | G6 Nbr>=60%.
-    # IS/OOS use a 70/30 capture-level walk-forward split by windows (multi-capture
-    # only); MaxDD/Drag are capture-level proxies from per-capture Net+Reb,
-    # settlement and unrealized summaries. Single-capture runs report N/A.
+    # IS/OOS use a 70/30 walk-forward split over actual per-window nets from the
+    # replay (`epoch_rollover` realized+rebate deltas, or Rust `window_end`), for any
+    # capture count with >=4 windows. MaxDD uses that same per-window equity curve,
+    # falling back to per-capture Net+Reb; Drag stays a capture-level proxy from
+    # settlement/unrealized. Runs with no window nets report N/A / NEEDS-OOS.
     # -----------------------------------------------------------------------
     Update-SurvivalVerdicts -Sorted $sorted
 
@@ -1485,19 +1587,20 @@ try {
         $plainSummary.Add((Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $false))
     }
     $plainSummary.Add(($plainRowFmt -f $dashes))
+    $plainSummary.Add("  Win Rate = windows won / windows with results (per-window lifecycle nets); n/a = no window results")
     $plainSummary.Add("")
-    $plainSummary.Add("STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (In Sample / Out Sample 70/30 by windows; Drawdown / Expiry Drag capture-level proxies)")
-    $plainSummary.Add("G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60% | QueueDecay=$QueueDecay (promotion requires conservative)")
+    $plainSummary.Add("  STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (In Sample / Out Sample 70/30 by windows; Drawdown by window equity; Expiry Drag capture-level proxy)")
+    $plainSummary.Add("  G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60% | QueueDecay=$QueueDecay (promotion requires conservative)")
     if (-not $isMultiCapture) {
-        $plainSummary.Add("NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures (or multi -InputPath) for full walk-forward verdicts.")
+        $plainSummary.Add("  NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures (or multi -InputPath) for full walk-forward verdicts.")
     }
     $vWidths = @(4, 10, 10, 9, 12, 11, 9, 10)
     $vFmtParts = for ($vi = 0; $vi -lt $vWidths.Count; $vi++) { "{$vi,$($vWidths[$vi])}" }
     $vFmt = $vFmtParts -join " "
     $vHeaders = @("Rank", "In Sample", "Out Sample", "Retention", "Max Drawdown", "Expiry Drag", "Neighbors", "Verdict")
     $vDashes = @($vWidths | ForEach-Object { "-" * $_ })
-    $plainSummary.Add(($vFmt -f $vHeaders))
-    $plainSummary.Add(($vFmt -f $vDashes))
+    $plainSummary.Add(("  " + ($vFmt -f $vHeaders)))
+    $plainSummary.Add(("  " + ($vFmt -f $vDashes)))
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
         $r = $sorted[$ri]
         $isS = if ([double]::IsNaN($r.ISNum)) { 'n/a'.PadLeft(10) } else { (Format-GateMoneyText -Value ([double]$r.ISNum) -Culture $inv).PadLeft(10) }
@@ -1506,11 +1609,11 @@ try {
         $ddS = if ([double]::IsNaN($r.MaxDDNum)) { 'n/a'.PadLeft(12) } else { (("{0:F0}%" -f $r.MaxDDNum).PadLeft(12)) }
         $dragS = (("{0:F0}%" -f $r.DragNum).PadLeft(11))
         $nbrS = if ([double]::IsNaN($r.NbrNum)) { 'n/a'.PadLeft(9) } else { (("{0:F0}%" -f $r.NbrNum).PadLeft(9)) }
-        $plainSummary.Add(($vFmt -f @(($ri + 1).ToString($inv).PadLeft(4), $isS, $oosS, $retS, $ddS, $dragS, $nbrS, ([string]$r.Verdict).PadLeft(10))))
+        $plainSummary.Add(("  " + ($vFmt -f @(($ri + 1).ToString($inv).PadLeft(4), $isS, $oosS, $retS, $ddS, $dragS, $nbrS, ([string]$r.Verdict).PadLeft(10)))))
     }
-    $plainSummary.Add(($vFmt -f $vDashes))
+    $plainSummary.Add(("  " + ($vFmt -f $vDashes)))
     $approvedCount = @($sorted | Where-Object { $_.Verdict -eq "APPROVED" }).Count
-    $plainSummary.Add(("Verdicts: {0}/{1} APPROVED | FAIL(Gx) = first failed gate | NEEDS-OOS = re-run multi-capture | N/A = under-powered proxy" -f $approvedCount, $sorted.Count))
+    $plainSummary.Add(("  Verdicts: {0}/{1} APPROVED | FAIL(Gx) = first failed gate | NEEDS-OOS = re-run multi-capture | N/A = under-powered proxy" -f $approvedCount, $sorted.Count))
     # Write the leaderboard before printing, so an interrupted console dump still leaves the ranked artifact.
     $plainSummary | Set-Content -LiteralPath $summaryPath -Encoding utf8
 
@@ -1530,19 +1633,20 @@ try {
         Write-Host (Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $true)
     }
     Write-Host (Format-ColorText -Text ($plainRowFmt -f $dashes) -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text "  Win Rate = windows won / windows with results (per-window lifecycle nets); n/a = no window results" -Code $AnsiGray)
 
     # Print Strategy Verification table (same fixed-width contract: static columns, padded badges)
     Write-Host ""
     Write-Host (Format-ColorText -Text "🛡️  STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES" -Code $AnsiBoldCyan)
-    Write-Host (Format-ColorText -Text "G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60%" -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text "  G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60%" -Code $AnsiGray)
     if ($QueueDecay -ne "conservative") {
-        Write-Host (Format-ColorText -Text ("NOTE: QueueDecay={0} (exploratory) - promotion requires -QueueDecay conservative." -f $QueueDecay) -Code $AnsiBoldYellow)
+        Write-Host (Format-ColorText -Text ("  NOTE: QueueDecay={0} (exploratory) - promotion requires -QueueDecay conservative." -f $QueueDecay) -Code $AnsiBoldYellow)
     }
     if (-not $isMultiCapture) {
-        Write-Host (Format-ColorText -Text "NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures for full walk-forward verdicts." -Code $AnsiYellow)
+        Write-Host (Format-ColorText -Text "  NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures for full walk-forward verdicts." -Code $AnsiYellow)
     }
-    Write-Host (Format-ColorText -Text ($vFmt -f $vHeaders) -Code $AnsiBoldWhite)
-    Write-Host (Format-ColorText -Text ($vFmt -f $vDashes) -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text ("  " + ($vFmt -f $vHeaders)) -Code $AnsiBoldWhite)
+    Write-Host (Format-ColorText -Text ("  " + ($vFmt -f $vDashes)) -Code $AnsiGray)
     for ($ri = 0; $ri -lt $sorted.Count; $ri++) {
         $r = $sorted[$ri]
         $rkRaw = (($ri + 1).ToString($inv)).PadLeft(4)
@@ -1553,11 +1657,11 @@ try {
         $dragCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.DragNum)) -Pass ($r.G5 -eq "PASS") -IsNA $false -Width 11
         $nbrCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$r.NbrNum)) -Pass ($r.G6 -eq "PASS") -IsNA ($r.G6 -eq "N/A") -Width 9
         $verCell = Format-VerdictCell -Verdict ([string]$r.Verdict) -Width 10
-        Write-Host ("{0} {1} {2} {3} {4} {5} {6} {7}" -f $rkRaw, $isCell, $oosCell, $retCell, $ddCell, $dragCell, $nbrCell, $verCell)
+        Write-Host ("  {0} {1} {2} {3} {4} {5} {6} {7}" -f $rkRaw, $isCell, $oosCell, $retCell, $ddCell, $dragCell, $nbrCell, $verCell)
     }
-    Write-Host (Format-ColorText -Text ($vFmt -f $vDashes) -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text ("  " + ($vFmt -f $vDashes)) -Code $AnsiGray)
     $approvedCon = @($sorted | Where-Object { $_.Verdict -eq "APPROVED" }).Count
-    Write-Host ("Verdicts: {0}/{1} APPROVED  |  FAIL(Gx) = first failed gate  |  NEEDS-OOS = re-run multi-capture" -f $approvedCon, $sorted.Count)
+    Write-Host ("  Verdicts: {0}/{1} APPROVED  |  FAIL(Gx) = first failed gate  |  NEEDS-OOS = re-run multi-capture" -f $approvedCon, $sorted.Count)
 
     Write-Host ""
 }

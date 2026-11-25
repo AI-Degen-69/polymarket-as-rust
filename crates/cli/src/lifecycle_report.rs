@@ -303,6 +303,23 @@ struct EpochRolloverEvent<'a> {
 }
 
 #[derive(Serialize)]
+struct WindowEndEvent<'a> {
+    market_slug: &'a str,
+    window_index: usize,
+    complete: bool,
+    winning_outcome: Option<Outcome>,
+    net_pnl_micro: i64,
+    realized_pnl_micro: i64,
+    unrealized_pnl_micro: i64,
+    settlement_pnl_delta_micro: i64,
+    fees_paid_micro: u64,
+    estimated_rebate_micro: u64,
+    fills_count: u64,
+    merges_count: u64,
+    total_pairs_merged_micro: u64,
+}
+
+#[derive(Serialize)]
 struct LifecycleSummaryEvent<'a> {
     source: &'a str,
     market_slug: &'a str,
@@ -2119,6 +2136,48 @@ pub(crate) fn record_epoch_rollover_jsonl(
             pairs_merged_micro,
             fees_paid_micro,
             estimated_rebate_micro,
+        },
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_window_end_jsonl(
+    jsonl: &mut JsonlWriter,
+    now_ms: u64,
+    mono_ns: u64,
+    market_slug: &str,
+    window_index: usize,
+    complete: bool,
+    winning_outcome: Option<Outcome>,
+    net_pnl_micro: i64,
+    realized_pnl_micro: i64,
+    unrealized_pnl_micro: i64,
+    settlement_pnl_delta_micro: i64,
+    fees_paid_micro: u64,
+    estimated_rebate_micro: u64,
+    fills_count: u64,
+    merges_count: u64,
+    total_pairs_merged_micro: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    jsonl.write_event(
+        now_ms,
+        mono_ns,
+        "window_end",
+        &WindowEndEvent {
+            market_slug,
+            window_index,
+            complete,
+            winning_outcome,
+            net_pnl_micro,
+            realized_pnl_micro,
+            unrealized_pnl_micro,
+            settlement_pnl_delta_micro,
+            fees_paid_micro,
+            estimated_rebate_micro,
+            fills_count,
+            merges_count,
+            total_pairs_merged_micro,
         },
     )?;
     Ok(())

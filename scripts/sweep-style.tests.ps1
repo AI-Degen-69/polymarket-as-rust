@@ -144,6 +144,30 @@ try {
     Assert-True (-not ($null -eq $env:NO_COLOR)) "empty NO_COLOR counts as set (disables color)"
     Remove-Item Env:NO_COLOR
     Assert-True ($null -eq $env:NO_COLOR) "unset NO_COLOR allows color"
+
+    # --- Window-level survival inputs (IS/OOS split, MaxDD) ---------------
+    $survSmall = Get-SurvivalInputs -CapRuns @() -TotalWindows 3 -IsMultiCapture $false -CaptureCount 1 `
+        -SumVolIn 100.0 -SumGross 0.0 -SumSettle 0.0 -SumUnreal 0.0 -WindowNets @(10.0, -20.0, 10.0)
+    Assert-True ([Math]::Abs($survSmall.MaxDD - 20.0) -lt 1e-9) "3-window series reports 20% MaxDD"
+    Assert-True ([double]::IsNaN($survSmall.IS) -and [double]::IsNaN($survSmall.OOS)) "under 4 windows skips the IS/OOS split"
+
+    $survSplit = Get-SurvivalInputs -CapRuns @() -TotalWindows 10 -IsMultiCapture $true -CaptureCount 2 `
+        -SumVolIn 100.0 -SumGross 0.0 -SumSettle 0.0 -SumUnreal 0.0 -WindowNets @(-1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 1.0, 1.0, 1.0, 1.0)
+    Assert-True ($survSplit.ISWin -eq 7 -and $survSplit.OOSWin -eq 3) "10 windows split 7 IS / 3 OOS"
+    Assert-True ([Math]::Abs($survSplit.IS - 10.0) -lt 1e-9) "IS sums the first 7 window nets"
+    Assert-True ([Math]::Abs($survSplit.OOS - 3.0) -lt 1e-9) "OOS sums the final 3 window nets"
+    Assert-True ([Math]::Abs($survSplit.Retain - 30.0) -lt 1e-9) "OOS retention is 30% of IS"
+
+    $capRuns = @(
+        [PSCustomObject]@{ Windows = 2; NetPlusRebNum = 5.0 },
+        [PSCustomObject]@{ Windows = 2; NetPlusRebNum = -10.0 }
+    )
+    $survFallback = Get-SurvivalInputs -CapRuns $capRuns -TotalWindows 4 -IsMultiCapture $true -CaptureCount 2 `
+        -SumVolIn 100.0 -SumGross 0.0 -SumSettle 0.0 -SumUnreal 0.0 -WindowNets @()
+    Assert-True ([Math]::Abs($survFallback.MaxDD - 10.0) -lt 1e-9) "no window nets falls back to capture-level MaxDD"
+    $survSingle = Get-SurvivalInputs -CapRuns @($capRuns[0]) -TotalWindows 2 -IsMultiCapture $false -CaptureCount 1 `
+        -SumVolIn 100.0 -SumGross 0.0 -SumSettle 0.0 -SumUnreal 0.0 -WindowNets @()
+    Assert-True ([double]::IsNaN($survSingle.MaxDD)) "single capture without window nets reports MaxDD n/a"
 }
 finally {
     if ($null -eq $previousNoColor) {

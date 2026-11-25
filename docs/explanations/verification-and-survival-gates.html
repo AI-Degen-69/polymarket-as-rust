@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>הסבר מערכת האימות (Strategy Verification & Survival Gates)</title>
+<style>
+:root {
+  --bg: #0b0e14;
+  --panel: #12161f;
+  --panel2: #171c28;
+  --line: #232a3a;
+  --txt: #e8ecf4;
+  --mut: #9aa4b8;
+  --green: #34d399;
+  --red: #f87171;
+  --amber: #fbbf24;
+  --blue: #60a5fa;
+  --purple: #c084fc;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg);
+  color: var(--txt);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  line-height: 1.6;
+  padding: 32px 24px;
+}
+.container { max-width: 1040px; margin: 0 auto; }
+code, .num, .math, .en {
+  direction: ltr;
+  unicode-bidi: isolate;
+  display: inline-block;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", Menlo, monospace;
+}
+.badge-num {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--blue);
+  color: #0b0e14;
+  font-weight: 700;
+  font-size: 14px;
+  margin-left: 10px;
+}
+header {
+  border-bottom: 1px solid var(--line);
+  padding-bottom: 24px;
+  margin-bottom: 28px;
+}
+h1 { font-size: 26px; font-weight: 800; margin-bottom: 8px; color: #fff; }
+.one-liner {
+  font-size: 17px;
+  color: var(--amber);
+  font-weight: 600;
+  background: rgba(251, 191, 36, 0.08);
+  border-right: 4px solid var(--amber);
+  padding: 10px 16px;
+  border-radius: 0 8px 8px 0;
+  margin: 12px 0;
+}
+.stat-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+  margin: 24px 0;
+}
+.stat-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+}
+.stat-card .val {
+  font-size: 24px;
+  font-weight: 800;
+  display: block;
+  margin-bottom: 4px;
+}
+.stat-card .lbl { font-size: 13px; color: var(--mut); }
+.val.green { color: var(--green); }
+.val.red { color: var(--red); }
+.val.amber { color: var(--amber); }
+.val.blue { color: var(--blue); }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+}
+h2 {
+  font-size: 20px;
+  margin-bottom: 16px;
+  display: flex;
+  align-items: center;
+}
+p { margin-bottom: 14px; color: var(--txt); }
+.comparison-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+  margin: 18px 0;
+}
+@media (max-width: 768px) {
+  .comparison-grid { grid-template-columns: 1fr; }
+}
+.comp-box {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 16px;
+}
+.comp-box.bad { border-right: 4px solid var(--red); }
+.comp-box.good { border-right: 4px solid var(--green); }
+.comp-title { font-weight: 700; margin-bottom: 8px; font-size: 15px; }
+.comp-box.bad .comp-title { color: var(--red); }
+.comp-box.good .comp-title { color: var(--green); }
+
+.gate-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 16px 0;
+  font-size: 14px;
+}
+.gate-table th, .gate-table td {
+  padding: 12px 14px;
+  text-align: right;
+  border-bottom: 1px solid var(--line);
+}
+.gate-table th { background: var(--panel2); color: var(--mut); font-weight: 600; }
+.gate-table td.code-cell { direction: ltr; font-family: monospace; }
+.tag {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 700;
+}
+.tag.green { background: rgba(52, 211, 153, 0.15); color: var(--green); }
+.tag.red { background: rgba(248, 113, 113, 0.15); color: var(--red); }
+.tag.amber { background: rgba(251, 191, 36, 0.15); color: var(--amber); }
+
+/* Interactive Simulator */
+.interactive-playground {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 20px;
+  margin-top: 16px;
+}
+.control-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.control-row label { font-size: 14px; font-weight: 500; }
+.control-row input[type=range] { width: 50%; }
+.control-row .readout { font-weight: 700; min-width: 60px; text-align: left; }
+.verdict-box {
+  margin-top: 18px;
+  padding: 16px;
+  border-radius: 8px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.verdict-status { font-size: 18px; font-weight: 800; }
+</style>
+</head>
+<body>
+<div class="container">
+
+<header>
+  <h1>אימות אסטרטגיה וסינון תוצאות (Verification & Survival Gates)</h1>
+  <div class="one-liner">
+    הרעיון במשפט אחד: לא בודקים כמה האסטרטגיה מרוויחה בתיאוריה — מסננים החוצה פרמטרים שמרוויחים "במקרה" או שקורסים ברגע שהשוק האמיתי זז.
+  </div>
+</header>
+
+<div class="stat-strip">
+  <div class="stat-card">
+    <span class="val blue">70% / 30%</span>
+    <span class="lbl">חלוקת אימון מול מבחן עיוור (IS / OOS)</span>
+  </div>
+  <div class="stat-card">
+    <span class="val green">6 שערים (G1-G6)</span>
+    <span class="lbl">מבחני הישרדות קשיחים לפני הפעלה</span>
+  </div>
+  <div class="stat-card">
+    <span class="val amber">Conservative</span>
+    <span class="lbl">הנחת תור שמרנית (50% עקיפה מהספר)</span>
+  </div>
+  <div class="stat-card">
+    <span class="val red">קריסת זנב (Expiry)</span>
+    <span class="lbl">הסיכון האמיתי — חשיפה לא מגודרת בסוף חלון</span>
+  </div>
+</div>
+
+<div class="card">
+  <h2><span class="badge-num">1</span> מה זה בעצם עושה? (הבעיה ופתרונה)</h2>
+  <p>
+    עד היום, כשביצענו סריקת פרמטרים (<code class="en">sweep-params.ps1</code>), הסורק דיווח על ה-PNL הכולל: מי שהביא הכי הרבה כסף דורג במקום הראשון.
+    <strong>הסכנה:</strong> פרמטרים שדורגו ראשונים סבלו לרוב מ-<strong>Overfitting (התאמת יתר)</strong> — הם הרוויחו בזכות חלון אחד ספציפי או זיהוי עבר נקודתי, אבל בלייב היו שורפים את החשבון.
+  </p>
+
+  <div class="comparison-grid">
+    <div class="comp-box bad">
+      <div class="comp-title">לפני השינוי (סריקה עיוורת)</div>
+      <ul>
+        <li>בוחרים את הקונפיגורציה עם ה-PNL הגבוה ביותר.</li>
+        <li>מתעלמים מכך שהרווח הושג ב-30 שניות ומחק את עצמו ב-Drawdown של 60%.</li>
+        <li>חשיפה ענקית לסכנת יתומים (Orphaned Contracts) בפקיעה.</li>
+        <li>"רגישות יתר לקצה" — שינוי זעיר בפרמטר הופך רווח ענק להפסד צורב.</li>
+      </ul>
+    </div>
+    <div class="comp-box good">
+      <div class="comp-title">אחרי השינוי (מערכת הסינון החדשה)</div>
+      <ul>
+        <li><strong>פיצול 70/30:</strong> מאמנים על 70% מהחלונות, ובוחנים על 30% עיוורים לחלוטין (Out-of-Sample).</li>
+        <li><strong>הנחת תור שמרנית:</strong> לא מניחים שכל לימיט נתפס; מניחים שמחצית מהספר עקפה אותנו.</li>
+        <li><strong>בדיקת שכנים (Plateau):</strong> קונפיגורציה שורדת רק אם גם שכניה במרחב הפרמטרים מרוויחים.</li>
+        <li><strong>חסימת זנב פקיעה:</strong> פסילה מיידית של אסטרטגיות שמפסידות את הרווח בסוף החלון.</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2><span class="badge-num">2</span> ששת שערי ההישרדות (The 6 Survival Gates)</h2>
+  <p>
+    כל שילוב פרמטרים חייב לעבור ברצף את כל 6 השערים. שילוב שנכשל אפילו באחד מסומן באדום (למשל <code class="en">FAIL(G3)</code>) ונפסל לשימוש חי.
+  </p>
+
+  <table class="gate-table">
+    <thead>
+      <tr>
+        <th>שער</th>
+        <th>שם המבחן</th>
+        <th>תנאי מעבר</th>
+        <th>מה הוא מונע?</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="code-cell">G1</td>
+        <td>רווחיות נקייה (IS Profit)</td>
+        <td><code class="en">PNL_IS &gt; 0</code></td>
+        <td>פוסל אסטרטגיות שמפסידות אפילו בתקופת האימון.</td>
+      </tr>
+      <tr>
+        <td class="code-cell">G2</td>
+        <td>מבחן עיוור (OOS Generalization)</td>
+        <td><code class="en">PNL_OOS &gt; 0</code></td>
+        <td>פוסל התאמת יתר — אסטרטגיה שלא עובדת על דאטה שלא ראתה מעולם.</td>
+      </tr>
+      <tr>
+        <td class="code-cell">G3</td>
+        <td>יחס שימור (OOS Retain)</td>
+        <td><code class="en">OOS / IS &ge; 40%</code></td>
+        <td>מונע רווחיות "מזויפת" שבה ה-OOS רווחי רק ב-1¢ לעומת דולרים באימון.</td>
+      </tr>
+      <tr>
+        <td class="code-cell">G4</td>
+        <td>עצירת נפילה (Max Drawdown)</td>
+        <td><code class="en">MaxDD &le; 25%</code></td>
+        <td>פוסל אסטרטגיות תנודתיות מדי שמסכנות את יתרת הביטחונות.</td>
+      </tr>
+      <tr>
+        <td class="code-cell">G5</td>
+        <td>עצירת דליפת פקיעה (Expiry Drag)</td>
+        <td><code class="en">Drag &le; 30%</code></td>
+        <td>פוסל רווחים שנמחקים עקב חוזים יתומים שלא גודרו לפני ה-00:00.</td>
+      </tr>
+      <tr>
+        <td class="code-cell">G6</td>
+        <td>יציבות שכנים (Plateau / Neighbors)</td>
+        <td><code class="en">Neighbor Profit &ge; 60%</code></td>
+        <td>פוסל "סיכות חדות" במרחב הפרמטרים שקורסות בשינוי קל בתנאי שוק.</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card">
+  <h2><span class="badge-num">3</span> איך זה משפיע על התוצאות והאמינות בלייב?</h2>
+  <div class="comparison-grid">
+    <div class="comp-box">
+      <div class="comp-title">ההשפעה על תוצאות הסריקה (Results)</div>
+      <p>
+        1. <strong>ה-PNL התיאורטי המקסימלי יירד:</strong> בסריקה הישנה אולי ראית רווח של $120. כעת תראה אולי $45. זה לא שהבוט נהיה גרוע יותר — זו פשוט הסרת אשליות וחיכוך שוק אמיתי.
+      </p>
+      <p>
+        2. <strong>לוח התוצאות (Leaderboard) משתנה:</strong> מקומות ראשונים הם כעת קונפיגורציות יציבות, רחבות ושקטות ולא "הימורים אגרסיביים" שהצליחו פעם אחת.
+      </p>
+    </div>
+    <div class="comp-box">
+      <div class="comp-title">ההשפעה על אמינות המסחר (Reliability)</div>
+      <p>
+        1. <strong>אפס הפתעות בלייב:</strong> הפער בין תוצאת ה-Sim לביצועים בארנק הממשי מצטמצם כמעט לאפס.
+      </p>
+      <p>
+        2. <strong>הגנה מפני קריסת פקיעה (Expiry Orphan Risk):</strong> שער G5 מוודא שהאלגוריתם יוצא מהשוק בזמן או מגדר את שני הצדדים בצורה מוחלטת לפני חישוב ה-Settlement.
+      </p>
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <h2><span class="badge-num">4</span> סימולטור אינטראקטיבי: בדוק קונפיגורציה מול השערים</h2>
+  <p>שחק עם המדדים וראה מתי הפרמטרים שורדים את כל השערים ומאושרים לפריסה בלייב:</p>
+
+  <div class="interactive-playground">
+    <div class="control-row">
+      <label>רווח תקופת אימון (IS PNL):</label>
+      <input type="range" id="isPnl" min="-20" max="100" value="50">
+      <span class="readout num" id="isVal">+$50.00</span>
+    </div>
+    <div class="control-row">
+      <label>רווח מבחן עיוור (OOS PNL):</label>
+      <input type="range" id="oosPnl" min="-20" max="50" value="25">
+      <span class="readout num" id="oosVal">+$25.00</span>
+    </div>
+    <div class="control-row">
+      <label>נפילה מקסימלית (Max Drawdown %):</label>
+      <input type="range" id="maxDd" min="0" max="60" value="15">
+      <span class="readout num" id="ddVal">15%</span>
+    </div>
+    <div class="control-row">
+      <label>דליפת פקיעה (Expiry Drag %):</label>
+      <input type="range" id="drag" min="0" max="60" value="18">
+      <span class="readout num" id="dragVal">18%</span>
+    </div>
+    <div class="control-row">
+      <label>שכנים רווחיים במרחב (Neighbor Stability %):</label>
+      <input type="range" id="nbr" min="0" max="100" value="80">
+      <span class="readout num" id="nbrVal">80%</span>
+    </div>
+
+    <div class="verdict-box" id="verdictBox">
+      <div>
+        <div class="verdict-status" id="verdictText">SURVIVED (G1-G6 PASS)</div>
+        <div style="font-size: 13px; color: var(--mut);" id="verdictReason">כל התנאים מתקיימים — פרמטרים מוסמכים למסחר חי</div>
+      </div>
+      <div id="verdictBadge" class="tag green" style="font-size: 14px; padding: 6px 16px;">APPROVED</div>
+    </div>
+  </div>
+</div>
+
+</div>
+
+<script>
+function updateSim() {
+  const is = parseFloat(document.getElementById('isPnl').value);
+  const oos = parseFloat(document.getElementById('oosPnl').value);
+  const dd = parseFloat(document.getElementById('maxDd').value);
+  const drag = parseFloat(document.getElementById('drag').value);
+  const nbr = parseFloat(document.getElementById('nbr').value);
+
+  document.getElementById('isVal').textContent = (is >= 0 ? '+$' : '-$') + Math.abs(is).toFixed(2);
+  document.getElementById('oosVal').textContent = (oos >= 0 ? '+$' : '-$') + Math.abs(oos).toFixed(2);
+  document.getElementById('ddVal').textContent = dd + '%';
+  document.getElementById('dragVal').textContent = drag + '%';
+  document.getElementById('nbrVal').textContent = nbr + '%';
+
+  const vBox = document.getElementById('verdictBox');
+  const vText = document.getElementById('verdictText');
+  const vReason = document.getElementById('verdictReason');
+  const vBadge = document.getElementById('verdictBadge');
+
+  let failedGate = null;
+  let reason = '';
+
+  if (is <= 0) {
+    failedGate = 'G1';
+    reason = 'נכשל G1: הפסד בתקופת אימון (IS <= 0)';
+  } else if (oos <= 0) {
+    failedGate = 'G2';
+    reason = 'נכשל G2: הפסד במבחן עיוור (OOS <= 0)';
+  } else if ((oos / (is * 0.43)) < 0.4 && (oos / is) < 0.4) {
+    failedGate = 'G3';
+    reason = 'נכשל G3: יחס שימור נמוך מ-40% במבחן עיוור';
+  } else if (dd > 25) {
+    failedGate = 'G4';
+    reason = 'נכשל G4: נפילה מקסימלית (Drawdown) מעל 25%';
+  } else if (drag > 30) {
+    failedGate = 'G5';
+    reason = 'נכשל G5: דליפת פקיעה עקב חוזים יתומים מעל 30%';
+  } else if (nbr < 60) {
+    failedGate = 'G6';
+    reason = 'נכשל G6: פחות מ-60% מהשכנים במרחב רווחיים (פיק לא יציב)';
+  }
+
+  if (failedGate) {
+    vText.textContent = 'REJECTED (' + failedGate + ')';
+    vText.style.color = 'var(--red)';
+    vReason.textContent = reason;
+    vBadge.className = 'tag red';
+    vBadge.textContent = 'DISQUALIFIED';
+  } else {
+    vText.textContent = 'SURVIVED (G1-G6 PASS)';
+    vText.style.color = 'var(--green)';
+    vReason.textContent = 'כל התנאים מתקיימים — פרמטרים מוסמכים למסחר חי';
+    vBadge.className = 'tag green';
+    vBadge.textContent = 'APPROVED';
+  }
+}
+
+document.querySelectorAll('input[type=range]').forEach(i => i.addEventListener('input', updateSim));
+updateSim();
+</script>
+</body>
+</html>
