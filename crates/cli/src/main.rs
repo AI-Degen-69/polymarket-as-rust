@@ -38,12 +38,31 @@ use core_types::{
     default_simulation_settings,
 };
 
+fn micro_to_whole_units(field: &str, micro: u64, fallback: u64) -> u64 {
+    if micro >= MICRO_SCALE && micro.is_multiple_of(MICRO_SCALE) {
+        micro / MICRO_SCALE
+    } else {
+        eprintln!(
+            "warning: DEFAULTS.json {field} ({micro}) is not a positive whole-unit multiple of {MICRO_SCALE}; using fallback {fallback}"
+        );
+        fallback
+    }
+}
+
 fn default_v_max_usd() -> u64 {
-    EngineConfig::default().max_notional_per_leg_micro.as_u64() / MICRO_SCALE
+    micro_to_whole_units(
+        "max_notional_per_leg_micro",
+        EngineConfig::default().max_notional_per_leg_micro.as_u64(),
+        50,
+    )
 }
 
 fn default_base_size_shares() -> u64 {
-    EngineConfig::default().base_order_size_shares.as_u64() / MICRO_SCALE
+    micro_to_whole_units(
+        "base_order_size_shares",
+        EngineConfig::default().base_order_size_shares.as_u64(),
+        20,
+    )
 }
 
 fn default_cli_queue_decay() -> CliQueueDecay {
@@ -1670,5 +1689,17 @@ mod tests {
             }
             _ => panic!("expected Lifecycle"),
         }
+    }
+
+    #[test]
+    fn cli_defaults_are_positive_whole_units_matching_embedded_defaults() {
+        let cfg = EngineConfig::default();
+        let v_max_micro = cfg.max_notional_per_leg_micro.as_u64();
+        let base_micro = cfg.base_order_size_shares.as_u64();
+        assert!(v_max_micro >= MICRO_SCALE && v_max_micro.is_multiple_of(MICRO_SCALE));
+        assert!(base_micro >= MICRO_SCALE && base_micro.is_multiple_of(MICRO_SCALE));
+        assert_eq!(default_v_max_usd(), 50);
+        assert_eq!(default_base_size_shares(), 20);
+        assert_eq!(micro_to_whole_units("test_fractional", 50_500_000, 50), 50);
     }
 }

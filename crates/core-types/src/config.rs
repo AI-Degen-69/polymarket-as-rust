@@ -409,9 +409,9 @@ impl DefaultBundle {
 
 static DEFAULT_BUNDLE: OnceLock<DefaultBundle> = OnceLock::new();
 
-fn parse_embedded_defaults_bundle() -> Result<DefaultBundle, ConfigError> {
+fn parse_defaults_bundle_from_str(json: &str) -> Result<DefaultBundle, ConfigError> {
     let parsed: EmbeddedDefaultsFile =
-        serde_json::from_str(EMBEDDED_DEFAULTS_JSON).map_err(|err| ConfigError::InvalidValue {
+        serde_json::from_str(json).map_err(|err| ConfigError::InvalidValue {
             key: "DEFAULTS.json",
             value: "<embedded>".to_string(),
             reason: err.to_string(),
@@ -451,16 +451,25 @@ fn parse_embedded_defaults_bundle() -> Result<DefaultBundle, ConfigError> {
         clock_drift_max_ms: e.clock_drift_max_ms,
         credentials: LiveCredentials::default(),
     };
-    engine.validate()?;
+    validate_modes(&engine)?;
+    validate_addresses(&engine)?;
+    validate_math_bounds(&engine)?;
     Ok(DefaultBundle {
         engine,
         simulation: parsed.simulation,
     })
 }
 
+fn parse_embedded_defaults_bundle() -> Result<DefaultBundle, ConfigError> {
+    parse_defaults_bundle_from_str(EMBEDDED_DEFAULTS_JSON)
+}
+
 fn default_bundle() -> &'static DefaultBundle {
     DEFAULT_BUNDLE.get_or_init(|| {
-        parse_embedded_defaults_bundle().unwrap_or_else(|_| DefaultBundle::fallback())
+        parse_embedded_defaults_bundle().unwrap_or_else(|err| {
+            eprintln!("warning: embedded DEFAULTS.json failed to parse/validate ({err}); using hardcoded fallback");
+            DefaultBundle::fallback()
+        })
     })
 }
 
@@ -551,7 +560,8 @@ impl EngineConfig {
 
     /// Validates cross-field mode latches, address shapes, credentials, and math/risk bounds.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_modes_and_credentials(self)?;
+        validate_modes(self)?;
+        validate_credentials(self)?;
         validate_addresses(self)?;
         validate_math_bounds(self)?;
         Ok(())
@@ -763,7 +773,7 @@ where
     })
 }
 
-fn validate_modes_and_credentials(cfg: &EngineConfig) -> Result<(), ConfigError> {
+fn validate_modes(cfg: &EngineConfig) -> Result<(), ConfigError> {
     if cfg.execution_mode == ExecutionMode::CanaryLive && cfg.dry_run {
         return Err(invariant(
             "canary-live mode cannot run with dry_run=true; set DRY_RUN=false explicitly",
@@ -774,6 +784,10 @@ fn validate_modes_and_credentials(cfg: &EngineConfig) -> Result<(), ConfigError>
             "paper and dry-run modes require dry_run=true to keep order gates armed",
         ));
     }
+    Ok(())
+}
+
+fn validate_credentials(cfg: &EngineConfig) -> Result<(), ConfigError> {
     if cfg.polybolt_enabled && !cfg.credentials.has_polybolt_credentials() {
         return Err(invariant(
             "polybolt_enabled=true requires CLOB_API_KEY, CLOB_API_SECRET, CLOB_API_PASSPHRASE, and CHAINLINK_API_KEY",
@@ -1257,5 +1271,21 @@ mod tests {
         );
         assert_eq!(default_simulation_settings().maker_rebate_floor_e6, 0);
         assert_eq!(default_simulation_settings().maker_rebate_tier1_e6, 30_000);
+    }
+
+    #[test]
+    fn embedded_defaults_parser_allows_polybolt_without_credentials() {
+        let json = EMBEDDED_DEFAULTS_JSON.replacen(
+            "\"polybolt_enabled\": false",
+            "\"polybolt_enabled\": true",
+            1,
+        );
+        let bundle = parse_defaults_bundle_from_str(&json)
+            .expect("embedded parser must allow polybolt_enabled=true before env credentials load");
+        assert!(bundle.engine.polybolt_enabled);
+        assert!(
+            bundle.engine.validate().is_err(),
+            "full EngineConfig::validate() must still require PolyBolt credentials"
+        );
     }
 }
