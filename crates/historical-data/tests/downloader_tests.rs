@@ -599,3 +599,152 @@ async fn resume_rejects_mismatched_content_range_and_preserves_prior_credit_on_4
     assert_eq!(fs::read(&part_path).unwrap(), b"PARTIAL_BYTES");
     assert_eq!(client2.load_manifest().unwrap().charged_units, 24);
 }
+
+#[tokio::test]
+async fn partial_200_stream_saves_prefix_to_part_and_resumes_without_double_charge() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    let tmp = TestTempDir::new("partial_stream_resume");
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let zip_payload = zip_bytes_with_entries(&[(
+        "polymarket/l2/2026/10/28/btc-15m_yes_0.parquet",
+        minimal_l2_parquet_bytes("btc-updown-15m-1793146500"),
+    )]);
+    let split = zip_payload.len() / 2;
+    let first_half = zip_payload[..split].to_vec();
+    let total_len = zip_payload.len();
+
+    let accept_task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut req_buf = [0_u8; 1024];
+        let _ = socket.read(&mut req_buf).await.unwrap();
+        let headers =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {total_len}\r\nConnection: close\r\n\r\n");
+        socket.write_all(headers.as_bytes()).await.unwrap();
+        socket.write_all(&first_half).await.unwrap();
+        socket.flush().await.unwrap();
+        drop(socket);
+    });
+
+    let cfg = test_config(&tmp, &format!("http://{addr}"), Some("sk-stream-1"));
+    let client = PmdataClient::new(cfg).unwrap();
+    let d = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+    let err = client
+        .download_day_bundle(
+            PmdataDataset::L2,
+            d,
+            "btc",
+            UpDownInterval::M15,
+            Some(PmdataL2Outcome::Yes),
+            false,
+        )
+        .await
+        .unwrap_err();
+    accept_task.await.unwrap();
+    assert!(!matches!(err, HistoricalError::QuotaExceeded { .. }));
+
+    let cache_path = client.bundle_cache_path(
+        PmdataDataset::L2,
+        d,
+        "btc",
+        UpDownInterval::M15,
+        Some(PmdataL2Outcome::Yes),
+    );
+    let part_path = PathBuf::from(format!("{}.part", cache_path.display()));
+    assert_eq!(fs::read(&part_path).unwrap(), zip_payload[..split]);
+    assert_eq!(client.load_manifest().unwrap().charged_units, 24);
+
+    let server2 = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/polymarket/l2/2026/10/28/btc-15m.zip"))
+        .and(header("range", format!("bytes={split}-")))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "content-range",
+                    format!("bytes {split}-{}/{total_len}", total_len - 1),
+                )
+                .set_body_bytes(zip_payload[split..].to_vec()),
+        )
+        .expect(1)
+        .mount(&server2)
+        .await;
+    let cfg2 = PmdataConfig {
+        base_url: server2.uri(),
+        catalog_url: format!("{}/markets.parquet", server2.uri()),
+        ..client.config().clone()
+    };
+    let client2 = PmdataClient::new(cfg2).unwrap();
+    let plan = client2
+        .plan_day_bundles(
+            "btc",
+            UpDownInterval::M15,
+            &[d],
+            historical_data::IngestionMode::QuotaSaving,
+            false,
+        )
+        .unwrap();
+    assert_eq!(plan.items[0].dataset, PmdataDataset::L2);
+    assert_eq!(plan.items[0].quota_cost, 0);
+
+    let outcome = client2
+        .download_day_bundle(
+            PmdataDataset::L2,
+            d,
+            "btc",
+            UpDownInterval::M15,
+            Some(PmdataL2Outcome::Yes),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, DownloadOutcome::Downloaded { .. }));
+    assert_eq!(client2.load_manifest().unwrap().charged_units, 24);
+    assert_eq!(fs::read(&cache_path).unwrap(), zip_payload);
+}
+
+#[tokio::test]
+async fn redirect_is_rejected_without_forwarding_api_key() {
+    let primary = MockServer::start().await;
+    let evil_target = MockServer::start().await;
+    let tmp = TestTempDir::new("reject_redirect");
+    let cfg = test_config(&tmp, &primary.uri(), Some("sk-secret-redirect"));
+    let client = PmdataClient::new(cfg).unwrap();
+    let d = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&evil_target)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/polymarket/l2/2026/10/28/btc-15m.zip"))
+        .respond_with(
+            ResponseTemplate::new(302)
+                .insert_header("location", format!("{}/steal", evil_target.uri())),
+        )
+        .expect(1)
+        .mount(&primary)
+        .await;
+
+    let err = client
+        .download_day_bundle(
+            PmdataDataset::L2,
+            d,
+            "btc",
+            UpDownInterval::M15,
+            Some(PmdataL2Outcome::Yes),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        HistoricalError::HttpStatus { status: 302, .. }
+    ));
+    assert_eq!(client.load_manifest().unwrap().charged_units, 0);
+}

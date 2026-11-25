@@ -464,8 +464,11 @@ fn normalize_pmdata_preserves_provenance_dedups_trades_and_handles_full_vs_quota
     let out_jsonl = tmp.path.join("canonical.jsonl");
     write_canonical_jsonl(&out_jsonl, &qs.events).unwrap();
     let roundtrip = read_canonical_jsonl(&out_jsonl).unwrap();
-    assert_eq!(roundtrip.len(), qs.events.len());
-    assert!(verify_reconstructed_books_for_stream(&roundtrip).unwrap() >= 1);
+    assert_eq!(roundtrip, qs.events);
+    assert_eq!(
+        verify_reconstructed_books_for_stream(&roundtrip).unwrap(),
+        2
+    );
 }
 
 #[test]
@@ -833,6 +836,15 @@ fn normalizer_enforces_crossed_guard_coalescing_resolution_conflicts_and_phase0_
         )
         .is_err()
     );
+    assert!(
+        normalize_pmdata_market(
+            &qs_files,
+            IngestionMode::QuotaSaving,
+            Some(&meta),
+            Some(Outcome::Up)
+        )
+        .is_ok()
+    );
 
     // QuotaSaving only derives complementary Down book for the 1 uncrossed snapshot (not crossed snap or missing-BBO pc).
     let qs =
@@ -871,4 +883,336 @@ fn normalizer_enforces_crossed_guard_coalescing_resolution_conflicts_and_phase0_
         markets: vec![audit],
     });
     assert!(md.contains("Yes/No exact snapshot mirrors=1/1"));
+}
+
+#[test]
+fn no_rows_resolution_distinct_missing_id_trades_direct_both_validation_and_bipartite_match() {
+    let tmp = TestTempDir::new("review_regressions");
+    let slug = "btc-updown-5m-1793145900";
+    let start_ms = 1_793_145_900_000_u64;
+    let t0_us = (start_ms as i64) * 1_000;
+    let expiry_us = t0_us + 300_000_000;
+    let meta = catalog_entry(slug, "Up", "Down");
+
+    // 1. Resolution only present on `no_rows` as "Yes" (`winning_outcome` label) maps to `Outcome::Up`.
+    // 2. Two missing-ID trades with identical `(ts, outcome, price, size)` but distinct `local_timestamp_us` are both retained.
+    let yes_path = tmp.path.join("yes_only.parquet");
+    let no_path = tmp.path.join("no_resolved.parquet");
+    let trades_path = tmp.path.join("no_id_trades.parquet");
+
+    write_l2_parquet(
+        &yes_path,
+        &[L2RowSpec {
+            slug,
+            ts_us: t0_us + 1_000_000,
+            local_us: t0_us + 1_005_000,
+            event_type: "book",
+            bids: &[(0.48, 20.0)],
+            asks: &[(0.52, 20.0)],
+            pc_price: None,
+            pc_size: None,
+            pc_side: None,
+            new_tick_str: None,
+            winning: None,
+        }],
+    );
+    write_l2_parquet(
+        &no_path,
+        &[
+            L2RowSpec {
+                slug,
+                ts_us: t0_us + 1_000_000,
+                local_us: t0_us + 1_005_000,
+                event_type: "book",
+                bids: &[(0.48, 20.0)],
+                asks: &[(0.52, 20.0)],
+                pc_price: None,
+                pc_size: None,
+                pc_side: None,
+                new_tick_str: None,
+                winning: None,
+            },
+            L2RowSpec {
+                slug,
+                ts_us: expiry_us + 200_000,
+                local_us: expiry_us + 205_000,
+                event_type: "market_resolved",
+                bids: &[],
+                asks: &[],
+                pc_price: None,
+                pc_size: None,
+                pc_side: None,
+                new_tick_str: None,
+                winning: Some("Yes"),
+            },
+        ],
+    );
+    write_trades_parquet(
+        &trades_path,
+        &[
+            TradeRowSpec {
+                slug,
+                ts_us: t0_us + 2_000_000,
+                local_us: t0_us + 2_001_000,
+                outcome: "yes",
+                price: 0.50,
+                size: 5.0,
+                side: "buy",
+                trade_id: None,
+            },
+            TradeRowSpec {
+                slug,
+                ts_us: t0_us + 2_000_000,
+                local_us: t0_us + 2_002_000,
+                outcome: "yes",
+                price: 0.50,
+                size: 5.0,
+                side: "buy",
+                trade_id: None,
+            },
+        ],
+        false,
+    );
+
+    let qs_only = PmdataMarketFiles {
+        market_slug: slug.to_string(),
+        yes_l2_path: yes_path.clone(),
+        no_l2_path: None,
+        trades_path: Some(trades_path.clone()),
+        onchain_fills_path: None,
+    };
+    let qs_norm =
+        normalize_pmdata_market(&qs_only, IngestionMode::QuotaSaving, Some(&meta), None).unwrap();
+    let retained_trades = qs_norm
+        .events
+        .iter()
+        .filter(|e| matches!(e.kind, CanonicalEventKind::TradePrint { .. }))
+        .count();
+    assert_eq!(retained_trades, 2);
+    assert!(
+        historical_data::validate_canonical_replay_quality(
+            &qs_norm.events,
+            BookQualityFilter::DirectBothRequired
+        )
+        .is_err()
+    );
+
+    let full_files = PmdataMarketFiles {
+        market_slug: slug.to_string(),
+        yes_l2_path: yes_path,
+        no_l2_path: Some(no_path),
+        trades_path: Some(trades_path),
+        onchain_fills_path: None,
+    };
+    let full_norm =
+        normalize_pmdata_market(&full_files, IngestionMode::Full, Some(&meta), None).unwrap();
+    assert!(full_norm.summary.has_explicit_resolution);
+    assert!(full_norm.events.iter().any(|e| matches!(
+        e.kind,
+        CanonicalEventKind::MarketResolution {
+            winning_outcome: Outcome::Up,
+            ..
+        }
+    )));
+    assert!(
+        historical_data::validate_canonical_replay_quality(
+            &full_norm.events,
+            BookQualityFilter::DirectBothRequired
+        )
+        .is_ok()
+    );
+    let audit = historical_data::audit_pmdata_historical_market(&full_files, Some(&meta)).unwrap();
+    assert!(audit.has_explicit_market_resolved);
+    assert_eq!(audit.winning_outcome_label.as_deref(), Some("Yes"));
+
+    // Bipartite matching: live trades at 2000ms and 2800ms, pmdata trades at 1100ms and 2000ms (all within 1000ms
+    // cross-pairing except 2800 vs 1100) must match BOTH pairs (2000<->1100 and 2800<->2000) rather than greedily
+    // matching 2000<->2000 first and leaving 2800 vs 1100 (diff=1700ms > 1000ms) unmatched!
+    let bp_yes = tmp.path.join("bp_yes.parquet");
+    let bp_no = tmp.path.join("bp_no.parquet");
+    let bp_trades = tmp.path.join("bp_trades.parquet");
+    let bp_live = tmp.path.join("bp_live.jsonl");
+    write_l2_parquet(
+        &bp_yes,
+        &[L2RowSpec {
+            slug,
+            ts_us: t0_us + 1_000_000,
+            local_us: t0_us + 1_001_000,
+            event_type: "book",
+            bids: &[(0.48, 20.0)],
+            asks: &[(0.52, 20.0)],
+            pc_price: None,
+            pc_size: None,
+            pc_side: None,
+            new_tick_str: None,
+            winning: None,
+        }],
+    );
+    write_l2_parquet(
+        &bp_no,
+        &[L2RowSpec {
+            slug,
+            ts_us: t0_us + 1_000_000,
+            local_us: t0_us + 1_001_000,
+            event_type: "book",
+            bids: &[(0.48, 20.0)],
+            asks: &[(0.52, 20.0)],
+            pc_price: None,
+            pc_size: None,
+            pc_side: None,
+            new_tick_str: None,
+            winning: None,
+        }],
+    );
+    write_trades_parquet(
+        &bp_trades,
+        &[
+            TradeRowSpec {
+                slug,
+                ts_us: t0_us + 1_100_000,
+                local_us: t0_us + 1_101_000,
+                outcome: "yes",
+                price: 0.50,
+                size: 5.0,
+                side: "buy",
+                trade_id: Some("pm-1"),
+            },
+            TradeRowSpec {
+                slug,
+                ts_us: t0_us + 2_000_000,
+                local_us: t0_us + 2_001_000,
+                outcome: "yes",
+                price: 0.50,
+                size: 5.0,
+                side: "buy",
+                trade_id: Some("pm-2"),
+            },
+        ],
+        true,
+    );
+    let desc = MarketDescriptor {
+        slug: slug.to_string(),
+        condition_id: "0xcond_bp".to_string(),
+        question: "BTC Up or Down".to_string(),
+        version: ProtocolVersion::CtfV1,
+        neg_risk: false,
+        asset_id_up: "0xup".to_string(),
+        asset_id_dn: "0xdn".to_string(),
+        tick_size_micro: MicroUsdc(10_000),
+        min_order_size_micro: SharesMicro(5_000_000),
+        taker_delay_ms: 50,
+        fee_schedule: FeeSchedule::btc_5m_default(),
+        start_ts_ms: start_ms,
+        expiry_ts_ms: start_ms + 300_000,
+        strike_price_usd: None,
+    };
+    let book_up = FixedBook::<10>::try_from_slices(
+        Outcome::Up,
+        &[BookLevel {
+            price: MicroUsdc(480_000),
+            size: SharesMicro(20_000_000),
+        }],
+        &[BookLevel {
+            price: MicroUsdc(520_000),
+            size: SharesMicro(20_000_000),
+        }],
+        1_000,
+        start_ms + 1_000,
+    )
+    .unwrap();
+    let book_dn = FixedBook::<10>::try_from_slices(
+        Outcome::Down,
+        &[BookLevel {
+            price: MicroUsdc(480_000),
+            size: SharesMicro(20_000_000),
+        }],
+        &[BookLevel {
+            price: MicroUsdc(520_000),
+            size: SharesMicro(20_000_000),
+        }],
+        1_000,
+        start_ms + 1_000,
+    )
+    .unwrap();
+    let live_lines = vec![
+        serde_json::json!({
+            "ts_unix_ms": start_ms,
+            "mono_ns": 100_u64,
+            "event": "market_discovered",
+            "payload": desc,
+        }),
+        serde_json::json!({
+            "ts_unix_ms": start_ms + 1_000,
+            "mono_ns": 1_000_u64,
+            "event": "poly_book",
+            "payload": {
+                "BookSnapshot": {
+                    "outcome": "Up",
+                    "book": book_up,
+                    "rx_mono_ns": 1_000_u64,
+                    "exch_ts_ms": start_ms + 1_000,
+                }
+            }
+        }),
+        serde_json::json!({
+            "ts_unix_ms": start_ms + 1_000,
+            "mono_ns": 1_200_u64,
+            "event": "poly_book",
+            "payload": {
+                "BookSnapshot": {
+                    "outcome": "Down",
+                    "book": book_dn,
+                    "rx_mono_ns": 1_200_u64,
+                    "exch_ts_ms": start_ms + 1_000,
+                }
+            }
+        }),
+        serde_json::json!({
+            "ts_unix_ms": start_ms + 2_000,
+            "mono_ns": 2_000_u64,
+            "event": "poly_trade",
+            "payload": {
+                "LastTrade": {
+                    "outcome": "Up",
+                    "side": "Buy",
+                    "price": 500_000_u64,
+                    "size": 5_000_000_u64,
+                    "rx_mono_ns": 2_000_u64,
+                    "exch_ts_ms": start_ms + 2_000,
+                }
+            }
+        }),
+        serde_json::json!({
+            "ts_unix_ms": start_ms + 2_800,
+            "mono_ns": 2_800_u64,
+            "event": "poly_trade",
+            "payload": {
+                "LastTrade": {
+                    "outcome": "Up",
+                    "side": "Buy",
+                    "price": 500_000_u64,
+                    "size": 5_000_000_u64,
+                    "rx_mono_ns": 2_800_u64,
+                    "exch_ts_ms": start_ms + 2_800,
+                }
+            }
+        }),
+    ];
+    let mut lf = File::create(&bp_live).unwrap();
+    for line in live_lines {
+        writeln!(lf, "{}", serde_json::to_string(&line).unwrap()).unwrap();
+    }
+    drop(lf);
+
+    let bp_files = PmdataMarketFiles {
+        market_slug: slug.to_string(),
+        yes_l2_path: bp_yes,
+        no_l2_path: Some(bp_no),
+        trades_path: Some(bp_trades),
+        onchain_fills_path: None,
+    };
+    let rec =
+        reconcile_live_vs_pmdata(&bp_live, &bp_files, Some(&meta), IngestionMode::Full).unwrap();
+    assert_eq!(rec.matched_trades, 2);
+    assert_eq!(rec.verdict, FidelityVerdict::CompatibleWithLimitations);
 }

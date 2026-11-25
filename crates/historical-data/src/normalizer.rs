@@ -1,7 +1,10 @@
 use std::collections::HashSet;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CANONICAL_TMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 use core_types::{
     BookLevel, FeeSchedule, MicroUsdc, ONE_DOLLAR_MICRO, OrderSide, Outcome, SharesMicro,
@@ -165,6 +168,13 @@ pub const fn historical_fee_schedule(start_ts_ms: u64) -> FeeSchedule {
 
 /// Normalizes a PMData market's Parquet files (`l2` Yes, optional `l2` No, optional `trades`,
 /// optional `onchain_fills`) into a causally ordered canonical stream preserving full provenance.
+///
+/// # Errors
+/// - `HistoricalError::Normalization` if `IngestionMode::Full` is selected without `no_l2_path`,
+///   if catalog outcome metadata (`yes_outcome`/`no_outcome`) is missing or ambiguous, if any
+///   Parquet row `market_slug` or `catalog_meta.market_slug` disagrees with `files.market_slug`,
+///   or if `resolution_override` conflicts with an observed PMData `market_resolved` outcome.
+/// - `HistoricalError::Io` / `InvalidParquet` / `SchemaMismatch` if any input file is missing or malformed.
 pub fn normalize_pmdata_market(
     files: &PmdataMarketFiles,
     mode: IngestionMode,
@@ -176,6 +186,17 @@ pub fn normalize_pmdata_market(
         return Err(HistoricalError::Normalization {
             context: "pmdata".to_string(),
             detail: "market_slug must be non-empty".to_string(),
+        });
+    }
+    if let Some(meta) = catalog_meta
+        && meta.market_slug.trim() != slug
+    {
+        return Err(HistoricalError::Normalization {
+            context: slug.to_string(),
+            detail: format!(
+                "catalog entry slug `{}` does not match requested market `{slug}`",
+                meta.market_slug
+            ),
         });
     }
     if mode == IngestionMode::Full && files.no_l2_path.is_none() {
@@ -204,13 +225,26 @@ pub fn normalize_pmdata_market(
             ),
         });
     }
+    validate_slug_in_rows(
+        yes_rows.iter().map(|r| r.market_slug.as_str()),
+        slug,
+        &files.yes_l2_path,
+    )?;
 
     let no_rows = match (&files.no_l2_path, mode) {
-        (Some(p), IngestionMode::Full) => Some(read_l2_parquet(p)?),
+        (Some(p), IngestionMode::Full) => {
+            let rows = read_l2_parquet(p)?;
+            validate_slug_in_rows(rows.iter().map(|r| r.market_slug.as_str()), slug, p)?;
+            Some(rows)
+        }
         _ => None,
     };
     let trade_rows = match &files.trades_path {
-        Some(p) => read_trades_parquet(p)?,
+        Some(p) => {
+            let rows = read_trades_parquet(p)?;
+            validate_slug_in_rows(rows.iter().map(|r| r.market_slug.as_str()), slug, p)?;
+            rows
+        }
         None => Vec::new(),
     };
     let fill_rows = match &files.onchain_fills_path {
@@ -225,6 +259,7 @@ pub fn normalize_pmdata_market(
     };
 
     let mut tick_micro = DEFAULT_TICK_MICRO;
+    let mut tick_timeline: Vec<(i64, MicroUsdc)> = Vec::new();
     let min_size = DEFAULT_MIN_ORDER_SIZE_MICRO;
 
     // 1. Build L2 canonical stream preserving exact file order for Yes and (when present) No.
@@ -233,8 +268,11 @@ pub fn normalize_pmdata_market(
     let mut resolved_outcome: Option<Outcome> = None;
     let mut yes_book_tracker = BookMaintainer::new(mapping.yes_maps_to);
     let mut yes_book_crossed = false;
+    let mut down_derivation_invalidated = false;
+    let mut yes_mono_ts_us: Option<i64> = None;
 
     for row in &yes_rows {
+        let prev_tick = tick_micro;
         let mut produced = convert_l2_row(
             row,
             mapping.yes_maps_to,
@@ -243,10 +281,21 @@ pub fn normalize_pmdata_market(
             min_size,
             mode == IngestionMode::QuotaSaving,
             mapping.no_maps_to,
-            Some((&mut yes_book_tracker, &mut yes_book_crossed)),
+            mapping,
+            Some((
+                &mut yes_book_tracker,
+                &mut yes_book_crossed,
+                &mut down_derivation_invalidated,
+            )),
             &mut summary,
         )?;
-        for item in &produced {
+        if tick_micro != prev_tick {
+            tick_timeline.push((row.timestamp_us, tick_micro));
+        }
+        let clamped_ts = yes_mono_ts_us.map_or(row.timestamp_us, |p| p.max(row.timestamp_us));
+        yes_mono_ts_us = Some(clamped_ts);
+        for item in &mut produced {
+            item.sort_ts_us = clamped_ts;
             if let CanonicalEventKind::MarketResolution {
                 winning_outcome, ..
             } = item.event.kind
@@ -271,6 +320,7 @@ pub fn normalize_pmdata_market(
 
     if let Some(no_list) = &no_rows {
         let mut no_tick = DEFAULT_TICK_MICRO;
+        let mut no_mono_ts_us: Option<i64> = None;
         for row in no_list {
             // Market-level events (`tick_size_change`, `market_resolved`) already come from Yes L2;
             // keep only book & price_change rows from No L2 to avoid duplicate market-level events,
@@ -286,6 +336,7 @@ pub fn normalize_pmdata_market(
                     min_size,
                     false,
                     mapping.yes_maps_to,
+                    mapping,
                     None,
                     &mut summary,
                 )?;
@@ -299,9 +350,15 @@ pub fn normalize_pmdata_market(
                 min_size,
                 false,
                 mapping.yes_maps_to,
+                mapping,
                 None,
                 &mut summary,
             )?;
+            let clamped_ts = no_mono_ts_us.map_or(row.timestamp_us, |p| p.max(row.timestamp_us));
+            no_mono_ts_us = Some(clamped_ts);
+            for item in &mut produced {
+                item.sort_ts_us = clamped_ts;
+            }
             if et == "market_resolved" {
                 for item in &produced {
                     if let CanonicalEventKind::MarketResolution {
@@ -332,7 +389,7 @@ pub fn normalize_pmdata_market(
     }
 
     // Causal interleave of Yes + No L2 streams when Full mode provides both files.
-    // Stable sort by `(sort_ts_us, sort_local_us, source_rank)` preserves intra-file order strictly.
+    // `sort_ts_us` is clamped monotonically per file so intra-file record order never inverts.
     if no_rows.is_some() {
         l2_stream.sort_by_key(|t| (t.sort_ts_us, t.sort_local_us, t.stream_rank));
     }
@@ -341,11 +398,12 @@ pub fn normalize_pmdata_market(
     let mut trades_stream: Vec<TimedEvent> = Vec::with_capacity(trade_rows.len());
     let mut seen_trades: HashSet<TradeDedupKey> = HashSet::new();
     for (idx, row) in trade_rows.iter().enumerate() {
+        let active_tick = tick_in_force_at(&tick_timeline, row.timestamp_us);
         if let Some(ev) = convert_trade_row(
             row,
             idx,
             &mapping,
-            tick_micro,
+            active_tick,
             min_size,
             &mut seen_trades,
             &mut summary,
@@ -358,8 +416,14 @@ pub fn normalize_pmdata_market(
     // 3. Build optional OnchainFills stream (kept strictly distinct from TradePrint).
     let mut onchain_stream: Vec<TimedEvent> = Vec::with_capacity(fill_rows.len());
     for (idx, row) in fill_rows.iter().enumerate() {
+        let active_tick = tick_in_force_at(&tick_timeline, row.timestamp_us);
         onchain_stream.push(convert_onchain_row(
-            row, idx, slug, &mapping, tick_micro, min_size,
+            row,
+            idx,
+            slug,
+            &mapping,
+            active_tick,
+            min_size,
         )?);
     }
     onchain_stream.sort_by_key(|t| (t.sort_ts_us, t.sort_local_us, t.stream_rank));
@@ -438,12 +502,7 @@ pub fn normalize_pmdata_market(
         } else {
             monotonic_replay_ms = item.event.timestamp.replay_order_ts_ms;
         }
-        item.event
-            .validate_provenance_invariants()
-            .map_err(|detail| HistoricalError::Normalization {
-                context: slug.to_string(),
-                detail,
-            })?;
+        item.event.validate_provenance_invariants()?;
         events.push(item.event);
     }
 
@@ -869,6 +928,29 @@ pub fn normalize_live_jsonl(path: &Path) -> Result<Vec<CanonicalEvent>, Historic
     Ok(out)
 }
 
+struct TempFileCleanupGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempFileCleanupGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempFileCleanupGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Writes canonical events as newline-delimited JSON atomically.
 pub fn write_canonical_jsonl(
     path: &Path,
@@ -882,19 +964,31 @@ pub fn write_canonical_jsonl(
             source,
         })?;
     }
-    let tmp_name = format!(
-        "{}.tmp.{}",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("canonical.jsonl"),
-        std::process::id()
-    );
-    let tmp_path = path.with_file_name(tmp_name);
+    let base_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("canonical.jsonl");
+    let pid = std::process::id();
+    let (tmp_path, file) = loop {
+        let seq = CANONICAL_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+        let candidate = path.with_file_name(format!("{base_name}.tmp.{pid}.{seq}"));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(f) => break (candidate, f),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(source) => {
+                return Err(HistoricalError::Io {
+                    context: format!("create temp canonical jsonl `{}`", candidate.display()),
+                    source,
+                });
+            }
+        }
+    };
+    let mut cleanup = TempFileCleanupGuard::new(tmp_path.clone());
     {
-        let file = File::create(&tmp_path).map_err(|source| HistoricalError::Io {
-            context: format!("create temp canonical jsonl `{}`", tmp_path.display()),
-            source,
-        })?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
         for ev in events {
             serde_json::to_writer(&mut writer, ev).map_err(|source| HistoricalError::Json {
@@ -920,13 +1014,11 @@ pub fn write_canonical_jsonl(
                 source,
             })?;
     }
-    if let Err(err) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(HistoricalError::Io {
-            context: format!("rename canonical jsonl to `{}`", path.display()),
-            source: err,
-        });
-    }
+    std::fs::rename(&tmp_path, path).map_err(|source| HistoricalError::Io {
+        context: format!("rename canonical jsonl to `{}`", path.display()),
+        source,
+    })?;
+    cleanup.disarm();
     Ok(())
 }
 
@@ -955,11 +1047,17 @@ pub fn read_canonical_jsonl(path: &Path) -> Result<Vec<CanonicalEvent>, Historic
                 context: format!("canonical line {} of `{}`", idx + 1, path.display()),
                 source,
             })?;
-        ev.validate_provenance_invariants()
-            .map_err(|detail| HistoricalError::Normalization {
+        if ev.schema_version != CANONICAL_SCHEMA_VERSION {
+            return Err(HistoricalError::Normalization {
                 context: path.display().to_string(),
-                detail,
-            })?;
+                detail: format!(
+                    "unsupported canonical schema_version {} at line {} (expected {CANONICAL_SCHEMA_VERSION})",
+                    ev.schema_version,
+                    idx + 1
+                ),
+            });
+        }
+        ev.validate_provenance_invariants()?;
         events.push(ev);
     }
     Ok(events)
@@ -975,11 +1073,47 @@ struct TimedEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct TradeDedupKey {
     timestamp_us: i64,
+    local_timestamp_us: Option<i64>,
     outcome: Outcome,
     side: OrderSide,
     price_micro: u64,
     size_micro: u64,
     trade_id: Option<String>,
+}
+
+fn validate_slug_in_rows<'a, I>(
+    slugs: I,
+    expected_slug: &str,
+    path: &Path,
+) -> Result<(), HistoricalError>
+where
+    I: Iterator<Item = &'a str>,
+{
+    for raw in slugs {
+        let trimmed = raw.trim();
+        if trimmed != expected_slug {
+            return Err(HistoricalError::Normalization {
+                context: expected_slug.to_string(),
+                detail: format!(
+                    "source `{}` contains row for market `{trimmed}` (expected `{expected_slug}`)",
+                    path.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn tick_in_force_at(timeline: &[(i64, MicroUsdc)], ts_us: i64) -> MicroUsdc {
+    let mut current = DEFAULT_TICK_MICRO;
+    for &(change_ts, tick) in timeline {
+        if change_ts <= ts_us {
+            current = tick;
+        } else {
+            break;
+        }
+    }
+    current
 }
 
 fn resolve_market_window(
@@ -1055,7 +1189,8 @@ fn convert_l2_row(
     min_size: SharesMicro,
     derive_complementary: bool,
     opposite_outcome: Outcome,
-    mut book_tracker: Option<(&mut BookMaintainer, &mut bool)>,
+    mapping: OutcomeMapping,
+    mut book_tracker: Option<(&mut BookMaintainer, &mut bool, &mut bool)>,
     summary: &mut NormalizationSummary,
 ) -> Result<Vec<TimedEvent>, HistoricalError> {
     let (ts, timing_quality, mut base_flags) =
@@ -1111,13 +1246,20 @@ fn convert_l2_row(
                 .first()
                 .zip(asks.first())
                 .is_some_and(|(b, a)| b.price >= a.price);
-            if let Some((tracker, tracker_crossed)) = book_tracker.as_mut() {
+            if let Some((tracker, tracker_crossed, down_invalidated)) = book_tracker.as_mut() {
                 if is_crossed {
                     **tracker_crossed = true;
+                    **down_invalidated = true;
                 } else {
                     let exch_ms = ts.exchange_ts_ms.unwrap_or(0);
                     let applied_ok = tracker.apply_snapshot(&bids, &asks, 0, exch_ms).is_ok();
                     **tracker_crossed = !applied_ok;
+                    if applied_ok {
+                        // A complete uncrossed snapshot repairs any earlier skipped Down derivation.
+                        **down_invalidated = false;
+                    } else {
+                        **down_invalidated = true;
+                    }
                 }
             }
             if is_crossed {
@@ -1279,25 +1421,32 @@ fn convert_l2_row(
                 },
             }];
 
-            let tracker_uncrossed = if let Some((tracker, tracker_crossed)) = book_tracker.as_mut()
-            {
-                let exch_ms = ts.exchange_ts_ms.unwrap_or(0);
-                let _ = tracker.apply_delta_allow_transient_cross(side, price, size, 0, exch_ms);
-                !**tracker_crossed
-                    && !tracker.is_crossed()
-                    && tracker
-                        .best_bid()
-                        .zip(tracker.best_ask())
-                        .is_some_and(|(b, a)| b.price < a.price)
-            } else {
-                false
-            };
+            let (tracker_uncrossed, down_invalidated) =
+                if let Some((tracker, tracker_crossed, invalidated)) = book_tracker.as_mut() {
+                    let exch_ms = ts.exchange_ts_ms.unwrap_or(0);
+                    let _ =
+                        tracker.apply_delta_allow_transient_cross(side, price, size, 0, exch_ms);
+                    let uncrossed = !**tracker_crossed
+                        && !tracker.is_crossed()
+                        && tracker
+                            .best_bid()
+                            .zip(tracker.best_ask())
+                            .is_some_and(|(b, a)| b.price < a.price);
+                    (uncrossed, &mut **invalidated)
+                } else {
+                    (false, &mut false)
+                };
             let proven_uncrossed = match best_bid.zip(best_ask) {
                 Some((b, a)) => b < a,
                 None => !crossed_hint && tracker_uncrossed,
             } && price.0 > 0
                 && price.0 < ONE_DOLLAR_MICRO;
-            if derive_complementary && proven_uncrossed {
+            // Once a Yes update is skipped, halt derived Down deltas until the next uncrossed
+            // `book` snapshot resets the full Down book, preventing stale level drift.
+            if derive_complementary && !proven_uncrossed {
+                *down_invalidated = true;
+            }
+            if derive_complementary && proven_uncrossed && !*down_invalidated {
                 let comp_side = match side {
                     OrderSide::Buy => OrderSide::Sell,
                     OrderSide::Sell => OrderSide::Buy,
@@ -1390,7 +1539,8 @@ fn convert_l2_row(
                         context: slug.clone(),
                         detail: "market_resolved row missing winning_outcome".to_string(),
                     })?;
-            let mapped = parse_resolution_outcome(raw_win, outcome, opposite_outcome, &slug)?;
+            let mapped =
+                parse_resolution_outcome(raw_win, mapping.yes_maps_to, mapping.no_maps_to, &slug)?;
             Ok(vec![TimedEvent {
                 sort_ts_us: row.timestamp_us,
                 sort_local_us: row.local_timestamp_us,
@@ -1473,6 +1623,9 @@ fn convert_trade_row(
 
     let key = TradeDedupKey {
         timestamp_us: row.timestamp_us,
+        local_timestamp_us: normalized_trade_id
+            .is_none()
+            .then_some(row.local_timestamp_us),
         outcome,
         side,
         price_micro: price.0,
@@ -1680,13 +1833,31 @@ pub fn verify_reconstructed_books_for_stream(
                 bids,
                 asks,
             } => {
+                if ev
+                    .provenance
+                    .quality_flags
+                    .contains(&QualityFlag::CrossedBookObserved)
+                {
+                    continue;
+                }
                 let m = match outcome {
                     Outcome::Up => &mut up,
                     Outcome::Down => &mut dn,
                 };
-                if m.apply_snapshot(bids, asks, mono_ns, exch_ms).is_ok() {
-                    snapshots_checked = snapshots_checked.saturating_add(1);
+                if m.is_crossed() {
+                    return Err(HistoricalError::Normalization {
+                        context: ev.provenance.market_slug.clone(),
+                        detail: format!(
+                            "unrepaired transient cross on {outcome:?} before snapshot at {exch_ms}ms"
+                        ),
+                    });
                 }
+                m.apply_snapshot(bids, asks, mono_ns, exch_ms)
+                    .map_err(|err| HistoricalError::Normalization {
+                        context: ev.provenance.market_slug.clone(),
+                        detail: format!("snapshot reconstruction failed for {outcome:?}: {err}"),
+                    })?;
+                snapshots_checked = snapshots_checked.saturating_add(1);
             }
             CanonicalEventKind::PriceChange {
                 outcome,
@@ -1699,10 +1870,24 @@ pub fn verify_reconstructed_books_for_stream(
                     Outcome::Up => &mut up,
                     Outcome::Down => &mut dn,
                 };
-                let _ = m.apply_delta_allow_transient_cross(*side, *price, *size, mono_ns, exch_ms);
+                m.apply_delta_allow_transient_cross(*side, *price, *size, mono_ns, exch_ms)
+                    .map_err(|err| HistoricalError::Normalization {
+                        context: ev.provenance.market_slug.clone(),
+                        detail: format!("delta reconstruction failed for {outcome:?}: {err}"),
+                    })?;
             }
             _ => {}
         }
+    }
+    if up.is_crossed() || dn.is_crossed() {
+        return Err(HistoricalError::Normalization {
+            context: "book_reconstruction".to_string(),
+            detail: format!(
+                "unrepaired crossed book at end of stream (up_crossed={}, dn_crossed={})",
+                up.is_crossed(),
+                dn.is_crossed()
+            ),
+        });
     }
     Ok(snapshots_checked)
 }

@@ -273,19 +273,25 @@ pub enum CanonicalEventKind {
 
 impl CanonicalEvent {
     /// Validates structural provenance invariants (e.g., PMData MUST NEVER carry `mono_ns` or `clock_sync`).
-    pub fn validate_provenance_invariants(&self) -> Result<(), String> {
+    pub fn validate_provenance_invariants(&self) -> Result<(), HistoricalError> {
         if self.provenance.source == DataSource::Pmdata {
             if self.timestamp.mono_ns.is_some() {
-                return Err("PMData canonical event must have mono_ns == None".to_string());
+                return Err(HistoricalError::Normalization {
+                    context: self.provenance.market_slug.clone(),
+                    detail: "PMData canonical event must have mono_ns == None".to_string(),
+                });
             }
             if self.timestamp.clock_sync.is_some() {
-                return Err("PMData canonical event must have clock_sync == None".to_string());
+                return Err(HistoricalError::Normalization {
+                    context: self.provenance.market_slug.clone(),
+                    detail: "PMData canonical event must have clock_sync == None".to_string(),
+                });
             }
             if self.timestamp.timing_estimation.is_none() {
-                return Err(
-                    "PMData canonical event must disclose timing_estimation for replay_order_ts_ms"
-                        .to_string(),
-                );
+                return Err(HistoricalError::Normalization {
+                    context: self.provenance.market_slug.clone(),
+                    detail: "PMData canonical event must disclose timing_estimation for replay_order_ts_ms".to_string(),
+                });
             }
         }
         Ok(())
@@ -419,7 +425,7 @@ pub fn canonical_metadata_to_descriptor(
         fee_schedule: *fee_schedule,
         start_ts_ms: *start_ts_ms,
         expiry_ts_ms: *expiry_ts_ms,
-        strike_price_usd: strike_price_usd.and_then(|v| FinitePosF64::try_new(v).ok()),
+        strike_price_usd: strike_price_usd.map(FinitePosF64::try_new).transpose()?,
     };
     desc.validate()
         .map_err(|err| HistoricalError::Normalization {
@@ -427,4 +433,52 @@ pub fn canonical_metadata_to_descriptor(
             detail: err.to_string(),
         })?;
     Ok((desc, *interval))
+}
+
+/// Validates market-wide book-quality requirements across filtered replay events.
+/// For `BookQualityFilter::DirectBothRequired`, every market in `events` must have
+/// directly observed books (`DirectLiveWs` / `DirectPmdataYes` / `DirectPmdataNo`) for BOTH
+/// `Outcome::Up` and `Outcome::Down`.
+pub fn validate_canonical_replay_quality(
+    events: &[CanonicalEvent],
+    book_quality: BookQualityFilter,
+) -> Result<(), HistoricalError> {
+    if book_quality != BookQualityFilter::DirectBothRequired {
+        return Ok(());
+    }
+    let mut seen_sides: std::collections::BTreeMap<&str, (bool, bool)> =
+        std::collections::BTreeMap::new();
+    for ev in events {
+        let slug = ev.provenance.market_slug.as_str();
+        let entry = seen_sides.entry(slug).or_insert((false, false));
+        let is_direct = matches!(
+            ev.provenance.book_derivation,
+            BookDerivation::DirectLiveWs
+                | BookDerivation::DirectPmdataYes
+                | BookDerivation::DirectPmdataNo
+        );
+        if !is_direct {
+            continue;
+        }
+        match &ev.kind {
+            CanonicalEventKind::BookSnapshot { outcome, .. }
+            | CanonicalEventKind::PriceChange { outcome, .. }
+            | CanonicalEventKind::BestBidAsk { outcome, .. } => match outcome {
+                Outcome::Up => entry.0 = true,
+                Outcome::Down => entry.1 = true,
+            },
+            _ => {}
+        }
+    }
+    for (slug, (has_up, has_dn)) in seen_sides {
+        if !has_up || !has_dn {
+            return Err(HistoricalError::Normalization {
+                context: slug.to_string(),
+                detail: format!(
+                    "min-book-quality direct-both requires direct Up and Down books for market `{slug}` (has_up={has_up}, has_dn={has_dn})"
+                ),
+            });
+        }
+    }
+    Ok(())
 }

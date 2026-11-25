@@ -454,6 +454,7 @@ fn run_canonical_replay(
         )
         .into());
     }
+    historical_data::validate_canonical_replay_quality(&filtered_events, args.min_book_quality)?;
 
     if has_pmdata {
         eprintln!(
@@ -513,6 +514,10 @@ fn run_canonical_replay(
         if let CanonicalEventKind::MarketResolution {
             winning_outcome, ..
         } = ev.kind
+            && state
+                .desc
+                .as_ref()
+                .is_some_and(|d| d.slug == ev.provenance.market_slug)
         {
             state.explicit_winning_outcome = Some(winning_outcome);
         }
@@ -548,7 +553,7 @@ fn run_canonical_replay(
                 &mut pipe,
             ) {
                 let expiry_ns = clock.now_ns().unwrap_or(0);
-                let _ = record_epoch_rollover_jsonl(
+                record_epoch_rollover_jsonl(
                     &mut jsonl,
                     expiry_ms,
                     expiry_ns,
@@ -560,10 +565,52 @@ fn run_canonical_replay(
                     pending.pairs_merged_micro,
                     pending.fees_paid_micro,
                     pending.estimated_rebate_micro,
-                );
+                )?;
             }
             state.epoch_settled = true;
         }
+
+        if !matches!(ev.kind, CanonicalEventKind::MarketMetadata { .. })
+            && !state.epoch_settled
+            && let Some(desc) = state.desc.as_ref()
+        {
+            let bounded_ms = cur_sim_ms.min(desc.expiry_ts_ms);
+            if let Some(target) = state.next_eval_ms
+                && bounded_ms.saturating_sub(target) > 600_000
+            {
+                state.next_eval_ms = Some(bounded_ms);
+            }
+            while state.next_eval_ms.is_some_and(|target| target < bounded_ms) {
+                let eval_now = state.next_eval_ms.unwrap_or(bounded_ms);
+                state.next_eval_ms = Some(eval_now.saturating_add(100));
+                if !header_printed && let Some(d) = state.desc.as_ref() {
+                    print_paper_header(
+                        TraceSourceMode::Replay.as_str(),
+                        d,
+                        args.v_max,
+                        args.base_size,
+                        args.latency_ms,
+                        &args.duration,
+                        &args.jsonl,
+                    );
+                    header_printed = true;
+                }
+                eval_sim_step(
+                    eval_now,
+                    &mut state,
+                    &mut pipe,
+                    (&mut broker, &mut ledger, &mut telemetry),
+                    cfg,
+                    args,
+                    (&mut tracker, &mut jsonl, &clock),
+                )?;
+            }
+        }
+
+        let active_slug_matches = state
+            .desc
+            .as_ref()
+            .is_some_and(|d| d.slug == ev.provenance.market_slug);
 
         match ev.kind {
             CanonicalEventKind::MarketMetadata { .. } => {
@@ -572,6 +619,13 @@ fn run_canonical_replay(
                     (desc.expiry_ts_ms.saturating_sub(desc.start_ts_ms) as f64 / 1000.0).max(1.0);
                 if let Some(prev) = state.desc.as_ref() {
                     if prev.condition_id != desc.condition_id || prev.slug != desc.slug {
+                        if !state.epoch_settled && cur_sim_ms < prev.expiry_ts_ms {
+                            return Err(format!(
+                                "overlapping `market_metadata` rollover from `{}` (expiry={}) to `{}` at replay_order_ts_ms={cur_sim_ms}",
+                                prev.slug, prev.expiry_ts_ms, desc.slug
+                            )
+                            .into());
+                        }
                         epoch = epoch.saturating_add(1);
                         state.rollover_to_market(
                             desc,
@@ -604,29 +658,31 @@ fn run_canonical_replay(
                 bids,
                 asks,
             } => {
-                let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
-                let mono_ns = ev.timestamp.mono_ns.unwrap_or(0);
-                let fixed =
-                    CanonicalEvent::to_fixed_book_10(outcome, &bids, &asks, mono_ns, exch_ms)?;
-                match outcome {
-                    Outcome::Up => {
-                        if let Ok(valid) = state.book_up.apply_snapshot(
-                            fixed.bids_slice(),
-                            fixed.asks_slice(),
-                            mono_ns,
-                            exch_ms,
-                        ) {
-                            state.latest_up = Some(valid);
+                if active_slug_matches {
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    let mono_ns = ev.timestamp.mono_ns.unwrap_or(0);
+                    let fixed =
+                        CanonicalEvent::to_fixed_book_10(outcome, &bids, &asks, mono_ns, exch_ms)?;
+                    match outcome {
+                        Outcome::Up => {
+                            if let Ok(valid) = state.book_up.apply_snapshot(
+                                fixed.bids_slice(),
+                                fixed.asks_slice(),
+                                mono_ns,
+                                exch_ms,
+                            ) {
+                                state.latest_up = Some(valid);
+                            }
                         }
-                    }
-                    Outcome::Down => {
-                        if let Ok(valid) = state.book_dn.apply_snapshot(
-                            fixed.bids_slice(),
-                            fixed.asks_slice(),
-                            mono_ns,
-                            exch_ms,
-                        ) {
-                            state.latest_dn = Some(valid);
+                        Outcome::Down => {
+                            if let Ok(valid) = state.book_dn.apply_snapshot(
+                                fixed.bids_slice(),
+                                fixed.asks_slice(),
+                                mono_ns,
+                                exch_ms,
+                            ) {
+                                state.latest_dn = Some(valid);
+                            }
                         }
                     }
                 }
@@ -638,31 +694,33 @@ fn run_canonical_replay(
                 size,
                 ..
             } => {
-                let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
-                let mono_ns = ev.timestamp.mono_ns.unwrap_or(0);
-                match outcome {
-                    Outcome::Up => {
-                        let _ = state
-                            .book_up
-                            .apply_delta_allow_transient_cross(side, price, size, mono_ns, exch_ms);
-                        if !state.book_up.is_crossed()
-                            && let Ok(top) = state.book_up.top_n::<10>()
-                        {
-                            state.latest_up = Some(top);
+                if active_slug_matches {
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    let mono_ns = ev.timestamp.mono_ns.unwrap_or(0);
+                    match outcome {
+                        Outcome::Up => {
+                            let _ = state.book_up.apply_delta_allow_transient_cross(
+                                side, price, size, mono_ns, exch_ms,
+                            );
+                            if !state.book_up.is_crossed()
+                                && let Ok(top) = state.book_up.top_n::<10>()
+                            {
+                                state.latest_up = Some(top);
+                            }
+                        }
+                        Outcome::Down => {
+                            let _ = state.book_dn.apply_delta_allow_transient_cross(
+                                side, price, size, mono_ns, exch_ms,
+                            );
+                            if !state.book_dn.is_crossed()
+                                && let Ok(top) = state.book_dn.top_n::<10>()
+                            {
+                                state.latest_dn = Some(top);
+                            }
                         }
                     }
-                    Outcome::Down => {
-                        let _ = state
-                            .book_dn
-                            .apply_delta_allow_transient_cross(side, price, size, mono_ns, exch_ms);
-                        if !state.book_dn.is_crossed()
-                            && let Ok(top) = state.book_dn.top_n::<10>()
-                        {
-                            state.latest_dn = Some(top);
-                        }
-                    }
+                    broker.on_book_update(outcome, side, price, size, exch_ms);
                 }
-                broker.on_book_update(outcome, side, price, size, exch_ms);
             }
             CanonicalEventKind::TradePrint {
                 outcome,
@@ -671,18 +729,20 @@ fn run_canonical_replay(
                 size,
                 ..
             } => {
-                let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
-                handle_replay_trade_print(
-                    &mut state,
-                    &mut pipe,
-                    (&mut broker, &mut ledger, &mut telemetry),
-                    (outcome, side, price, size, exch_ms),
-                    &mut jsonl,
-                    &clock,
-                )?;
+                if active_slug_matches {
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    handle_replay_trade_print(
+                        &mut state,
+                        &mut pipe,
+                        (&mut broker, &mut ledger, &mut telemetry),
+                        (outcome, side, price, size, exch_ms),
+                        &mut jsonl,
+                        &clock,
+                    )?;
+                }
             }
             CanonicalEventKind::TickSizeChange { new_tick_micro, .. } => {
-                if let Some(desc) = state.desc.as_mut() {
+                if active_slug_matches && let Some(desc) = state.desc.as_mut() {
                     desc.tick_size_micro = new_tick_micro;
                 }
             }
@@ -702,7 +762,9 @@ fn run_canonical_replay(
             CanonicalEventKind::MarketResolution {
                 winning_outcome, ..
             } => {
-                state.explicit_winning_outcome = Some(winning_outcome);
+                if active_slug_matches {
+                    state.explicit_winning_outcome = Some(winning_outcome);
+                }
             }
             CanonicalEventKind::ClockSync { .. }
             | CanonicalEventKind::BestBidAsk { .. }
@@ -765,7 +827,7 @@ fn run_canonical_replay(
             &mut pipe,
         ) {
             let now_ns = clock.now_ns().unwrap_or(0);
-            let _ = record_epoch_rollover_jsonl(
+            record_epoch_rollover_jsonl(
                 &mut jsonl,
                 settle_ts,
                 now_ns,
@@ -777,9 +839,13 @@ fn run_canonical_replay(
                 pending.pairs_merged_micro,
                 pending.fees_paid_micro,
                 pending.estimated_rebate_micro,
-            );
+            )?;
         }
         state.epoch_settled = true;
+    }
+
+    if state.desc.is_none() {
+        return Err("canonical replay file contains no `market_metadata` event".into());
     }
 
     finalize_paper_output(

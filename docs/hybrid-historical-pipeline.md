@@ -70,7 +70,7 @@ cargo run -p cli -- pmdata download --market-slug btc-updown-15m-1793146500 --mo
 # 5b. Download a full Day Bundle or date range (requires explicit --yes confirmation; optional --include-onchain)
 cargo run -p cli -- pmdata download --from-date 2026-10-28 --to-date 2026-10-28 --asset btc --interval 15m --mode full --yes
 
-# 6a. Normalize PMData Parquets into Canonical JSONL (supply --resolution-override when market_resolved is absent)
+# 6a. Normalize PMData Parquets into Canonical JSONL (`--trades` is optional for zero-trade markets; supply `--resolution-override` when `market_resolved` is absent)
 cargo run -p cli -- pmdata normalize `
   --source pmdata `
   --yes-l2 data/pmdata/markets/2026-10-28/l2/btc-updown-15m-1793146500_yes.parquet `
@@ -82,13 +82,18 @@ cargo run -p cli -- pmdata normalize `
 # 6b. Normalize a live capture JSONL into Canonical JSONL
 cargo run -p cli -- pmdata normalize --source live-jsonl --input logs/captures/<capture>.jsonl --output data/canonical/live.canonical.jsonl
 
-# 7. Replay canonical JSONL (auto-detected) through Paper or Lifecycle (uses 900s horizon for 15m)
+# 7. Replay canonical JSONL (auto-detected) through Paper or Lifecycle (`--min-book-quality direct-both` verifies every market has direct Up+Down books)
 cargo run -p cli -- lifecycle --source replay `
   --input data/canonical/btc-updown-15m-1793146500.canonical.jsonl `
   --source-filter pmdata `
   --min-book-quality direct-both
 
-# 8. Re-verify historical Phase 0 samples locally (0 quota)
+# 8a. Cache the three Phase 0 sample markets first if not already downloaded (3 quota units each in `full` mode)
+cargo run -p cli -- pmdata download --market-slug btc-updown-5m-1791417900 --mode full
+cargo run -p cli -- pmdata download --market-slug btc-updown-5m-1793145900 --mode full
+cargo run -p cli -- pmdata download --market-slug btc-updown-15m-1793146500 --mode full
+
+# 8b. Re-verify cached historical Phase 0 samples locally (0 extra quota)
 cargo run -p cli -- pmdata verify-historical `
   --samples btc-updown-5m-1791417900 btc-updown-5m-1793145900 btc-updown-15m-1793146500 `
   --report-out docs/pmdata-phase0-historical-report.md

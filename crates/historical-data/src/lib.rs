@@ -26,7 +26,7 @@ pub use canonical::{
     BookDerivation, CANONICAL_SCHEMA_VERSION, CanonicalEvent, CanonicalEventKind,
     CanonicalTimestamp, ClockSyncMeta, DataSource, EventProvenance, QualityFlag, ResolutionSource,
     TimingEstimate, TimingQuality, canonical_event_matches_filters,
-    canonical_metadata_to_descriptor, is_canonical_jsonl_line,
+    canonical_metadata_to_descriptor, is_canonical_jsonl_line, validate_canonical_replay_quality,
 };
 pub use catalog::{
     OutcomeMapping, catalog_available_dates, filter_updown_markets, infer_interval_from_slug,

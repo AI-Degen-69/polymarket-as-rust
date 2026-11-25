@@ -2551,6 +2551,8 @@ impl LivePaperSimulator {
     }
 }
 
+const REPLAY_MANDATORY_FLATTEN_SECS: u64 = 30;
+
 fn build_risk_actor(
     harness: ActorPipelineHarness,
     risk_config: RiskConfig,
@@ -2566,7 +2568,7 @@ fn build_risk_actor(
     })?;
     let lifecycle = EpochLifecycleController::new(LifecycleConfig {
         pre_expiry_lockout_secs: 60,
-        mandatory_flatten_secs: 30,
+        mandatory_flatten_secs: REPLAY_MANDATORY_FLATTEN_SECS,
         terminal_lockout_secs: 15,
         min_order_size_shares,
     })?;
@@ -3408,6 +3410,7 @@ async fn run_canonical_replay_epoch(
         )
         .into());
     }
+    historical_data::validate_canonical_replay_quality(&events, args.min_book_quality)?;
 
     if has_pmdata {
         eprintln!(
@@ -3456,6 +3459,7 @@ async fn run_canonical_replay_epoch(
             winning_outcome, ..
         } = &ev.kind
             && let Some(sess) = session.as_mut()
+            && sess.sim.desc.slug == ev.provenance.market_slug
         {
             sess.sim.explicit_winning_outcome = Some(*winning_outcome);
             sess.sim.market_resolved_flag = true;
@@ -3560,6 +3564,13 @@ async fn run_canonical_replay_epoch(
                     if desc.condition_id != sess.sim.desc.condition_id
                         || desc.slug != sess.sim.desc.slug
                     {
+                        if !sess.sim.epoch_settled && cur_sim_ms < sess.sim.desc.expiry_ts_ms {
+                            return Err(format!(
+                                "overlapping `market_metadata` rollover from `{}` (expiry={}) to `{}` at replay_order_ts_ms={cur_sim_ms}",
+                                sess.sim.desc.slug, sess.sim.desc.expiry_ts_ms, desc.slug
+                            )
+                            .into());
+                        }
                         epoch = epoch.saturating_add(1);
                         let start_ms = desc.start_ts_ms;
                         sess.sim
@@ -3603,7 +3614,9 @@ async fn run_canonical_replay_epoch(
                 bids,
                 asks,
             } => {
-                if let Some(sess) = session.as_mut() {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
                     let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
                     let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
                     let fixed =
@@ -3627,7 +3640,9 @@ async fn run_canonical_replay_epoch(
                 best_bid,
                 best_ask,
             } => {
-                if let Some(sess) = session.as_mut() {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
                     let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
                     let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
                     let pm_ev = PolyMarketEvent::PriceChange {
@@ -3652,7 +3667,9 @@ async fn run_canonical_replay_epoch(
                 size,
                 ..
             } => {
-                if let Some(sess) = session.as_mut() {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
                     let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
                     let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
                     let pm_ev = PolyMarketEvent::LastTrade {
@@ -3672,7 +3689,9 @@ async fn run_canonical_replay_epoch(
                 outcome,
                 new_tick_micro,
             } => {
-                if let Some(sess) = session.as_mut() {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
                     TickPrecision::from_micro(new_tick_micro)?;
                     let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
                     let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
@@ -3692,7 +3711,9 @@ async fn run_canonical_replay_epoch(
                 best_bid,
                 best_ask,
             } => {
-                if let Some(sess) = session.as_mut() {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
                     let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
                     let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
                     let pm_ev = PolyMarketEvent::BestBidAsk {
@@ -3759,12 +3780,35 @@ async fn step_replay_eval_grid(
     if let Some(target) = *next_eval_ms
         && cur_sim_ms.saturating_sub(target) > MAX_REPLAY_GAP_CATCHUP_MS
     {
+        let flatten_start_ms = sess
+            .sim
+            .desc
+            .expiry_ts_ms
+            .saturating_sub(REPLAY_MANDATORY_FLATTEN_SECS.saturating_mul(1_000));
         eprintln!(
             "  {} replay timestamp gap of {}ms exceeds {MAX_REPLAY_GAP_CATCHUP_MS}ms; fast-forwarding evaluation grid",
             theme::current().badge(Badge::Warn),
             cur_sim_ms.saturating_sub(target)
         );
-        *next_eval_ms = Some(cur_sim_ms);
+        if target < flatten_start_ms && cur_sim_ms >= flatten_start_ms {
+            if cur_sim_ms.saturating_sub(flatten_start_ms) <= MAX_REPLAY_GAP_CATCHUP_MS {
+                *next_eval_ms = Some(flatten_start_ms);
+            } else {
+                let flatten_ns = flatten_start_ms
+                    .saturating_sub(anchor_ts_ms)
+                    .saturating_mul(1_000_000);
+                let actors = LiveActorChannels {
+                    pricing_tx: &sess.pricing_tx,
+                    risk_tx: &sess.risk_tx,
+                };
+                sess.sim
+                    .step_tick(flatten_start_ms, flatten_ns, 0, &actors, latencies, jsonl)
+                    .await?;
+                *next_eval_ms = Some(cur_sim_ms);
+            }
+        } else {
+            *next_eval_ms = Some(cur_sim_ms);
+        }
     }
 
     while let Some(eval_ms) = *next_eval_ms {
@@ -5490,6 +5534,142 @@ mod tests {
         assert!(sum["ticks_evaluated"].as_u64().unwrap() >= 1);
         let log_txt = std::fs::read_to_string(&out_path).unwrap();
         assert!(log_txt.contains("\"winning_outcome\":\"Down\""));
+
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn replay_sparse_gap_over_600s_enters_mandatory_flatten_before_settlement() {
+        use historical_data::{
+            BookDerivation, CANONICAL_SCHEMA_VERSION, CanonicalEvent, CanonicalEventKind,
+            CanonicalTimestamp, DataSource, EventProvenance, ResolutionSource, TimingEstimate,
+            TimingQuality, UpDownInterval, write_canonical_jsonl,
+        };
+
+        let ts0 = 1_793_146_500_000_u64;
+        let expiry = ts0 + 900_000;
+        let slug = "btc-updown-15m-1793146500";
+        let prov = |derivation: BookDerivation, orig: &str| EventProvenance {
+            source: DataSource::Pmdata,
+            original_event_type: orig.to_string(),
+            market_slug: slug.to_string(),
+            timing_quality: TimingQuality::ExchangeAndProviderUtc,
+            book_derivation: derivation,
+            normalization_version: CANONICAL_SCHEMA_VERSION,
+            raw_price_f64: None,
+            raw_size_f64: None,
+            quality_flags: Vec::new(),
+        };
+        let make_ts = |ms: u64| CanonicalTimestamp {
+            exchange_ts_ms: Some(ms),
+            exchange_ts_us: Some((ms as i64) * 1_000),
+            provider_local_ts_us: Some((ms as i64) * 1_000 + 2_000),
+            unix_ts_ms: None,
+            mono_ns: None,
+            clock_sync: None,
+            replay_order_ts_ms: ms,
+            timing_estimation: Some(TimingEstimate {
+                method: "exchange_ts_us_to_ms_floor".to_string(),
+                uncertainty_note: "synthetic sparse test".to_string(),
+            }),
+        };
+        let events = vec![
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::NotApplicable, "market_metadata"),
+                timestamp: make_ts(ts0),
+                kind: CanonicalEventKind::MarketMetadata {
+                    slug: slug.to_string(),
+                    condition_id: Some("0xcond_sparse_flatten".to_string()),
+                    question: Some("BTC 15m Sparse Test".to_string()),
+                    interval: UpDownInterval::M15,
+                    version: Some(core_types::ProtocolVersion::CtfV1),
+                    neg_risk: Some(false),
+                    asset_id_up: Some("0xup".to_string()),
+                    asset_id_dn: Some("0xdn".to_string()),
+                    yes_outcome_label: Some("Up".to_string()),
+                    no_outcome_label: Some("Down".to_string()),
+                    tick_size_micro: MicroUsdc(10_000),
+                    min_order_size_micro: SharesMicro(5_000_000),
+                    taker_delay_ms: Some(50),
+                    fee_schedule: FeeSchedule::btc_5m_default(),
+                    start_ts_ms: ts0,
+                    expiry_ts_ms: expiry,
+                    strike_price_usd: None,
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::DirectPmdataYes, "book"),
+                timestamp: make_ts(ts0 + 500),
+                kind: CanonicalEventKind::BookSnapshot {
+                    outcome: Outcome::Up,
+                    bids: vec![BookLevel {
+                        price: MicroUsdc(480_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                    asks: vec![BookLevel {
+                        price: MicroUsdc(520_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::DirectPmdataNo, "book"),
+                timestamp: make_ts(ts0 + 500),
+                kind: CanonicalEventKind::BookSnapshot {
+                    outcome: Outcome::Down,
+                    bids: vec![BookLevel {
+                        price: MicroUsdc(480_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                    asks: vec![BookLevel {
+                        price: MicroUsdc(520_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::NotApplicable, "market_resolved"),
+                timestamp: make_ts(expiry + 500),
+                kind: CanonicalEventKind::MarketResolution {
+                    winning_outcome: Outcome::Up,
+                    resolution_source: ResolutionSource::ExternalOverride,
+                    raw_winning_label: Some("Up".to_string()),
+                },
+            },
+        ];
+
+        let in_path = temp_jsonl_path("lc_sparse_flatten_in");
+        let out_path = temp_jsonl_path("lc_sparse_flatten_out");
+        write_canonical_jsonl(&in_path, &events).unwrap();
+
+        run(LifecycleArgs {
+            source: LifecycleSourceMode::Replay,
+            display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
+            input: Some(in_path.clone()),
+            duration: "900s".to_string(),
+            allow_mid_window: true,
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            source_filter: SourceFilter::PmdataOnly,
+            min_book_quality: BookQualityFilter::DirectBothRequired,
+            jsonl: out_path.clone(),
+        })
+        .unwrap();
+
+        let log_txt = std::fs::read_to_string(&out_path).unwrap();
+        assert!(log_txt.contains("\"phase\":\"MandatoryFlatten\""));
+        assert!(log_txt.contains("\"winning_outcome\":\"Up\""));
 
         let _ = std::fs::remove_file(&in_path);
         let _ = std::fs::remove_file(&out_path);

@@ -8,7 +8,7 @@ use core_types::{
 use feeds::BookMaintainer;
 use serde::{Deserialize, Serialize};
 
-use crate::canonical::{CanonicalEvent, CanonicalEventKind, DataSource};
+use crate::canonical::{CanonicalEvent, CanonicalEventKind, DataSource, QualityFlag};
 use crate::catalog::{OutcomeMapping, infer_interval_from_slug};
 use crate::config::IngestionMode;
 use crate::error::HistoricalError;
@@ -192,7 +192,8 @@ pub fn audit_pmdata_historical_market(
     let mut mant_no = BookMaintainer::new(Outcome::Down);
     let mut reconstructed_yes_at_ts: BTreeMap<i64, FixedBook<10>> = BTreeMap::new();
     let mut reconstructed_no_at_ts: BTreeMap<i64, FixedBook<10>> = BTreeMap::new();
-    let tick_micro = MicroUsdc(10_000);
+    let mut yes_tick_micro = MicroUsdc(10_000);
+    let mut no_tick_micro = MicroUsdc(10_000);
 
     for r in &yes_rows {
         if let Some(p) = prev_ts
@@ -216,7 +217,7 @@ pub fn audit_pmdata_historical_market(
                     &r.bid_sizes,
                     &r.ask_prices,
                     &r.ask_sizes,
-                    tick_micro,
+                    yes_tick_micro,
                     &slug,
                 )?;
                 max_p_delta = max_p_delta.max(pd);
@@ -243,11 +244,11 @@ pub fn audit_pmdata_historical_market(
                     max_p_delta = max_p_delta.max(float_micro_residual(p));
                     max_s_delta = max_s_delta.max(float_micro_residual(s));
                     if let (Ok((pm, pf)), Ok((sm, _)), Some(side)) = (
-                        convert_price_to_micro(p, tick_micro, false, &slug),
+                        convert_price_to_micro(p, yes_tick_micro, false, &slug),
                         convert_size_to_micro(s, SharesMicro::ZERO, true, &slug),
                         feeds::parse_order_side(side_s),
                     ) {
-                        if !pf.is_empty() {
+                        if pf.contains(&QualityFlag::SubTickPrice) {
                             sub_tick = sub_tick.saturating_add(1);
                         }
                         let _ = mant_yes.apply_delta_allow_transient_cross(
@@ -265,7 +266,16 @@ pub fn audit_pmdata_historical_market(
                     }
                 }
             }
-            "tick_size_change" => yes_tc = yes_tc.saturating_add(1),
+            "tick_size_change" => {
+                yes_tc = yes_tc.saturating_add(1);
+                if let Some(raw_t) = r.new_tick_size
+                    && let Ok((new_tick, _)) =
+                        convert_price_to_micro(raw_t, MicroUsdc(1), false, &slug)
+                    && core_types::TickPrecision::from_micro(new_tick).is_ok()
+                {
+                    yes_tick_micro = new_tick;
+                }
+            }
             "market_resolved" => {
                 yes_mr = yes_mr.saturating_add(1);
                 winning_label = r.winning_outcome.clone();
@@ -274,7 +284,14 @@ pub fn audit_pmdata_historical_market(
         }
     }
 
+    let mut prev_no_ts = None;
     for r in &no_rows {
+        if let Some(p) = prev_no_ts
+            && r.timestamp_us < p
+        {
+            l2_non_mono = l2_non_mono.saturating_add(1);
+        }
+        prev_no_ts = Some(r.timestamp_us);
         match r.event_type.as_str() {
             "book" => {
                 no_books = no_books.saturating_add(1);
@@ -289,7 +306,7 @@ pub fn audit_pmdata_historical_market(
                     &r.bid_sizes,
                     &r.ask_prices,
                     &r.ask_sizes,
-                    tick_micro,
+                    no_tick_micro,
                     &slug,
                 )?;
                 max_p_delta = max_p_delta.max(pd);
@@ -312,24 +329,39 @@ pub fn audit_pmdata_historical_market(
                 no_pc = no_pc.saturating_add(1);
                 if let (Some(p), Some(s), Some(side_s)) =
                     (r.pc_price, r.pc_size, r.pc_side.as_deref())
-                    && let (Ok((pm, _)), Ok((sm, _)), Some(side)) = (
-                        convert_price_to_micro(p, tick_micro, false, &slug),
+                {
+                    max_p_delta = max_p_delta.max(float_micro_residual(p));
+                    max_s_delta = max_s_delta.max(float_micro_residual(s));
+                    if let (Ok((pm, pf)), Ok((sm, _)), Some(side)) = (
+                        convert_price_to_micro(p, no_tick_micro, false, &slug),
                         convert_size_to_micro(s, SharesMicro::ZERO, true, &slug),
                         feeds::parse_order_side(side_s),
-                    )
-                {
-                    let _ = mant_no.apply_delta_allow_transient_cross(
-                        side,
-                        pm,
-                        sm,
-                        0,
-                        (r.timestamp_us / 1_000).max(0) as u64,
-                    );
-                    if !mant_no.is_crossed()
-                        && let Ok(top) = mant_no.top_n::<10>()
-                    {
-                        reconstructed_no_at_ts.insert(r.timestamp_us, top);
+                    ) {
+                        if pf.contains(&QualityFlag::SubTickPrice) {
+                            sub_tick = sub_tick.saturating_add(1);
+                        }
+                        let _ = mant_no.apply_delta_allow_transient_cross(
+                            side,
+                            pm,
+                            sm,
+                            0,
+                            (r.timestamp_us / 1_000).max(0) as u64,
+                        );
+                        if !mant_no.is_crossed()
+                            && let Ok(top) = mant_no.top_n::<10>()
+                        {
+                            reconstructed_no_at_ts.insert(r.timestamp_us, top);
+                        }
                     }
+                }
+            }
+            "tick_size_change" => {
+                if let Some(raw_t) = r.new_tick_size
+                    && let Ok((new_tick, _)) =
+                        convert_price_to_micro(raw_t, MicroUsdc(1), false, &slug)
+                    && core_types::TickPrecision::from_micro(new_tick).is_ok()
+                {
+                    no_tick_micro = new_tick;
                 }
             }
             _ => {}
@@ -362,15 +394,17 @@ pub fn audit_pmdata_historical_market(
                 if &mirrored_bids_from_ya == nb && &mirrored_asks_from_yb == na {
                     exact_mirror_snaps = exact_mirror_snaps.saturating_add(1);
                 } else {
-                    let y_best_bid_comp = yb
-                        .first()
-                        .map(|l| MicroUsdc(ONE_DOLLAR_MICRO.saturating_sub(l.price.0)));
-                    let y_best_ask_comp = ya
-                        .first()
-                        .map(|l| MicroUsdc(ONE_DOLLAR_MICRO.saturating_sub(l.price.0)));
-                    let n_best_ask = na.first().map(|l| l.price);
-                    let n_best_bid = nb.first().map(|l| l.price);
-                    if y_best_bid_comp != n_best_ask || y_best_ask_comp != n_best_bid {
+                    let any_price_mismatch = mirrored_bids_from_ya.len() != nb.len()
+                        || mirrored_asks_from_yb.len() != na.len()
+                        || mirrored_bids_from_ya
+                            .iter()
+                            .zip(nb.iter())
+                            .any(|(a, b)| a.price != b.price)
+                        || mirrored_asks_from_yb
+                            .iter()
+                            .zip(na.iter())
+                            .any(|(a, b)| a.price != b.price);
+                    if any_price_mismatch {
                         bbo_mismatches = bbo_mismatches.saturating_add(1);
                     } else {
                         size_mismatches = size_mismatches.saturating_add(1);
@@ -407,18 +441,17 @@ pub fn audit_pmdata_historical_market(
                 bids,
                 asks,
             } => {
-                let m = match outcome {
-                    Outcome::Up => &mut mant_norm_up,
-                    Outcome::Down => &mut mant_norm_dn,
+                let (m, slot) = match outcome {
+                    Outcome::Up => (&mut mant_norm_up, &mut cur_up),
+                    Outcome::Down => (&mut mant_norm_dn, &mut cur_dn),
                 };
                 if m.apply_snapshot(bids, asks, 0, ex_ms).is_ok()
+                    && !m.is_crossed()
                     && let (Some(b), Some(a)) = (m.best_bid(), m.best_ask())
                 {
-                    let slot = match outcome {
-                        Outcome::Up => &mut cur_up,
-                        Outcome::Down => &mut cur_dn,
-                    };
                     *slot = Some((b.price, a.price));
+                } else {
+                    *slot = None;
                 }
             }
             CanonicalEventKind::PriceChange {
@@ -428,19 +461,17 @@ pub fn audit_pmdata_historical_market(
                 size,
                 ..
             } => {
-                let m = match outcome {
-                    Outcome::Up => &mut mant_norm_up,
-                    Outcome::Down => &mut mant_norm_dn,
+                let (m, slot) = match outcome {
+                    Outcome::Up => (&mut mant_norm_up, &mut cur_up),
+                    Outcome::Down => (&mut mant_norm_dn, &mut cur_dn),
                 };
                 let _ = m.apply_delta_allow_transient_cross(*side, *price, *size, 0, ex_ms);
                 if !m.is_crossed()
                     && let (Some(b), Some(a)) = (m.best_bid(), m.best_ask())
                 {
-                    let slot = match outcome {
-                        Outcome::Up => &mut cur_up,
-                        Outcome::Down => &mut cur_dn,
-                    };
                     *slot = Some((b.price, a.price));
+                } else {
+                    *slot = None;
                 }
             }
             CanonicalEventKind::TradePrint { outcome, price, .. } => {
@@ -459,13 +490,30 @@ pub fn audit_pmdata_historical_market(
         }
     }
 
+    let mut norm_winning_label: Option<String> = None;
+    let mut norm_has_resolution = false;
+    for ev in &norm.events {
+        if let CanonicalEventKind::MarketResolution {
+            winning_outcome,
+            raw_winning_label,
+            ..
+        } = &ev.kind
+        {
+            norm_has_resolution = true;
+            norm_winning_label = raw_winning_label
+                .clone()
+                .or_else(|| Some(format!("{winning_outcome:?}")));
+        }
+    }
+    let effective_winning_label = norm_winning_label.or(winning_label);
+
     let mut distinct_outcomes = Vec::new();
     for tr in &trade_rows {
         if !distinct_outcomes.contains(&tr.outcome) {
             distinct_outcomes.push(tr.outcome.clone());
         }
     }
-    if yes_mr == 0 {
+    if !norm_has_resolution {
         notes.push(
             "No `market_resolved` row in L2 (expected in 2026-08-07..2026-11-17 gap)".to_string(),
         );
@@ -514,8 +562,8 @@ pub fn audit_pmdata_historical_market(
         trades_total_with_prior_book: trades_with_book,
         l2_timestamp_non_monotonic: l2_non_mono,
         provider_latency_us: compute_distribution(&mut latencies_us),
-        has_explicit_market_resolved: yes_mr > 0,
-        winning_outcome_label: winning_label,
+        has_explicit_market_resolved: norm_has_resolution,
+        winning_outcome_label: effective_winning_label,
         crossed_snapshots_yes: crossed_yes,
         crossed_snapshots_no: crossed_no,
         notes,
@@ -551,9 +599,9 @@ pub fn reconcile_live_vs_pmdata(
     let live_counts = count_by_event_type(&live_events);
     let pm_counts = count_by_event_type(&pm_stream.events);
 
-    // 1. Compare book snapshots keyed by `(exchange_ts_ms, outcome)`.
-    let mut live_snaps: HashMap<(u64, Outcome), (Vec<BookLevel>, Vec<BookLevel>)> = HashMap::new();
-    let mut pm_snaps: HashMap<(u64, Outcome), (Vec<BookLevel>, Vec<BookLevel>)> = HashMap::new();
+    // 1. Compare book snapshots keyed by `(exchange_ts_ms, outcome)`, preserving multiple snapshots per ms.
+    let mut live_snaps: HashMap<(u64, Outcome), Vec<SnapPair>> = HashMap::new();
+    let mut pm_snaps: HashMap<(u64, Outcome), Vec<SnapPair>> = HashMap::new();
     for ev in &live_events {
         if let CanonicalEventKind::BookSnapshot {
             outcome,
@@ -562,7 +610,10 @@ pub fn reconcile_live_vs_pmdata(
         } = &ev.kind
             && let Some(ex) = ev.timestamp.exchange_ts_ms
         {
-            live_snaps.insert((ex, *outcome), (bids.clone(), asks.clone()));
+            live_snaps
+                .entry((ex, *outcome))
+                .or_default()
+                .push((bids.clone(), asks.clone()));
         }
     }
     for ev in &pm_stream.events {
@@ -573,24 +624,39 @@ pub fn reconcile_live_vs_pmdata(
         } = &ev.kind
             && let Some(ex) = ev.timestamp.exchange_ts_ms
         {
-            pm_snaps.insert((ex, *outcome), (bids.clone(), asks.clone()));
+            pm_snaps
+                .entry((ex, *outcome))
+                .or_default()
+                .push((bids.clone(), asks.clone()));
         }
     }
     let mut matched_snapshots = 0_usize;
     let mut snapshot_bbo_mismatches = 0_usize;
     let mut snapshot_depth_mismatches = 0_usize;
-    for (k, (lb, la)) in &live_snaps {
-        if let Some((pb, pa)) = pm_snaps.get(k) {
-            matched_snapshots = matched_snapshots.saturating_add(1);
-            let l_bbo = (lb.first().map(|x| x.price), la.first().map(|x| x.price));
-            let p_bbo = (pb.first().map(|x| x.price), pa.first().map(|x| x.price));
-            if l_bbo != p_bbo {
-                snapshot_bbo_mismatches = snapshot_bbo_mismatches.saturating_add(1);
-            } else if lb.iter().take(10).ne(pb.iter().take(10))
-                || la.iter().take(10).ne(pa.iter().take(10))
-            {
-                snapshot_depth_mismatches = snapshot_depth_mismatches.saturating_add(1);
+    let mut unpaired_snapshots = 0_usize;
+    for (k, live_list) in &live_snaps {
+        if let Some(pm_list) = pm_snaps.get(k) {
+            unpaired_snapshots =
+                unpaired_snapshots.saturating_add(live_list.len().abs_diff(pm_list.len()));
+            for ((lb, la), (pb, pa)) in live_list.iter().zip(pm_list.iter()) {
+                matched_snapshots = matched_snapshots.saturating_add(1);
+                let l_bbo = (lb.first().map(|x| x.price), la.first().map(|x| x.price));
+                let p_bbo = (pb.first().map(|x| x.price), pa.first().map(|x| x.price));
+                if l_bbo != p_bbo {
+                    snapshot_bbo_mismatches = snapshot_bbo_mismatches.saturating_add(1);
+                } else if lb.iter().take(10).ne(pb.iter().take(10))
+                    || la.iter().take(10).ne(pa.iter().take(10))
+                {
+                    snapshot_depth_mismatches = snapshot_depth_mismatches.saturating_add(1);
+                }
             }
+        } else {
+            unpaired_snapshots = unpaired_snapshots.saturating_add(live_list.len());
+        }
+    }
+    for (k, pm_list) in &pm_snaps {
+        if !live_snaps.contains_key(k) {
+            unpaired_snapshots = unpaired_snapshots.saturating_add(pm_list.len());
         }
     }
 
@@ -662,42 +728,19 @@ pub fn reconcile_live_vs_pmdata(
         additional_pc = additional_pc.saturating_add(pc.saturating_sub(lc));
     }
 
-    // 3. Compare trades by `(exchange_ts_ms, outcome, side)` + check price/size diffs.
-    let live_trades = collect_trades(&live_events);
+    // 3. Maximum bipartite trade pairing within +-1,000 ms (tie-breaking toward exact price+size).
+    let mut live_trades = collect_trades(&live_events);
+    live_trades.sort_by_key(|t| t.exch_ms);
     let mut pm_trades = collect_trades(&pm_stream.events);
     pm_trades.sort_by_key(|t| t.exch_ms);
     let mut matched_trades = 0_usize;
     let mut trade_price_mismatches = 0_usize;
     let mut trade_size_mismatches = 0_usize;
     let mut exch_diffs_ms = Vec::new();
-    let mut pm_used = vec![false; pm_trades.len()];
-
-    for lt in &live_trades {
-        let min_ms = lt.exch_ms.saturating_sub(1_000);
-        let max_ms = lt.exch_ms.saturating_add(1_000);
-        let start_idx = pm_trades.partition_point(|pt| pt.exch_ms < min_ms);
-        let end_idx = pm_trades.partition_point(|pt| pt.exch_ms <= max_ms);
-        let mut best_match: Option<(usize, i64)> = None;
-        for j in start_idx..end_idx {
-            if pm_used.get(j).copied().unwrap_or(true) {
-                continue;
-            }
-            let Some(pt) = pm_trades.get(j) else {
-                continue;
-            };
-            if lt.outcome == pt.outcome && lt.side == pt.side {
-                let diff = (pt.exch_ms as i64).saturating_sub(lt.exch_ms as i64);
-                if diff.abs() <= 1_000
-                    && best_match.is_none_or(|(_, best_d)| diff.abs() < best_d.abs())
-                {
-                    best_match = Some((j, diff));
-                }
-            }
-        }
-        if let Some((j, diff)) = best_match
-            && let (Some(slot), Some(pt)) = (pm_used.get_mut(j), pm_trades.get(j))
-        {
-            *slot = true;
+    let pairs = max_bipartite_trade_match(&live_trades, &pm_trades);
+    for (li, pj) in pairs {
+        if let (Some(lt), Some(pt)) = (live_trades.get(li), pm_trades.get(pj)) {
+            let diff = (pt.exch_ms as i64).saturating_sub(lt.exch_ms as i64);
             matched_trades = matched_trades.saturating_add(1);
             exch_diffs_ms.push(diff);
             if lt.price != pt.price {
@@ -734,6 +777,11 @@ pub fn reconcile_live_vs_pmdata(
         limitations
             .push("Down book derived via ComplementaryFromYesL2 (not direct No L2).".to_string());
     }
+    if unpaired_snapshots > 0 {
+        limitations.push(format!(
+            "Unpaired book snapshots in same-millisecond buckets: {unpaired_snapshots}"
+        ));
+    }
     if missing_pc > 0 || missing_trades > 0 {
         limitations.push(format!(
             "Missing events in PMData relative to live: price_changes={missing_pc}, trades={missing_trades}"
@@ -748,11 +796,13 @@ pub fn reconcile_live_vs_pmdata(
     let verdict = classify_reconcile_verdict(
         matched_snapshots,
         snapshot_bbo_mismatches,
+        snapshot_depth_mismatches,
         matched_pc,
         missing_pc,
         matched_trades,
         missing_trades,
         trade_price_mismatches,
+        trade_size_mismatches,
         recon_checkpoints,
         recon_bbo_matches,
         resolution_live,
@@ -981,6 +1031,30 @@ pub fn render_reconcile_markdown(report: &LiveVsPmdataReport) -> String {
             "- **Reconstructed BBO:** matched={}/{}",
             r.reconstructed_bbo_matches, r.reconstructed_checkpoints
         );
+        if let Some(dist) = &r.exchange_ts_diff_ms {
+            let _ = writeln!(
+                out,
+                "- **Trade Timestamp Diff (pmdata - live, ms):** count={}, min={}ms, p50={}ms, p95={}ms, p99={}ms, max={}ms",
+                dist.count, dist.min, dist.p50, dist.p95, dist.p99, dist.max
+            );
+        } else {
+            let _ = writeln!(out, "- **Trade Timestamp Diff (ms):** <none matched>");
+        }
+        let _ = writeln!(
+            out,
+            "- **Event Counts:** live={:?} | pmdata={:?}",
+            r.live_events_by_type, r.pmdata_events_by_type
+        );
+        let live_win = r
+            .resolution_live
+            .map_or_else(|| "<missing>".to_string(), |o| format!("{o:?}"));
+        let pm_win = r
+            .resolution_pmdata
+            .map_or_else(|| "<missing>".to_string(), |o| format!("{o:?}"));
+        let _ = writeln!(
+            out,
+            "- **Settlement Resolution:** live={live_win}, pmdata={pm_win}"
+        );
         if !r.limitations.is_empty() {
             for lim in &r.limitations {
                 let _ = writeln!(out, "- **Limitation:** {lim}");
@@ -1010,7 +1084,7 @@ fn convert_book_vecs(
         max_s = max_s.max(float_micro_residual(s));
         let (pm, pf) = convert_price_to_micro(p, tick_micro, false, slug)?;
         let (sm, _) = convert_size_to_micro(s, SharesMicro::ZERO, false, slug)?;
-        if !pf.is_empty() {
+        if pf.contains(&QualityFlag::SubTickPrice) {
             sub_tick = sub_tick.saturating_add(1);
         }
         bids.push(BookLevel {
@@ -1023,7 +1097,7 @@ fn convert_book_vecs(
         max_s = max_s.max(float_micro_residual(s));
         let (pm, pf) = convert_price_to_micro(p, tick_micro, false, slug)?;
         let (sm, _) = convert_size_to_micro(s, SharesMicro::ZERO, false, slug)?;
-        if !pf.is_empty() {
+        if pf.contains(&QualityFlag::SubTickPrice) {
             sub_tick = sub_tick.saturating_add(1);
         }
         asks.push(BookLevel {
@@ -1217,11 +1291,13 @@ fn extract_resolution(events: &[CanonicalEvent]) -> Option<Outcome> {
 fn classify_reconcile_verdict(
     matched_snapshots: usize,
     snapshot_bbo_mismatches: usize,
+    snapshot_depth_mismatches: usize,
     matched_pc: usize,
     missing_pc: usize,
     matched_trades: usize,
     missing_trades: usize,
     trade_price_mismatches: usize,
+    trade_size_mismatches: usize,
     recon_checkpoints: usize,
     recon_bbo_matches: usize,
     resolution_live: Option<Outcome>,
@@ -1238,7 +1314,9 @@ fn classify_reconcile_verdict(
         return FidelityVerdict::NotEquivalent;
     }
     if snapshot_bbo_mismatches > 0
+        || snapshot_depth_mismatches > 0
         || trade_price_mismatches > 0
+        || trade_size_mismatches > 0
         || (recon_checkpoints > 0 && recon_bbo_matches * 100 < recon_checkpoints * 90)
         || (matched_trades + missing_trades > 0
             && missing_trades * 100 > (matched_trades + missing_trades) * 10)
@@ -1252,4 +1330,73 @@ fn classify_reconcile_verdict(
     // for latency-sensitive execution is always at best CompatibleWithLimitations unless identical.
     let _ = DataSource::Pmdata;
     FidelityVerdict::CompatibleWithLimitations
+}
+
+fn max_bipartite_trade_match(
+    live_trades: &[TradeCmp],
+    pm_trades: &[TradeCmp],
+) -> Vec<(usize, usize)> {
+    fn try_augment(
+        li: usize,
+        adj: &[Vec<usize>],
+        pm_match: &mut [Option<usize>],
+        visited: &mut [bool],
+    ) -> bool {
+        let Some(neighbors) = adj.get(li) else {
+            return false;
+        };
+        for &pj in neighbors {
+            if visited.get(pj).copied().unwrap_or(true) {
+                continue;
+            }
+            if let Some(v) = visited.get_mut(pj) {
+                *v = true;
+            }
+            let prev = pm_match.get(pj).copied().flatten();
+            if prev.is_none()
+                || prev.is_some_and(|other_li| try_augment(other_li, adj, pm_match, visited))
+            {
+                if let Some(slot) = pm_match.get_mut(pj) {
+                    *slot = Some(li);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    let mut adj: Vec<Vec<usize>> = Vec::with_capacity(live_trades.len());
+    for lt in live_trades {
+        let min_ms = lt.exch_ms.saturating_sub(1_000);
+        let max_ms = lt.exch_ms.saturating_add(1_000);
+        let start_idx = pm_trades.partition_point(|pt| pt.exch_ms < min_ms);
+        let end_idx = pm_trades.partition_point(|pt| pt.exch_ms <= max_ms);
+        let mut cands: Vec<(u8, u64, usize)> = Vec::new();
+        for j in start_idx..end_idx {
+            let Some(pt) = pm_trades.get(j) else {
+                continue;
+            };
+            if lt.outcome == pt.outcome && lt.side == pt.side {
+                let exact_penalty = u8::from(lt.price != pt.price || lt.size != pt.size);
+                let dist = lt.exch_ms.abs_diff(pt.exch_ms);
+                cands.push((exact_penalty, dist, j));
+            }
+        }
+        cands.sort_unstable();
+        adj.push(cands.into_iter().map(|(_, _, j)| j).collect());
+    }
+
+    let mut pm_match: Vec<Option<usize>> = vec![None; pm_trades.len()];
+    for li in 0..live_trades.len() {
+        let mut visited = vec![false; pm_trades.len()];
+        let _ = try_augment(li, &adj, &mut pm_match, &mut visited);
+    }
+
+    let mut pairs = Vec::new();
+    for (pj, opt_li) in pm_match.into_iter().enumerate() {
+        if let Some(li) = opt_li {
+            pairs.push((li, pj));
+        }
+    }
+    pairs
 }

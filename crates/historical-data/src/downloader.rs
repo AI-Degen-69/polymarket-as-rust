@@ -18,7 +18,7 @@ use crate::config::{IngestionMode, PmdataConfig, PmdataDataset, PmdataL2Outcome,
 use crate::error::{HistoricalError, sanitize_snippet};
 use crate::manifest::{
     EndpointKind, EntryStatus, ManifestEntry, ManifestStore, QuotaManifest, ReserveMetadata,
-    ReserveOutcome,
+    ReserveOutcome, existing_valid_cache_entry,
 };
 use crate::parquet_reader::verify_parquet_readable;
 
@@ -80,6 +80,7 @@ impl PmdataClient {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(config.request_timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
             .tcp_nodelay(true)
             .user_agent("poly-as-historical/0.1.0")
             .build()
@@ -287,35 +288,43 @@ impl PmdataClient {
             if let ReserveOutcome::AlreadyCached(entry) = self.manifest.reserve(meta.clone())? {
                 return Ok(DownloadOutcome::CacheHit(*entry));
             }
-        } else {
-            // Re-record reservation even when refreshing catalog (0 quota cost).
-            self.manifest.reserve(meta)?;
+            let bytes = match self.fetch_public_bytes(&self.config.catalog_url).await {
+                Ok((status, b)) => (status, b),
+                Err(err) => {
+                    if let Err(merr) = self.manifest.release_uncharged(
+                        &entry_key,
+                        0,
+                        None,
+                        EntryStatus::FailedUncharged,
+                        err.to_string(),
+                    ) {
+                        return Err(HistoricalError::ManifestIo {
+                            path: self.manifest.path().to_path_buf(),
+                            detail: format!(
+                                "catalog fetch failed ({err}) and manifest release failed: {merr}"
+                            ),
+                        });
+                    }
+                    return Err(err);
+                }
+            };
+            let (size, sha) = write_verified_parquet_atomic(&cache_path, &bytes.1)?;
+            let entry = self
+                .manifest
+                .commit_success(&entry_key, 0, bytes.0, size, sha, cache_path)?;
+            return Ok(DownloadOutcome::Downloaded {
+                entry,
+                extracted_files: Vec::new(),
+            });
         }
 
-        let bytes = match self.fetch_public_bytes(&self.config.catalog_url).await {
-            Ok((status, b)) => (status, b),
-            Err(err) => {
-                if let Err(merr) = self.manifest.release_uncharged(
-                    &entry_key,
-                    0,
-                    None,
-                    EntryStatus::FailedUncharged,
-                    err.to_string(),
-                ) {
-                    return Err(HistoricalError::ManifestIo {
-                        path: self.manifest.path().to_path_buf(),
-                        detail: format!(
-                            "catalog fetch failed ({err}) and manifest release failed: {merr}"
-                        ),
-                    });
-                }
-                return Err(err);
-            }
-        };
+        // Force-refresh keeps any existing completed catalog entry intact until the replacement
+        // is verified on disk.
+        let bytes = self.fetch_public_bytes(&self.config.catalog_url).await?;
         let (size, sha) = write_verified_parquet_atomic(&cache_path, &bytes.1)?;
         let entry = self
             .manifest
-            .commit_success(&entry_key, 0, bytes.0, size, sha, cache_path)?;
+            .upsert_completed(meta, bytes.0, size, sha, cache_path)?;
         Ok(DownloadOutcome::Downloaded {
             entry,
             extracted_files: Vec::new(),
@@ -476,8 +485,17 @@ impl PmdataClient {
         let cache_path = self.bundle_cache_path(dataset, date, asset, interval, outcome);
         let extract_dir = self.bundle_extract_dir(dataset, date, asset, interval, outcome);
         let entry_key = bundle_entry_key(dataset, date, asset, interval, outcome);
-        let cost = interval.day_bundle_quota_units();
-        let cached = self.manifest.check_cached(&entry_key)?;
+        let raw_cost = interval.day_bundle_quota_units();
+        let part_path = partial_path_for(&cache_path);
+        let existing_part_bytes = fs::metadata(&part_path).ok().map_or(0, |m| m.len());
+        let manifest_snapshot = self.manifest.load()?;
+        let cached = existing_valid_cache_entry(&manifest_snapshot, &entry_key);
+        let prior_credit = ManifestStore::resumable_prior_credit(
+            &manifest_snapshot,
+            &entry_key,
+            existing_part_bytes > 0,
+        );
+        let cost = raw_cost.saturating_sub(prior_credit);
         let plan = DownloadPlanItem {
             entry_key: entry_key.clone(),
             endpoint_kind: EndpointKind::DayBundle,
@@ -496,12 +514,40 @@ impl PmdataClient {
             return Ok(DownloadOutcome::DryRun(plan));
         }
         if let Some(entry) = cached {
+            if !dir_has_parquet(&extract_dir) && cache_path.is_file() {
+                let _ = extract_verified_zip_into(&cache_path, &extract_dir)?;
+            }
+            return Ok(DownloadOutcome::CacheHit(entry));
+        }
+
+        // Recover a locally promoted/verified ZIP if a prior attempt finished extracting/promoting
+        // `part_path -> cache_path` before `commit_success` failed to save the manifest.
+        if cache_path.is_file()
+            && let Some(prev_entry) = manifest_snapshot.entries.get(&entry_key)
+            && matches!(
+                prev_entry.status,
+                EntryStatus::Reserved | EntryStatus::FailedAmbiguous
+            )
+            && let Ok((size, sha, _)) = extract_verified_zip_into(&cache_path, &extract_dir)
+        {
+            let recovered_cost = if prev_entry.status == EntryStatus::Reserved {
+                raw_cost.saturating_sub(prev_entry.quota_units_charged)
+            } else {
+                0
+            };
+            let entry = self.manifest.commit_success_for(
+                &entry_key,
+                prev_entry.reservation_id.as_deref(),
+                recovered_cost,
+                prev_entry.http_status.unwrap_or(200),
+                size,
+                sha,
+                cache_path,
+            )?;
             return Ok(DownloadOutcome::CacheHit(entry));
         }
 
         let api_key = self.config.require_api_key()?.to_string();
-        let part_path = partial_path_for(&cache_path);
-        let existing_part_bytes = fs::metadata(&part_path).ok().map_or(0, |m| m.len());
 
         // If a partial `.part` exists (> 0 bytes) and a prior ambiguous attempt already charged
         // quota for `entry_key`, resuming via `Range: bytes=START-` does NOT consume extra quota.
@@ -515,43 +561,30 @@ impl PmdataClient {
             utc_date: date.format("%Y-%m-%d").to_string(),
             market_slug: None,
             requested_url: url.clone(),
-            quota_cost: cost,
+            quota_cost: raw_cost,
         };
-        let (reserve_outcome, attempt_cost) = self
+        let (reserve_outcome, attempt_cost, res_guard) = self
             .manifest
-            .reserve_with_resume(meta, existing_part_bytes > 0)?;
+            .reserve_with_resume_guarded(meta, existing_part_bytes > 0)?;
         if let ReserveOutcome::AlreadyCached(entry) = reserve_outcome {
+            if !dir_has_parquet(&extract_dir) && cache_path.is_file() {
+                let _ = extract_verified_zip_into(&cache_path, &extract_dir)?;
+            }
             return Ok(DownloadOutcome::CacheHit(*entry));
         }
+        let res_id = res_guard.as_ref().map(|g| g.reservation_id.as_str());
 
         let range_start = (existing_part_bytes > 0).then_some(existing_part_bytes);
         match self
-            .fetch_authenticated_bytes(&url, &api_key, range_start)
+            .fetch_authenticated_stream_to_part(&url, &api_key, range_start, &part_path)
             .await
         {
-            FetchResult::Ok { status, bytes } => {
-                if let Err(err) =
-                    append_or_write_part(&part_path, range_start.is_some(), status, &bytes)
-                {
-                    if let Err(merr) = self.manifest.commit_ambiguous_failure(
-                        &entry_key,
-                        attempt_cost,
-                        Some(status),
-                        err.to_string(),
-                    ) {
-                        return Err(HistoricalError::ManifestIo {
-                            path: self.manifest.path().to_path_buf(),
-                            detail: format!(
-                                "bundle part write failed ({err}) and manifest commit failed: {merr}"
-                            ),
-                        });
-                    }
-                    return Err(err);
-                }
+            FetchStreamResult::Ok { status } => {
                 match verify_and_extract_zip(&part_path, &cache_path, &extract_dir) {
                     Ok((size, sha, extracted_files)) => {
-                        let entry = self.manifest.commit_success(
+                        let entry = self.manifest.commit_success_for(
                             &entry_key,
+                            res_id,
                             attempt_cost,
                             status,
                             size,
@@ -569,8 +602,9 @@ impl PmdataClient {
                             // issue `Range: bytes=<corrupt_len>-` and wedge on HTTP 416.
                             let _ = fs::remove_file(&part_path);
                         }
-                        if let Err(merr) = self.manifest.commit_ambiguous_failure(
+                        if let Err(merr) = self.manifest.commit_ambiguous_failure_for(
                             &entry_key,
+                            res_id,
                             attempt_cost,
                             Some(status),
                             err.to_string(),
@@ -586,7 +620,7 @@ impl PmdataClient {
                     }
                 }
             }
-            FetchResult::UnchargedHttp {
+            FetchStreamResult::UnchargedHttp {
                 status,
                 entry_status,
                 message,
@@ -594,8 +628,9 @@ impl PmdataClient {
                 if status == 416 {
                     let _ = fs::remove_file(&part_path);
                 }
-                let entry = self.manifest.release_uncharged(
+                let entry = self.manifest.release_uncharged_for(
                     &entry_key,
+                    res_id,
                     attempt_cost,
                     Some(status),
                     entry_status,
@@ -610,9 +645,10 @@ impl PmdataClient {
                     message,
                 })
             }
-            FetchResult::PreSendError(err) => {
-                if let Err(merr) = self.manifest.release_uncharged(
+            FetchStreamResult::PreSendError(err) => {
+                if let Err(merr) = self.manifest.release_uncharged_for(
                     &entry_key,
+                    res_id,
                     attempt_cost,
                     None,
                     EntryStatus::FailedUncharged,
@@ -627,9 +663,10 @@ impl PmdataClient {
                 }
                 Err(err)
             }
-            FetchResult::AmbiguousFailure { status, detail } => {
-                if let Err(merr) = self.manifest.commit_ambiguous_failure(
+            FetchStreamResult::AmbiguousFailure { status, detail } => {
+                if let Err(merr) = self.manifest.commit_ambiguous_failure_for(
                     &entry_key,
+                    res_id,
                     attempt_cost,
                     status,
                     detail.clone(),
@@ -748,11 +785,16 @@ impl PmdataClient {
         let entry_key = bundle_entry_key(dataset, date, asset, interval, outcome);
         let url = self.build_bundle_url(dataset, date, asset, interval, outcome)?;
         let cache_path = self.bundle_cache_path(dataset, date, asset, interval, outcome);
-        let already_cached = manifest.get_completed(&entry_key).is_some_and(|e| {
-            e.local_cache_path
-                .as_ref()
-                .is_some_and(|p| p.is_file() && fs::metadata(p).is_ok_and(|m| m.len() > 0))
-        });
+        let part_path = partial_path_for(&cache_path);
+        let has_partial = fs::metadata(&part_path).ok().is_some_and(|m| m.len() > 0);
+        let already_cached = existing_valid_cache_entry(manifest, &entry_key).is_some();
+        let raw_cost = interval.day_bundle_quota_units();
+        let prior_credit = ManifestStore::resumable_prior_credit(manifest, &entry_key, has_partial);
+        let quota_cost = if already_cached {
+            0
+        } else {
+            raw_cost.saturating_sub(prior_credit)
+        };
         Ok(DownloadPlanItem {
             entry_key,
             endpoint_kind: EndpointKind::DayBundle,
@@ -765,7 +807,7 @@ impl PmdataClient {
             url,
             cache_path,
             already_cached,
-            quota_cost: interval.day_bundle_quota_units(),
+            quota_cost,
         })
     }
 
@@ -844,6 +886,17 @@ impl PmdataClient {
                         .get(CONTENT_RANGE)
                         .and_then(|v| v.to_str().ok())
                         .map(str::to_string);
+                    if let Some(entry_status) = classify_uncharged_http_status(status) {
+                        let msg = match resp.bytes().await {
+                            Ok(b) => sanitize_snippet(&String::from_utf8_lossy(&b), Some(api_key)),
+                            Err(err) => sanitize_snippet(&err.to_string(), Some(api_key)),
+                        };
+                        return FetchResult::UnchargedHttp {
+                            status,
+                            entry_status,
+                            message: msg,
+                        };
+                    }
                     let body = match resp.bytes().await {
                         Ok(b) => b,
                         Err(err) => {
@@ -858,12 +911,17 @@ impl PmdataClient {
                     };
                     if status == 206 {
                         let expected_start = range_start.unwrap_or(0);
-                        if !valid_content_range_start(content_range.as_deref(), expected_start) {
+                        if !valid_content_range(
+                            content_range.as_deref(),
+                            expected_start,
+                            body.len() as u64,
+                        ) {
                             return FetchResult::AmbiguousFailure {
                                 status: Some(status),
                                 detail: format!(
-                                    "invalid or mismatched Content-Range {:?} for resume offset {expected_start}",
-                                    content_range.as_deref().unwrap_or("<missing>")
+                                    "invalid or mismatched Content-Range {:?} for resume offset {expected_start} (body_len={})",
+                                    content_range.as_deref().unwrap_or("<missing>"),
+                                    body.len()
                                 ),
                             };
                         }
@@ -879,20 +937,15 @@ impl PmdataClient {
                         };
                     }
                     let msg = sanitize_snippet(&String::from_utf8_lossy(&body), Some(api_key));
-                    let entry_status = match status {
-                        404 => EntryStatus::NotFound,
-                        400 | 401 | 403 | 429 => EntryStatus::Forbidden,
-                        _ if (500..=599).contains(&status) => {
-                            return FetchResult::AmbiguousFailure {
-                                status: Some(status),
-                                detail: msg,
-                            };
-                        }
-                        _ => EntryStatus::FailedUncharged,
-                    };
+                    if (500..=599).contains(&status) {
+                        return FetchResult::AmbiguousFailure {
+                            status: Some(status),
+                            detail: msg,
+                        };
+                    }
                     return FetchResult::UnchargedHttp {
                         status,
-                        entry_status,
+                        entry_status: EntryStatus::FailedUncharged,
                         message: msg,
                     };
                 }
@@ -920,6 +973,195 @@ impl PmdataClient {
             }
         }
     }
+
+    async fn fetch_authenticated_stream_to_part(
+        &self,
+        url: &str,
+        api_key: &str,
+        range_start: Option<u64>,
+        part_path: &Path,
+    ) -> FetchStreamResult {
+        let mut headers = HeaderMap::new();
+        let Ok(val) = HeaderValue::from_str(api_key) else {
+            return FetchStreamResult::PreSendError(HistoricalError::Config {
+                key: "PMDATA_API_KEY",
+                detail: "API key contains invalid HTTP header characters".to_string(),
+            });
+        };
+        headers.insert("api_key", val);
+        if let Some(start) = range_start {
+            let Ok(rval) = HeaderValue::from_str(&format!("bytes={start}-")) else {
+                return FetchStreamResult::PreSendError(HistoricalError::Config {
+                    key: "range_start",
+                    detail: "invalid Range header value".to_string(),
+                });
+            };
+            headers.insert(RANGE, rval);
+        }
+
+        let mut attempt = 0_u32;
+        loop {
+            let resp_res = self.http.get(url).headers(headers.clone()).send().await;
+            match resp_res {
+                Ok(mut resp) => {
+                    let status = resp.status().as_u16();
+                    let content_range = resp
+                        .headers()
+                        .get(CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    if let Some(entry_status) = classify_uncharged_http_status(status) {
+                        let msg = match resp.bytes().await {
+                            Ok(b) => sanitize_snippet(&String::from_utf8_lossy(&b), Some(api_key)),
+                            Err(err) => sanitize_snippet(&err.to_string(), Some(api_key)),
+                        };
+                        return FetchStreamResult::UnchargedHttp {
+                            status,
+                            entry_status,
+                            message: msg,
+                        };
+                    }
+                    if status != 200 && status != 206 {
+                        let msg = match resp.bytes().await {
+                            Ok(b) => sanitize_snippet(&String::from_utf8_lossy(&b), Some(api_key)),
+                            Err(err) => sanitize_snippet(&err.to_string(), Some(api_key)),
+                        };
+                        if (500..=599).contains(&status) {
+                            return FetchStreamResult::AmbiguousFailure {
+                                status: Some(status),
+                                detail: msg,
+                            };
+                        }
+                        return FetchStreamResult::UnchargedHttp {
+                            status,
+                            entry_status: EntryStatus::FailedUncharged,
+                            message: msg,
+                        };
+                    }
+
+                    let expected_range_len = if status == 206 {
+                        let expected_start = range_start.unwrap_or(0);
+                        let Some(decl_len) =
+                            parse_content_range_len(content_range.as_deref(), expected_start)
+                        else {
+                            return FetchStreamResult::AmbiguousFailure {
+                                status: Some(status),
+                                detail: format!(
+                                    "invalid or mismatched Content-Range {:?} for resume offset {expected_start}",
+                                    content_range.as_deref().unwrap_or("<missing>")
+                                ),
+                            };
+                        };
+                        Some(decl_len)
+                    } else {
+                        None
+                    };
+
+                    if let Err(err) = ensure_parent(part_path) {
+                        return FetchStreamResult::AmbiguousFailure {
+                            status: Some(status),
+                            detail: err.to_string(),
+                        };
+                    }
+                    let mut file = if range_start.is_some() && status == 206 {
+                        match OpenOptions::new().append(true).open(part_path) {
+                            Ok(mut f) => {
+                                if let Err(err) = f.seek(SeekFrom::End(0)) {
+                                    return FetchStreamResult::AmbiguousFailure {
+                                        status: Some(status),
+                                        detail: format!("seek partial zip failed: {err}"),
+                                    };
+                                }
+                                f
+                            }
+                            Err(err) => {
+                                return FetchStreamResult::AmbiguousFailure {
+                                    status: Some(status),
+                                    detail: format!("open partial zip failed: {err}"),
+                                };
+                            }
+                        }
+                    } else {
+                        match File::create(part_path) {
+                            Ok(f) => f,
+                            Err(err) => {
+                                return FetchStreamResult::AmbiguousFailure {
+                                    status: Some(status),
+                                    detail: format!("create partial zip failed: {err}"),
+                                };
+                            }
+                        }
+                    };
+
+                    let mut written_this_resp = 0_u64;
+                    loop {
+                        match resp.chunk().await {
+                            Ok(Some(chunk)) => {
+                                if let Err(err) = file.write_all(&chunk) {
+                                    let _ = file.sync_all();
+                                    return FetchStreamResult::AmbiguousFailure {
+                                        status: Some(status),
+                                        detail: format!("write bundle chunk failed: {err}"),
+                                    };
+                                }
+                                written_this_resp =
+                                    written_this_resp.saturating_add(chunk.len() as u64);
+                            }
+                            Ok(None) => break,
+                            Err(err) => {
+                                let _ = file.sync_all();
+                                return FetchStreamResult::AmbiguousFailure {
+                                    status: Some(status),
+                                    detail: format!(
+                                        "response body read interrupted after HTTP {status}: {}",
+                                        sanitize_snippet(&err.to_string(), Some(api_key))
+                                    ),
+                                };
+                            }
+                        }
+                    }
+                    if let Err(err) = file.sync_all() {
+                        return FetchStreamResult::AmbiguousFailure {
+                            status: Some(status),
+                            detail: format!("sync partial zip failed: {err}"),
+                        };
+                    }
+                    if let Some(decl_len) = expected_range_len
+                        && written_this_resp != decl_len
+                    {
+                        return FetchStreamResult::AmbiguousFailure {
+                            status: Some(status),
+                            detail: format!(
+                                "Content-Range declared {decl_len} bytes, received {written_this_resp}"
+                            ),
+                        };
+                    }
+                    return FetchStreamResult::Ok { status };
+                }
+                Err(err) => {
+                    let detail = sanitize_snippet(&err.to_string(), Some(api_key));
+                    if err.is_connect() && attempt < self.config.max_retries {
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(200_u64 * u64::from(attempt)))
+                            .await;
+                        continue;
+                    }
+                    if err.is_connect() {
+                        return FetchStreamResult::PreSendError(HistoricalError::Http {
+                            endpoint: url.to_string(),
+                            detail,
+                        });
+                    }
+                    return FetchStreamResult::AmbiguousFailure {
+                        status: None,
+                        detail: format!(
+                            "post-send transport/timeout error (conservatively accounted): {detail}"
+                        ),
+                    };
+                }
+            }
+        }
+    }
 }
 
 enum FetchResult {
@@ -937,6 +1179,31 @@ enum FetchResult {
         status: Option<u16>,
         detail: String,
     },
+}
+
+enum FetchStreamResult {
+    Ok {
+        status: u16,
+    },
+    UnchargedHttp {
+        status: u16,
+        entry_status: EntryStatus,
+        message: String,
+    },
+    PreSendError(HistoricalError),
+    AmbiguousFailure {
+        status: Option<u16>,
+        detail: String,
+    },
+}
+
+fn classify_uncharged_http_status(status: u16) -> Option<EntryStatus> {
+    match status {
+        404 => Some(EntryStatus::NotFound),
+        400 | 401 | 403 | 429 => Some(EntryStatus::Forbidden),
+        416 => Some(EntryStatus::FailedUncharged),
+        _ => None,
+    }
 }
 
 /// Validates that `?outcome=No` is only used on `l2`.
@@ -1040,7 +1307,7 @@ fn ensure_parent(path: &Path) -> Result<(), HistoricalError> {
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<(u64, String), HistoricalError> {
+pub(crate) fn sha256_file(path: &Path) -> Result<(u64, String), HistoricalError> {
     let mut file = File::open(path).map_err(|source| HistoricalError::Io {
         context: format!("hash file `{}`", path.display()),
         source,
@@ -1110,110 +1377,71 @@ fn write_verified_parquet_atomic(
     Ok((size, sha))
 }
 
-fn valid_content_range_start(header: Option<&str>, expected_start: u64) -> bool {
-    let Some(raw) = header else {
-        return false;
-    };
-    let Some(rest) = raw.trim().strip_prefix("bytes ") else {
-        return false;
-    };
-    let Some((start_str, _)) = rest.split_once('-') else {
-        return false;
-    };
-    start_str.trim().parse::<u64>().ok() == Some(expected_start)
-}
-
-struct TempDirGuard {
-    path: PathBuf,
-    armed: bool,
-}
-
-impl TempDirGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, armed: true }
+fn parse_content_range_len(header: Option<&str>, expected_start: u64) -> Option<u64> {
+    let raw = header?.trim();
+    let rest = raw.strip_prefix("bytes ")?;
+    let (range_part, total_part) = rest.split_once('/')?;
+    let (start_str, end_str) = range_part.split_once('-')?;
+    let start = start_str.trim().parse::<u64>().ok()?;
+    let end = end_str.trim().parse::<u64>().ok()?;
+    if start != expected_start || end < start {
+        return None;
     }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = fs::remove_dir_all(&self.path);
+    let total_str = total_part.trim();
+    if total_str != "*" {
+        let total = total_str.parse::<u64>().ok()?;
+        if end >= total {
+            return None;
         }
     }
+    end.checked_sub(start)?.checked_add(1)
 }
 
-fn append_or_write_part(
-    part_path: &Path,
-    is_resume: bool,
-    status: u16,
-    bytes: &[u8],
-) -> Result<(), HistoricalError> {
-    ensure_parent(part_path)?;
-    if is_resume && status == 206 {
-        let mut f = OpenOptions::new()
-            .append(true)
-            .open(part_path)
-            .map_err(|source| HistoricalError::Io {
-                context: format!("open partial zip `{}` for append", part_path.display()),
-                source,
-            })?;
-        f.seek(SeekFrom::End(0))
-            .map_err(|source| HistoricalError::Io {
-                context: format!("seek partial zip `{}`", part_path.display()),
-                source,
-            })?;
-        f.write_all(bytes).map_err(|source| HistoricalError::Io {
-            context: format!("append partial zip `{}`", part_path.display()),
-            source,
-        })?;
-        f.sync_all().map_err(|source| HistoricalError::Io {
-            context: format!("sync partial zip `{}`", part_path.display()),
-            source,
-        })?;
-    } else {
-        let mut f = File::create(part_path).map_err(|source| HistoricalError::Io {
-            context: format!("create partial zip `{}`", part_path.display()),
-            source,
-        })?;
-        f.write_all(bytes).map_err(|source| HistoricalError::Io {
-            context: format!("write partial zip `{}`", part_path.display()),
-            source,
-        })?;
-        f.sync_all().map_err(|source| HistoricalError::Io {
-            context: format!("sync partial zip `{}`", part_path.display()),
-            source,
-        })?;
+fn valid_content_range(header: Option<&str>, expected_start: u64, body_len: u64) -> bool {
+    parse_content_range_len(header, expected_start) == Some(body_len)
+}
+
+fn dir_has_parquet(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for ent in entries.flatten() {
+        let p = ent.path();
+        if p.is_file()
+            && p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("parquet"))
+        {
+            return true;
+        }
+        if p.is_dir() && dir_has_parquet(&p) {
+            return true;
+        }
     }
-    Ok(())
+    false
 }
 
-/// Verifies every ZIP entry's CRC32 and extracts safely into `extract_dir`, then promotes `part_path -> zip_dest`.
-pub fn verify_and_extract_zip(
-    part_path: &Path,
-    zip_dest: &Path,
+fn extract_verified_zip_into(
+    zip_path: &Path,
     extract_dir: &Path,
 ) -> Result<(u64, String, Vec<PathBuf>), HistoricalError> {
-    let file = File::open(part_path).map_err(|source| HistoricalError::Io {
-        context: format!("open zip `{}`", part_path.display()),
+    let file = File::open(zip_path).map_err(|source| HistoricalError::Io {
+        context: format!("open zip `{}`", zip_path.display()),
         source,
     })?;
     let mut archive = ZipArchive::new(file).map_err(|err| HistoricalError::InvalidZip {
-        path: part_path.to_path_buf(),
+        path: zip_path.to_path_buf(),
         detail: err.to_string(),
     })?;
     if archive.is_empty() {
         return Err(HistoricalError::InvalidZip {
-            path: part_path.to_path_buf(),
+            path: zip_path.to_path_buf(),
             detail: "ZIP archive contains 0 entries".to_string(),
         });
     }
     if archive.len() > MAX_ZIP_ENTRIES {
         return Err(HistoricalError::InvalidZip {
-            path: part_path.to_path_buf(),
+            path: zip_path.to_path_buf(),
             detail: format!(
                 "ZIP entry count {} exceeds safety limit {MAX_ZIP_ENTRIES}",
                 archive.len()
@@ -1243,18 +1471,18 @@ pub fn verify_and_extract_zip(
         let mut entry = archive
             .by_index(i)
             .map_err(|err| HistoricalError::InvalidZip {
-                path: part_path.to_path_buf(),
+                path: zip_path.to_path_buf(),
                 detail: format!("failed to open ZIP entry #{i}: {err}"),
             })?;
         if entry.is_symlink() {
             return Err(HistoricalError::InvalidZip {
-                path: part_path.to_path_buf(),
+                path: zip_path.to_path_buf(),
                 detail: format!("symlink entry `{}` is not permitted", entry.name()),
             });
         }
         let Some(safe_rel) = entry.enclosed_name() else {
             return Err(HistoricalError::InvalidZip {
-                path: part_path.to_path_buf(),
+                path: zip_path.to_path_buf(),
                 detail: format!("unsafe path traversal entry `{}`", entry.name()),
             });
         };
@@ -1267,7 +1495,6 @@ pub fn verify_and_extract_zip(
             continue;
         }
         ensure_parent(&out_path)?;
-        // Stream with explicit size caps while forcing full CRC32 verification on EOF.
         let written = {
             let out_file = File::create(&out_path).map_err(|source| HistoricalError::Io {
                 context: format!("create extracted file `{}`", out_path.display()),
@@ -1277,7 +1504,7 @@ pub fn verify_and_extract_zip(
             let mut bounded = (&mut entry).take(MAX_ZIP_ENTRY_BYTES.saturating_add(1));
             let n = std::io::copy(&mut bounded, &mut writer).map_err(|err| {
                 HistoricalError::InvalidZip {
-                    path: part_path.to_path_buf(),
+                    path: zip_path.to_path_buf(),
                     detail: format!("CRC/decompression error on `{}`: {err}", safe_rel.display()),
                 }
             })?;
@@ -1289,7 +1516,7 @@ pub fn verify_and_extract_zip(
         };
         if written > MAX_ZIP_ENTRY_BYTES {
             return Err(HistoricalError::InvalidZip {
-                path: part_path.to_path_buf(),
+                path: zip_path.to_path_buf(),
                 detail: format!(
                     "ZIP entry `{}` exceeds per-entry cap ({MAX_ZIP_ENTRY_BYTES} bytes)",
                     safe_rel.display()
@@ -1299,7 +1526,7 @@ pub fn verify_and_extract_zip(
         total_uncompressed = total_uncompressed.saturating_add(written);
         if total_uncompressed > MAX_ZIP_TOTAL_BYTES {
             return Err(HistoricalError::InvalidZip {
-                path: part_path.to_path_buf(),
+                path: zip_path.to_path_buf(),
                 detail: format!(
                     "cumulative ZIP uncompressed size exceeds cap ({MAX_ZIP_TOTAL_BYTES} bytes)"
                 ),
@@ -1328,19 +1555,53 @@ pub fn verify_and_extract_zip(
     })?;
     tmp_guard.disarm();
 
-    let (size, sha) = sha256_file(part_path)?;
-    ensure_parent(zip_dest)?;
-    if zip_dest.exists() {
-        let _ = fs::remove_file(zip_dest);
-    }
-    fs::rename(part_path, zip_dest).map_err(|source| HistoricalError::Io {
-        context: format!("promote zip `{}`", zip_dest.display()),
-        source,
-    })?;
-
+    let (size, sha) = sha256_file(zip_path)?;
     let extracted_paths = extracted_rel
         .into_iter()
         .map(|rel| extract_dir.join(rel))
         .collect();
+    Ok((size, sha, extracted_paths))
+}
+
+struct TempDirGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+/// Verifies every ZIP entry's CRC32 and extracts safely into `extract_dir`, then promotes `part_path -> zip_dest`.
+pub fn verify_and_extract_zip(
+    part_path: &Path,
+    zip_dest: &Path,
+    extract_dir: &Path,
+) -> Result<(u64, String, Vec<PathBuf>), HistoricalError> {
+    let (size, sha, extracted_paths) = extract_verified_zip_into(part_path, extract_dir)?;
+    ensure_parent(zip_dest)?;
+    if let Err(err) = fs::rename(part_path, zip_dest) {
+        if zip_dest.exists() {
+            let _ = fs::remove_file(zip_dest);
+        }
+        fs::rename(part_path, zip_dest).map_err(|rename_err| HistoricalError::Io {
+            context: format!("promote zip `{}` (initial: {err})", zip_dest.display()),
+            source: rename_err,
+        })?;
+    }
     Ok((size, sha, extracted_paths))
 }

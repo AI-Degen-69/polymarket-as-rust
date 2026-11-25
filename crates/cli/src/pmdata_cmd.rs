@@ -509,6 +509,14 @@ fn run_download(
 
     let mut spent = 0_u32;
     for item in &plan.items {
+        if item.already_cached && !yes && client.manifest().check_cached(&item.entry_key)?.is_none()
+        {
+            return Err(format!(
+                "bundle `{}` became uncached or corrupted after planning; rerun with `--yes` to redownload",
+                item.url
+            )
+            .into());
+        }
         let d = parse_utc_date(&item.utc_date)?;
         let res = rt.block_on(client.download_day_bundle(
             item.dataset,
@@ -645,9 +653,6 @@ fn run_normalize(p: NormalizeParams) -> Result<(), Box<dyn Error>> {
             let yes_l2 = p
                 .yes_l2
                 .ok_or("--yes-l2 <yes_l2.parquet> is required when --source pmdata")?;
-            let trades = p
-                .trades
-                .ok_or("--trades <trades.parquet> is required when --source pmdata")?;
             let slug = p
                 .market_slug
                 .or_else(|| infer_slug_from_path(&yes_l2))
@@ -660,7 +665,7 @@ fn run_normalize(p: NormalizeParams) -> Result<(), Box<dyn Error>> {
                 market_slug: slug,
                 yes_l2_path: yes_l2,
                 no_l2_path: p.no_l2,
-                trades_path: Some(trades),
+                trades_path: p.trades,
                 onchain_fills_path: p.onchain_fills,
             };
             normalize_pmdata_market(
@@ -747,11 +752,30 @@ fn run_verify_historical(
         audits.push(audit);
     }
 
+    let mut parsed_dates: Vec<NaiveDate> = samples
+        .iter()
+        .filter_map(|slug| {
+            parse_slug_start_secs(slug)
+                .and_then(|s| i64::try_from(s).ok())
+                .and_then(|s| chrono::DateTime::from_timestamp(s, 0))
+                .map(|dt| dt.date_naive())
+        })
+        .collect();
+    parsed_dates.sort();
+    let date_scope = match (parsed_dates.first(), parsed_dates.last()) {
+        (Some(min_d), Some(max_d)) if min_d == max_d => format!("on UTC date `{min_d}`"),
+        (Some(min_d), Some(max_d)) => format!("across `{min_d}..={max_d}`"),
+        _ => "across the audited historical sample slugs".to_string(),
+    };
+
     let report = HistoricalPhase0Report {
         generated_utc: Utc::now().to_rfc3339(),
         quota_units_consumed: manifest.charged_units,
         verdict: FidelityVerdict::HistoricalSchemaVerifiedOnly,
-        disclaimer: "Historical PMData schema, complementarity, and book reconstruction verified ONLY on pre-cutoff (`<= 2026-11-03`) historical markets. Live JSONL vs. PMData equivalence remains UNVERIFIED pending overlapping live 5m and 15m captures (`2026-11-22..25` live captures blocked by free-tier 21-day cutoff; zero live 15m captures exist).".to_string(),
+        disclaimer: format!(
+            "Historical PMData schema, complementarity, and book reconstruction verified ONLY {date_scope} across {} sample market(s). Live JSONL vs. PMData equivalence remains UNVERIFIED pending overlapping live 5m and 15m captures.",
+            audits.len()
+        ),
         markets: audits,
     };
     let md = render_historical_phase0_markdown(&report);

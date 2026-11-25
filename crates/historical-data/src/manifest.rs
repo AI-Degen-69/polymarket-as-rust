@@ -1,20 +1,18 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::config::HARD_MAX_QUOTA_CAP;
+use crate::downloader::sha256_file;
 use crate::error::HistoricalError;
 
 const MANIFEST_SCHEMA_VERSION: u16 = 1;
-const LOCK_STALE_SECS: u64 = 60;
-const LOCK_WAIT_ITERS: usize = 200;
-const LOCK_RETRY_MS: u64 = 25;
 static LOCK_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Logical endpoint family recorded in the persistent manifest.
@@ -86,6 +84,9 @@ pub struct ManifestEntry {
     pub remaining_quota_after: u32,
     /// Current entry status.
     pub status: EntryStatus,
+    /// Unique identifier of the active reservation holding `reserved_units`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reservation_id: Option<String>,
     /// Sanitized error detail if any (never includes API keys).
     pub error_detail: Option<String>,
 }
@@ -167,22 +168,30 @@ impl QuotaManifest {
     }
 }
 
-/// Concurrency-safe handle to a persistent `QuotaManifest` guarded by an exclusive lock file.
+/// Concurrency-safe handle to a persistent `QuotaManifest` guarded by an OS-managed exclusive lock.
 #[derive(Debug, Clone)]
 pub struct ManifestStore {
     path: PathBuf,
     quota_cap: u32,
+    live_keys: Arc<Mutex<HashSet<String>>>,
 }
 
 struct LockGuard {
-    lock_path: PathBuf,
-    token: String,
+    _file: File,
 }
 
-impl Drop for LockGuard {
+/// RAII handle releasing an in-process live reservation key on drop unless completed.
+#[derive(Debug)]
+pub struct LiveReservationGuard {
+    live_keys: Arc<Mutex<HashSet<String>>>,
+    entry_key: String,
+    pub reservation_id: String,
+}
+
+impl Drop for LiveReservationGuard {
     fn drop(&mut self) {
-        if fs::read_to_string(&self.lock_path).ok().as_deref() == Some(self.token.as_str()) {
-            let _ = fs::remove_file(&self.lock_path);
+        if let Ok(mut guard) = self.live_keys.lock() {
+            guard.remove(&self.entry_key);
         }
     }
 }
@@ -199,6 +208,7 @@ impl ManifestStore {
         Ok(Self {
             path: path.into(),
             quota_cap,
+            live_keys: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -214,28 +224,89 @@ impl ManifestStore {
         self.load_unlocked()
     }
 
-    /// Checks whether `entry_key` is already cached on disk without mutating the manifest.
+    /// Checks whether `entry_key` is already cached on disk (size + SHA-256 verified) without mutating the manifest.
     pub fn check_cached(&self, entry_key: &str) -> Result<Option<ManifestEntry>, HistoricalError> {
         let manifest = self.load()?;
         Ok(existing_valid_cache_entry(&manifest, entry_key))
     }
 
+    /// Returns prior charged quota credit eligible for byte-range resume (`0` if ineligible).
+    #[must_use]
+    pub fn resumable_prior_credit(
+        manifest: &QuotaManifest,
+        entry_key: &str,
+        has_partial_file: bool,
+    ) -> u32 {
+        if !has_partial_file {
+            return 0;
+        }
+        manifest
+            .entries
+            .get(entry_key)
+            .filter(|e| {
+                matches!(
+                    e.status,
+                    EntryStatus::FailedAmbiguous
+                        | EntryStatus::Forbidden
+                        | EntryStatus::FailedUncharged
+                ) && e.quota_units_charged > 0
+            })
+            .map_or(0, |e| e.quota_units_charged)
+    }
+
     /// Atomically checks cache, validates quota headroom (`charged + reserved + cost <= cap`),
-    /// and persists a `Reserved` entry BEFORE sending any network request.
-    ///
-    /// When `has_partial_file` is `true` and a prior `FailedAmbiguous` attempt already charged
-    /// quota for `entry_key`, reserves `0` additional units for a `Range` resume. Returns the
-    /// `(ReserveOutcome, reserved_cost_for_this_attempt)` pair.
-    pub fn reserve_with_resume(
+    /// and persists a `Reserved` entry with a unique `reservation_id` BEFORE sending any network request.
+    pub fn reserve_with_resume_guarded(
         &self,
         meta: ReserveMetadata,
         has_partial_file: bool,
-    ) -> Result<(ReserveOutcome, u32), HistoricalError> {
+    ) -> Result<(ReserveOutcome, u32, Option<LiveReservationGuard>), HistoricalError> {
+        self.reserve_with_resume_inner(meta, has_partial_file, true)
+    }
+
+    fn reserve_with_resume_inner(
+        &self,
+        meta: ReserveMetadata,
+        has_partial_file: bool,
+        track_live: bool,
+    ) -> Result<(ReserveOutcome, u32, Option<LiveReservationGuard>), HistoricalError> {
+        let mut guard: Option<LiveReservationGuard> = None;
+        let reservation_id = format!(
+            "res-{}-{}",
+            std::process::id(),
+            LOCK_SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        if track_live {
+            {
+                let mut active =
+                    self.live_keys
+                        .lock()
+                        .map_err(|_| HistoricalError::ManifestLocked {
+                            path: self.lock_path(),
+                            detail: "manifest live_keys mutex poisoned".to_string(),
+                        })?;
+                if !active.insert(meta.entry_key.clone()) {
+                    return Err(HistoricalError::ManifestLocked {
+                        path: self.lock_path(),
+                        detail: format!(
+                            "concurrent in-flight download already active for `{}`",
+                            meta.entry_key
+                        ),
+                    });
+                }
+            }
+            guard = Some(LiveReservationGuard {
+                live_keys: Arc::clone(&self.live_keys),
+                entry_key: meta.entry_key.clone(),
+                reservation_id: reservation_id.clone(),
+            });
+        }
+
         let _lock = self.acquire_lock()?;
         let mut manifest = self.load_unlocked()?;
 
         if let Some(cached) = existing_valid_cache_entry(&manifest, &meta.entry_key) {
-            return Ok((ReserveOutcome::AlreadyCached(Box::new(cached)), 0));
+            return Ok((ReserveOutcome::AlreadyCached(Box::new(cached)), 0, None));
         }
 
         if let Some(existing) = manifest.entries.get(&meta.entry_key)
@@ -250,27 +321,14 @@ impl ManifestStore {
                 entry_mut.quota_units_charged =
                     entry_mut.quota_units_charged.saturating_add(orphaned);
                 entry_mut.status = EntryStatus::FailedAmbiguous;
+                entry_mut.reservation_id = None;
                 entry_mut.error_detail =
                     Some("recovered orphaned Reserved manifest entry conservatively".to_string());
             }
         }
 
-        let prior_charged = if has_partial_file {
-            manifest
-                .entries
-                .get(&meta.entry_key)
-                .filter(|e| {
-                    matches!(
-                        e.status,
-                        EntryStatus::FailedAmbiguous
-                            | EntryStatus::Forbidden
-                            | EntryStatus::FailedUncharged
-                    ) && e.quota_units_charged > 0
-                })
-                .map_or(0, |e| e.quota_units_charged)
-        } else {
-            0
-        };
+        let prior_charged =
+            Self::resumable_prior_credit(&manifest, &meta.entry_key, has_partial_file);
         let attempt_cost = meta.quota_cost.saturating_sub(prior_charged);
 
         let total_after = manifest
@@ -314,11 +372,27 @@ impl ManifestStore {
             quota_units_charged: prior_charged,
             remaining_quota_after: remaining_after,
             status: EntryStatus::Reserved,
+            reservation_id: Some(reservation_id),
             error_detail: None,
         };
         manifest.entries.insert(meta.entry_key, entry);
         self.save_unlocked(&manifest)?;
-        Ok((ReserveOutcome::Reserved { remaining_after }, attempt_cost))
+        Ok((
+            ReserveOutcome::Reserved { remaining_after },
+            attempt_cost,
+            guard,
+        ))
+    }
+
+    /// Atomically checks cache, validates quota headroom (`charged + reserved + cost <= cap`),
+    /// and persists a `Reserved` entry BEFORE sending any network request.
+    pub fn reserve_with_resume(
+        &self,
+        meta: ReserveMetadata,
+        has_partial_file: bool,
+    ) -> Result<(ReserveOutcome, u32), HistoricalError> {
+        let (outcome, cost, _) = self.reserve_with_resume_inner(meta, has_partial_file, false)?;
+        Ok((outcome, cost))
     }
 
     /// Atomically checks cache, validates quota headroom (`charged + reserved + cost <= cap`),
@@ -328,10 +402,51 @@ impl ManifestStore {
         Ok(outcome)
     }
 
-    /// Finalizes a reserved entry on verified download success (`reserved -> charged`).
-    pub fn commit_success(
+    /// Finalizes a verified local entry without consuming a prior reservation slot.
+    pub fn upsert_completed(
+        &self,
+        meta: ReserveMetadata,
+        http_status: u16,
+        file_size_bytes: u64,
+        content_sha256: String,
+        local_cache_path: PathBuf,
+    ) -> Result<ManifestEntry, HistoricalError> {
+        let _lock = self.acquire_lock()?;
+        let mut manifest = self.load_unlocked()?;
+        let remaining_after = manifest.remaining_quota();
+        let entry = ManifestEntry {
+            entry_key: meta.entry_key.clone(),
+            provider: "pmdata".to_string(),
+            endpoint_kind: meta.endpoint_kind,
+            dataset_type: meta.dataset_type,
+            outcome_param: meta.outcome_param,
+            asset: meta.asset,
+            interval: meta.interval,
+            utc_date: meta.utc_date,
+            market_slug: meta.market_slug,
+            requested_url: meta.requested_url,
+            http_status: Some(http_status),
+            download_timestamp_utc: Utc::now().to_rfc3339(),
+            file_size_bytes,
+            local_cache_path: Some(local_cache_path),
+            content_sha256: Some(content_sha256),
+            quota_units_charged: 0,
+            remaining_quota_after: remaining_after,
+            status: EntryStatus::Completed,
+            reservation_id: None,
+            error_detail: None,
+        };
+        manifest.entries.insert(meta.entry_key, entry.clone());
+        self.save_unlocked(&manifest)?;
+        Ok(entry)
+    }
+
+    /// Finalizes a reserved entry on verified download success (`reserved -> charged`), verifying `reservation_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_success_for(
         &self,
         entry_key: &str,
+        expected_reservation_id: Option<&str>,
         quota_cost: u32,
         http_status: u16,
         file_size_bytes: u64,
@@ -340,6 +455,25 @@ impl ManifestStore {
     ) -> Result<ManifestEntry, HistoricalError> {
         let _lock = self.acquire_lock()?;
         let mut manifest = self.load_unlocked()?;
+        let existing_res = manifest
+            .entries
+            .get(entry_key)
+            .ok_or_else(|| HistoricalError::ManifestIo {
+                path: self.path.clone(),
+                detail: format!("missing reserved manifest entry `{entry_key}` on commit"),
+            })?
+            .reservation_id
+            .as_deref();
+        if let Some(exp) = expected_reservation_id
+            && existing_res != Some(exp)
+        {
+            return Err(HistoricalError::ManifestIo {
+                path: self.path.clone(),
+                detail: format!(
+                    "reservation mismatch on `{entry_key}`: expected `{exp}`, found {existing_res:?}"
+                ),
+            });
+        }
         manifest.reserved_units = manifest.reserved_units.saturating_sub(quota_cost);
         manifest.charged_units = manifest.charged_units.saturating_add(quota_cost);
         let remaining_after = manifest.remaining_quota();
@@ -360,16 +494,39 @@ impl ManifestStore {
         entry.quota_units_charged = entry.quota_units_charged.saturating_add(quota_cost);
         entry.remaining_quota_after = remaining_after;
         entry.status = EntryStatus::Completed;
+        entry.reservation_id = None;
         entry.error_detail = None;
         let cloned = entry.clone();
         self.save_unlocked(&manifest)?;
         Ok(cloned)
     }
 
-    /// Releases a reservation when PMData definitely did NOT charge quota (`400/401/403/404/429` or pre-send error).
-    pub fn release_uncharged(
+    /// Finalizes a reserved entry on verified download success (`reserved -> charged`).
+    pub fn commit_success(
         &self,
         entry_key: &str,
+        quota_cost: u32,
+        http_status: u16,
+        file_size_bytes: u64,
+        content_sha256: String,
+        local_cache_path: PathBuf,
+    ) -> Result<ManifestEntry, HistoricalError> {
+        self.commit_success_for(
+            entry_key,
+            None,
+            quota_cost,
+            http_status,
+            file_size_bytes,
+            content_sha256,
+            local_cache_path,
+        )
+    }
+
+    /// Releases a reservation when PMData definitely did NOT charge quota, verifying `reservation_id`.
+    pub fn release_uncharged_for(
+        &self,
+        entry_key: &str,
+        expected_reservation_id: Option<&str>,
         quota_cost: u32,
         http_status: Option<u16>,
         status: EntryStatus,
@@ -377,6 +534,25 @@ impl ManifestStore {
     ) -> Result<ManifestEntry, HistoricalError> {
         let _lock = self.acquire_lock()?;
         let mut manifest = self.load_unlocked()?;
+        let existing_res = manifest
+            .entries
+            .get(entry_key)
+            .ok_or_else(|| HistoricalError::ManifestIo {
+                path: self.path.clone(),
+                detail: format!("missing reserved manifest entry `{entry_key}` on release"),
+            })?
+            .reservation_id
+            .as_deref();
+        if let Some(exp) = expected_reservation_id
+            && existing_res != Some(exp)
+        {
+            return Err(HistoricalError::ManifestIo {
+                path: self.path.clone(),
+                detail: format!(
+                    "reservation mismatch on `{entry_key}` release: expected `{exp}`, found {existing_res:?}"
+                ),
+            });
+        }
         manifest.reserved_units = manifest.reserved_units.saturating_sub(quota_cost);
         let remaining_after = manifest.remaining_quota();
 
@@ -395,22 +571,64 @@ impl ManifestStore {
         }
         entry.remaining_quota_after = remaining_after;
         entry.status = status;
+        entry.reservation_id = None;
         entry.error_detail = Some(error_detail);
         let cloned = entry.clone();
         self.save_unlocked(&manifest)?;
         Ok(cloned)
     }
 
-    /// Conservatively charges quota when a failure happens after the request may have been billed.
-    pub fn commit_ambiguous_failure(
+    /// Releases a reservation when PMData definitely did NOT charge quota (`400/401/403/404/429` or pre-send error).
+    pub fn release_uncharged(
         &self,
         entry_key: &str,
+        quota_cost: u32,
+        http_status: Option<u16>,
+        status: EntryStatus,
+        error_detail: String,
+    ) -> Result<ManifestEntry, HistoricalError> {
+        self.release_uncharged_for(
+            entry_key,
+            None,
+            quota_cost,
+            http_status,
+            status,
+            error_detail,
+        )
+    }
+
+    /// Conservatively charges quota when a failure happens after the request may have been billed, verifying `reservation_id`.
+    pub fn commit_ambiguous_failure_for(
+        &self,
+        entry_key: &str,
+        expected_reservation_id: Option<&str>,
         quota_cost: u32,
         http_status: Option<u16>,
         error_detail: String,
     ) -> Result<ManifestEntry, HistoricalError> {
         let _lock = self.acquire_lock()?;
         let mut manifest = self.load_unlocked()?;
+        let existing_res = manifest
+            .entries
+            .get(entry_key)
+            .ok_or_else(|| HistoricalError::ManifestIo {
+                path: self.path.clone(),
+                detail: format!(
+                    "missing reserved manifest entry `{entry_key}` on ambiguous commit"
+                ),
+            })?
+            .reservation_id
+            .as_deref();
+        if let Some(exp) = expected_reservation_id
+            && existing_res != Some(exp)
+        {
+            return Err(HistoricalError::ManifestIo {
+                path: self.path.clone(),
+                detail: format!(
+                    "reservation mismatch on `{entry_key}` ambiguous commit: expected `{exp}`, found {existing_res:?}"
+                ),
+            });
+        }
         manifest.reserved_units = manifest.reserved_units.saturating_sub(quota_cost);
         manifest.charged_units = manifest.charged_units.saturating_add(quota_cost);
         let remaining_after = manifest.remaining_quota();
@@ -430,10 +648,22 @@ impl ManifestStore {
         entry.quota_units_charged = entry.quota_units_charged.saturating_add(quota_cost);
         entry.remaining_quota_after = remaining_after;
         entry.status = EntryStatus::FailedAmbiguous;
+        entry.reservation_id = None;
         entry.error_detail = Some(error_detail);
         let cloned = entry.clone();
         self.save_unlocked(&manifest)?;
         Ok(cloned)
+    }
+
+    /// Conservatively charges quota when a failure happens after the request may have been billed.
+    pub fn commit_ambiguous_failure(
+        &self,
+        entry_key: &str,
+        quota_cost: u32,
+        http_status: Option<u16>,
+        error_detail: String,
+    ) -> Result<ManifestEntry, HistoricalError> {
+        self.commit_ambiguous_failure_for(entry_key, None, quota_cost, http_status, error_detail)
     }
 
     fn ensure_parent_dir(&self) -> Result<(), HistoricalError> {
@@ -463,59 +693,21 @@ impl ManifestStore {
     fn acquire_lock(&self) -> Result<LockGuard, HistoricalError> {
         self.ensure_parent_dir()?;
         let lock_path = self.lock_path();
-        let pid = std::process::id();
-        for _ in 0..LOCK_WAIT_ITERS {
-            let seq = LOCK_SEQ.fetch_add(1, Ordering::Relaxed);
-            let token = format!("pid={pid};seq={seq}\n");
-            let claim_path = lock_path.with_extension(format!("claim.{pid}.{seq}"));
-            {
-                let mut claim = OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&claim_path)
-                    .map_err(|err| HistoricalError::ManifestLocked {
-                        path: lock_path.clone(),
-                        detail: format!("failed to create claim file: {err}"),
-                    })?;
-                claim.write_all(token.as_bytes()).map_err(|err| {
-                    HistoricalError::ManifestLocked {
-                        path: lock_path.clone(),
-                        detail: format!("failed to write lock token: {err}"),
-                    }
-                })?;
-                let _ = claim.sync_all();
-            }
-            let link_res = fs::hard_link(&claim_path, &lock_path);
-            let _ = fs::remove_file(&claim_path);
-
-            match link_res {
-                Ok(()) => return Ok(LockGuard { lock_path, token }),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if let Ok(meta) = fs::metadata(&lock_path)
-                        && let Ok(modified) = meta.modified()
-                        && let Ok(age) = SystemTime::now().duration_since(modified)
-                        && age > Duration::from_secs(LOCK_STALE_SECS)
-                    {
-                        let stale_path = lock_path.with_extension(format!("stale.{pid}.{seq}"));
-                        if fs::rename(&lock_path, &stale_path).is_ok() {
-                            let _ = fs::remove_file(&stale_path);
-                        }
-                        continue;
-                    }
-                    std::thread::sleep(Duration::from_millis(LOCK_RETRY_MS));
-                }
-                Err(err) => {
-                    return Err(HistoricalError::ManifestLocked {
-                        path: lock_path,
-                        detail: err.to_string(),
-                    });
-                }
-            }
-        }
-        Err(HistoricalError::ManifestLocked {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .map_err(|err| HistoricalError::ManifestLocked {
+                path: lock_path.clone(),
+                detail: format!("failed to open lock file: {err}"),
+            })?;
+        file.lock().map_err(|err| HistoricalError::ManifestLocked {
             path: lock_path,
-            detail: "timed out waiting for exclusive manifest lock".to_string(),
-        })
+            detail: format!("failed to acquire OS exclusive lock: {err}"),
+        })?;
+        Ok(LockGuard { _file: file })
     }
 
     fn load_unlocked(&self) -> Result<QuotaManifest, HistoricalError> {
@@ -617,11 +809,19 @@ impl ManifestStore {
     }
 }
 
-fn existing_valid_cache_entry(manifest: &QuotaManifest, entry_key: &str) -> Option<ManifestEntry> {
+pub(crate) fn existing_valid_cache_entry(
+    manifest: &QuotaManifest,
+    entry_key: &str,
+) -> Option<ManifestEntry> {
     let entry = manifest.get_completed(entry_key)?;
     let path = entry.local_cache_path.as_ref()?;
+    let expected_sha = entry.content_sha256.as_deref()?;
     let meta = fs::metadata(path).ok()?;
-    if meta.is_file() && meta.len() > 0 && meta.len() == entry.file_size_bytes {
+    if !meta.is_file() || meta.len() == 0 || meta.len() != entry.file_size_bytes {
+        return None;
+    }
+    let (actual_len, actual_sha) = sha256_file(path).ok()?;
+    if actual_len == entry.file_size_bytes && actual_sha == expected_sha {
         Some(entry.clone())
     } else {
         None

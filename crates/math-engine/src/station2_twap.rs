@@ -244,7 +244,9 @@ impl RollingTwapAndVariance {
         self.term_valid = false;
     }
 
-    /// Dynamically updates contract epoch horizon (`300.0` for 5m, `900.0` for 15m, `3600.0` for 1h).
+    /// Dynamically updates contract epoch horizon (`300.0` for 5m per `IMPLEMENTATION_PLAN.md`,
+    /// `900.0` for 15m, `3600.0` for 1h). Scales `tau_frac = tau_secs / epoch_secs` for remaining
+    /// variance while keeping the 60s trailing and terminal TWAP windows unchanged.
     pub fn set_epoch_secs(&mut self, epoch_secs: f64) -> Result<(), MathError> {
         check_pos_finite(epoch_secs)?;
         self.config.epoch_secs = epoch_secs;
