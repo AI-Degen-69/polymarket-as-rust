@@ -1757,6 +1757,7 @@ fn format_lifecycle_summary(
     let realized = t.fmt_pnl(stats.realized_pnl_micro);
     let unrealized = t.fmt_pnl(stats.unrealized_pnl_micro);
     let net_pnl = t.fmt_pnl(net_pnl_micro);
+    let net_pnl_3pct = t.fmt_pnl(net_pnl_micro.saturating_add(stats.estimated_rebate_micro as i64));
     let settlement = t.fmt_pnl(stats.settlement_pnl_micro);
     let fees = format!("${:.2}", stats.fees_paid_micro as f64 / MICRO_SCALE as f64);
     let rebate = format!(
@@ -1782,7 +1783,7 @@ fn format_lifecycle_summary(
         &[
             ("Realized", &realized),
             ("Unrealized", &unrealized),
-            ("Net PnL", &net_pnl),
+            ("Net (0% reb)", &net_pnl),
         ],
     );
     push_summary_row(
@@ -1791,17 +1792,22 @@ fn format_lifecycle_summary(
         &[
             ("Settlement", &settlement),
             ("Fees paid", &fees),
-            ("Est rebate", &rebate),
+            ("Rebate (3%)", &rebate),
         ],
     );
     push_summary_row(
         &mut out,
         t,
         &[
-            ("Fill ratio", &fill_ratio),
+            ("Net (+3% reb)", &net_pnl_3pct),
             ("Markout 1s", &markout_1s),
             ("Markout 5s", &markout_5s),
         ],
+    );
+    push_summary_row(
+        &mut out,
+        t,
+        &[("Fill ratio", &fill_ratio), ("", ""), ("", "")],
     );
 
     // Risk & breakers

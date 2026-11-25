@@ -87,6 +87,7 @@ struct PaperSummaryJsonl<'a> {
     unrealized_pnl_micro: i64,
     net_pnl_micro: i64,
     fees_paid_micro: u64,
+    estimated_rebate_micro: u64,
     rpm_60s: usize,
     fill_ratio: f64,
     post_fill_markout_1s_bps: f64,
@@ -342,6 +343,7 @@ pub(crate) struct PaperSummaryDisplay<'a> {
     pub(crate) realized_pnl: i64,
     pub(crate) unrealized_pnl: i64,
     pub(crate) fees_paid: u64,
+    pub(crate) estimated_rebate: u64,
     pub(crate) rpm_60s: usize,
     pub(crate) fill_ratio: f64,
     pub(crate) markout_1s_bps: f64,
@@ -353,6 +355,7 @@ pub(crate) struct PaperSummaryDisplay<'a> {
 pub(crate) fn print_summary_table(disp: &PaperSummaryDisplay<'_>) {
     let t = theme::current();
     let net_pnl = disp.realized_pnl + disp.unrealized_pnl;
+    let net_pnl_3pct = net_pnl.saturating_add(disp.estimated_rebate as i64);
     let edge_pnl = net_pnl - disp.baseline_pnl;
 
     println!();
@@ -376,10 +379,12 @@ pub(crate) fn print_summary_table(disp: &PaperSummaryDisplay<'_>) {
         t.kv(
             "PnL (Real / Unreal):",
             &format!(
-                "{} / {} | Net={}",
+                "{} / {} | Net(0%)={} | Reb(3%)=${} | Net(+3%)={}",
                 t.fmt_pnl(disp.realized_pnl),
                 t.fmt_pnl(disp.unrealized_pnl),
-                t.fmt_pnl(net_pnl)
+                t.fmt_pnl(net_pnl),
+                MicroUsdc(disp.estimated_rebate),
+                t.fmt_pnl(net_pnl_3pct)
             )
         )
     );
@@ -520,6 +525,7 @@ pub(crate) fn record_summary_jsonl(
         unrealized_pnl_micro: disp.unrealized_pnl,
         net_pnl_micro: net_pnl,
         fees_paid_micro: disp.fees_paid,
+        estimated_rebate_micro: disp.estimated_rebate,
         rpm_60s: disp.rpm_60s,
         fill_ratio: disp.fill_ratio,
         post_fill_markout_1s_bps: disp.markout_1s_bps,
