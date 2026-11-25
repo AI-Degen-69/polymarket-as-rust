@@ -281,7 +281,11 @@ fn test_vector_6_maker_rebate_accrual_and_epoch_settlement() {
     let mut ledger = PaperLedger::new(FeeSchedule::btc_5m_default());
 
     // Maker fill: 100 shares UP @ $0.50 -> wV = 100 * 0.50 * 0.50 = 25.00
-    // Counterfactual fee = 25 * 0.05 = $1.25; 20% maker rebate share = $0.25 = 250_000 micro-USDC.
+    // Counterfactual fee = 25 * 0.05 = $1.25; 3% post-Nov-21 Tier-1 rebate share = $0.0375 = 37_500 micro-USDC.
+    assert_eq!(
+        paper_sim::accounting::DEFAULT_MAKER_REBATE_SHARE_E6,
+        core_types::default_simulation_settings().maker_rebate_tier1_e6
+    );
     let fill = SimFill {
         sim_id: 1,
         outcome: Outcome::Up,
@@ -293,7 +297,7 @@ fn test_vector_6_maker_rebate_accrual_and_epoch_settlement() {
     };
     assert!(ledger.record_fill(&fill).unwrap().is_none());
     assert_eq!(ledger.maker_weighted_volume_micro, 25_000_000);
-    assert_eq!(ledger.estimated_rebate_micro, 250_000);
+    assert_eq!(ledger.estimated_rebate_micro, 37_500);
 
     // Settle epoch with UP winning: 100 UP @ $1.00 - $50.00 cost = +$50.00
     let expected_settled = ledger.settlement_pnl_micro(Outcome::Up);
@@ -306,7 +310,7 @@ fn test_vector_6_maker_rebate_accrual_and_epoch_settlement() {
     assert_eq!(ledger.cost_basis_up_micro, 0);
     assert_eq!(ledger.cost_basis_dn_micro, 0);
 
-    // Changing fee schedule to 0% in the next epoch must NOT erase prior $0.25 accrued rebate (#14):
+    // Changing fee schedule to 0% in the next epoch must NOT erase prior $0.0375 accrued rebate (#14):
     let mut zero_fee = FeeSchedule::btc_5m_default();
     zero_fee.fee_rate_e6 = 0;
     ledger.set_fee_schedule(zero_fee);
@@ -321,8 +325,8 @@ fn test_vector_6_maker_rebate_accrual_and_epoch_settlement() {
     };
     assert!(ledger.record_fill(&fill_epoch2).unwrap().is_none());
     assert_eq!(
-        ledger.estimated_rebate_micro, 250_000,
-        "zero-fee epoch must preserve previously accrued $0.25 maker rebate"
+        ledger.estimated_rebate_micro, 37_500,
+        "zero-fee epoch must preserve previously accrued $0.0375 maker rebate"
     );
 }
 

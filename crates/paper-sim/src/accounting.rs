@@ -7,8 +7,16 @@ use serde::{Deserialize, Serialize};
 use crate::error::PaperSimError;
 use crate::fifo_book::SimFill;
 
-/// Default maker rebate share (`20%` scaled by `10^6`) applied to counterfactual maker fee pool.
-pub const DEFAULT_MAKER_REBATE_SHARE_E6: u64 = 200_000;
+/// Strict live maker rebate floor (`0%`) below `$200K` 30-day Maker Weighted Volume.
+pub const MAKER_REBATE_FLOOR_SHARE_E6: u64 = 0;
+
+/// Post-Nov-21 Tier-1 (`$200K–$1M` 30-day wV) maker rebate share (`3%` scaled by `10^6`).
+pub const MAKER_REBATE_TIER1_SHARE_E6: u64 = 30_000;
+
+/// Default maker rebate share (`3%` Tier-1 scaled by `10^6`) tracked in `estimated_rebate_micro`.
+///
+/// `realized_pnl_micro` and `net_pnl_micro` remain at the strict `0%` floor.
+pub const DEFAULT_MAKER_REBATE_SHARE_E6: u64 = MAKER_REBATE_TIER1_SHARE_E6;
 
 /// Event emitted when matching UP and DOWN shares are atomically merged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
