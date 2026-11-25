@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core-types",
     "crates/feeds",
+    "crates/historical-data",
     "crates/math-engine",
     "crates/paper-sim",
     "crates/risk-lifecycle",
@@ -52,3 +53,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net",
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Media", "Win32_System_Console", "Win32_System_Performance"] }
 wiremock = "0.6"
+arrow-array = { version = "55", default-features = false }
+arrow-schema = { version = "55", default-features = false }
+parquet = { version = "55", default-features = false, features = ["arrow", "snap", "zstd", "flate2", "lz4"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
