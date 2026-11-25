@@ -20,6 +20,7 @@ clap.workspace = true
 core-types = { path = "../core-types" }
 execution = { path = "../execution" }
 feeds = { path = "../feeds" }
+historical-data = { path = "../historical-data" }
 math-engine = { path = "../math-engine" }
 paper-sim = { path = "../paper-sim" }
 rand.workspace = true

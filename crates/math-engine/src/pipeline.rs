@@ -221,6 +221,13 @@ impl MathPipeline {
         self.pending_defensive_cancel_dn = false;
     }
 
+    /// Dynamically updates contract epoch horizon (`300.0` for 5m, `900.0` for 15m, `3600.0` for 1h).
+    pub fn set_epoch_secs(&mut self, epoch_secs: f64) -> Result<(), MathError> {
+        self.st2.set_epoch_secs(epoch_secs)?;
+        self.config.station2.epoch_secs = epoch_secs;
+        Ok(())
+    }
+
     /// Computes `[expiry_ms - 60s, expiry_ms]` terminal TWAP when available,
     /// falling back to the trailing 60s TWAP at `now_ms`.
     #[must_use]

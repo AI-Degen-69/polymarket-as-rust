@@ -1,0 +1,30 @@
+[package]
+name = "historical-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow-array.workspace = true
+arrow-schema.workspace = true
+chrono.workspace = true
+core-types = { path = "../core-types" }
+dotenvy.workspace = true
+feeds = { path = "../feeds" }
+hex.workspace = true
+parquet.workspace = true
+reqwest.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true

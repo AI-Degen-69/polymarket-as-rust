@@ -22,7 +22,7 @@ Pure-Rust, terminal-first Avellaneda-Stoikov dual-bid market maker for Polymarke
 
 ## Quick Start (PowerShell)
 
-Requires Rust `1.88+` (`edition = "2024"`).
+Requires Rust `1.89+` (`edition = "2024"`).
 
 ```powershell
 # Copy config template (never commit .env)

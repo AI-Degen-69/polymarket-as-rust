@@ -15,6 +15,11 @@ use feeds::{
     BinanceSpotEvent, BookMaintainer, DEFAULT_RING_CAPACITY, FeedHealthEvent, FeedId,
     GammaDiscoveryClient, OracleTwapEvent, PolyMarketEvent,
 };
+use historical_data::{
+    BookQualityFilter, CanonicalEvent, CanonicalEventKind, DataSource, SourceFilter,
+    canonical_event_matches_filters, canonical_metadata_to_descriptor, is_canonical_jsonl_line,
+    read_canonical_jsonl,
+};
 use math_engine::{
     CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
 };
@@ -88,6 +93,8 @@ pub(crate) struct LifecycleArgs {
     pub(crate) queue_decay: paper_sim::QueueDecayPolicy,
     pub(crate) math: crate::MathOverrides,
     pub(crate) pinning: CorePinning,
+    pub(crate) source_filter: SourceFilter,
+    pub(crate) min_book_quality: BookQualityFilter,
     pub(crate) jsonl: PathBuf,
 }
 
@@ -109,6 +116,7 @@ struct PricingJob {
     spot_ticks: Vec<(u64, f64)>,
     up_trade_sizes: Vec<SharesMicro>,
     reset_epoch: bool,
+    epoch_secs: Option<f64>,
 }
 
 struct PricingAck {
@@ -175,6 +183,9 @@ fn pricing_actor_loop(
         }
         if job.reset_epoch {
             pipeline.reset_epoch();
+        }
+        if let Some(secs) = job.epoch_secs {
+            let _ = pipeline.set_epoch_secs(secs);
         }
         for (ts_ms, spot) in &job.spot_ticks {
             let _ = pipeline.on_binance_spot(*ts_ms, *spot, job.strike_usd, job.expiry_ms);
@@ -1057,6 +1068,8 @@ struct LivePaperSimulator {
     pending_spot_ticks: Vec<(u64, f64)>,
     pending_up_trades: Vec<SharesMicro>,
     pending_reset_epoch: bool,
+    pending_epoch_secs: Option<f64>,
+    explicit_winning_outcome: Option<Outcome>,
     pending_tick_sync_ack: bool,
     broker: FifoPaperBroker,
     ledger: PaperLedger,
@@ -1124,6 +1137,8 @@ impl LivePaperSimulator {
             pending_spot_ticks: Vec::with_capacity(64),
             pending_up_trades: Vec::with_capacity(32),
             pending_reset_epoch: false,
+            pending_epoch_secs: None,
+            explicit_winning_outcome: None,
             pending_tick_sync_ack: false,
             broker: FifoPaperBroker::new(broker_config),
             ledger,
@@ -1936,6 +1951,7 @@ impl LivePaperSimulator {
             spot_ticks: std::mem::take(&mut self.pending_spot_ticks),
             up_trade_sizes: std::mem::take(&mut self.pending_up_trades),
             reset_epoch: std::mem::take(&mut self.pending_reset_epoch),
+            epoch_secs: self.pending_epoch_secs.take(),
         };
 
         let (pricing_ack_tx, pricing_ack_rx) = oneshot::channel();
@@ -2176,6 +2192,9 @@ impl LivePaperSimulator {
     }
 
     fn resolve_winning_outcome(&self) -> Outcome {
+        if let Some(explicit) = self.explicit_winning_outcome {
+            return explicit;
+        }
         let imp_up = self.latest_up.as_ref().and_then(terminal_implied_price);
         let imp_dn = self.latest_dn.as_ref().and_then(terminal_implied_price);
 
@@ -2379,6 +2398,10 @@ impl LivePaperSimulator {
         self.pending_spot_ticks.clear();
         self.pending_up_trades.clear();
         self.pending_reset_epoch = true;
+        self.pending_epoch_secs = Some(
+            (next_desc.expiry_ts_ms.saturating_sub(next_desc.start_ts_ms) as f64 / 1000.0).max(1.0),
+        );
+        self.explicit_winning_outcome = None;
         self.pending_tick_sync_ack = false;
         self.current_phase = None;
         self.current_tier = RiskTier::Tier1Normal;
@@ -2528,6 +2551,8 @@ impl LivePaperSimulator {
     }
 }
 
+const REPLAY_MANDATORY_FLATTEN_SECS: u64 = 30;
+
 fn build_risk_actor(
     harness: ActorPipelineHarness,
     risk_config: RiskConfig,
@@ -2543,7 +2568,7 @@ fn build_risk_actor(
     })?;
     let lifecycle = EpochLifecycleController::new(LifecycleConfig {
         pre_expiry_lockout_secs: 60,
-        mandatory_flatten_secs: 30,
+        mandatory_flatten_secs: REPLAY_MANDATORY_FLATTEN_SECS,
         terminal_lockout_secs: 15,
         min_order_size_shares,
     })?;
@@ -2601,7 +2626,9 @@ fn spawn_managed_session(
         args.fault.into(),
     )?;
 
-    let pipe_cfg = MathPipelineConfig::from_engine_config(cfg)?;
+    let mut pipe_cfg = MathPipelineConfig::from_engine_config(cfg)?;
+    pipe_cfg.station2.epoch_secs =
+        (desc.expiry_ts_ms.saturating_sub(desc.start_ts_ms) as f64 / 1000.0).max(1.0);
     let math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
 
     let broker_cfg = FifoBrokerConfig {
@@ -3059,6 +3086,19 @@ async fn run_replay_epoch(
     input_path: PathBuf,
     clock: MonotonicClock,
 ) -> Result<(), Box<dyn Error>> {
+    let first_non_empty = {
+        let probe = BufReader::new(File::open(&input_path)?);
+        let mut found = None;
+        for line_res in probe.lines() {
+            let line = line_res?;
+            if !line.trim().is_empty() {
+                found = Some(line);
+                break;
+            }
+        }
+        found.ok_or("replay input file is empty")?
+    };
+
     let mut cfg = EngineConfig::from_env()?;
     args.math.apply_to(&mut cfg)?;
     print_engine_config_banner(&cfg);
@@ -3066,6 +3106,24 @@ async fn run_replay_epoch(
     let mut pricing_lat = LatencyTracker::new()?;
     let mut risk_lat = LatencyTracker::new()?;
     let mut total_lat = LatencyTracker::new()?;
+
+    if is_canonical_jsonl_line(&first_non_empty) {
+        return run_canonical_replay_epoch(
+            args,
+            input_path,
+            cfg,
+            jsonl,
+            (pricing_lat, risk_lat, total_lat),
+            clock,
+        )
+        .await;
+    }
+    if args.source_filter == SourceFilter::PmdataOnly {
+        return Err(
+            "live JSONL replay input contains no `pmdata` events under `--source-filter pmdata`"
+                .into(),
+        );
+    }
 
     let reader = BufReader::new(File::open(&input_path)?);
     let mut max_outer_mono = 0_u64;
@@ -3308,6 +3366,408 @@ async fn run_replay_epoch(
     )
 }
 
+#[allow(clippy::too_many_lines)]
+async fn run_canonical_replay_epoch(
+    args: LifecycleArgs,
+    input_path: PathBuf,
+    cfg: EngineConfig,
+    mut jsonl: JsonlWriter,
+    (mut pricing_lat, mut risk_lat, mut total_lat): (
+        LatencyTracker,
+        LatencyTracker,
+        LatencyTracker,
+    ),
+    clock: MonotonicClock,
+) -> Result<(), Box<dyn Error>> {
+    let raw_events = read_canonical_jsonl(&input_path)?;
+    if raw_events.is_empty() {
+        return Err("canonical replay input contains 0 events".into());
+    }
+
+    let mut has_pmdata = false;
+    let mut has_live = false;
+    let mut events: Vec<CanonicalEvent> = Vec::with_capacity(raw_events.len());
+    let mut filtered_out = 0_usize;
+
+    for ev in raw_events {
+        ev.validate_provenance_invariants()?;
+        if !canonical_event_matches_filters(&ev, args.source_filter, args.min_book_quality) {
+            filtered_out = filtered_out.saturating_add(1);
+            continue;
+        }
+        match ev.provenance.source {
+            DataSource::Pmdata => has_pmdata = true,
+            DataSource::LiveJsonl => has_live = true,
+        }
+        events.push(ev);
+    }
+
+    if events.is_empty() {
+        return Err(format!(
+            "all canonical events filtered out under --source-filter {} --min-book-quality {}",
+            args.source_filter.as_str(),
+            args.min_book_quality.as_str()
+        )
+        .into());
+    }
+    historical_data::validate_canonical_replay_quality(&events, args.min_book_quality)?;
+
+    if has_pmdata {
+        eprintln!(
+            "  {} PMData canonical replay (live={has_live}, pmdata=true, filtered_out={filtered_out}): mono_ns=None, clock_sync=None; replay uses UTC `replay_order_ts_ms`. Live equivalence UNVERIFIED.",
+            theme::current().badge(Badge::Warn),
+        );
+    }
+
+    let mut pending_resolutions: std::collections::HashMap<String, Outcome> =
+        std::collections::HashMap::new();
+    for ev in &events {
+        if let CanonicalEventKind::MarketResolution {
+            winning_outcome, ..
+        } = ev.kind
+        {
+            pending_resolutions.insert(ev.provenance.market_slug.clone(), winning_outcome);
+        }
+    }
+
+    let mut anchor_ts_ms: Option<u64> = None;
+    let mut next_eval_ms: Option<u64> = None;
+    let mut last_sim_ms = 0_u64;
+    let mut prev_sim_ms: Option<u64> = None;
+    let mut last_sim_ns = 0_u64;
+    let mut epoch = 0_u64;
+    let mut session: Option<ManagedLifecycleSession> = None;
+    let mut post_expiry_spots: Vec<(u64, f64)> = Vec::new();
+
+    for ev in events {
+        let cur_sim_ms = ev.timestamp.replay_order_ts_ms;
+        if let Some(prev) = prev_sim_ms
+            && cur_sim_ms < prev
+        {
+            return Err(format!(
+                "non-monotonic canonical replay_order_ts_ms: {cur_sim_ms} < {prev}"
+            )
+            .into());
+        }
+        prev_sim_ms = Some(cur_sim_ms);
+        let base_ts = *anchor_ts_ms.get_or_insert(cur_sim_ms);
+        let cur_sim_ns = cur_sim_ms.saturating_sub(base_ts).saturating_mul(1_000_000);
+        last_sim_ms = cur_sim_ms;
+        last_sim_ns = cur_sim_ns;
+
+        if let CanonicalEventKind::MarketResolution {
+            winning_outcome, ..
+        } = &ev.kind
+            && let Some(sess) = session.as_mut()
+            && sess.sim.desc.slug == ev.provenance.market_slug
+        {
+            sess.sim.explicit_winning_outcome = Some(*winning_outcome);
+            sess.sim.market_resolved_flag = true;
+        }
+
+        if let Some(sess) = session.as_mut()
+            && !sess.sim.epoch_settled
+            && cur_sim_ms >= sess.sim.desc.expiry_ts_ms
+        {
+            let expiry_ms = sess.sim.desc.expiry_ts_ms;
+            {
+                let mut latencies = LiveLatencies {
+                    pricing: &mut pricing_lat,
+                    risk: &mut risk_lat,
+                    total: &mut total_lat,
+                };
+                step_replay_eval_grid(
+                    sess,
+                    base_ts,
+                    expiry_ms,
+                    &mut next_eval_ms,
+                    &mut latencies,
+                    &mut jsonl,
+                )
+                .await?;
+            }
+            if sess.sim.explicit_winning_outcome.is_none()
+                && let Some(&win) = pending_resolutions.get(&sess.sim.desc.slug)
+            {
+                sess.sim.explicit_winning_outcome = Some(win);
+                sess.sim.market_resolved_flag = true;
+            }
+            let expiry_ns = expiry_ms.saturating_sub(base_ts).saturating_mul(1_000_000);
+            sess.sim
+                .settle_expired_epoch_if_needed(expiry_ms, expiry_ns, &mut jsonl)?;
+        }
+
+        if let Some(sess) = session.as_mut()
+            && sess.sim.epoch_settled
+            && cur_sim_ms >= sess.sim.desc.expiry_ts_ms
+        {
+            match ev.kind {
+                CanonicalEventKind::MarketMetadata { .. } => {
+                    let (desc, _) = canonical_metadata_to_descriptor(&ev.kind)?;
+                    if desc.condition_id != sess.sim.desc.condition_id
+                        || desc.slug != sess.sim.desc.slug
+                    {
+                        epoch = epoch.saturating_add(1);
+                        let start_ms = desc.start_ts_ms;
+                        sess.sim
+                            .rollover_to_market(desc, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                        for (ts_ms, spot) in post_expiry_spots.drain(..) {
+                            sess.sim.observe_spot(spot, ts_ms);
+                        }
+                        let eval_start = cur_sim_ms
+                            .max(start_ms)
+                            .checked_add(100)
+                            .ok_or("canonical replay timestamp overflow")?;
+                        next_eval_ms = Some(eval_start);
+                    }
+                }
+                CanonicalEventKind::BinanceSpot { event } => {
+                    let spot = match &event {
+                        BinanceSpotEvent::BookTicker { bid_e8, ask_e8, .. } => {
+                            (*bid_e8 as f64 + *ask_e8 as f64) / 200_000_000.0
+                        }
+                        BinanceSpotEvent::AggTrade { price_e8, .. } => {
+                            *price_e8 as f64 / 100_000_000.0
+                        }
+                    };
+                    if spot > 0.0 && spot.is_finite() {
+                        sess.sim.latest_spot = Some(spot);
+                        post_expiry_spots.push((cur_sim_ms, spot));
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if let Some(sess) = session.as_mut() {
+            let mut latencies = LiveLatencies {
+                pricing: &mut pricing_lat,
+                risk: &mut risk_lat,
+                total: &mut total_lat,
+            };
+            step_replay_eval_grid(
+                sess,
+                base_ts,
+                cur_sim_ms,
+                &mut next_eval_ms,
+                &mut latencies,
+                &mut jsonl,
+            )
+            .await?;
+        }
+
+        match ev.kind {
+            CanonicalEventKind::MarketMetadata { .. } => {
+                let (desc, _) = canonical_metadata_to_descriptor(&ev.kind)?;
+                if let Some(sess) = session.as_mut() {
+                    if desc.condition_id != sess.sim.desc.condition_id
+                        || desc.slug != sess.sim.desc.slug
+                    {
+                        if !sess.sim.epoch_settled && cur_sim_ms < sess.sim.desc.expiry_ts_ms {
+                            return Err(format!(
+                                "overlapping `market_metadata` rollover from `{}` (expiry={}) to `{}` at replay_order_ts_ms={cur_sim_ms}",
+                                sess.sim.desc.slug, sess.sim.desc.expiry_ts_ms, desc.slug
+                            )
+                            .into());
+                        }
+                        epoch = epoch.saturating_add(1);
+                        let start_ms = desc.start_ts_ms;
+                        sess.sim
+                            .rollover_to_market(desc, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                        for (ts_ms, spot) in post_expiry_spots.drain(..) {
+                            sess.sim.observe_spot(spot, ts_ms);
+                        }
+                        next_eval_ms = Some(
+                            cur_sim_ms
+                                .max(start_ms)
+                                .checked_add(100)
+                                .ok_or("canonical replay timestamp overflow")?,
+                        );
+                    }
+                } else {
+                    let start_ms = desc.start_ts_ms;
+                    let sess = spawn_managed_session(desc, &cfg, &args, cur_sim_ns, clock)?;
+                    print_epoch_banner(
+                        sess.sim.epoch_num,
+                        &sess.sim.desc.slug,
+                        sess.sim.strike_usd,
+                        sess.sim.desc.start_ts_ms,
+                        sess.sim.desc.expiry_ts_ms,
+                    );
+                    next_eval_ms = Some(
+                        cur_sim_ms
+                            .max(start_ms)
+                            .checked_add(100)
+                            .ok_or("canonical replay timestamp overflow")?,
+                    );
+                    session = Some(sess);
+                }
+            }
+            CanonicalEventKind::BinanceSpot { event } => {
+                if let Some(sess) = session.as_mut() {
+                    sess.sim.on_binance_event(event, cur_sim_ms);
+                }
+            }
+            CanonicalEventKind::BookSnapshot {
+                outcome,
+                bids,
+                asks,
+            } => {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
+                    let fixed =
+                        CanonicalEvent::to_fixed_book_10(outcome, &bids, &asks, mono_ns, exch_ms)?;
+                    let pm_ev = PolyMarketEvent::BookSnapshot {
+                        outcome,
+                        book: fixed,
+                        rx_mono_ns: mono_ns,
+                        exch_ts_ms: exch_ms,
+                        epoch,
+                    };
+                    sess.sim
+                        .on_poly_event(pm_ev, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                }
+            }
+            CanonicalEventKind::PriceChange {
+                outcome,
+                side,
+                price,
+                size,
+                best_bid,
+                best_ask,
+            } => {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
+                    let pm_ev = PolyMarketEvent::PriceChange {
+                        outcome,
+                        side,
+                        price,
+                        size,
+                        best_bid,
+                        best_ask,
+                        rx_mono_ns: mono_ns,
+                        exch_ts_ms: exch_ms,
+                        epoch,
+                    };
+                    sess.sim
+                        .on_poly_event(pm_ev, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                }
+            }
+            CanonicalEventKind::TradePrint {
+                outcome,
+                side,
+                price,
+                size,
+                ..
+            } => {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
+                    let pm_ev = PolyMarketEvent::LastTrade {
+                        outcome,
+                        side,
+                        price,
+                        size,
+                        rx_mono_ns: mono_ns,
+                        exch_ts_ms: exch_ms,
+                        epoch,
+                    };
+                    sess.sim
+                        .on_poly_event(pm_ev, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                }
+            }
+            CanonicalEventKind::TickSizeChange {
+                outcome,
+                new_tick_micro,
+            } => {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
+                    TickPrecision::from_micro(new_tick_micro)?;
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
+                    let pm_ev = PolyMarketEvent::TickSizeChange {
+                        outcome: outcome.unwrap_or(Outcome::Up),
+                        new_tick_micro,
+                        rx_mono_ns: mono_ns,
+                        exch_ts_ms: exch_ms,
+                        epoch,
+                    };
+                    sess.sim
+                        .on_poly_event(pm_ev, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                }
+            }
+            CanonicalEventKind::BestBidAsk {
+                outcome,
+                best_bid,
+                best_ask,
+            } => {
+                if let Some(sess) = session.as_mut()
+                    && sess.sim.desc.slug == ev.provenance.market_slug
+                {
+                    let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
+                    let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
+                    let pm_ev = PolyMarketEvent::BestBidAsk {
+                        outcome,
+                        best_bid,
+                        best_ask,
+                        rx_mono_ns: mono_ns,
+                        exch_ts_ms: exch_ms,
+                        epoch,
+                    };
+                    sess.sim
+                        .on_poly_event(pm_ev, cur_sim_ms, cur_sim_ns, &mut jsonl)?;
+                }
+            }
+            CanonicalEventKind::ClockSync { .. }
+            | CanonicalEventKind::MarketResolution { .. }
+            | CanonicalEventKind::OnchainFill { .. } => {}
+        }
+    }
+
+    let mut sess = session.ok_or("canonical replay file contains no `market_metadata` event")?;
+    {
+        let base_ts = anchor_ts_ms.unwrap_or(last_sim_ms);
+        let mut latencies = LiveLatencies {
+            pricing: &mut pricing_lat,
+            risk: &mut risk_lat,
+            total: &mut total_lat,
+        };
+        step_replay_eval_grid(
+            &mut sess,
+            base_ts,
+            last_sim_ms,
+            &mut next_eval_ms,
+            &mut latencies,
+            &mut jsonl,
+        )
+        .await?;
+    }
+    if last_sim_ms >= sess.sim.desc.expiry_ts_ms || sess.sim.explicit_winning_outcome.is_some() {
+        sess.sim
+            .settle_expired_epoch_if_needed(last_sim_ms, last_sim_ns, &mut jsonl)?;
+    }
+
+    let mut sim = sess.shutdown_returning_sim()?;
+    finalize_and_report_session(
+        &mut sim,
+        last_sim_ms,
+        last_sim_ns,
+        "replay",
+        (&mut pricing_lat, &mut risk_lat, &mut total_lat),
+        jsonl,
+    )
+}
+
 async fn step_replay_eval_grid(
     sess: &mut ManagedLifecycleSession,
     anchor_ts_ms: u64,
@@ -3320,12 +3780,35 @@ async fn step_replay_eval_grid(
     if let Some(target) = *next_eval_ms
         && cur_sim_ms.saturating_sub(target) > MAX_REPLAY_GAP_CATCHUP_MS
     {
+        let flatten_start_ms = sess
+            .sim
+            .desc
+            .expiry_ts_ms
+            .saturating_sub(REPLAY_MANDATORY_FLATTEN_SECS.saturating_mul(1_000));
         eprintln!(
             "  {} replay timestamp gap of {}ms exceeds {MAX_REPLAY_GAP_CATCHUP_MS}ms; fast-forwarding evaluation grid",
             theme::current().badge(Badge::Warn),
             cur_sim_ms.saturating_sub(target)
         );
-        *next_eval_ms = Some(cur_sim_ms);
+        if target < flatten_start_ms && cur_sim_ms >= flatten_start_ms {
+            if cur_sim_ms.saturating_sub(flatten_start_ms) <= MAX_REPLAY_GAP_CATCHUP_MS {
+                *next_eval_ms = Some(flatten_start_ms);
+            } else {
+                let flatten_ns = flatten_start_ms
+                    .saturating_sub(anchor_ts_ms)
+                    .saturating_mul(1_000_000);
+                let actors = LiveActorChannels {
+                    pricing_tx: &sess.pricing_tx,
+                    risk_tx: &sess.risk_tx,
+                };
+                sess.sim
+                    .step_tick(flatten_start_ms, flatten_ns, 0, &actors, latencies, jsonl)
+                    .await?;
+                *next_eval_ms = Some(cur_sim_ms);
+            }
+        } else {
+            *next_eval_ms = Some(cur_sim_ms);
+        }
     }
 
     while let Some(eval_ms) = *next_eval_ms {
@@ -4490,6 +4973,8 @@ mod tests {
                 ..Default::default()
             },
             pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
             jsonl: temp_jsonl_path("sim_epoch_rejects_math"),
         })
         .unwrap_err();
@@ -4703,6 +5188,8 @@ mod tests {
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
             jsonl: out.clone(),
         })
         .unwrap_err();
@@ -4723,6 +5210,8 @@ mod tests {
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
             jsonl: fixture.clone(),
         })
         .unwrap_err();
@@ -4753,6 +5242,8 @@ mod tests {
                 ..Default::default()
             },
             pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
             jsonl: out.clone(),
         });
         assert!(ok_res.is_ok(), "replay failed: {ok_res:?}");
@@ -4789,6 +5280,8 @@ mod tests {
                 ..Default::default()
             },
             pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
             jsonl,
         };
 
@@ -4838,6 +5331,8 @@ mod tests {
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
             jsonl: out.clone(),
         })
         .unwrap();
@@ -4887,6 +5382,296 @@ mod tests {
         ctx.sim.latest_dn = None;
         assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Up);
 
+        // 3. Explicit MarketResolution override takes highest priority (even over one-sided Up book).
+        ctx.sim.explicit_winning_outcome = Some(Outcome::Down);
+        assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Down);
+
         let _ = ctx.shutdown_and_read_jsonl(1_000);
+    }
+
+    #[test]
+    fn canonical_replay_handles_15m_pmdata_resolution_and_quality_filters() {
+        use historical_data::{
+            BookDerivation, CANONICAL_SCHEMA_VERSION, CanonicalEvent, CanonicalEventKind,
+            CanonicalTimestamp, DataSource, EventProvenance, ResolutionSource, TimingEstimate,
+            TimingQuality, UpDownInterval, write_canonical_jsonl,
+        };
+
+        let ts0 = 1_793_146_500_000_u64;
+        let expiry = ts0 + 900_000;
+        let slug = "btc-updown-15m-1793146500";
+        let make_ts = |ms: u64| CanonicalTimestamp {
+            exchange_ts_ms: Some(ms),
+            exchange_ts_us: Some((ms as i64) * 1_000),
+            provider_local_ts_us: Some((ms as i64) * 1_000 + 2_000),
+            unix_ts_ms: None,
+            mono_ns: None,
+            clock_sync: None,
+            replay_order_ts_ms: ms,
+            timing_estimation: Some(TimingEstimate {
+                method: "exchange_ts_us_to_ms_floor".to_string(),
+                uncertainty_note: "synthetic 15m PMData".to_string(),
+            }),
+        };
+        let prov = |deriv: BookDerivation, orig: &str| EventProvenance {
+            source: DataSource::Pmdata,
+            original_event_type: orig.to_string(),
+            market_slug: slug.to_string(),
+            timing_quality: TimingQuality::ExchangeAndProviderUtc,
+            book_derivation: deriv,
+            normalization_version: CANONICAL_SCHEMA_VERSION,
+            raw_price_f64: None,
+            raw_size_f64: None,
+            quality_flags: Vec::new(),
+        };
+
+        let events = vec![
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::NotApplicable, "market_metadata"),
+                timestamp: make_ts(ts0),
+                kind: CanonicalEventKind::MarketMetadata {
+                    condition_id: Some("0xcid_lc_15m".to_string()),
+                    slug: slug.to_string(),
+                    question: Some("BTC 15m Lifecycle Test".to_string()),
+                    interval: UpDownInterval::M15,
+                    version: Some(core_types::ProtocolVersion::CtfV1),
+                    neg_risk: Some(false),
+                    asset_id_up: Some("up15m".to_string()),
+                    asset_id_dn: Some("dn15m".to_string()),
+                    yes_outcome_label: Some("Up".to_string()),
+                    no_outcome_label: Some("Down".to_string()),
+                    tick_size_micro: MicroUsdc(10_000),
+                    min_order_size_micro: SharesMicro(5_000_000),
+                    taker_delay_ms: Some(50),
+                    fee_schedule: FeeSchedule::btc_5m_default(),
+                    start_ts_ms: ts0,
+                    expiry_ts_ms: expiry,
+                    strike_price_usd: None,
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::DirectPmdataYes, "book"),
+                timestamp: make_ts(ts0 + 500),
+                kind: CanonicalEventKind::BookSnapshot {
+                    outcome: Outcome::Up,
+                    bids: vec![BookLevel {
+                        price: MicroUsdc(480_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                    asks: vec![BookLevel {
+                        price: MicroUsdc(520_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::DirectPmdataNo, "book"),
+                timestamp: make_ts(ts0 + 500),
+                kind: CanonicalEventKind::BookSnapshot {
+                    outcome: Outcome::Down,
+                    bids: vec![BookLevel {
+                        price: MicroUsdc(480_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                    asks: vec![BookLevel {
+                        price: MicroUsdc(520_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::NotApplicable, "last_trade_price"),
+                timestamp: make_ts(ts0 + 2_000),
+                kind: CanonicalEventKind::TradePrint {
+                    outcome: Outcome::Up,
+                    side: OrderSide::Sell,
+                    price: MicroUsdc(480_000),
+                    size: SharesMicro(10_000_000),
+                    trade_id: Some("tr-lc-15m".to_string()),
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::NotApplicable, "market_resolved"),
+                timestamp: make_ts(expiry + 500),
+                kind: CanonicalEventKind::MarketResolution {
+                    winning_outcome: Outcome::Down,
+                    resolution_source: ResolutionSource::ExternalOverride,
+                    raw_winning_label: Some("Down".to_string()),
+                },
+            },
+        ];
+
+        let in_path = temp_jsonl_path("lc_canon_15m_in");
+        let out_path = temp_jsonl_path("lc_canon_15m_out");
+        write_canonical_jsonl(&in_path, &events).unwrap();
+
+        run(LifecycleArgs {
+            source: LifecycleSourceMode::Replay,
+            display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
+            input: Some(in_path.clone()),
+            duration: "900s".to_string(),
+            allow_mid_window: true,
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            source_filter: SourceFilter::PmdataOnly,
+            min_book_quality: BookQualityFilter::DirectBothRequired,
+            jsonl: out_path.clone(),
+        })
+        .unwrap();
+
+        let sum = read_summary_payload(&out_path);
+        assert!(sum["ticks_evaluated"].as_u64().unwrap() >= 1);
+        let log_txt = std::fs::read_to_string(&out_path).unwrap();
+        assert!(log_txt.contains("\"winning_outcome\":\"Down\""));
+
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn replay_sparse_gap_over_600s_enters_mandatory_flatten_before_settlement() {
+        use historical_data::{
+            BookDerivation, CANONICAL_SCHEMA_VERSION, CanonicalEvent, CanonicalEventKind,
+            CanonicalTimestamp, DataSource, EventProvenance, ResolutionSource, TimingEstimate,
+            TimingQuality, UpDownInterval, write_canonical_jsonl,
+        };
+
+        let ts0 = 1_793_146_500_000_u64;
+        let expiry = ts0 + 900_000;
+        let slug = "btc-updown-15m-1793146500";
+        let prov = |derivation: BookDerivation, orig: &str| EventProvenance {
+            source: DataSource::Pmdata,
+            original_event_type: orig.to_string(),
+            market_slug: slug.to_string(),
+            timing_quality: TimingQuality::ExchangeAndProviderUtc,
+            book_derivation: derivation,
+            normalization_version: CANONICAL_SCHEMA_VERSION,
+            raw_price_f64: None,
+            raw_size_f64: None,
+            quality_flags: Vec::new(),
+        };
+        let make_ts = |ms: u64| CanonicalTimestamp {
+            exchange_ts_ms: Some(ms),
+            exchange_ts_us: Some((ms as i64) * 1_000),
+            provider_local_ts_us: Some((ms as i64) * 1_000 + 2_000),
+            unix_ts_ms: None,
+            mono_ns: None,
+            clock_sync: None,
+            replay_order_ts_ms: ms,
+            timing_estimation: Some(TimingEstimate {
+                method: "exchange_ts_us_to_ms_floor".to_string(),
+                uncertainty_note: "synthetic sparse test".to_string(),
+            }),
+        };
+        let events = vec![
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::NotApplicable, "market_metadata"),
+                timestamp: make_ts(ts0),
+                kind: CanonicalEventKind::MarketMetadata {
+                    slug: slug.to_string(),
+                    condition_id: Some("0xcond_sparse_flatten".to_string()),
+                    question: Some("BTC 15m Sparse Test".to_string()),
+                    interval: UpDownInterval::M15,
+                    version: Some(core_types::ProtocolVersion::CtfV1),
+                    neg_risk: Some(false),
+                    asset_id_up: Some("0xup".to_string()),
+                    asset_id_dn: Some("0xdn".to_string()),
+                    yes_outcome_label: Some("Up".to_string()),
+                    no_outcome_label: Some("Down".to_string()),
+                    tick_size_micro: MicroUsdc(10_000),
+                    min_order_size_micro: SharesMicro(5_000_000),
+                    taker_delay_ms: Some(50),
+                    fee_schedule: FeeSchedule::btc_5m_default(),
+                    start_ts_ms: ts0,
+                    expiry_ts_ms: expiry,
+                    strike_price_usd: None,
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::DirectPmdataYes, "book"),
+                timestamp: make_ts(ts0 + 500),
+                kind: CanonicalEventKind::BookSnapshot {
+                    outcome: Outcome::Up,
+                    bids: vec![BookLevel {
+                        price: MicroUsdc(480_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                    asks: vec![BookLevel {
+                        price: MicroUsdc(520_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::DirectPmdataNo, "book"),
+                timestamp: make_ts(ts0 + 500),
+                kind: CanonicalEventKind::BookSnapshot {
+                    outcome: Outcome::Down,
+                    bids: vec![BookLevel {
+                        price: MicroUsdc(480_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                    asks: vec![BookLevel {
+                        price: MicroUsdc(520_000),
+                        size: SharesMicro(25_000_000),
+                    }],
+                },
+            },
+            CanonicalEvent {
+                schema_version: CANONICAL_SCHEMA_VERSION,
+                provenance: prov(BookDerivation::NotApplicable, "market_resolved"),
+                timestamp: make_ts(expiry + 500),
+                kind: CanonicalEventKind::MarketResolution {
+                    winning_outcome: Outcome::Up,
+                    resolution_source: ResolutionSource::ExternalOverride,
+                    raw_winning_label: Some("Up".to_string()),
+                },
+            },
+        ];
+
+        let in_path = temp_jsonl_path("lc_sparse_flatten_in");
+        let out_path = temp_jsonl_path("lc_sparse_flatten_out");
+        write_canonical_jsonl(&in_path, &events).unwrap();
+
+        run(LifecycleArgs {
+            source: LifecycleSourceMode::Replay,
+            display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
+            input: Some(in_path.clone()),
+            duration: "900s".to_string(),
+            allow_mid_window: true,
+            fast_forward: false,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            source_filter: SourceFilter::PmdataOnly,
+            min_book_quality: BookQualityFilter::DirectBothRequired,
+            jsonl: out_path.clone(),
+        })
+        .unwrap();
+
+        let log_txt = std::fs::read_to_string(&out_path).unwrap();
+        assert!(log_txt.contains("\"phase\":\"MandatoryFlatten\""));
+        assert!(log_txt.contains("\"winning_outcome\":\"Up\""));
+
+        let _ = std::fs::remove_file(&in_path);
+        let _ = std::fs::remove_file(&out_path);
     }
 }

@@ -21,6 +21,7 @@ mod lifecycle_report;
 mod log_paths;
 mod paper_cmd;
 mod paper_report;
+mod pmdata_cmd;
 mod preflight;
 mod sandbox_cmd;
 mod sandbox_report;
@@ -81,6 +82,42 @@ use trace_cmd::{TraceArgs, TraceSourceMode};
 enum CliTraceSource {
     Live,
     Replay,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliSourceFilter {
+    All,
+    Live,
+    Pmdata,
+}
+
+impl From<CliSourceFilter> for historical_data::SourceFilter {
+    fn from(value: CliSourceFilter) -> Self {
+        match value {
+            CliSourceFilter::All => Self::All,
+            CliSourceFilter::Live => Self::LiveOnly,
+            CliSourceFilter::Pmdata => Self::PmdataOnly,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliBookQualityFilter {
+    Any,
+    #[value(name = "direct-yes")]
+    DirectYes,
+    #[value(name = "direct-both")]
+    DirectBoth,
+}
+
+impl From<CliBookQualityFilter> for historical_data::BookQualityFilter {
+    fn from(value: CliBookQualityFilter) -> Self {
+        match value {
+            CliBookQualityFilter::Any => Self::Any,
+            CliBookQualityFilter::DirectYes => Self::DirectYesRequired,
+            CliBookQualityFilter::DirectBoth => Self::DirectBothRequired,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -545,6 +582,12 @@ enum Commands {
         queue_decay: CliQueueDecay,
         #[command(flatten)]
         math: MathOverrides,
+        /// Source filter for canonical replay (`all`, `live`, `pmdata`).
+        #[arg(long, value_enum, default_value_t = CliSourceFilter::All)]
+        source_filter: CliSourceFilter,
+        /// Minimum book derivation quality for canonical replay (`any`, `direct-yes`, `direct-both`).
+        #[arg(long, value_enum, default_value_t = CliBookQualityFilter::Any)]
+        min_book_quality: CliBookQualityFilter,
         /// Output path for structured JSONL telemetry log (defaults to `logs/paper/<DD-MM_HH-MM-SSZ>.jsonl`).
         #[arg(long)]
         jsonl: Option<PathBuf>,
@@ -592,9 +635,21 @@ enum Commands {
         /// Pin the live Risk actor OS thread to a zero-based logical CPU core.
         #[arg(long)]
         pin_risk_core: Option<usize>,
+        /// Source filter for canonical replay (`all`, `live`, `pmdata`).
+        #[arg(long, value_enum, default_value_t = CliSourceFilter::All)]
+        source_filter: CliSourceFilter,
+        /// Minimum book derivation quality for canonical replay (`any`, `direct-yes`, `direct-both`).
+        #[arg(long, value_enum, default_value_t = CliBookQualityFilter::Any)]
+        min_book_quality: CliBookQualityFilter,
         /// Output path for structured JSONL telemetry log (defaults to `logs/lifecycle/<DD-MM_HH-MM-SSZ>.jsonl`).
         #[arg(long)]
         jsonl: Option<PathBuf>,
+    },
+    /// PMData historical dataset catalog, quota-guarded download, canonical normalization, and reconciliation.
+    Pmdata {
+        /// PMData subcommand.
+        #[command(subcommand)]
+        action: pmdata_cmd::PmdataCommands,
     },
     /// NEX sandbox (Amoy 80002) health gate, market discovery, validation order, and feeds.
     Sandbox {
@@ -632,7 +687,7 @@ impl Commands {
             Self::Paper { source, .. } => matches!(source, CliTraceSource::Live),
             Self::Lifecycle { source, .. } => matches!(source, CliLifecycleSource::Live),
             Self::Exec { mode, .. } => matches!(mode, CliExecMode::CanaryLive),
-            Self::Doctor { .. } | Self::Sandbox { .. } => false,
+            Self::Doctor { .. } | Self::Sandbox { .. } | Self::Pmdata { .. } => false,
         }
     }
 }
@@ -704,6 +759,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             latency_ms,
             queue_decay,
             math,
+            source_filter,
+            min_book_quality,
             jsonl,
         } => paper_cmd::run(paper_cmd::PaperArgs {
             source: match source {
@@ -718,6 +775,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             latency_ms,
             queue_decay: queue_decay.into(),
             math,
+            source_filter: source_filter.into(),
+            min_book_quality: min_book_quality.into(),
             jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("paper")),
         }),
         Commands::Lifecycle {
@@ -735,6 +794,8 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             math,
             pin_pricing_core,
             pin_risk_core,
+            source_filter,
+            min_book_quality,
             jsonl,
         } => lifecycle_cmd::run(LifecycleArgs {
             source: match source {
@@ -766,8 +827,11 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 pricing_core: pin_pricing_core,
                 risk_core: pin_risk_core,
             },
+            source_filter: source_filter.into(),
+            min_book_quality: min_book_quality.into(),
             jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("lifecycle")),
         }),
+        Commands::Pmdata { action } => pmdata_cmd::run(action),
         Commands::Sandbox { action } => match action {
             SandboxCommands::Health {
                 require_allowlisted_egress,
@@ -1701,5 +1765,147 @@ mod tests {
         assert_eq!(default_v_max_usd(), 50);
         assert_eq!(default_base_size_shares(), 20);
         assert_eq!(micro_to_whole_units("test_fractional", 50_500_000, 50), 50);
+    }
+
+    #[test]
+    fn cli_parses_pmdata_subcommands_and_source_quality_filters() {
+        let cat = Cli::try_parse_from([
+            "poly-as",
+            "pmdata",
+            "catalog",
+            "--interval",
+            "15m",
+            "--from-date",
+            "2026-10-28",
+            "--to-date",
+            "2026-11-03",
+            "--limit",
+            "5",
+        ])
+        .unwrap();
+        assert!(!cat.command.needs_host_clock());
+
+        let dl = Cli::try_parse_from([
+            "poly-as",
+            "pmdata",
+            "download",
+            "--date",
+            "2026-10-28",
+            "--interval",
+            "5m",
+            "--mode",
+            "quota-saving",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(!dl.command.needs_host_clock());
+
+        let status = Cli::try_parse_from(["poly-as", "pmdata", "status"]).unwrap();
+        assert!(!status.command.needs_host_clock());
+
+        let norm = Cli::try_parse_from([
+            "poly-as",
+            "pmdata",
+            "normalize",
+            "--source",
+            "pmdata",
+            "--yes-l2",
+            "y.parquet",
+            "--trades",
+            "t.parquet",
+            "--mode",
+            "quota-saving",
+            "--resolution-override",
+            "up",
+            "--output",
+            "out.jsonl",
+        ])
+        .unwrap();
+        assert!(!norm.command.needs_host_clock());
+
+        let vh = Cli::try_parse_from([
+            "poly-as",
+            "pmdata",
+            "verify-historical",
+            "--samples",
+            "btc-updown-5m-1",
+            "btc-updown-15m-2",
+        ])
+        .unwrap();
+        assert!(!vh.command.needs_host_clock());
+
+        let rec = Cli::try_parse_from([
+            "poly-as",
+            "pmdata",
+            "reconcile",
+            "--live",
+            "live.jsonl",
+            "--yes-l2",
+            "yes.parquet",
+            "--trades",
+            "trades.parquet",
+            "--mode",
+            "quota-saving",
+        ])
+        .unwrap();
+        assert!(!rec.command.needs_host_clock());
+
+        let paper_f = Cli::try_parse_from([
+            "poly-as",
+            "paper",
+            "--source",
+            "replay",
+            "--source-filter",
+            "pmdata",
+            "--min-book-quality",
+            "direct-both",
+        ])
+        .unwrap();
+        match paper_f.command {
+            Commands::Paper {
+                source_filter,
+                min_book_quality,
+                ..
+            } => {
+                assert_eq!(
+                    historical_data::SourceFilter::from(source_filter),
+                    historical_data::SourceFilter::PmdataOnly
+                );
+                assert_eq!(
+                    historical_data::BookQualityFilter::from(min_book_quality),
+                    historical_data::BookQualityFilter::DirectBothRequired
+                );
+            }
+            _ => panic!("expected Paper"),
+        }
+
+        let lc_f = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--source-filter",
+            "live",
+            "--min-book-quality",
+            "direct-yes",
+        ])
+        .unwrap();
+        match lc_f.command {
+            Commands::Lifecycle {
+                source_filter,
+                min_book_quality,
+                ..
+            } => {
+                assert_eq!(
+                    historical_data::SourceFilter::from(source_filter),
+                    historical_data::SourceFilter::LiveOnly
+                );
+                assert_eq!(
+                    historical_data::BookQualityFilter::from(min_book_quality),
+                    historical_data::BookQualityFilter::DirectYesRequired
+                );
+            }
+            _ => panic!("expected Lifecycle"),
+        }
     }
 }

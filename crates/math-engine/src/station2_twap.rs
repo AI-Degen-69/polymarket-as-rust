@@ -244,6 +244,15 @@ impl RollingTwapAndVariance {
         self.term_valid = false;
     }
 
+    /// Dynamically updates contract epoch horizon (`300.0` for 5m per `IMPLEMENTATION_PLAN.md`,
+    /// `900.0` for 15m, `3600.0` for 1h). Scales `tau_frac = tau_secs / epoch_secs` for remaining
+    /// variance while keeping the 60s trailing and terminal TWAP windows unchanged.
+    pub fn set_epoch_secs(&mut self, epoch_secs: f64) -> Result<(), MathError> {
+        check_pos_finite(epoch_secs)?;
+        self.config.epoch_secs = epoch_secs;
+        Ok(())
+    }
+
     /// Returns count of samples currently held in the circular buffer.
     #[must_use]
     pub const fn sample_len(&self) -> usize {
@@ -1230,5 +1239,20 @@ mod tests {
         let ev = st2.evaluate(12_000, 300_000, 0.50, Some(90_000.0)).unwrap();
         assert!(ev.lead_lag.trigger_defensive_cancel_up);
         assert!(!ev.lead_lag.trigger_defensive_cancel_dn);
+    }
+
+    #[test]
+    fn set_epoch_secs_scales_15m_remaining_variance_correctly() {
+        let mut st2 = RollingTwapAndVariance::new(Station2Config::default()).unwrap();
+        assert!(st2.set_epoch_secs(0.0).is_err());
+        assert!(st2.set_epoch_secs(-900.0).is_err());
+        assert!(st2.set_epoch_secs(f64::NAN).is_err());
+
+        st2.set_epoch_secs(900.0).unwrap();
+        // With T = 900s and tau = 450s remaining at p_mid = 0.50:
+        // tau_frac = 450 / 900 = 0.50, v_rem = 0.25 * 0.50 = 0.125 (vs clamped 0.25 if T = 300s).
+        let out = st2.evaluate(450_000, 900_000, 0.50, None).unwrap();
+        assert_close(out.tau_secs, 450.0, 1e-9);
+        assert_close(out.v_rem, 0.125, 1e-9);
     }
 }
