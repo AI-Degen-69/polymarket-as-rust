@@ -331,15 +331,18 @@ function Get-SurvivalInputs {
     # Preferred: actual per-window net PnL from the window lifecycle events the replay emits
     # (`window_end` net + rebate, or `epoch_rollover` realized + rebate deltas).
     # Capture-level prorating is only used when no window events exist.
-    if ($null -ne $WindowNets -and $WindowNets.Count -ge 4) {
-        $isTarget = [int][Math]::Floor($WindowNets.Count * 0.7)
-        $isAcc = 0.0; $oosAcc = 0.0
-        for ($wi = 0; $wi -lt $WindowNets.Count; $wi++) {
-            if ($wi -lt $isTarget) { $isAcc += $WindowNets[$wi] } else { $oosAcc += $WindowNets[$wi] }
+    if ($null -ne $WindowNets -and $WindowNets.Count -gt 0) {
+        # IS/OOS needs >= 4 windows to split; drawdown is valid on any window series.
+        if ($WindowNets.Count -ge 4) {
+            $isTarget = [int][Math]::Floor($WindowNets.Count * 0.7)
+            $isAcc = 0.0; $oosAcc = 0.0
+            for ($wi = 0; $wi -lt $WindowNets.Count; $wi++) {
+                if ($wi -lt $isTarget) { $isAcc += $WindowNets[$wi] } else { $oosAcc += $WindowNets[$wi] }
+            }
+            $out.IS = $isAcc; $out.OOS = $oosAcc; $out.ISWin = $isTarget; $out.OOSWin = $WindowNets.Count - $isTarget
+            if ($isAcc -gt 1e-9) { $out.Retain = ($oosAcc / $isAcc) * 100.0 }
+            elseif ($oosAcc -gt 1e-9) { $out.Retain = [double]::PositiveInfinity }
         }
-        $out.IS = $isAcc; $out.OOS = $oosAcc; $out.ISWin = $isTarget; $out.OOSWin = $WindowNets.Count - $isTarget
-        if ($isAcc -gt 1e-9) { $out.Retain = ($oosAcc / $isAcc) * 100.0 }
-        elseif ($oosAcc -gt 1e-9) { $out.Retain = [double]::PositiveInfinity }
         # Drawdown on the actual per-window equity curve, same deployed-volume denominator
         # as the capture-level path below.
         $peak = 0.0; $wDD = 0.0; $wEq = 0.0
@@ -652,10 +655,19 @@ foreach ($p in $parsedInputPaths) {
 }
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+$origPwd = (Get-Location).Path
 Push-Location $repoRoot
+# logs/ is gitignored and never shared by worktrees: when this script is run from another
+# checkout (e.g. a worktree script against the main repo's captures), fall back to the
+# caller's logs directory so -AllCaptures / -Latest / sweep output resolve where the data is.
+$logsRoot = Join-Path $repoRoot "logs"
+if (-not (Test-Path -LiteralPath (Join-Path $logsRoot "captures"))) {
+    $callerLogs = Join-Path $origPwd "logs"
+    if (Test-Path -LiteralPath (Join-Path $callerLogs "captures")) { $logsRoot = $callerLogs }
+}
 try {
     if ($resolvedInputs.Count -eq 0) {
-        $capturesDir = Join-Path $repoRoot "logs/captures"
+        $capturesDir = Join-Path $logsRoot "captures"
         if (-not (Test-Path -LiteralPath $capturesDir)) {
             throw "Captures directory not found: $capturesDir (pass -InputPath or run poly-as feeds --discover)"
         }
@@ -672,9 +684,11 @@ try {
                 } |
                 Sort-Object -Property LastWriteTimeUtc)
             if ($Quick) {
+                # Re-sort the shortest pair into time order so the IS/OOS walk-forward stays chronological.
                 $matchedFiles = @($matchedFiles |
                     Sort-Object -Property @{ Expression = { [int]($_.Name -replace '^.*_(\d+)w\.jsonl$', '$1') } }, LastWriteTimeUtc |
-                    Select-Object -First 2)
+                    Select-Object -First 2 |
+                    Sort-Object -Property LastWriteTimeUtc)
                 Write-Host ("⚡ [QUICK] Captures: {0}" -f (($matchedFiles | ForEach-Object { $_.Name }) -join ", "))
             }
             if ($matchedFiles.Count -eq 0) {
@@ -720,6 +734,7 @@ try {
 
     if ($BinPath -ne "") {
         $binPath = $BinPath
+        if (-not [System.IO.Path]::IsPathRooted($binPath)) { $binPath = Join-Path $origPwd $binPath }
         if (-not (Test-Path -LiteralPath $binPath)) {
             throw "Explicit -BinPath not found: $binPath"
         }
@@ -748,7 +763,7 @@ try {
 
     $totalRuns = $parsedGammas.Count * $parsedVarSpreads.Count * $parsedMinTicks.Count * $parsedCrossLosses.Count * $parsedMaxEntryProbs.Count * $parsedMaxEntryPrices.Count * $parsedLLThresholds.Count * $parsedLLWindows.Count * $parsedLLCooldowns.Count * $parsedLLDirectionals.Count * $parsedHedgeSkews.Count * $parsedCapTier1.Count
     $stamp = [DateTime]::UtcNow.ToString("dd-MM_HH-mm-ssZ", $inv)
-    $sweepBase = Join-Path $repoRoot "logs/sweeps"
+    $sweepBase = Join-Path $logsRoot "sweeps"
     if (-not (Test-Path -LiteralPath $sweepBase)) {
         New-Item -ItemType Directory -Force -Path $sweepBase | Out-Null
     }
@@ -1065,6 +1080,8 @@ try {
                                                                 $evP = $evObj.payload
                                                                 $wSlug = $null
                                                                 foreach ($slugKey in @("expired_slug", "market_slug", "window_slug", "slug")) {
+                                                                    # StrictMode throws on a missing property, and the catch below would drop the event.
+                                                                    if ($null -eq $evP.PSObject.Properties[$slugKey]) { continue }
                                                                     $slugVal = $evP.$slugKey
                                                                     if ($null -ne $slugVal -and ([string]$slugVal) -ne "") { $wSlug = ([string]$slugVal).ToLowerInvariant(); break }
                                                                 }
@@ -1570,8 +1587,8 @@ try {
         $plainSummary.Add((Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $false))
     }
     $plainSummary.Add(($plainRowFmt -f $dashes))
-    $plainSummary.Add("")
     $plainSummary.Add("  Win Rate = windows won / windows with results (per-window lifecycle nets); n/a = no window results")
+    $plainSummary.Add("")
     $plainSummary.Add("  STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (In Sample / Out Sample 70/30 by windows; Drawdown by window equity; Expiry Drag capture-level proxy)")
     $plainSummary.Add("  G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=40% | G4 Max Drawdown<=25% | G5 Expiry Drag<=30% | G6 Neighbors>=60% | QueueDecay=$QueueDecay (promotion requires conservative)")
     if (-not $isMultiCapture) {
@@ -1606,7 +1623,6 @@ try {
     Write-Host (Format-ColorText -Text ("🏁 SWEEP COMPLETE  |  Total Elapsed: {0:F2}s  |  Avg/Config: {1:F2}s  |  Throughput: {2}" -f $totalElapsedSec, $avgConfigSec, $throughputText) -Code $AnsiBoldCyan)
     Write-Host ("Summary File : {0}" -f $summaryPath)
     Write-Host $majorRule
-    Write-Host (Format-ColorText -Text "  Win Rate = windows won / windows with results (per-window lifecycle nets); n/a = no window results" -Code $AnsiGray)
 
     # Print Config Leaderboard to Console
     Write-Host ""
@@ -1617,6 +1633,7 @@ try {
         Write-Host (Format-LeaderboardRow -RankNum ($ri + 1) -Row $sorted[$ri] -Colorize $true)
     }
     Write-Host (Format-ColorText -Text ($plainRowFmt -f $dashes) -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text "  Win Rate = windows won / windows with results (per-window lifecycle nets); n/a = no window results" -Code $AnsiGray)
 
     # Print Strategy Verification table (same fixed-width contract: static columns, padded badges)
     Write-Host ""
