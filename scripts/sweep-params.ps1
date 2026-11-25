@@ -14,6 +14,8 @@
     pwsh -File scripts/sweep-params.ps1 -InputPath logs/captures/22-11_05-56-27Z_20s_1w.jsonl -Gammas 0.02,0.08,0.15 -VarianceSpreads false
 .EXAMPLE
     pwsh -File scripts/sweep-params.ps1 -AllCaptures -Gammas 0.25 -VarianceSpreads true -MinSpreadTicks 2 -MaxCombinedBidMicro 980000
+.EXAMPLE
+    pwsh -File scripts/sweep-params.ps1 -Quick
 .NOTES
     Each single-capture invocation writes its outputs to a unique UTC-timestamped folder under
     logs/sweeps/<DD-MM_HH-MM-SSZ>_<N>runs_<capture-stem>/.
@@ -28,6 +30,8 @@ param(
     [switch]$Latest,
 
     [switch]$AllCaptures,
+
+    [switch]$Quick,
 
     [int]$MinWindows = 2,
 
@@ -615,14 +619,14 @@ foreach ($minTicks in $parsedMinTicks) {
 
 $parsedInputPaths = @($InputPath | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' })
 
-if ($AllCaptures -and $parsedInputPaths.Count -gt 0) {
-    throw "Cannot pass both -InputPath and -AllCaptures"
-}
-if ($Latest -and $parsedInputPaths.Count -gt 0) {
-    throw "Cannot pass both -InputPath and -Latest"
-}
-if ($Latest -and $AllCaptures) {
-    throw "Cannot pass both -AllCaptures and -Latest"
+# -InputPath, -Latest, -AllCaptures and -Quick all choose the input set: at most one may be given.
+$inputSelectors = @()
+if ($parsedInputPaths.Count -gt 0) { $inputSelectors += "-InputPath" }
+if ($Latest) { $inputSelectors += "-Latest" }
+if ($AllCaptures) { $inputSelectors += "-AllCaptures" }
+if ($Quick) { $inputSelectors += "-Quick" }
+if ($inputSelectors.Count -gt 1) {
+    throw "Pass at most one input selector (got $($inputSelectors -join ' + '))"
 }
 
 $resolvedInputs = [System.Collections.Generic.List[string]]::new()
@@ -647,16 +651,26 @@ try {
         if (-not (Test-Path -LiteralPath $capturesDir)) {
             throw "Captures directory not found: $capturesDir (pass -InputPath or run poly-as feeds --discover)"
         }
-        if ($AllCaptures) {
+        if ($Quick -or $AllCaptures) {
+            # -Quick reuses the -AllCaptures pool but keeps only the two shortest captures,
+            # floored at 5 windows so the IS/OOS split stays meaningful (a trailing partial
+            # window emits no per-window result); -MinWindows still wins if it is stricter.
+            $selectMinWindows = if ($Quick) { [Math]::Max($MinWindows, 5) } else { $MinWindows }
             $matchedFiles = @(Get-ChildItem -LiteralPath $capturesDir -Filter "*.jsonl" -File |
                 Where-Object {
                     -not $_.Name.EndsWith(".inprogress.jsonl", [System.StringComparison]::OrdinalIgnoreCase) -and
                     $_.Name -match '_(\d+)w\.jsonl$' -and
-                    [int]$Matches[1] -ge $MinWindows
+                    [int]$Matches[1] -ge $selectMinWindows
                 } |
                 Sort-Object -Property LastWriteTimeUtc)
+            if ($Quick) {
+                $matchedFiles = @($matchedFiles |
+                    Sort-Object -Property @{ Expression = { [int]($_.Name -replace '^.*_(\d+)w\.jsonl$', '$1') } }, LastWriteTimeUtc |
+                    Select-Object -First 2)
+                Write-Host ("⚡ [QUICK] Captures: {0}" -f (($matchedFiles | ForEach-Object { $_.Name }) -join ", "))
+            }
             if ($matchedFiles.Count -eq 0) {
-                throw "No finalized .jsonl captures matching _<N>w.jsonl with N >= $MinWindows found in $capturesDir"
+                throw "No finalized .jsonl captures matching _<N>w.jsonl with N >= $selectMinWindows found in $capturesDir"
             }
             foreach ($f in $matchedFiles) {
                 $resolvedInputs.Add($f.FullName)
