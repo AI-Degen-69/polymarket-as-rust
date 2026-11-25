@@ -713,3 +713,162 @@ fn reconcile_live_vs_pmdata_identifies_equivalent_and_discrepant_streams() {
     assert_eq!(diff_report.verdict, FidelityVerdict::NotEquivalent);
     assert!(diff_report.missing_in_pmdata_trades >= 1 || diff_report.trade_price_mismatches >= 1);
 }
+
+#[test]
+fn normalizer_enforces_crossed_guard_coalescing_resolution_conflicts_and_phase0_audit() {
+    use historical_data::{
+        HistoricalPhase0Report, audit_pmdata_historical_market, render_historical_phase0_markdown,
+    };
+
+    let tmp = TestTempDir::new("reg_norm");
+    let slug = "btc-updown-5m-1793145900";
+    let t0_us = 1_793_145_900_000_000_i64;
+    let yes_path = tmp.path.join("yes_l2.parquet");
+    let no_path = tmp.path.join("no_l2.parquet");
+    let trades_path = tmp.path.join("trades.parquet");
+
+    // Duplicate rounded price levels + crossed book + price_change without BBO + market_resolved=Up.
+    write_l2_parquet(
+        &yes_path,
+        &[
+            L2RowSpec {
+                slug,
+                ts_us: t0_us,
+                local_us: t0_us + 1_000,
+                event_type: "book",
+                bids: &[(0.51, 10.0), (0.510_000_1, 15.0)],
+                asks: &[(0.53, 25.0)],
+                pc_price: None,
+                pc_size: None,
+                pc_side: None,
+                new_tick_str: None,
+                winning: None,
+            },
+            L2RowSpec {
+                slug,
+                ts_us: t0_us + 100_000,
+                local_us: t0_us + 101_000,
+                event_type: "book",
+                bids: &[(0.55, 10.0)],
+                asks: &[(0.54, 10.0)],
+                pc_price: None,
+                pc_size: None,
+                pc_side: None,
+                new_tick_str: None,
+                winning: None,
+            },
+            L2RowSpec {
+                slug,
+                ts_us: t0_us + 200_000,
+                local_us: t0_us + 201_000,
+                event_type: "price_change",
+                bids: &[],
+                asks: &[],
+                pc_price: Some(0.52),
+                pc_size: Some(5.0),
+                pc_side: Some("BUY"),
+                new_tick_str: None,
+                winning: None,
+            },
+            L2RowSpec {
+                slug,
+                ts_us: t0_us + 300_000,
+                local_us: t0_us + 301_000,
+                event_type: "market_resolved",
+                bids: &[],
+                asks: &[],
+                pc_price: None,
+                pc_size: None,
+                pc_side: None,
+                new_tick_str: None,
+                winning: Some("Yes"),
+            },
+        ],
+    );
+    write_l2_parquet(
+        &no_path,
+        &[L2RowSpec {
+            slug,
+            ts_us: t0_us,
+            local_us: t0_us + 1_000,
+            event_type: "book",
+            bids: &[(0.47, 25.0)],
+            asks: &[(0.49, 25.0)],
+            pc_price: None,
+            pc_size: None,
+            pc_side: None,
+            new_tick_str: None,
+            winning: None,
+        }],
+    );
+    write_trades_parquet(&trades_path, &[], true);
+
+    let meta = catalog_entry(slug, "Up", "Down");
+    // Missing explicit trades path must error instead of silently returning empty.
+    let bad_files = PmdataMarketFiles {
+        market_slug: slug.to_string(),
+        yes_l2_path: yes_path.clone(),
+        no_l2_path: None,
+        trades_path: Some(tmp.path.join("does_not_exist.parquet")),
+        onchain_fills_path: None,
+    };
+    assert!(
+        normalize_pmdata_market(&bad_files, IngestionMode::QuotaSaving, Some(&meta), None).is_err()
+    );
+
+    // Conflicting resolution_override must error.
+    let qs_files = PmdataMarketFiles {
+        market_slug: slug.to_string(),
+        yes_l2_path: yes_path.clone(),
+        no_l2_path: None,
+        trades_path: Some(trades_path.clone()),
+        onchain_fills_path: None,
+    };
+    assert!(
+        normalize_pmdata_market(
+            &qs_files,
+            IngestionMode::QuotaSaving,
+            Some(&meta),
+            Some(Outcome::Down)
+        )
+        .is_err()
+    );
+
+    // QuotaSaving only derives complementary Down book for the 1 uncrossed snapshot (not crossed snap or missing-BBO pc).
+    let qs =
+        normalize_pmdata_market(&qs_files, IngestionMode::QuotaSaving, Some(&meta), None).unwrap();
+    assert_eq!(qs.summary.derived_down_events, 1);
+    assert_eq!(qs.summary.crossed_books_observed, 1);
+    assert!(qs.summary.has_explicit_resolution);
+
+    // Duplicate rounded bid levels coalesced to 1 level (`25.0` shares), allowing FixedBook conversion.
+    let first_snap = qs
+        .events
+        .iter()
+        .find(|e| matches!(e.kind, CanonicalEventKind::BookSnapshot { .. }))
+        .unwrap();
+    if let CanonicalEventKind::BookSnapshot { bids, .. } = &first_snap.kind {
+        assert_eq!(bids.len(), 1);
+        assert_eq!(bids[0].size, SharesMicro(25_000_000));
+    }
+
+    // Phase 0 audit & dynamic markdown rendering.
+    let full_files = PmdataMarketFiles {
+        market_slug: slug.to_string(),
+        yes_l2_path: yes_path,
+        no_l2_path: Some(no_path),
+        trades_path: Some(trades_path),
+        onchain_fills_path: None,
+    };
+    let audit = audit_pmdata_historical_market(&full_files, Some(&meta)).unwrap();
+    assert_eq!(audit.yes_no_exact_mirror_snapshots, 1);
+    assert!(audit.has_explicit_market_resolved);
+    let md = render_historical_phase0_markdown(&HistoricalPhase0Report {
+        generated_utc: "2026-11-25T00:00:00Z".to_string(),
+        quota_units_consumed: 3,
+        verdict: FidelityVerdict::HistoricalSchemaVerifiedOnly,
+        disclaimer: "test boundary".to_string(),
+        markets: vec![audit],
+    });
+    assert!(md.contains("Yes/No exact snapshot mirrors=1/1"));
+}

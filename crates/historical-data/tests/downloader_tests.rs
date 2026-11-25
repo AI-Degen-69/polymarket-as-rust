@@ -396,7 +396,14 @@ async fn day_bundle_zip_extraction_zip_slip_guard_and_range_resume_without_doubl
     Mock::given(method("GET"))
         .and(path("/polymarket/l2/2026/10/28/btc-15m.zip"))
         .and(header("range", format!("bytes={split}-").as_str()))
-        .respond_with(ResponseTemplate::new(206).set_body_bytes(good_zip[split..].to_vec()))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header(
+                    "content-range",
+                    format!("bytes {split}-{}/{}", good_zip.len() - 1, good_zip.len()).as_str(),
+                )
+                .set_body_bytes(good_zip[split..].to_vec()),
+        )
         .expect(1)
         .mount(&server)
         .await;
@@ -490,4 +497,105 @@ fn concurrent_manifest_reserves_respect_lock_and_650_cap() {
     let m = store.load().unwrap();
     assert_eq!(m.reserved_units, 10);
     assert_eq!(m.remaining_quota(), 0);
+}
+
+#[tokio::test]
+async fn resume_rejects_mismatched_content_range_and_preserves_prior_credit_on_429() {
+    let server = MockServer::start().await;
+    let tmp = TestTempDir::new("bad_content_range");
+    let cfg = test_config(&tmp, &server.uri(), Some("sk-key-cr"));
+    let client = PmdataClient::new(cfg).unwrap();
+    let d = NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+    let entry_key = bundle_entry_key(
+        PmdataDataset::L2,
+        d,
+        "btc",
+        UpDownInterval::M15,
+        Some(PmdataL2Outcome::Yes),
+    );
+    let cache_path = client.bundle_cache_path(
+        PmdataDataset::L2,
+        d,
+        "btc",
+        UpDownInterval::M15,
+        Some(PmdataL2Outcome::Yes),
+    );
+    let part_path = PathBuf::from(format!("{}.part", cache_path.display()));
+    fs::create_dir_all(part_path.parent().unwrap()).unwrap();
+    fs::write(&part_path, b"PARTIAL_BYTES").unwrap();
+
+    client
+        .manifest()
+        .reserve(ReserveMetadata {
+            entry_key: entry_key.clone(),
+            endpoint_kind: EndpointKind::DayBundle,
+            dataset_type: "l2".to_string(),
+            outcome_param: None,
+            asset: "btc".to_string(),
+            interval: "15m".to_string(),
+            utc_date: "2026-10-28".to_string(),
+            market_slug: None,
+            requested_url: "http://example/zip".to_string(),
+            quota_cost: 24,
+        })
+        .unwrap();
+    client
+        .manifest()
+        .commit_ambiguous_failure(&entry_key, 24, Some(200), "drop".into())
+        .unwrap();
+
+    // First retry hits 429; must release at 0 additional cost AND keep 24-unit credit!
+    Mock::given(method("GET"))
+        .and(path("/polymarket/l2/2026/10/28/btc-15m.zip"))
+        .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let err_429 = client
+        .download_day_bundle(
+            PmdataDataset::L2,
+            d,
+            "btc",
+            UpDownInterval::M15,
+            Some(PmdataL2Outcome::Yes),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err_429,
+        HistoricalError::HttpStatus { status: 429, .. }
+    ));
+
+    // Subsequent retry returns 206 with wrong Content-Range start -> rejected without corrupting `.part`.
+    let server2 = MockServer::start().await;
+    let cfg2 = PmdataConfig {
+        base_url: server2.uri(),
+        catalog_url: format!("{}/markets.parquet", server2.uri()),
+        ..client.config().clone()
+    };
+    let client2 = PmdataClient::new(cfg2).unwrap();
+    Mock::given(method("GET"))
+        .and(path("/polymarket/l2/2026/10/28/btc-15m.zip"))
+        .respond_with(
+            ResponseTemplate::new(206)
+                .insert_header("content-range", "bytes 0-5/100")
+                .set_body_bytes(b"WRONG!".to_vec()),
+        )
+        .mount(&server2)
+        .await;
+    let err_cr = client2
+        .download_day_bundle(
+            PmdataDataset::L2,
+            d,
+            "btc",
+            UpDownInterval::M15,
+            Some(PmdataL2Outcome::Yes),
+            false,
+        )
+        .await
+        .unwrap_err();
+    assert!(err_cr.to_string().contains("Content-Range"));
+    assert_eq!(fs::read(&part_path).unwrap(), b"PARTIAL_BYTES");
+    assert_eq!(client2.load_manifest().unwrap().charged_units, 24);
 }
