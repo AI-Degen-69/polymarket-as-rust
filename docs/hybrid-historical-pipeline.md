@@ -1,5 +1,7 @@
 # Hybrid BTC 5m / 15m Historical Data Pipeline
 
+Per-command reference: [`docs/pmdata/README.md`](pmdata/README.md).
+
 ## 1. Architecture Overview
 
 The pipeline unifies two distinct data sources without erasing clock, precision, or execution-fidelity differences:
