@@ -767,6 +767,7 @@ impl RiskActor {
             }
             LifecycleAction::ContinueQuoting {
                 prohibit_accumulation,
+                block_new_entries,
                 ..
             } => {
                 // 4. Station 7 Dollar-Notional Risk Engine:
@@ -894,6 +895,16 @@ impl RiskActor {
                             ),
                             None,
                         )
+                    } else {
+                        (None, None)
+                    }
+                } else if block_new_entries {
+                    // Entry-time guard: suppress fresh Leg-1 accumulation while allowing existing
+                    // inventory (including dust < 5 sh) to hedge or reduce.
+                    if snapshot.unhedged_up > snapshot.unhedged_dn {
+                        (None, risk_decision.size_dn)
+                    } else if snapshot.unhedged_dn > snapshot.unhedged_up {
+                        (risk_decision.size_up, None)
                     } else {
                         (None, None)
                     }
@@ -2119,5 +2130,163 @@ mod tests {
         assert_eq!(trace_4.action_up, OrderAction::Hold);
         assert_eq!(trace_4.action_dn, OrderAction::Hold);
         assert!(r_dn_dust.try_recv().is_err());
+    }
+
+    #[test]
+    fn test_entry_time_guard_blocks_fresh_entries_but_preserves_hedges_and_flatten() {
+        let make_actor = || {
+            let (harness, priority_rx, routine_rx) = ActorPipelineHarness::new(16, 16);
+            let risk_cfg = RiskConfig {
+                cap_tier1_reducing_to_delta: true,
+                ..Default::default()
+            };
+            let engine = DollarNotionalRiskEngine::new(risk_cfg).unwrap();
+            let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+            let lifecycle = EpochLifecycleController::new(LifecycleConfig {
+                entry_open_delay_secs: 15,
+                entry_cutoff_secs: Some(120),
+                ..Default::default()
+            })
+            .unwrap();
+            let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+            let actor = RiskActor::new(
+                harness.clone(),
+                engine,
+                hysteresis,
+                lifecycle,
+                breakers,
+                FaultInjection::None,
+            );
+            (actor, harness, priority_rx, routine_rx)
+        };
+
+        let make_proposal = |seq: u64, now_ms: u64| QuoteProposal {
+            seq,
+            now_ms,
+            expiry_ms: 300_000,
+            tick_size_micro: MicroUsdc(10_000),
+            quote: QuoteOutput::Active {
+                bid_up: Some(MicroUsdc(480_000)),
+                bid_dn: Some(MicroUsdc(490_000)),
+                pair_cost_micro: Some(MicroUsdc(970_000)),
+                gross_margin_bps: Some(300),
+            },
+            bid_up_raw: 0.48,
+            bid_dn_raw: 0.49,
+            best_bid_up: Some(MicroUsdc(470_000)),
+            best_ask_up: Some(MicroUsdc(500_000)),
+            best_bid_dn: Some(MicroUsdc(480_000)),
+            best_ask_dn: Some(MicroUsdc(510_000)),
+            ..Default::default()
+        };
+
+        // 1. Opening exclusion (0-15s, elapsed=5s -> tau=295s): flat -> both legs blocked.
+        let (mut actor_flat, harness_flat, _p_flat, mut r_flat) = make_actor();
+        harness_flat.publish_registry_snapshot(OrderRegistrySnapshot {
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_flat.publish_quote(make_proposal(1, 5_000));
+        let t_open = actor_flat.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(t_open.phase, EpochPhase::ActiveQuoting);
+        assert_eq!(t_open.action_up, OrderAction::Hold);
+        assert_eq!(t_open.action_dn, OrderAction::Hold);
+        assert!(r_flat.try_recv().is_err());
+
+        // 2. Inside permitted window (elapsed=15s -> tau=285s): flat -> both legs active!
+        harness_flat.publish_quote(make_proposal(2, 15_000));
+        let t_inside = actor_flat.step(2_000_000, 0).unwrap().unwrap();
+        assert!(matches!(t_inside.action_up, OrderAction::SubmitNew { .. }));
+        assert!(matches!(t_inside.action_dn, OrderAction::SubmitNew { .. }));
+        assert!(r_flat.try_recv().is_ok());
+        assert!(r_flat.try_recv().is_ok());
+
+        // 3. Past cutoff (elapsed=125s -> tau=175s): resting Live orders are canceled when flat!
+        actor_flat.hysteresis.set_state(
+            Outcome::Up,
+            crate::station8_hysteresis::OrderSlotState::Live {
+                order_id: "ord_up".to_string(),
+                price: MicroUsdc(480_000),
+                original_size: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+                remaining_size: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            },
+        );
+        actor_flat.hysteresis.set_state(
+            Outcome::Down,
+            crate::station8_hysteresis::OrderSlotState::Live {
+                order_id: "ord_dn".to_string(),
+                price: MicroUsdc(490_000),
+                original_size: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+                remaining_size: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            },
+        );
+        harness_flat.publish_quote(make_proposal(3, 125_000));
+        let t_after = actor_flat.step(3_000_000, 0).unwrap().unwrap();
+        assert!(matches!(t_after.action_up, OrderAction::Cancel { .. }));
+        assert!(matches!(t_after.action_dn, OrderAction::Cancel { .. }));
+
+        // 4. Past cutoff with non-dust inventory (q = +15sh UP): UP suppressed, DN hedge active!
+        let (mut actor_inv, harness_inv, _p_inv, mut r_inv) = make_actor();
+        harness_inv.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(15 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(7_200_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_inv.publish_quote(make_proposal(1, 130_000));
+        let t_hedge = actor_inv.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(t_hedge.action_up, OrderAction::Hold);
+        assert_eq!(
+            t_hedge.action_dn,
+            OrderAction::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(490_000),
+                size: SharesMicro::from_raw(15 * core_types::ONE_SHARE_MICRO),
+            }
+        );
+        assert!(r_inv.try_recv().is_ok());
+
+        // 5. Past cutoff with dust inventory (q = +2sh < 5sh): reducing leg still allowed to repair dust!
+        let (mut actor_dust, harness_dust, _p_dust, _r_dust) = make_actor();
+        harness_dust.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(2 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(960_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_dust.publish_quote(make_proposal(1, 130_000));
+        let t_dust = actor_dust.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(t_dust.action_up, OrderAction::Hold);
+        assert_eq!(
+            t_dust.action_dn,
+            OrderAction::SubmitNew {
+                outcome: Outcome::Down,
+                price: MicroUsdc(490_000),
+                size: SharesMicro::from_raw(5 * core_types::ONE_SHARE_MICRO),
+            }
+        );
+
+        // 6. MandatoryFlatten (tau=25s) still emits FlattenFak even when entry cutoff is 120s.
+        let (mut actor_flat_end, harness_flat_end, mut p_end, _r_end) = make_actor();
+        harness_flat_end.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(15 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(7_200_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+        harness_flat_end.publish_quote(make_proposal(1, 275_000));
+        let t_flatten = actor_flat_end.step(1_000_000, 0).unwrap().unwrap();
+        assert_eq!(t_flatten.phase, EpochPhase::MandatoryFlatten);
+        assert!(matches!(
+            t_flatten.flatten_action,
+            FlattenAction::FlattenFak {
+                outcome: Outcome::Down,
+                ..
+            }
+        ));
+        assert!(matches!(
+            p_end.try_recv().unwrap(),
+            ExecutionCommand::ExecuteFlattenFak { .. }
+        ));
     }
 }

@@ -20,6 +20,8 @@ const MAX_CLOCK_DRIFT_MS: i64 = 60_000;
 const MAX_LEAD_LAG_WINDOW_MS: u64 = 6_000;
 const MIN_LEAD_LAG_WINDOW_MS: u64 = 50;
 const MAX_LEAD_LAG_COOLDOWN_MS: u64 = 10_000;
+const EPOCH_DURATION_SECS: u64 = 300;
+const MAX_ENTRY_OPEN_DELAY_SECS: u64 = 240;
 const MAX_MIN_SPREAD_TICKS: u32 =
     ((ONE_DOLLAR_MICRO / TickPrecision::TenthMill.tick_micro().0) - 1) as u32;
 
@@ -143,7 +145,7 @@ pub struct EngineConfig {
     pub max_cross_tick_loss_micro: Option<u64>,
     /// Optional extreme-probability entry guard in `(0.5, 1.0)` (`Some(0.80)` default; `None` disables entry guard).
     pub max_entry_prob: Option<f64>,
-    /// Optional upper-only favorite entry price cap in `(0.0, 1.0)` (`Some(0.60)` default; `None` disables upper cap, suppresses fresh entries strictly above cap while preserving cheap legs and hedges).
+    /// Optional upper-only favorite entry price cap in `(0.0, 1.0)` (`Some(0.65)` default; `None` disables upper cap, suppresses fresh entries strictly above cap while preserving cheap legs and hedges).
     pub max_entry_price: Option<f64>,
     /// Binance lead-lag fair-probability shift triggering defensive cancel (`0.015` default).
     pub lead_lag_cancel_threshold: f64,
@@ -155,8 +157,14 @@ pub struct EngineConfig {
     pub lead_lag_directional: bool,
     /// Asymmetric reducing-leg skew multiplier in `[0.0, 1.0]` (`1.0` default).
     pub hedge_skew_mult: f64,
-    /// Cap Tier-1 reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (`false` default).
+    /// Cap Tier-1 reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (`true` default).
     pub cap_tier1_reducing_to_delta: bool,
+    /// Optional opposing-ask price trigger in `(0.0, 1.0)` unlocking Tier-1/Tier-2 passive 1:1 deficit cross-tick override (`None` = off default).
+    pub tier1_hedge_trigger_price: Option<f64>,
+    /// Seconds after epoch open during which fresh Leg-1 entries are skipped (`15` default; `0` = disabled).
+    pub entry_open_delay_secs: u64,
+    /// Optional elapsed seconds after epoch open at which fresh Leg-1 entries stop (`Some(120)` default; `None` = disabled).
+    pub entry_cutoff_secs: Option<u64>,
     /// Maximum permitted local-to-exchange clock drift in milliseconds (`1000ms` default).
     pub clock_drift_max_ms: i64,
     /// Non-serializable live credentials (excluded from serde/JSONL).
@@ -197,6 +205,9 @@ struct RawEngineConfig {
     lead_lag_directional: bool,
     hedge_skew_mult: f64,
     cap_tier1_reducing_to_delta: bool,
+    tier1_hedge_trigger_price: Option<f64>,
+    entry_open_delay_secs: u64,
+    entry_cutoff_secs: Option<u64>,
     clock_drift_max_ms: i64,
 }
 
@@ -234,6 +245,9 @@ impl Default for RawEngineConfig {
             lead_lag_directional: d.lead_lag_directional,
             hedge_skew_mult: d.hedge_skew_mult,
             cap_tier1_reducing_to_delta: d.cap_tier1_reducing_to_delta,
+            tier1_hedge_trigger_price: d.tier1_hedge_trigger_price,
+            entry_open_delay_secs: d.entry_open_delay_secs,
+            entry_cutoff_secs: d.entry_cutoff_secs,
             clock_drift_max_ms: d.clock_drift_max_ms,
         }
     }
@@ -274,6 +288,9 @@ impl TryFrom<RawEngineConfig> for EngineConfig {
             lead_lag_directional: raw.lead_lag_directional,
             hedge_skew_mult: raw.hedge_skew_mult,
             cap_tier1_reducing_to_delta: raw.cap_tier1_reducing_to_delta,
+            tier1_hedge_trigger_price: raw.tier1_hedge_trigger_price,
+            entry_open_delay_secs: raw.entry_open_delay_secs,
+            entry_cutoff_secs: raw.entry_cutoff_secs,
             clock_drift_max_ms: raw.clock_drift_max_ms,
             credentials: LiveCredentials::default(),
         };
@@ -321,6 +338,9 @@ impl fmt::Debug for EngineConfig {
                 "cap_tier1_reducing_to_delta",
                 &self.cap_tier1_reducing_to_delta,
             )
+            .field("tier1_hedge_trigger_price", &self.tier1_hedge_trigger_price)
+            .field("entry_open_delay_secs", &self.entry_open_delay_secs)
+            .field("entry_cutoff_secs", &self.entry_cutoff_secs)
             .field("clock_drift_max_ms", &self.clock_drift_max_ms)
             .field("credentials", &self.credentials)
             .finish()
@@ -379,12 +399,37 @@ struct EmbeddedEngineDefaults {
     lead_lag_directional: bool,
     hedge_skew_mult: f64,
     cap_tier1_reducing_to_delta: bool,
+    tier1_hedge_trigger_price: Option<f64>,
+    entry_open_delay_secs: u64,
+    entry_cutoff_secs: Option<u64>,
     clock_drift_max_ms: i64,
+}
+
+/// Provenance metadata recorded in repository root `DEFAULTS.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DefaultsProvenance {
+    /// Source sweep folder relative to repository root.
+    pub source_sweep: String,
+    /// Sweep run identifier.
+    pub run_id: String,
+    /// Run date window (UTC).
+    pub date: String,
+    /// Dataset capture and window count summary.
+    pub dataset: String,
+    /// Selected configuration and promoted override parameters.
+    pub selected_config: String,
+    /// Supporting selection and roadmap report path.
+    pub report: String,
+    /// Validation status tag (e.g., provisional research baseline).
+    pub status: String,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct EmbeddedDefaultsFile {
+    #[serde(default)]
+    provenance: Option<DefaultsProvenance>,
     engine: EmbeddedEngineDefaults,
     simulation: SimulationDefaults,
 }
@@ -393,6 +438,7 @@ struct EmbeddedDefaultsFile {
 struct DefaultBundle {
     engine: EngineConfig,
     simulation: SimulationDefaults,
+    provenance: Option<DefaultsProvenance>,
 }
 
 impl DefaultBundle {
@@ -403,7 +449,11 @@ impl DefaultBundle {
             maker_rebate_floor_e6: 0,
             maker_rebate_tier1_e6: 30_000,
         };
-        Self { engine, simulation }
+        Self {
+            engine,
+            simulation,
+            provenance: None,
+        }
     }
 }
 
@@ -448,6 +498,9 @@ fn parse_defaults_bundle_from_str(json: &str) -> Result<DefaultBundle, ConfigErr
         lead_lag_directional: e.lead_lag_directional,
         hedge_skew_mult: e.hedge_skew_mult,
         cap_tier1_reducing_to_delta: e.cap_tier1_reducing_to_delta,
+        tier1_hedge_trigger_price: e.tier1_hedge_trigger_price,
+        entry_open_delay_secs: e.entry_open_delay_secs,
+        entry_cutoff_secs: e.entry_cutoff_secs,
         clock_drift_max_ms: e.clock_drift_max_ms,
         credentials: LiveCredentials::default(),
     };
@@ -457,6 +510,7 @@ fn parse_defaults_bundle_from_str(json: &str) -> Result<DefaultBundle, ConfigErr
     Ok(DefaultBundle {
         engine,
         simulation: parsed.simulation,
+        provenance: parsed.provenance,
     })
 }
 
@@ -477,6 +531,12 @@ fn default_bundle() -> &'static DefaultBundle {
 #[must_use]
 pub fn default_simulation_settings() -> SimulationDefaults {
     default_bundle().simulation
+}
+
+/// Returns optional provenance metadata loaded from repository root `DEFAULTS.json`.
+#[must_use]
+pub fn default_provenance() -> Option<&'static DefaultsProvenance> {
+    default_bundle().provenance.as_ref()
 }
 
 impl EngineConfig {
@@ -505,13 +565,16 @@ impl EngineConfig {
             enforce_fee_floor: false,
             max_cross_tick_loss_micro: Some(80_000),
             max_entry_prob: Some(0.80),
-            max_entry_price: Some(0.60),
+            max_entry_price: Some(0.65),
             lead_lag_cancel_threshold: 0.015,
             lead_lag_window_ms: 1_000,
             lead_lag_cooldown_ms: 1_000,
             lead_lag_directional: true,
             hedge_skew_mult: 1.0,
-            cap_tier1_reducing_to_delta: false,
+            cap_tier1_reducing_to_delta: true,
+            tier1_hedge_trigger_price: None,
+            entry_open_delay_secs: 15,
+            entry_cutoff_secs: Some(120),
             clock_drift_max_ms: 1_000,
             credentials: LiveCredentials::default(),
         }
@@ -676,6 +739,13 @@ where
     if let Some(v) = non_empty(lookup, "CAP_TIER1_REDUCING_TO_DELTA")? {
         cfg.cap_tier1_reducing_to_delta = parse_bool("CAP_TIER1_REDUCING_TO_DELTA", &v)?;
     }
+    if let Some(v) = non_empty(lookup, "TIER1_HEDGE_TRIGGER_PRICE")? {
+        if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            cfg.tier1_hedge_trigger_price = None;
+        } else {
+            cfg.tier1_hedge_trigger_price = Some(parse_f64("TIER1_HEDGE_TRIGGER_PRICE", &v)?);
+        }
+    }
     Ok(())
 }
 
@@ -750,6 +820,28 @@ where
     }
     if let Some(v) = non_empty(lookup, "LEAD_LAG_DIRECTIONAL")? {
         cfg.lead_lag_directional = parse_bool("LEAD_LAG_DIRECTIONAL", &v)?;
+    }
+    if let Some(v) = non_empty(lookup, "ENTRY_OPEN_DELAY_SECS")? {
+        cfg.entry_open_delay_secs = v.parse::<u64>().map_err(|_| {
+            invalid_val(
+                "ENTRY_OPEN_DELAY_SECS",
+                v,
+                "expected non-negative integer seconds",
+            )
+        })?;
+    }
+    if let Some(v) = non_empty(lookup, "ENTRY_CUTOFF_SECS")? {
+        if v.eq_ignore_ascii_case("off") || v.eq_ignore_ascii_case("none") {
+            cfg.entry_cutoff_secs = None;
+        } else {
+            cfg.entry_cutoff_secs = Some(v.parse::<u64>().map_err(|_| {
+                invalid_val(
+                    "ENTRY_CUTOFF_SECS",
+                    v,
+                    "expected positive integer seconds or 'off'",
+                )
+            })?);
+        }
     }
     if let Some(v) = non_empty(lookup, "CLOCK_DRIFT_MAX_MS")? {
         cfg.clock_drift_max_ms = v
@@ -953,6 +1045,37 @@ fn validate_spread_and_timing(cfg: &EngineConfig) -> Result<(), ConfigError> {
             "hedge_skew_mult must be finite in [0.0, 1.0], got {}",
             cfg.hedge_skew_mult
         )));
+    }
+    if let Some(p_trig) = cfg.tier1_hedge_trigger_price {
+        if !p_trig.is_finite() || p_trig <= 0.0 || p_trig >= 1.0 {
+            return Err(invariant(format!(
+                "tier1_hedge_trigger_price must be finite in (0.0, 1.0), got {p_trig}"
+            )));
+        }
+        if !cfg.cap_tier1_reducing_to_delta {
+            return Err(invariant(
+                "tier1_hedge_trigger_price requires cap_tier1_reducing_to_delta=true to prevent reducing-leg overshoot",
+            ));
+        }
+    }
+    if cfg.entry_open_delay_secs > MAX_ENTRY_OPEN_DELAY_SECS {
+        return Err(invariant(format!(
+            "entry_open_delay_secs ({}) must be <= {MAX_ENTRY_OPEN_DELAY_SECS}",
+            cfg.entry_open_delay_secs
+        )));
+    }
+    if let Some(cutoff) = cfg.entry_cutoff_secs {
+        if cutoff == 0 || cutoff > EPOCH_DURATION_SECS {
+            return Err(invariant(format!(
+                "entry_cutoff_secs ({cutoff}) must be in 1..={EPOCH_DURATION_SECS}"
+            )));
+        }
+        if cfg.entry_open_delay_secs >= cutoff {
+            return Err(invariant(format!(
+                "entry_open_delay_secs ({}) must be < entry_cutoff_secs ({cutoff})",
+                cfg.entry_open_delay_secs
+            )));
+        }
     }
     if cfg.clock_drift_max_ms <= 0 || cfg.clock_drift_max_ms > MAX_CLOCK_DRIFT_MS {
         return Err(invariant(format!(
@@ -1175,7 +1298,7 @@ mod tests {
             .map(|(key, value)| (key.trim(), value.trim()))
             .collect();
 
-        const TUNING_KEYS: [&str; 22] = [
+        const TUNING_KEYS: [&str; 25] = [
             "EXECUTION_MODE",
             "DRY_RUN",
             "ENGINE_GAMMA",
@@ -1197,6 +1320,9 @@ mod tests {
             "LEAD_LAG_DIRECTIONAL",
             "HEDGE_SKEW_MULT",
             "CAP_TIER1_REDUCING_TO_DELTA",
+            "TIER1_HEDGE_TRIGGER_PRICE",
+            "ENTRY_OPEN_DELAY_SECS",
+            "ENTRY_CUTOFF_SECS",
             "CLOCK_DRIFT_MAX_MS",
         ];
         for key in TUNING_KEYS {
@@ -1241,6 +1367,9 @@ mod tests {
             lead_lag_directional,
             hedge_skew_mult,
             cap_tier1_reducing_to_delta,
+            tier1_hedge_trigger_price,
+            entry_open_delay_secs,
+            entry_cutoff_secs,
             clock_drift_max_ms,
         );
     }
@@ -1264,13 +1393,55 @@ mod tests {
         assert_eq!(cfg.gamma, 0.12);
         assert_eq!(cfg.max_combined_bid_micro, MicroUsdc(980_000));
         assert_eq!(cfg.max_entry_prob, Some(0.80));
-        assert_eq!(cfg.max_entry_price, Some(0.60));
+        assert_eq!(cfg.max_entry_price, Some(0.65));
+        assert_eq!(
+            cfg.cap_tier1_reducing_to_delta,
+            bundle.engine.cap_tier1_reducing_to_delta
+        );
+        assert!(cfg.cap_tier1_reducing_to_delta);
+        assert_eq!(
+            cfg.tier1_hedge_trigger_price,
+            bundle.engine.tier1_hedge_trigger_price
+        );
+        assert_eq!(cfg.tier1_hedge_trigger_price, None);
+        assert_eq!(
+            cfg.entry_open_delay_secs,
+            bundle.engine.entry_open_delay_secs
+        );
+        assert_eq!(cfg.entry_open_delay_secs, 15);
+        assert_eq!(cfg.entry_cutoff_secs, bundle.engine.entry_cutoff_secs);
+        assert_eq!(cfg.entry_cutoff_secs, Some(120));
+
+        let fallback = EngineConfig::hardcoded_fallback();
+        assert_eq!(fallback.max_entry_price, cfg.max_entry_price);
+        assert_eq!(
+            fallback.cap_tier1_reducing_to_delta,
+            cfg.cap_tier1_reducing_to_delta
+        );
+        assert_eq!(
+            fallback.tier1_hedge_trigger_price,
+            cfg.tier1_hedge_trigger_price
+        );
+        assert_eq!(fallback.entry_open_delay_secs, cfg.entry_open_delay_secs);
+        assert_eq!(fallback.entry_cutoff_secs, cfg.entry_cutoff_secs);
         assert_eq!(
             default_simulation_settings().queue_decay,
             DefaultQueueDecay::Conservative
         );
         assert_eq!(default_simulation_settings().maker_rebate_floor_e6, 0);
         assert_eq!(default_simulation_settings().maker_rebate_tier1_e6, 30_000);
+
+        let prov = default_provenance().expect("DEFAULTS.json provenance must be populated");
+        assert_eq!(
+            prov.source_sweep,
+            "logs/sweeps/25-11_21-55-50Z_boundary-9runs_20caps-226w"
+        );
+        assert_eq!(prov.run_id, "boundary-9runs_20caps-226w");
+        assert_eq!(
+            prov.selected_config,
+            "Config #6/9 (max_entry_price=0.65, entry_cutoff_secs=120, tier1_hedge_trigger_price=off)"
+        );
+        assert_eq!(prov.report, "docs/boundary-sweep-selection-report.md");
     }
 
     #[test]

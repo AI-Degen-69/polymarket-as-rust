@@ -405,3 +405,64 @@ fn test_vector_8_taker_flatten_with_merge_returns_merge_event() {
     assert_eq!(ledger.filled_up, SharesMicro::ZERO);
     assert_eq!(ledger.filled_dn, SharesMicro::ZERO);
 }
+
+#[test]
+fn test_vector_9_volume_in_and_signed_merge_gain_tracking() {
+    let mut ledger = PaperLedger::new(FeeSchedule::btc_5m_default());
+
+    // 1. Passive buy 20 UP @ $0.45 ($9.00 notional) + 20 DN @ $0.50 ($10.00 notional) -> +$1.00 merge gain
+    let fill_up = SimFill {
+        sim_id: 1,
+        outcome: Outcome::Up,
+        side: OrderSide::Buy,
+        price: MicroUsdc(450_000),
+        filled_shares: SharesMicro(20_000_000),
+        fill_ts_ms: 100,
+        is_maker: true,
+    };
+    assert!(ledger.record_fill(&fill_up).unwrap().is_none());
+
+    let fill_dn = SimFill {
+        sim_id: 2,
+        outcome: Outcome::Down,
+        side: OrderSide::Buy,
+        price: MicroUsdc(500_000),
+        filled_shares: SharesMicro(20_000_000),
+        fill_ts_ms: 200,
+        is_maker: true,
+    };
+    let merge1 = ledger.record_fill(&fill_dn).unwrap().unwrap();
+    assert_eq!(merge1.realized_gain_micro, 1_000_000);
+
+    // 2. Passive buy 10 DN @ $0.40 ($4.00) + aggressive buy 10 UP @ $0.75 ($7.50) -> -$1.50 merge loss
+    let fill_dn_2 = SimFill {
+        sim_id: 3,
+        outcome: Outcome::Down,
+        side: OrderSide::Buy,
+        price: MicroUsdc(400_000),
+        filled_shares: SharesMicro(10_000_000),
+        fill_ts_ms: 300,
+        is_maker: true,
+    };
+    assert!(ledger.record_fill(&fill_dn_2).unwrap().is_none());
+
+    let (_, merge2_opt) = ledger
+        .record_taker_flatten_with_merge(
+            Outcome::Up,
+            OrderSide::Buy,
+            MicroUsdc(750_000),
+            SharesMicro(10_000_000),
+        )
+        .unwrap();
+    let merge2 = merge2_opt.unwrap();
+    assert_eq!(merge2.realized_gain_micro, -1_500_000);
+
+    // 3. Total shares bought = 20 + 20 + 10 + 10 = 60 shares
+    assert_eq!(ledger.total_shares_bought_micro, 60_000_000);
+    // Total volume_in = $9.00 + $10.00 + $4.00 + $7.50 = $30.50
+    assert_eq!(ledger.volume_in_micro, 30_500_000);
+    // Merge gains: +$1.00 positive, $1.50 negative loss magnitude, -$0.50 net
+    assert_eq!(ledger.positive_merge_gain_micro, 1_000_000);
+    assert_eq!(ledger.negative_merge_loss_micro, 1_500_000);
+    assert_eq!(ledger.total_merge_gain_micro, -500_000);
+}

@@ -1367,4 +1367,53 @@ mod tests {
             assert!(DualBidPricer::new(bad_cfg).is_err());
         }
     }
+
+    #[test]
+    fn cross_tick_override_unblocks_only_reducing_leg_and_preserves_entry_guard_on_accumulating_leg()
+     {
+        let clock = MonotonicClock::start();
+        let mut cfg = PricerConfig::try_default().unwrap();
+        cfg.max_cross_tick_loss_micro = Some(80_000);
+        cfg.max_entry_price = Some(0.60);
+        let pricer = DualBidPricer::new(cfg).unwrap();
+
+        // Long DOWN (q = -20sh) @ $0.48 -> cross-tick cap on UP = $0.98 + $0.08 - $0.48 = $0.58.
+        // Live book moved UP to $0.70/$0.71, DN to $0.29/$0.30.
+        let bounds = PostOnlyBounds {
+            best_bid_up: Some(MicroUsdc(690_000)),
+            best_ask_up: Some(MicroUsdc(710_000)),
+            best_bid_dn: Some(MicroUsdc(290_000)),
+            best_ask_dn: Some(MicroUsdc(300_000)),
+            active_bid_up: None,
+            active_bid_dn: None,
+        };
+        let mut inp = make_input(-20, 10_000, bounds);
+        inp.s_i = 0.70;
+        inp.v_rem = 0.0;
+        inp.cost_context.avg_cost_dn = Some(MicroUsdc(480_000));
+
+        // Without override: UP reducing bid is clamped to $0.58!
+        inp.cost_context.allow_cross_tick_override = false;
+        let blocked = pricer.price(&inp, &clock).unwrap();
+        assert!(blocked.cross_tick_clamped_up);
+        assert!(!blocked.cross_tick_clamped_dn);
+        if let QuoteOutput::Active { bid_up, .. } = blocked.quote {
+            assert_eq!(bid_up, Some(MicroUsdc(580_000)));
+        } else {
+            panic!("expected active quote");
+        }
+
+        // With override: UP reducing bid unblocks above $0.58 (to $0.68), while accumulating DN
+        // leg stays strictly constrained by pair cost / entry guard (never lifted above $0.60).
+        inp.cost_context.allow_cross_tick_override = true;
+        let unblocked = pricer.price(&inp, &clock).unwrap();
+        assert!(!unblocked.cross_tick_clamped_up);
+        assert!(!unblocked.cross_tick_clamped_dn);
+        if let QuoteOutput::Active { bid_up, bid_dn, .. } = unblocked.quote {
+            assert!(bid_up.is_some_and(|p| p.0 > 580_000));
+            assert!(bid_dn.is_none_or(|p| p.0 <= 600_000));
+        } else {
+            panic!("expected active quote");
+        }
+    }
 }

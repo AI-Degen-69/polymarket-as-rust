@@ -56,6 +56,21 @@ pub struct PaperLedger {
     pub total_pairs_merged: SharesMicro,
     /// Total fill events processed.
     pub total_fills_count: u64,
+    /// Cumulative outcome shares purchased across passive and aggressive buy fills (micro-shares).
+    #[serde(default)]
+    pub total_shares_bought_micro: u64,
+    /// Cumulative USDC notional deployed across passive and aggressive buy fills (micro-USDC).
+    #[serde(default)]
+    pub volume_in_micro: u64,
+    /// Cumulative net realized PnL from atomic pair merges in micro-USDC.
+    #[serde(default)]
+    pub total_merge_gain_micro: i64,
+    /// Cumulative positive realized PnL from profitable pair merges in micro-USDC.
+    #[serde(default)]
+    pub positive_merge_gain_micro: u64,
+    /// Cumulative absolute loss from negative cross-tick pair merges in micro-USDC.
+    #[serde(default)]
+    pub negative_merge_loss_micro: u64,
     /// Active market fee schedule.
     pub fee_schedule: FeeSchedule,
     /// Maker rebates locked in before prior fee-schedule transitions.
@@ -84,6 +99,11 @@ impl PaperLedger {
             estimated_rebate_micro: 0,
             total_pairs_merged: SharesMicro::ZERO,
             total_fills_count: 0,
+            total_shares_bought_micro: 0,
+            volume_in_micro: 0,
+            total_merge_gain_micro: 0,
+            positive_merge_gain_micro: 0,
+            negative_merge_loss_micro: 0,
             active_fee_rate_e6: fee_schedule.fee_rate_e6,
             fee_schedule,
             carried_rebate_micro: 0,
@@ -121,6 +141,16 @@ impl PaperLedger {
         // Fill cost = filled_shares * price / 10^6
         let cost_micro =
             ((fill.filled_shares.0 as u128 * fill.price.0 as u128) / (MICRO_SCALE as u128)) as u64;
+        if fill.side == OrderSide::Buy {
+            self.total_shares_bought_micro = self
+                .total_shares_bought_micro
+                .checked_add(fill.filled_shares.0)
+                .ok_or(PaperSimError::ArithmeticOverflow)?;
+            self.volume_in_micro = self
+                .volume_in_micro
+                .checked_add(cost_micro)
+                .ok_or(PaperSimError::ArithmeticOverflow)?;
+        }
 
         match fill.outcome {
             Outcome::Up => {
@@ -190,6 +220,21 @@ impl PaperLedger {
             .realized_pnl_micro
             .checked_add(realized_gain_micro)
             .ok_or(PaperSimError::ArithmeticOverflow)?;
+        self.total_merge_gain_micro = self
+            .total_merge_gain_micro
+            .checked_add(realized_gain_micro)
+            .ok_or(PaperSimError::ArithmeticOverflow)?;
+        if realized_gain_micro >= 0 {
+            self.positive_merge_gain_micro = self
+                .positive_merge_gain_micro
+                .checked_add(realized_gain_micro as u64)
+                .ok_or(PaperSimError::ArithmeticOverflow)?;
+        } else {
+            self.negative_merge_loss_micro = self
+                .negative_merge_loss_micro
+                .checked_add(realized_gain_micro.unsigned_abs())
+                .ok_or(PaperSimError::ArithmeticOverflow)?;
+        }
 
         self.total_pairs_merged.0 = self
             .total_pairs_merged
@@ -311,6 +356,14 @@ impl PaperLedger {
             }
             OrderSide::Buy => {
                 // Buying shares aggressively
+                self.total_shares_bought_micro = self
+                    .total_shares_bought_micro
+                    .checked_add(shares.0)
+                    .ok_or(PaperSimError::ArithmeticOverflow)?;
+                self.volume_in_micro = self
+                    .volume_in_micro
+                    .checked_add(notional)
+                    .ok_or(PaperSimError::ArithmeticOverflow)?;
                 match outcome {
                     Outcome::Up => {
                         self.filled_up.0 = self

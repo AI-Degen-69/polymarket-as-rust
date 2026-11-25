@@ -28,8 +28,8 @@ pub mod telemetry;
 
 pub use clock::{ClockOffsetEstimator, HighResTimerGuard, MonotonicClock};
 pub use config::{
-    DefaultQueueDecay, EngineConfig, LiveCredentials, SimulationDefaults,
-    default_simulation_settings,
+    DefaultQueueDecay, DefaultsProvenance, EngineConfig, LiveCredentials, SimulationDefaults,
+    default_provenance, default_simulation_settings,
 };
 pub use error::{ClockError, ConfigError, MathError, ParseDecimalError, TelemetryError, WireError};
 pub use market::{
@@ -241,9 +241,12 @@ mod tests {
         assert_eq!(cfg.gamma, 0.12);
         assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
         assert_eq!(cfg.max_entry_prob, Some(0.80));
-        assert_eq!(cfg.max_entry_price, Some(0.60));
+        assert_eq!(cfg.max_entry_price, Some(0.65));
         assert_eq!(cfg.hedge_skew_mult, 1.0);
-        assert!(!cfg.cap_tier1_reducing_to_delta);
+        assert!(cfg.cap_tier1_reducing_to_delta);
+        assert_eq!(cfg.tier1_hedge_trigger_price, None);
+        assert_eq!(cfg.entry_open_delay_secs, 15);
+        assert_eq!(cfg.entry_cutoff_secs, Some(120));
 
         let json = serde_json::to_string(&cfg).unwrap();
         let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();
@@ -739,8 +742,10 @@ mod tests {
 
         let mut false_map = HashMap::new();
         false_map.insert("CAP_TIER1_REDUCING_TO_DELTA", "false");
+        false_map.insert("TIER1_HEDGE_TRIGGER_PRICE", "off");
         let false_cfg = EngineConfig::from_lookup(lookup_map(&false_map)).unwrap();
         assert!(!false_cfg.cap_tier1_reducing_to_delta);
+        assert_eq!(false_cfg.tier1_hedge_trigger_price, None);
 
         for bad_mult in ["-0.01", "1.01", "NaN", "inf", "-inf"] {
             let mut m = HashMap::new();
@@ -750,5 +755,68 @@ mod tests {
                 "expected error for HEDGE_SKEW_MULT={bad_mult}"
             );
         }
+    }
+
+    #[test]
+    fn config_validates_tier1_hedge_trigger_and_entry_time_guards() {
+        let mut valid = HashMap::new();
+        valid.insert("CAP_TIER1_REDUCING_TO_DELTA", "true");
+        valid.insert("TIER1_HEDGE_TRIGGER_PRICE", "0.65");
+        valid.insert("ENTRY_OPEN_DELAY_SECS", "15");
+        valid.insert("ENTRY_CUTOFF_SECS", "120");
+        let cfg = EngineConfig::from_lookup(lookup_map(&valid)).unwrap();
+        assert_eq!(cfg.tier1_hedge_trigger_price, Some(0.65));
+        assert_eq!(cfg.entry_open_delay_secs, 15);
+        assert_eq!(cfg.entry_cutoff_secs, Some(120));
+
+        let json = serde_json::to_string(&cfg).unwrap();
+        let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.tier1_hedge_trigger_price, Some(0.65));
+        assert_eq!(roundtrip.entry_open_delay_secs, 15);
+        assert_eq!(roundtrip.entry_cutoff_secs, Some(120));
+
+        let mut off_map = HashMap::new();
+        off_map.insert("TIER1_HEDGE_TRIGGER_PRICE", "off");
+        off_map.insert("ENTRY_OPEN_DELAY_SECS", "0");
+        off_map.insert("ENTRY_CUTOFF_SECS", "NONE");
+        let off_cfg = EngineConfig::from_lookup(lookup_map(&off_map)).unwrap();
+        assert_eq!(off_cfg.tier1_hedge_trigger_price, None);
+        assert_eq!(off_cfg.entry_open_delay_secs, 0);
+        assert_eq!(off_cfg.entry_cutoff_secs, None);
+
+        // Trigger requires cap_tier1_reducing_to_delta = true.
+        let mut un_capped = HashMap::new();
+        un_capped.insert("CAP_TIER1_REDUCING_TO_DELTA", "false");
+        un_capped.insert("TIER1_HEDGE_TRIGGER_PRICE", "0.65");
+        assert!(EngineConfig::from_lookup(lookup_map(&un_capped)).is_err());
+
+        for bad_trig in ["0.0", "-0.1", "1.0", "1.2", "NaN", "inf"] {
+            let mut m = HashMap::new();
+            m.insert("CAP_TIER1_REDUCING_TO_DELTA", "true");
+            m.insert("TIER1_HEDGE_TRIGGER_PRICE", bad_trig);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&m)).is_err(),
+                "expected error for TIER1_HEDGE_TRIGGER_PRICE={bad_trig}"
+            );
+        }
+
+        let mut bad_delay = HashMap::new();
+        bad_delay.insert("ENTRY_OPEN_DELAY_SECS", "241");
+        assert!(EngineConfig::from_lookup(lookup_map(&bad_delay)).is_err());
+
+        for bad_cutoff in ["0", "301"] {
+            let mut m = HashMap::new();
+            m.insert("ENTRY_CUTOFF_SECS", bad_cutoff);
+            assert!(
+                EngineConfig::from_lookup(lookup_map(&m)).is_err(),
+                "expected error for ENTRY_CUTOFF_SECS={bad_cutoff}"
+            );
+        }
+
+        // Open delay must be strictly less than cutoff.
+        let mut inverted = HashMap::new();
+        inverted.insert("ENTRY_OPEN_DELAY_SECS", "120");
+        inverted.insert("ENTRY_CUTOFF_SECS", "120");
+        assert!(EngineConfig::from_lookup(lookup_map(&inverted)).is_err());
     }
 }

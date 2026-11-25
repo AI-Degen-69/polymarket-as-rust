@@ -1,4 +1,4 @@
-use core_types::{MicroUsdc, ONE_SHARE_MICRO, Outcome, SharesMicro};
+use core_types::{MicroUsdc, ONE_SHARE_MICRO, Outcome, SharesMicro, SignedSharesMicro};
 use serde::{Deserialize, Serialize};
 
 use crate::error::RiskLifecycleError;
@@ -27,6 +27,100 @@ pub const fn allows_cross_tick_override(tier: RiskTier, phase: Option<EpochPhase
             phase,
             Some(EpochPhase::PreExpiryLockout | EpochPhase::MandatoryFlatten)
         )
+}
+
+/// Stateful latch for early Tier-1/Tier-2 passive 1:1 deficit cross-tick override (B+).
+///
+/// Unlocks cross-tick pair-cost capping when:
+/// - `trigger_price_micro` is configured (`Some(p)`),
+/// - `cap_tier1_reducing_to_delta` is enabled (preventing reducing-leg overshoot),
+/// - active risk tier is `Tier1Normal` or `Tier2ModerateSkew`,
+/// - `|q| >= min_order_size_micro`, and
+/// - the reducing (opposing) leg's `best_ask >= trigger_price_micro`.
+///
+/// Once triggered, the override stays latched for the active `heavy_leg` until
+/// `|q| < min_order_size_micro`, the heavy leg flips, or `reset()` is called on epoch rollover.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DeficitHedgeOverrideLatch {
+    latched_heavy_leg: Option<Outcome>,
+}
+
+impl DeficitHedgeOverrideLatch {
+    /// Creates an unlatched deficit hedge override tracker.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            latched_heavy_leg: None,
+        }
+    }
+
+    /// Resets the latch (must be called on epoch rollover).
+    pub fn reset(&mut self) {
+        self.latched_heavy_leg = None;
+    }
+
+    /// Returns `true` when the override is currently latched.
+    #[must_use]
+    pub const fn is_latched(&self) -> bool {
+        self.latched_heavy_leg.is_some()
+    }
+
+    /// Returns the heavy leg for which the override is currently latched, if any.
+    #[must_use]
+    pub const fn latched_heavy_leg(&self) -> Option<Outcome> {
+        self.latched_heavy_leg
+    }
+
+    /// Evaluates whether the B+ deficit cross-tick override is active on this tick.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate(
+        &mut self,
+        tier: RiskTier,
+        inventory_q: SignedSharesMicro,
+        min_order_size_micro: SharesMicro,
+        best_ask_up: Option<MicroUsdc>,
+        best_ask_dn: Option<MicroUsdc>,
+        trigger_price_micro: Option<MicroUsdc>,
+        cap_tier1_reducing_to_delta: bool,
+    ) -> bool {
+        let Some(trigger) = trigger_price_micro else {
+            self.latched_heavy_leg = None;
+            return false;
+        };
+        if !cap_tier1_reducing_to_delta {
+            self.latched_heavy_leg = None;
+            return false;
+        }
+        let abs_q = inventory_q.0.unsigned_abs();
+        if abs_q == 0 || abs_q < min_order_size_micro.as_u64() {
+            self.latched_heavy_leg = None;
+            return false;
+        }
+        let heavy = if inventory_q.0 > 0 {
+            Outcome::Up
+        } else {
+            Outcome::Down
+        };
+        if self.latched_heavy_leg != Some(heavy) {
+            self.latched_heavy_leg = None;
+        }
+        if !matches!(tier, RiskTier::Tier1Normal | RiskTier::Tier2ModerateSkew) {
+            self.latched_heavy_leg = None;
+            return false;
+        }
+        if self.latched_heavy_leg == Some(heavy) {
+            return true;
+        }
+        let opposing_ask = match heavy {
+            Outcome::Up => best_ask_dn,
+            Outcome::Down => best_ask_up,
+        };
+        if opposing_ask.is_some_and(|ask| ask >= trigger) {
+            self.latched_heavy_leg = Some(heavy);
+            return true;
+        }
+        false
+    }
 }
 
 /// Point-in-time snapshot of the execution order registry and position ledger.
@@ -777,5 +871,141 @@ mod tests {
             d_neg.size_up,
             Some(SharesMicro::from_raw(15 * ONE_SHARE_MICRO))
         );
+    }
+
+    #[test]
+    fn deficit_hedge_override_latch_respects_thresholds_tiers_and_resets() {
+        let min_sh = SharesMicro::from_raw(5 * ONE_SHARE_MICRO);
+        let trig_65 = Some(MicroUsdc(650_000));
+        let mut latch = DeficitHedgeOverrideLatch::new();
+
+        // 1. Disabled when trigger is None or cap_tier1_reducing_to_delta is false.
+        assert!(!latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(20 * ONE_SHARE_MICRO as i64),
+            min_sh,
+            Some(MicroUsdc(300_000)),
+            Some(MicroUsdc(700_000)),
+            None,
+            true,
+        ));
+        assert!(!latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(20 * ONE_SHARE_MICRO as i64),
+            min_sh,
+            Some(MicroUsdc(300_000)),
+            Some(MicroUsdc(700_000)),
+            trig_65,
+            false,
+        ));
+        assert!(!latch.is_latched());
+
+        // 2. Inventory threshold around abs(q) = 5 sh: 4.99 sh does not qualify, 5.00 sh qualifies.
+        assert!(!latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(4_990_000),
+            min_sh,
+            Some(MicroUsdc(300_000)),
+            Some(MicroUsdc(700_000)),
+            trig_65,
+            true,
+        ));
+        assert!(!latch.is_latched());
+
+        // 3. Opposing ask strictly below trigger ($0.64 < $0.65) does not qualify.
+        assert!(!latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
+            min_sh,
+            Some(MicroUsdc(360_000)),
+            Some(MicroUsdc(640_000)),
+            trig_65,
+            true,
+        ));
+        assert!(!latch.is_latched());
+
+        // 4. Opposing ask at trigger ($0.65 >= $0.65) latches for Tier 1 long UP.
+        assert!(latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
+            min_sh,
+            Some(MicroUsdc(350_000)),
+            Some(MicroUsdc(650_000)),
+            trig_65,
+            true,
+        ));
+        assert_eq!(latch.latched_heavy_leg(), Some(Outcome::Up));
+
+        // 5. Latch persists when opposing ask dips back below trigger ($0.58) while abs(q) >= 5 sh.
+        assert!(latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(5 * ONE_SHARE_MICRO as i64),
+            min_sh,
+            Some(MicroUsdc(420_000)),
+            Some(MicroUsdc(580_000)),
+            trig_65,
+            true,
+        ));
+        assert!(latch.is_latched());
+
+        // 6. Also works across Tier1 -> Tier2 without losing latch.
+        assert!(latch.evaluate(
+            RiskTier::Tier2ModerateSkew,
+            SignedSharesMicro(15 * ONE_SHARE_MICRO as i64),
+            min_sh,
+            Some(MicroUsdc(450_000)),
+            Some(MicroUsdc(550_000)),
+            trig_65,
+            true,
+        ));
+
+        // 7. Sign flip (long UP -> long DOWN) clears the old latch and re-checks UP ask.
+        assert!(!latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(-(10 * ONE_SHARE_MICRO as i64)),
+            min_sh,
+            Some(MicroUsdc(640_000)),
+            Some(MicroUsdc(360_000)),
+            trig_65,
+            true,
+        ));
+        assert!(!latch.is_latched());
+
+        // 8. Long DOWN checks best_ask_up against trigger ($0.70 >= $0.65).
+        assert!(latch.evaluate(
+            RiskTier::Tier2ModerateSkew,
+            SignedSharesMicro(-(10 * ONE_SHARE_MICRO as i64)),
+            min_sh,
+            Some(MicroUsdc(700_000)),
+            Some(MicroUsdc(300_000)),
+            trig_65,
+            true,
+        ));
+        assert_eq!(latch.latched_heavy_leg(), Some(Outcome::Down));
+
+        // 9. Clears when inventory drops below 5 sh, and stays clear on rebound until re-triggered.
+        assert!(!latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(-(4_990_000)),
+            min_sh,
+            Some(MicroUsdc(500_000)),
+            Some(MicroUsdc(500_000)),
+            trig_65,
+            true,
+        ));
+        assert!(!latch.is_latched());
+
+        // 10. Explicit reset clears latch (epoch rollover).
+        assert!(latch.evaluate(
+            RiskTier::Tier1Normal,
+            SignedSharesMicro(10 * ONE_SHARE_MICRO as i64),
+            min_sh,
+            Some(MicroUsdc(300_000)),
+            Some(MicroUsdc(700_000)),
+            trig_65,
+            true,
+        ));
+        latch.reset();
+        assert!(!latch.is_latched());
     }
 }
