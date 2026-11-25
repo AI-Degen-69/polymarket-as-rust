@@ -989,6 +989,15 @@ fn fixed_book_mid(book: &FixedBook<10>) -> Option<MicroUsdc> {
     Some(MicroUsdc(bid.0.saturating_add(ask.0) / 2))
 }
 
+fn terminal_implied_price(book: &FixedBook<10>) -> Option<MicroUsdc> {
+    match (book.best_bid(), book.best_ask()) {
+        (Some(bid), Some(ask)) => Some(MicroUsdc(bid.price.0.saturating_add(ask.price.0) / 2)),
+        (Some(bid), None) => Some(bid.price),
+        (None, Some(ask)) => Some(ask.price),
+        (None, None) => None,
+    }
+}
+
 fn fixed_book_depth_at(book: &FixedBook<10>, price: MicroUsdc) -> SharesMicro {
     for lvl in book.bids_slice() {
         if lvl.price == price {
@@ -2167,25 +2176,48 @@ impl LivePaperSimulator {
     }
 
     fn resolve_winning_outcome(&self) -> Outcome {
-        if let (Some(ref_px), Some(strike)) =
-            (self.latest_twap_60s.or(self.latest_spot), self.strike_usd)
+        let imp_up = self.latest_up.as_ref().and_then(terminal_implied_price);
+        let imp_dn = self.latest_dn.as_ref().and_then(terminal_implied_price);
+
+        // 1. Unambiguous terminal CLOB consensus (`>= $0.85` vs `<= $0.15`,
+        //    including one-sided `$0.99 / None` or `None / $0.01` books at expiry).
+        const HIGH_CONF: u64 = 850_000;
+        const LOW_CONF: u64 = 150_000;
+        if let Some(u) = imp_up
+            && u.0 >= HIGH_CONF
+            && imp_dn.is_none_or(|d| d.0 <= LOW_CONF)
         {
-            if ref_px >= strike {
+            return Outcome::Up;
+        }
+        if let Some(d) = imp_dn
+            && d.0 >= HIGH_CONF
+            && imp_up.is_none_or(|u| u.0 <= LOW_CONF)
+        {
+            return Outcome::Down;
+        }
+        if let Some(u) = imp_up
+            && u.0 <= LOW_CONF
+            && imp_dn.is_none()
+        {
+            return Outcome::Down;
+        }
+        if let Some(d) = imp_dn
+            && d.0 <= LOW_CONF
+            && imp_up.is_none()
+        {
+            return Outcome::Up;
+        }
+
+        // 2. Terminal instantaneous spot vs strike (never trailing 60s TWAP).
+        if let (Some(spot), Some(strike)) = (self.latest_spot, self.strike_usd) {
+            if spot >= strike {
                 return Outcome::Up;
             }
             return Outcome::Down;
         }
-        let mid_up = self
-            .latest_up
-            .as_ref()
-            .and_then(fixed_book_mid)
-            .unwrap_or(MicroUsdc(500_000));
-        let mid_dn = self
-            .latest_dn
-            .as_ref()
-            .and_then(fixed_book_mid)
-            .unwrap_or(MicroUsdc(500_000));
-        if mid_up >= mid_dn {
+
+        // 3. Fallback book-implied tiebreaker.
+        if imp_up.unwrap_or(MicroUsdc(500_000)) >= imp_dn.unwrap_or(MicroUsdc(500_000)) {
             Outcome::Up
         } else {
             Outcome::Down
@@ -4817,5 +4849,44 @@ mod tests {
 
         let _ = std::fs::remove_file(&fixture);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_winning_outcome_ignores_twap_and_handles_one_sided_book() {
+        let mut ctx = setup_test_actors(
+            "resolve_outcome",
+            test_market("btc-5m-resolve", 0, 300_000),
+            50,
+            20,
+            0,
+        );
+
+        // 1. Trailing 60s TWAP below strike must NOT override terminal spot >= strike.
+        ctx.sim.strike_usd = Some(95_000.0);
+        ctx.sim.latest_twap_60s = Some(94_800.0);
+        ctx.sim.latest_spot = Some(95_050.0);
+        ctx.sim.latest_up = Some(test_book(Outcome::Up, 500_000, 520_000, 5, 1_000));
+        ctx.sim.latest_dn = Some(test_book(Outcome::Down, 480_000, 500_000, 5, 1_000));
+        assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Up);
+
+        // 2. Unambiguous one-sided terminal CLOB ($0.99 bid, no ask) overrides spot basis drift.
+        ctx.sim.latest_spot = Some(94_995.0);
+        ctx.sim.latest_up = Some(
+            FixedBook::try_from_slices(
+                Outcome::Up,
+                &[BookLevel {
+                    price: MicroUsdc(990_000),
+                    size: SharesMicro(100 * ONE_SHARE_MICRO),
+                }],
+                &[],
+                1_000,
+                1_000,
+            )
+            .unwrap(),
+        );
+        ctx.sim.latest_dn = None;
+        assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Up);
+
+        let _ = ctx.shutdown_and_read_jsonl(1_000);
     }
 }
