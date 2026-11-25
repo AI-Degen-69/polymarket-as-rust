@@ -121,28 +121,48 @@ impl PaperState {
     }
 
     fn resolve_winning_outcome(&self) -> Outcome {
-        if let (Some(ref_px), Some(strike)) = (
-            self.oracle_twap_60s_usd
-                .or(self.twap_60s_usd)
-                .or(self.spot_usd),
-            self.strike_usd,
-        ) {
-            if ref_px >= strike {
+        let imp_up = self.latest_up.as_ref().and_then(terminal_implied_price);
+        let imp_dn = self.latest_dn.as_ref().and_then(terminal_implied_price);
+
+        // 1. Unambiguous terminal CLOB consensus (`>= $0.85` vs `<= $0.15`,
+        //    including one-sided `$0.99 / None` or `None / $0.01` books at expiry).
+        const HIGH_CONF: u64 = 850_000;
+        const LOW_CONF: u64 = 150_000;
+        if let Some(u) = imp_up
+            && u.0 >= HIGH_CONF
+            && imp_dn.is_none_or(|d| d.0 <= LOW_CONF)
+        {
+            return Outcome::Up;
+        }
+        if let Some(d) = imp_dn
+            && d.0 >= HIGH_CONF
+            && imp_up.is_none_or(|u| u.0 <= LOW_CONF)
+        {
+            return Outcome::Down;
+        }
+        if let Some(u) = imp_up
+            && u.0 <= LOW_CONF
+            && imp_dn.is_none()
+        {
+            return Outcome::Down;
+        }
+        if let Some(d) = imp_dn
+            && d.0 <= LOW_CONF
+            && imp_up.is_none()
+        {
+            return Outcome::Up;
+        }
+
+        // 2. Terminal instantaneous spot vs strike (never trailing 60s TWAP).
+        if let (Some(spot), Some(strike)) = (self.spot_usd, self.strike_usd) {
+            if spot >= strike {
                 return Outcome::Up;
             }
             return Outcome::Down;
         }
-        let mid_up = self
-            .latest_up
-            .as_ref()
-            .and_then(fixed_book_mid)
-            .unwrap_or(MicroUsdc(500_000));
-        let mid_dn = self
-            .latest_dn
-            .as_ref()
-            .and_then(fixed_book_mid)
-            .unwrap_or(MicroUsdc(500_000));
-        if mid_up >= mid_dn {
+
+        // 3. Fallback book-implied tiebreaker.
+        if imp_up.unwrap_or(MicroUsdc(500_000)) >= imp_dn.unwrap_or(MicroUsdc(500_000)) {
             Outcome::Up
         } else {
             Outcome::Down
@@ -237,6 +257,15 @@ fn fixed_book_mid(book: &FixedBook<10>) -> Option<MicroUsdc> {
     let bid = book.best_bid()?.price;
     let ask = book.best_ask()?.price;
     Some(MicroUsdc(bid.0.saturating_add(ask.0) / 2))
+}
+
+fn terminal_implied_price(book: &FixedBook<10>) -> Option<MicroUsdc> {
+    match (book.best_bid(), book.best_ask()) {
+        (Some(bid), Some(ask)) => Some(MicroUsdc(bid.price.0.saturating_add(ask.price.0) / 2)),
+        (Some(bid), None) => Some(bid.price),
+        (None, Some(ask)) => Some(ask.price),
+        (None, None) => None,
+    }
 }
 
 fn fixed_book_depth_at(book: &FixedBook<10>, price: MicroUsdc) -> SharesMicro {
@@ -1661,27 +1690,43 @@ mod tests {
         let mut state = PaperState::new();
         state.set_market(test_market("btc-5m-test", 0, 300_000));
 
-        // Case 1: Spot >= Strike -> Up (when TWAP unavailable)
+        // Case 1: Spot >= Strike -> Up (when book is 50/50 or absent)
         state.spot_usd = Some(95_000.0);
         state.strike_usd = Some(95_000.0);
         assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
 
-        // Case 2: Spot < Strike -> Down (when TWAP unavailable)
+        // Case 2: Spot < Strike -> Down
         state.spot_usd = Some(94_999.0);
         state.strike_usd = Some(95_000.0);
         assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
 
-        // Case 3: Local 60s TWAP takes precedence over instantaneous spot
+        // Case 3: Trailing 60s TWAP must NOT override instantaneous terminal spot
         state.spot_usd = Some(95_500.0);
         state.twap_60s_usd = Some(94_900.0);
+        state.oracle_twap_60s_usd = Some(94_800.0);
         state.strike_usd = Some(95_000.0);
-        assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
-
-        // Case 4: Oracle 60s TWAP takes precedence over local TWAP and spot
-        state.oracle_twap_60s_usd = Some(95_050.0);
         assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
 
-        // Case 5: No strike, fallback to book mid (UP >= DN -> Up)
+        // Case 4: Unambiguous one-sided terminal CLOB book ($0.99 bid, no ask) overrides spot drift
+        state.spot_usd = Some(94_990.0);
+        state.strike_usd = Some(95_000.0);
+        state.latest_up = Some(
+            FixedBook::try_from_slices(
+                Outcome::Up,
+                &[BookLevel {
+                    price: MicroUsdc(990_000),
+                    size: SharesMicro(100 * ONE_SHARE_MICRO),
+                }],
+                &[],
+                0,
+                0,
+            )
+            .unwrap(),
+        );
+        state.latest_dn = None;
+        assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
+
+        // Case 5: Ambiguous book + no strike -> fallback to book implied (UP >= DN -> Up)
         state.spot_usd = None;
         state.twap_60s_usd = None;
         state.oracle_twap_60s_usd = None;
@@ -1690,7 +1735,7 @@ mod tests {
         state.latest_dn = Some(test_book(Outcome::Down, 440_000, 450_000));
         assert_eq!(state.resolve_winning_outcome(), Outcome::Up);
 
-        // Case 6: No strike, fallback to book mid (UP < DN -> Down)
+        // Case 6: Fallback to book implied (UP < DN -> Down)
         state.latest_up = Some(test_book(Outcome::Up, 440_000, 450_000));
         state.latest_dn = Some(test_book(Outcome::Down, 550_000, 560_000));
         assert_eq!(state.resolve_winning_outcome(), Outcome::Down);
@@ -1813,11 +1858,11 @@ mod tests {
     }
 
     #[test]
-    fn test_settlement_uses_terminal_60s_twap_over_last_second_spot_spike() {
+    fn test_settlement_uses_terminal_spot_not_60s_twap() {
         let clock = MonotonicClock::start();
         let start_ms = 1_700_000_000_000_u64;
         let expiry_ms = start_ms + 300_000;
-        let market = test_market("btc-5m-twap-settle", start_ms, expiry_ms);
+        let market = test_market("btc-5m-spot-settle", start_ms, expiry_ms);
 
         let mut state = PaperState::new();
         state.set_market(market.clone());
@@ -1834,8 +1879,8 @@ mod tests {
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
         let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
 
-        // Feed [T-60s, T-1s] at $94,900, then spike at T-1s to $95,500.
-        // 60s TWAP = (94_900 * 59 + 95_500 * 1) / 60 = $94,910 < $95,000 strike -> Down wins!
+        // Feed [T-60s, T-1s] at $94,900, then move at T-1s to $95,500.
+        // Trailing 60s TWAP stays < $95,000, but terminal spot at expiry >= strike -> Up wins.
         let _ = pipe.on_binance_spot(expiry_ms - 60_000, 94_900.0, state.strike_usd, expiry_ms);
         let _ = pipe.on_binance_spot(expiry_ms - 1_000, 95_500.0, state.strike_usd, expiry_ms);
         state.observe_spot(95_500.0);
@@ -1848,8 +1893,8 @@ mod tests {
                 &mut telemetry,
                 &mut pipe,
             )
-            .expect("should settle using 60s TWAP");
-        assert_eq!(pending.winning_outcome, Outcome::Down);
+            .expect("should settle using terminal spot");
+        assert_eq!(pending.winning_outcome, Outcome::Up);
         assert!(state.twap_60s_usd.is_some_and(|v| v < 95_000.0));
     }
 
