@@ -1,4 +1,13 @@
 {
+  "provenance": {
+    "source_sweep": "logs/sweeps/25-11_21-55-50Z_boundary-9runs_20caps-226w",
+    "run_id": "boundary-9runs_20caps-226w",
+    "date": "2026-11-25 to 2026-11-26",
+    "dataset": "20 captures / 226 windows",
+    "selected_config": "Config #6/9 (max_entry_price=0.65, entry_cutoff_secs=120, tier1_hedge_trigger_price=off)",
+    "report": "docs/boundary-sweep-selection-report.md",
+    "status": "provisional-research-baseline"
+  },
   "engine": {
     "execution_mode": "Paper",
     "dry_run": true,
@@ -20,13 +29,16 @@
     "enforce_fee_floor": false,
     "max_cross_tick_loss_micro": 80000,
     "max_entry_prob": 0.80,
-    "max_entry_price": 0.60,
+    "max_entry_price": 0.65,
     "lead_lag_cancel_threshold": 0.015,
     "lead_lag_window_ms": 1000,
     "lead_lag_cooldown_ms": 1000,
     "lead_lag_directional": true,
     "hedge_skew_mult": 1.0,
-    "cap_tier1_reducing_to_delta": false,
+    "cap_tier1_reducing_to_delta": true,
+    "tier1_hedge_trigger_price": null,
+    "entry_open_delay_secs": 15,
+    "entry_cutoff_secs": 120,
     "clock_drift_max_ms": 1000
   },
   "simulation": {

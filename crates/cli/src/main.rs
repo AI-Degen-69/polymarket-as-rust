@@ -245,6 +245,52 @@ fn parse_max_entry_price_override(raw: &str) -> Result<MaxEntryPriceOverride, St
     Ok(MaxEntryPriceOverride::Value(val))
 }
 
+/// CLI override value for `--tier1-hedge-trigger-price` supporting a probability trigger or `off`/`none`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Tier1HedgeTriggerOverride {
+    Off,
+    Value(f64),
+}
+
+fn parse_tier1_hedge_trigger_override(raw: &str) -> Result<Tier1HedgeTriggerOverride, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Tier1HedgeTriggerOverride::Off);
+    }
+    let val = trimmed.parse::<f64>().map_err(|_| {
+        format!(
+            "invalid --tier1-hedge-trigger-price '{raw}': expected finite float in (0.0, 1.0) or 'off'"
+        )
+    })?;
+    if !val.is_finite() || val <= 0.0 || val >= 1.0 {
+        return Err(
+            "`--tier1-hedge-trigger-price` must be finite in (0.0, 1.0) or 'off'".to_string(),
+        );
+    }
+    Ok(Tier1HedgeTriggerOverride::Value(val))
+}
+
+/// CLI override value for `--entry-cutoff-secs` supporting an integer cutoff or `off`/`none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryCutoffOverride {
+    Off,
+    Value(u64),
+}
+
+fn parse_entry_cutoff_override(raw: &str) -> Result<EntryCutoffOverride, String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("off") || trimmed.eq_ignore_ascii_case("none") {
+        return Ok(EntryCutoffOverride::Off);
+    }
+    let val = trimmed.parse::<u64>().map_err(|_| {
+        format!("invalid --entry-cutoff-secs '{raw}': expected integer in 1..=300 or 'off'")
+    })?;
+    if val == 0 || val > 300 {
+        return Err("`--entry-cutoff-secs` must be in 1..=300 or 'off'".to_string());
+    }
+    Ok(EntryCutoffOverride::Value(val))
+}
+
 /// Optional Stations 4–6 math competitiveness overrides for live/replay A/B testing.
 #[derive(Debug, Clone, Copy, Default, clap::Args)]
 pub(crate) struct MathOverrides {
@@ -290,6 +336,15 @@ pub(crate) struct MathOverrides {
     /// Override whether Tier-1 caps reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (`false` default).
     #[arg(long)]
     pub(crate) cap_tier1_hedge: Option<bool>,
+    /// Override opposing-ask trigger price in `(0.0, 1.0)` unlocking Tier-1/Tier-2 passive 1:1 deficit cross-tick override (`off` disables).
+    #[arg(long, value_parser = parse_tier1_hedge_trigger_override)]
+    pub(crate) tier1_hedge_trigger_price: Option<Tier1HedgeTriggerOverride>,
+    /// Override seconds after epoch open during which fresh Leg-1 entries are skipped (`0` disables).
+    #[arg(long)]
+    pub(crate) entry_open_delay_secs: Option<u64>,
+    /// Override elapsed seconds after epoch open at which fresh Leg-1 entries stop (`off` disables).
+    #[arg(long, value_parser = parse_entry_cutoff_override)]
+    pub(crate) entry_cutoff_secs: Option<EntryCutoffOverride>,
 }
 
 impl MathOverrides {
@@ -308,6 +363,9 @@ impl MathOverrides {
             || self.lead_lag_directional.is_some()
             || self.hedge_skew_mult.is_some()
             || self.cap_tier1_hedge.is_some()
+            || self.tier1_hedge_trigger_price.is_some()
+            || self.entry_open_delay_secs.is_some()
+            || self.entry_cutoff_secs.is_some()
     }
 
     pub(crate) fn apply_to(
@@ -400,6 +458,28 @@ impl MathOverrides {
         }
         if let Some(cap) = self.cap_tier1_hedge {
             cfg.cap_tier1_reducing_to_delta = cap;
+        }
+        if let Some(trig) = self.tier1_hedge_trigger_price {
+            match trig {
+                Tier1HedgeTriggerOverride::Off => cfg.tier1_hedge_trigger_price = None,
+                Tier1HedgeTriggerOverride::Value(p) => {
+                    if !p.is_finite() || p <= 0.0 || p >= 1.0 {
+                        return Err(
+                            "`--tier1-hedge-trigger-price` must be finite in (0.0, 1.0)".into()
+                        );
+                    }
+                    cfg.tier1_hedge_trigger_price = Some(p);
+                }
+            }
+        }
+        if let Some(delay) = self.entry_open_delay_secs {
+            cfg.entry_open_delay_secs = delay;
+        }
+        if let Some(cutoff) = self.entry_cutoff_secs {
+            cfg.entry_cutoff_secs = match cutoff {
+                EntryCutoffOverride::Off => None,
+                EntryCutoffOverride::Value(secs) => Some(secs),
+            };
         }
         cfg.validate()?;
         Ok(())
@@ -1325,7 +1405,11 @@ mod tests {
                 assert!(!cfg.enforce_fee_floor);
                 assert_eq!(cfg.max_cross_tick_loss_micro, Some(80_000));
                 assert_eq!(cfg.max_entry_prob, Some(0.80));
-                assert_eq!(cfg.max_entry_price, Some(0.60));
+                assert_eq!(cfg.max_entry_price, Some(0.65));
+                assert!(cfg.cap_tier1_reducing_to_delta);
+                assert_eq!(cfg.tier1_hedge_trigger_price, None);
+                assert_eq!(cfg.entry_open_delay_secs, 15);
+                assert_eq!(cfg.entry_cutoff_secs, Some(120));
             }
             _ => panic!("expected Paper"),
         }
@@ -1561,17 +1645,17 @@ mod tests {
         );
 
         let parsed_cap =
-            Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-price", "0.65"]).unwrap();
+            Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-price", "0.58"]).unwrap();
         match parsed_cap.command {
             Commands::Lifecycle { math, .. } => {
                 assert!(math.is_any_set());
                 assert_eq!(
                     math.max_entry_price,
-                    Some(MaxEntryPriceOverride::Value(0.65))
+                    Some(MaxEntryPriceOverride::Value(0.58))
                 );
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
-                assert_eq!(cfg.max_entry_price, Some(0.65));
+                assert_eq!(cfg.max_entry_price, Some(0.58));
             }
             _ => panic!("expected Lifecycle"),
         }
@@ -1704,15 +1788,18 @@ mod tests {
         }
 
         for (mult_str, cap_str) in [("0.0", "false"), ("1.0", "true")] {
-            let cli = Cli::try_parse_from([
+            let mut args = vec![
                 "poly-as",
                 "paper",
                 "--hedge-skew-mult",
                 mult_str,
                 "--cap-tier1-hedge",
                 cap_str,
-            ])
-            .unwrap();
+            ];
+            if cap_str == "false" {
+                args.extend(["--tier1-hedge-trigger-price", "off"]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
             match cli.command {
                 Commands::Paper { math, .. } => {
                     let mut cfg = core_types::EngineConfig::default();
@@ -1907,5 +1994,101 @@ mod tests {
             }
             _ => panic!("expected Lifecycle"),
         }
+    }
+    #[test]
+    fn cli_parses_and_validates_tier1_hedge_trigger_and_entry_guards() {
+        let parsed = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--cap-tier1-hedge",
+            "true",
+            "--tier1-hedge-trigger-price",
+            "0.65",
+            "--entry-open-delay-secs",
+            "15",
+            "--entry-cutoff-secs",
+            "120",
+        ])
+        .unwrap();
+        match parsed.command {
+            Commands::Lifecycle { math, .. } => {
+                assert!(math.is_any_set());
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert!(cfg.cap_tier1_reducing_to_delta);
+                assert_eq!(cfg.tier1_hedge_trigger_price, Some(0.65));
+                assert_eq!(cfg.entry_open_delay_secs, 15);
+                assert_eq!(cfg.entry_cutoff_secs, Some(120));
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        // Trigger without --cap-tier1-hedge true fails validation.
+        let un_capped = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--cap-tier1-hedge",
+            "false",
+            "--tier1-hedge-trigger-price",
+            "0.70",
+        ])
+        .unwrap();
+        match un_capped.command {
+            Commands::Lifecycle { math, .. } => {
+                let mut cfg = core_types::EngineConfig::default();
+                assert!(math.apply_to(&mut cfg).is_err());
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        // 'off' clears trigger and cutoff.
+        let off_cli = Cli::try_parse_from([
+            "poly-as",
+            "lifecycle",
+            "--source",
+            "replay",
+            "--tier1-hedge-trigger-price",
+            "off",
+            "--entry-cutoff-secs",
+            "none",
+        ])
+        .unwrap();
+        match off_cli.command {
+            Commands::Lifecycle { math, .. } => {
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.tier1_hedge_trigger_price, None);
+                assert_eq!(cfg.entry_cutoff_secs, None);
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+    }
+
+    #[test]
+    fn cli_lifecycle_and_pipeline_defaults_resolve_promoted_defaults() {
+        let cli = Cli::try_parse_from(["poly-as", "lifecycle"]).unwrap();
+        match cli.command {
+            Commands::Lifecycle {
+                queue_decay, math, ..
+            } => {
+                assert_eq!(queue_decay, CliQueueDecay::Conservative);
+                assert!(!math.is_any_set());
+                let mut cfg = core_types::EngineConfig::default();
+                math.apply_to(&mut cfg).unwrap();
+                assert_eq!(cfg.max_entry_price, Some(0.65));
+                assert!(cfg.cap_tier1_reducing_to_delta);
+                assert_eq!(cfg.tier1_hedge_trigger_price, None);
+                assert_eq!(cfg.entry_open_delay_secs, 15);
+                assert_eq!(cfg.entry_cutoff_secs, Some(120));
+            }
+            _ => panic!("expected Lifecycle"),
+        }
+
+        let pipe_cfg = math_engine::MathPipelineConfig::try_default().unwrap();
+        assert_eq!(pipe_cfg.pricer.max_entry_price, Some(0.65));
     }
 }

@@ -89,14 +89,15 @@ Safe during capture: `cargo fmt --all -- --check`, `cargo clippy --workspace --a
 
 ## 7. Key Files & Calibration Sync Surface
 
-Every engine calibration touches five files. Edit all five in one change, or the defaults drift.
+Every engine calibration touches six files. Edit all six in one change, or the defaults drift.
 
 | File | Role |
 | --- | --- |
-| `crates/core-types/src/config.rs` | Env parsing, defaults, validation |
+| `DEFAULTS.json` | Single JSON source of truth + provenance |
+| `crates/core-types/src/config.rs` | Env parsing, defaults, fallback, validation |
 | `crates/core-types/src/lib.rs` | Default-value and env-roundtrip tests |
 | `crates/cli/src/main.rs` | CLI paths and test configs |
-| `scripts/sweep-params.ps1` | Sweep env overrides |
+| `scripts/sweep-params.ps1` | Sweep env overrides and default highlight check |
 | `.env.example` | Documented operator values |
 
 `.env.example` must mirror the `EngineConfig::default()` values in `config.rs`. A mismatch is drift: fix it in the same change.

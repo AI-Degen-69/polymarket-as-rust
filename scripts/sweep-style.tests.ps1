@@ -125,9 +125,9 @@ try {
 
     # --- Entry-price sweep detection -------------------------------------
     Assert-True (-not (Test-EntryPriceSwept -Prices @("off"))) "single 'off' entry price hides the MaxPx column"
-    Assert-True (-not (Test-EntryPriceSwept -Prices @("0.6"))) "default 0.6 entry price hides the MaxPx column"
-    Assert-True (Test-EntryPriceSwept -Prices @("0.7")) "non-default entry price shows the MaxPx column"
-    Assert-True (Test-EntryPriceSwept -Prices @("off", "0.6")) "two entry prices show the MaxPx column"
+    Assert-True (-not (Test-EntryPriceSwept -Prices @("0.65"))) "default 0.65 entry price hides the MaxPx column"
+    Assert-True (Test-EntryPriceSwept -Prices @("0.60")) "non-default 0.60 entry price shows the MaxPx column"
+    Assert-True (Test-EntryPriceSwept -Prices @("off", "0.65")) "two entry prices show the MaxPx column"
 
     # --- Plain mode ------------------------------------------------------
     $script:UseAnsi = $false
@@ -156,7 +156,48 @@ try {
     Assert-True ($survSplit.ISWin -eq 7 -and $survSplit.OOSWin -eq 3) "10 windows split 7 IS / 3 OOS"
     Assert-True ([Math]::Abs($survSplit.IS - 10.0) -lt 1e-9) "IS sums the first 7 window nets"
     Assert-True ([Math]::Abs($survSplit.OOS - 3.0) -lt 1e-9) "OOS sums the final 3 window nets"
-    Assert-True ([Math]::Abs($survSplit.Retain - 30.0) -lt 1e-9) "OOS retention is 30% of IS"
+    Assert-True ([Math]::Abs($survSplit.Retain - 70.0) -lt 1e-9) "OOS per-window retention is 70% of IS (1.0/win vs 1.4286/win)"
+
+    # --- G4 AllocatedCapital & G5 MergePos / TailDrag ----------------------
+    $survG45 = Get-SurvivalInputs -CapRuns @() -TotalWindows 4 -IsMultiCapture $true -CaptureCount 2 `
+        -SumVolIn 1000.0 -AllocatedCapital 50.0 -SumGross 55.0 -SumSettle -23.62 -SumUnreal 0.0 `
+        -SumMergeNet 78.61 -SumMergePos 89.03 -SumMergeNegLoss 10.42 -WindowNets @(15.0, -9.71, 25.0, 26.30)
+    Assert-True ([Math]::Abs($survG45.MaxDD - 19.42) -lt 1e-6) 'MaxDD uses AllocatedCapital ($9.71 / $50 = 19.42%), not SumVolIn'
+    Assert-True ([Math]::Abs($survG45.Drag - (23.62 / 89.03 * 100.0)) -lt 1e-6) "Expiry drag divides settlement loss by positive merge gains"
+    Assert-True ([Math]::Abs($survG45.TailDrag - (34.04 / 89.03 * 100.0)) -lt 1e-6) "Tail drag adds negative merge losses to settlement losses"
+    $survPartialWindows = Get-SurvivalInputs -CapRuns @() -TotalWindows 6 -IsMultiCapture $false -CaptureCount 1 `
+        -SumVolIn 1000.0 -SumGross 10.0 -SumSettle 0.0 -SumUnreal 0.0 -WindowNets @(5.0, 5.0, 5.0, 5.0)
+    Assert-True ([double]::IsNaN($survPartialWindows.IS)) 'Partial window series (4 of 6 windows) is not scored as the full sample'
+
+    $evalPass = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 26.5 -NbrVal 100.0 -TailDragVal 38.2
+    Assert-True ($evalPass.Verdict -eq "APPROVED") "Config passing G1-G6 and TailDrag<=50% is APPROVED"
+    $evalRelabelFail = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 20.9 -DragVal 12.1 -NbrVal 100.0 -TailDragVal 57.3
+    Assert-True ($evalRelabelFail.G5 -eq "FAIL" -and $evalRelabelFail.Verdict -eq "FAIL(G5)") "High negative-merge TailDrag>50% fails G5 despite low settlement drag"
+    $evalUnknownTail = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 12.1 -NbrVal 100.0
+    Assert-True ($evalUnknownTail.G5 -eq "N/A" -and $evalUnknownTail.Verdict -eq "N/A") "Unknown TailDrag reports G5 N/A and is ineligible for APPROVED"
+    $evalZeroTail = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 12.1 -NbrVal 100.0 -TailDragVal 0.0
+    Assert-True ($evalZeroTail.G5 -eq "PASS" -and $evalZeroTail.Verdict -eq "APPROVED") "Measured zero TailDrag still passes G5"
+
+    # --- G6 Manhattan-1 adjacency + OOS neighbor survival -----------------
+    $mkRow = {
+        param([string]$px, [string]$t1, [double]$isv, [double]$oosv, [double]$netv)
+        [PSCustomObject]@{
+            Gamma = "0.12"; VarSpr = "true"; MinT = "1"; XTick = '$0.08'; MaxP = "0.8"
+            MaxPx = $px; LLTh = '$0.015'; LLWin = "1000"; LLCd = "1000"; LLDir = "true"
+            HSkew = "1"; T1Cap = "true"; T1Trig = $t1; EntryDelay = "15s"; EntryCut = "120s"
+            NetPnLNum = $netv; ISNum = $isv; OOSNum = $oosv
+            RetainNum = 100.0; MaxDDNum = 10.0; DragNum = 20.0; TailDragNum = 25.0
+            NbrNum = [double]::NaN; G1 = ""; G2 = ""; G3 = ""; G4 = ""; G5 = ""; G6 = ""; Verdict = ""
+        }
+    }
+    $gridRows = @(
+        (& $mkRow '$0.50' "off" 10.0 10.0 20.0),
+        (& $mkRow '$0.55' "off" 10.0 -2.0 8.0),
+        (& $mkRow '$0.60' "off" 10.0 10.0 20.0)
+    )
+    Update-SurvivalVerdicts -Sorted $gridRows
+    Assert-True ([Math]::Abs($gridRows[0].NbrNum - 0.0) -lt 1e-9) 'G6 Manhattan-1 skips non-adjacent $0.60 and rejects OOS-negative $0.55'
+    Assert-True ([Math]::Abs($gridRows[1].NbrNum - 100.0) -lt 1e-9) "G6 interior cell sees both immediate neighbors"
 
     $capRuns = @(
         [PSCustomObject]@{ Windows = 2; NetPlusRebNum = 5.0 },
@@ -168,6 +209,128 @@ try {
     $survSingle = Get-SurvivalInputs -CapRuns @($capRuns[0]) -TotalWindows 2 -IsMultiCapture $false -CaptureCount 1 `
         -SumVolIn 100.0 -SumGross 0.0 -SumSettle 0.0 -SumUnreal 0.0 -WindowNets @()
     Assert-True ([double]::IsNaN($survSingle.MaxDD)) "single capture without window nets reports MaxDD n/a"
+
+    # --- Read-CaptureJsonlMetrics: summary telemetry & legacy fallbacks ---
+    $tmpMetricDir = Join-Path ([System.IO.Path]::GetTempPath()) ("sweep-metrics-test-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Force -Path $tmpMetricDir | Out-Null
+    try {
+        $fakeCap = [PSCustomObject]@{ Name = "cap.jsonl"; Stem = "cap"; Windows = 1 }
+        $fullPath = Join-Path $tmpMetricDir "full.jsonl"
+        @(
+            '{"event":"summary","payload":{"realized_pnl_micro":5000000,"unrealized_pnl_micro":0,"net_pnl_micro":5000000,"estimated_rebate_micro":100000,"baseline_pnl_micro":0,"total_pairs_merged_micro":20000000,"fills_count":2,"merges_count":1,"rpm_60s":2,"markout_1s_bps":0,"markout_5s_bps":0,"total_shares_bought_micro":40000000,"volume_in_micro":19500000,"total_merge_gain_micro":5000000,"positive_merge_gain_micro":5500000,"negative_merge_loss_micro":500000}}'
+        ) | Set-Content -LiteralPath $fullPath -Encoding utf8
+        $mFull = (Read-CaptureJsonlMetrics -OutJsonl $fullPath -Cap $fakeCap -CapIdx 0 -BaseSize 20 -MaxCombinedBidMicro 980000 -WinColW 12 -TblSep " | ").CapRun
+        Assert-True ([Math]::Abs($mFull.QuantityNum - 40.0) -lt 1e-6) "summary telemetry supplies total_shares_bought_micro"
+        Assert-True ([Math]::Abs($mFull.VolumeInNum - 19.5) -lt 1e-6) "summary telemetry supplies volume_in_micro"
+        Assert-True ([Math]::Abs($mFull.MergePosNum - 5.5) -lt 1e-6 -and [Math]::Abs($mFull.MergeNegLossNum - 0.5) -lt 1e-6) "summary telemetry supplies merge gains and losses"
+
+        $legacyPath = Join-Path $tmpMetricDir "legacy.jsonl"
+        @(
+            '{"event":"fill","payload":{"side":"BUY","filled_shares_micro":20000000,"price_micro":510000}}',
+            '{"event":"fill","payload":{"side":"BUY","filled_shares_micro":10000000,"price_micro":450000}}',
+            '{"event":"flatten","payload":{"side":"BUY","size_micro":10000000,"price_micro":10000}}',
+            '{"event":"merge","payload":{"realized_gain_micro":1200000}}',
+            '{"event":"merge","payload":{"realized_gain_micro":-300000}}',
+            '{"event":"window_end","payload":{"slug":"w1","net_pnl_micro":900000}}',
+            '{"event":"summary","payload":{"realized_pnl_micro":900000,"unrealized_pnl_micro":0,"net_pnl_micro":900000,"estimated_rebate_micro":0,"baseline_pnl_micro":0,"total_pairs_merged_micro":20000000,"fills_count":2,"flattens_executed":1,"merges_count":2,"rpm_60s":1,"markout_1s_bps":0,"markout_5s_bps":0,"settlement_pnl_micro":0}}'
+        ) | Set-Content -LiteralPath $legacyPath -Encoding utf8
+        $mLeg = (Read-CaptureJsonlMetrics -OutJsonl $legacyPath -Cap $fakeCap -CapIdx 0 -BaseSize 20 -MaxCombinedBidMicro 980000 -WinColW 12 -TblSep " | ").CapRun
+        Assert-True ([Math]::Abs($mLeg.QuantityNum - 40.0) -lt 1e-6) "legacy scan sums BUY fill + BUY flatten shares (40sh)"
+        Assert-True ([Math]::Abs($mLeg.VolumeInNum - 14.8) -lt 1e-6) 'legacy scan reconstructs exact BUY notional ($10.20 + $4.50 + $0.10 = $14.80)'
+        Assert-True ([Math]::Abs($mLeg.MergePosNum - 1.2) -lt 1e-6 -and [Math]::Abs($mLeg.MergeNegLossNum - 0.3) -lt 1e-6) "legacy scan splits positive and negative merge events"
+
+        $summaryOnlyPath = Join-Path $tmpMetricDir "summary_only.jsonl"
+        @(
+            '{"event":"summary","payload":{"realized_pnl_micro":2000000,"unrealized_pnl_micro":0,"net_pnl_micro":2000000,"estimated_rebate_micro":0,"baseline_pnl_micro":0,"total_pairs_merged_micro":10000000,"fills_count":5,"merges_count":2,"rpm_60s":1,"markout_1s_bps":0,"markout_5s_bps":0,"settlement_pnl_micro":0}}'
+        ) | Set-Content -LiteralPath $summaryOnlyPath -Encoding utf8
+        $mSummOnly = (Read-CaptureJsonlMetrics -OutJsonl $summaryOnlyPath -Cap $fakeCap -CapIdx 0 -BaseSize 20 -MaxCombinedBidMicro 980000 -WinColW 12 -TblSep " | ").CapRun
+        Assert-True ([double]::IsNaN($mSummOnly.MergePosNum) -and [double]::IsNaN($mSummOnly.MergeNegLossNum)) "summary-only legacy JSONL with merges>0 does not mistake missing merge events for 0.0"
+        Assert-True ($mSummOnly.VolumeInNum -gt 0.0) "summary-only legacy JSONL with fills>0 falls back to synthetic volume instead of 0.0"
+    } finally {
+        if (Test-Path -LiteralPath $tmpMetricDir) { Remove-Item -LiteralPath $tmpMetricDir -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- Config banner timestamp & format ---------------------------------
+    $sampleMap = @{
+        "V Max" = "`$50"; "Base Size" = "20sh"; "Max Pair" = "`$0.98"; "Queue Decay" = "conservative"
+        "Gamma" = "0.12"; "Variance" = "true"; "Min Ticks" = "1"; "Cross Loss" = "`$0.08"
+        "Entry Prob" = "0.8"; "Entry Price" = "`$0.65"; "Threshold" = "`$0.015"; "Window Ms" = "1000"
+        "Cooldown Ms" = "1000"; "Direction" = "true"; "Hedge Skew" = "1"; "Tier 1 Cap" = "true"
+        "T1 Trigger" = "off"; "Entry Delay" = "15s"; "Entry Cut" = "120s"
+    }
+    $script:UseAnsi = $false
+    $plainBanner = Format-ConfigBannerLines -Index 4 -Total 18 -Curr $sampleMap -Prev $null -StartTimeText "19:05"
+    Assert-True ($plainBanner[1].StartsWith("⚙️  [CONFIG #4 / 18] - [19:05] ---")) "plain config banner includes #idx/total and HH:MM timestamp"
+    Assert-True ($plainBanner[1].Length -ge 100) "plain config banner pads dashes to full rule width"
+
+    $script:UseAnsi = $true
+    $ansiBanner = Format-ConfigBannerLines -Index 4 -Total 18 -Curr $sampleMap -Prev $null -StartTimeText "19:05"
+    Assert-True ((Get-VisibleText $ansiBanner[1]).StartsWith("⚙️  [CONFIG #4 / 18] - [19:05] ---")) "ANSI config banner keeps visible header format"
+
+    # --- Resume state detection (Complete vs Partial vs Pending) ----------
+    $tmpRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sweep-resume-test-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        $capA = Join-Path $tmpRoot "cap_a"
+        $capB = Join-Path $tmpRoot "cap_b"
+        New-Item -ItemType Directory -Force -Path $capA, $capB | Out-Null
+        $fakeCaptures = @(
+            [PSCustomObject]@{ Stem = "cap_a"; Name = "cap_a.jsonl"; Windows = 5 },
+            [PSCustomObject]@{ Stem = "cap_b"; Name = "cap_b.jsonl"; Windows = 5 }
+        )
+
+        # Pending
+        $stPending = Get-ConfigDiskStatus -SweepDir $tmpRoot -Captures $fakeCaptures -IsMultiCapture $true -Stem "cfg_pending"
+        Assert-True ($stPending.Status -eq "Pending") "missing files classify as Pending"
+
+        # Complete
+        '{"event":"summary","payload":{"realized_pnl_micro":0}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_done.jsonl") -Encoding utf8
+        '{"event":"summary","payload":{"realized_pnl_micro":0}}' | Set-Content -LiteralPath (Join-Path $capB "cfg_done.jsonl") -Encoding utf8
+        $stDone = Get-ConfigDiskStatus -SweepDir $tmpRoot -Captures $fakeCaptures -IsMultiCapture $true -Stem "cfg_done"
+        Assert-True ($stDone.Status -eq "Complete" -and $stDone.ValidSummaryCount -eq 2) "readable summary events classify as Complete"
+
+        # A summary the metrics reader cannot parse is not resumable as Complete.
+        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_empty.jsonl") -Encoding utf8
+        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capB "cfg_empty.jsonl") -Encoding utf8
+        $stEmpty = Get-ConfigDiskStatus -SweepDir $tmpRoot -Captures $fakeCaptures -IsMultiCapture $true -Stem "cfg_empty"
+        Assert-True ($stEmpty.Status -eq "Partial") "summary without readable fields classifies as Partial"
+
+        # Partial (missing second capture)
+        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_part1.jsonl") -Encoding utf8
+        $stPart1 = Get-ConfigDiskStatus -SweepDir $tmpRoot -Captures $fakeCaptures -IsMultiCapture $true -Stem "cfg_part1"
+        Assert-True ($stPart1.Status -eq "Partial") "single capture file classifies as Partial"
+
+        # Partial (missing summary line in second capture)
+        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_part2.jsonl") -Encoding utf8
+        '{"event":"tick","payload":{}}' | Set-Content -LiteralPath (Join-Path $capB "cfg_part2.jsonl") -Encoding utf8
+        $stPart2 = Get-ConfigDiskStatus -SweepDir $tmpRoot -Captures $fakeCaptures -IsMultiCapture $true -Stem "cfg_part2"
+        Assert-True ($stPart2.Status -eq "Partial") "jsonl without final summary classifies as Partial"
+    } finally {
+        if (Test-Path -LiteralPath $tmpRoot) { Remove-Item -LiteralPath $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- Explicit -OutputDir safety (create new, refuse existing) ---------
+    $tmpOutParent = Join-Path ([System.IO.Path]::GetTempPath()) ("sweep-outdir-test-" + [Guid]::NewGuid().ToString("N"))
+    try {
+        $newOutDir = Join-Path $tmpOutParent "fresh_9runs"
+        $resolvedOut = Resolve-NewSweepOutputDir -OutputDir $newOutDir -OrigPwd $tmpOutParent
+        Assert-True (Test-Path -LiteralPath $resolvedOut -PathType Container) "Resolve-NewSweepOutputDir creates brand-new unique directory"
+
+        $threwOnExisting = $false
+        try {
+            $null = Resolve-NewSweepOutputDir -OutputDir $resolvedOut -OrigPwd $tmpOutParent
+        } catch {
+            $threwOnExisting = $true
+        }
+        Assert-True $threwOnExisting "Resolve-NewSweepOutputDir refuses to overwrite or reuse an existing directory"
+    } finally {
+        if (Test-Path -LiteralPath $tmpOutParent) { Remove-Item -LiteralPath $tmpOutParent -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+
+    # --- Syntax check of sweep-params.ps1 --------------------------------
+    $parseErrs = $null
+    $parseTokens = $null
+    $null = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot "sweep-params.ps1"), [ref]$parseTokens, [ref]$parseErrs)
+    Assert-True ($parseErrs.Count -eq 0) "sweep-params.ps1 parses with zero syntax errors"
 }
 finally {
     if ($null -eq $previousNoColor) {

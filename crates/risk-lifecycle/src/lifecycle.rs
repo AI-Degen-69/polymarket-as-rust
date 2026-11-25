@@ -28,6 +28,8 @@ pub enum LifecycleAction {
         tau_secs: u64,
         /// Whether accumulation is prohibited in this phase.
         prohibit_accumulation: bool,
+        /// Whether fresh Leg-1 entries are suppressed by the entry-time guard.
+        block_new_entries: bool,
     },
     /// Cancel all standing maker quotes across both orderbooks.
     CancelAllResting {
@@ -70,6 +72,8 @@ pub enum LifecycleAction {
 /// Configuration thresholds for the 300s epoch lifecycle controller.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LifecycleConfig {
+    /// Total epoch duration in seconds (default 300s).
+    pub epoch_duration_secs: u64,
     /// Horizon duration in seconds for PreExpiryLockout (default 60s).
     pub pre_expiry_lockout_secs: u64,
     /// Horizon duration in seconds for MandatoryFlatten (default 30s).
@@ -78,15 +82,22 @@ pub struct LifecycleConfig {
     pub terminal_lockout_secs: u64,
     /// Minimum order size in whole shares.
     pub min_order_size_shares: u64,
+    /// Seconds after epoch open during which fresh Leg-1 entries are skipped (default 0s).
+    pub entry_open_delay_secs: u64,
+    /// Optional elapsed seconds after epoch open at which fresh Leg-1 entries stop (default `None`).
+    pub entry_cutoff_secs: Option<u64>,
 }
 
 impl Default for LifecycleConfig {
     fn default() -> Self {
         Self {
+            epoch_duration_secs: 300,
             pre_expiry_lockout_secs: 60,
             mandatory_flatten_secs: 30,
             terminal_lockout_secs: 15,
             min_order_size_shares: 5,
+            entry_open_delay_secs: 0,
+            entry_cutoff_secs: None,
         }
     }
 }
@@ -94,17 +105,33 @@ impl Default for LifecycleConfig {
 impl LifecycleConfig {
     /// Validates lifecycle horizon thresholds.
     pub fn validate(&self) -> Result<(), RiskLifecycleError> {
-        if !(self.pre_expiry_lockout_secs > self.mandatory_flatten_secs
+        if !(self.epoch_duration_secs > self.pre_expiry_lockout_secs
+            && self.pre_expiry_lockout_secs > self.mandatory_flatten_secs
             && self.mandatory_flatten_secs > self.terminal_lockout_secs
             && self.terminal_lockout_secs > 0)
         {
             return Err(RiskLifecycleError::InvalidConfig(
-                "Lifecycle horizons must satisfy: lockout (60s) > flatten (30s) > terminal (15s) > 0".to_string(),
+                "Lifecycle horizons must satisfy: epoch (300s) > lockout (60s) > flatten (30s) > terminal (15s) > 0".to_string(),
             ));
         }
         if self.min_order_size_shares == 0 {
             return Err(RiskLifecycleError::InvalidConfig(
                 "min_order_size_shares must be strictly positive".to_string(),
+            ));
+        }
+        if self.entry_open_delay_secs > self.epoch_duration_secs {
+            return Err(RiskLifecycleError::InvalidConfig(
+                "entry_open_delay_secs must be <= epoch_duration_secs".to_string(),
+            ));
+        }
+        if let Some(cutoff) = self.entry_cutoff_secs
+            && (cutoff == 0
+                || cutoff > self.epoch_duration_secs
+                || self.entry_open_delay_secs >= cutoff)
+        {
+            return Err(RiskLifecycleError::InvalidConfig(
+                "entry_cutoff_secs must satisfy entry_open_delay_secs < cutoff <= epoch_duration_secs"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -223,12 +250,29 @@ impl EpochLifecycleController {
             (None, 0)
         };
 
+        // Derive elapsed time from the millisecond remainder: truncating `tau_secs` first
+        // opened the entry window (and tripped the cutoff) up to 999ms early.
+        let elapsed_secs = self
+            .config
+            .epoch_duration_secs
+            .saturating_mul(1000)
+            .saturating_sub(tau_ms)
+            / 1000;
+
         match phase {
-            EpochPhase::ActiveQuoting => LifecycleAction::ContinueQuoting {
-                phase,
-                tau_secs,
-                prohibit_accumulation: false,
-            },
+            EpochPhase::ActiveQuoting => {
+                let block_new_entries = elapsed_secs < self.config.entry_open_delay_secs
+                    || self
+                        .config
+                        .entry_cutoff_secs
+                        .is_some_and(|cutoff| elapsed_secs >= cutoff);
+                LifecycleAction::ContinueQuoting {
+                    phase,
+                    tau_secs,
+                    prohibit_accumulation: false,
+                    block_new_entries,
+                }
+            }
 
             EpochPhase::PreExpiryLockout => {
                 // If completely flat, cancel both sides and stay flat!
@@ -244,6 +288,7 @@ impl EpochLifecycleController {
                         phase,
                         tau_secs,
                         prohibit_accumulation: true,
+                        block_new_entries: true,
                     }
                 }
             }
@@ -372,6 +417,7 @@ mod tests {
             mandatory_flatten_secs: 30,
             terminal_lockout_secs: 15,
             min_order_size_shares: 5,
+            ..Default::default()
         };
         let mut controller = EpochLifecycleController::new(config).unwrap();
 
@@ -533,5 +579,136 @@ mod tests {
                 reason: "Mandatory flatten BUY DOWN at ask".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_entry_time_guard_window_boundaries_and_lifecycle_transitions() {
+        let mut controller = EpochLifecycleController::new(LifecycleConfig {
+            entry_open_delay_secs: 15,
+            entry_cutoff_secs: Some(120),
+            ..Default::default()
+        })
+        .unwrap();
+        let snapshot = OrderRegistrySnapshot::default();
+        let expiry_ms = 300_000;
+
+        let make_input = |now_ms: u64| LifecycleInput {
+            now_ms,
+            expiry_ms,
+            best_ask_up: None,
+            best_ask_dn: None,
+            best_bid_up: None,
+            best_bid_dn: None,
+            flatten_in_flight: false,
+        };
+
+        // 0-15s opening exclusion: elapsed = 0s, 14s -> blocked; 15s -> allowed.
+        assert_eq!(
+            controller.evaluate(&make_input(0), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 300,
+                prohibit_accumulation: false,
+                block_new_entries: true,
+            }
+        );
+        assert_eq!(
+            controller.evaluate(&make_input(14_000), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 286,
+                prohibit_accumulation: false,
+                block_new_entries: true,
+            }
+        );
+        assert_eq!(
+            controller.evaluate(&make_input(15_000), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 285,
+                prohibit_accumulation: false,
+                block_new_entries: false,
+            }
+        );
+
+        // Sub-second boundaries: 14.999s elapsed is still inside the opening delay.
+        assert_eq!(
+            controller.evaluate(&make_input(14_999), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 285,
+                prohibit_accumulation: false,
+                block_new_entries: true,
+            }
+        );
+
+        // Inside [15s, 120s): elapsed = 119s -> allowed.
+        assert_eq!(
+            controller.evaluate(&make_input(119_000), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 181,
+                prohibit_accumulation: false,
+                block_new_entries: false,
+            }
+        );
+
+        // 119.999s elapsed is still before the 120s cutoff.
+        assert_eq!(
+            controller.evaluate(&make_input(119_999), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 180,
+                prohibit_accumulation: false,
+                block_new_entries: false,
+            }
+        );
+
+        // Cutoff at 120s and after (elapsed = 120s, 239s -> blocked, ActiveQuoting).
+        assert_eq!(
+            controller.evaluate(&make_input(120_000), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 180,
+                prohibit_accumulation: false,
+                block_new_entries: true,
+            }
+        );
+        assert_eq!(
+            controller.evaluate(&make_input(239_000), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 61,
+                prohibit_accumulation: false,
+                block_new_entries: true,
+            }
+        );
+
+        // Lifecycle transitions at T-60s, T-30s, T-15s, T-0s still fire normally.
+        assert!(matches!(
+            controller.evaluate(&make_input(240_000), &snapshot),
+            LifecycleAction::CancelAllResting {
+                phase: EpochPhase::PreExpiryLockout,
+                ..
+            }
+        ));
+        assert!(matches!(
+            controller.evaluate(&make_input(270_000), &snapshot),
+            LifecycleAction::CancelAllResting {
+                phase: EpochPhase::MandatoryFlatten,
+                ..
+            }
+        ));
+        assert!(matches!(
+            controller.evaluate(&make_input(285_000), &snapshot),
+            LifecycleAction::CancelAllResting {
+                phase: EpochPhase::TerminalLockout,
+                ..
+            }
+        ));
+        assert!(matches!(
+            controller.evaluate(&make_input(300_000), &snapshot),
+            LifecycleAction::EpochRollover { .. }
+        ));
     }
 }

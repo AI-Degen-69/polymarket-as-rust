@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use core_types::{
     ClockOffsetEstimator, EngineConfig, FeeSchedule, FixedBook, HighResTimerGuard, JsonlWriter,
-    LatencyTracker, MarketDescriptor, MicroUsdc, MonotonicClock, ONE_SHARE_MICRO, OrderSide,
-    Outcome, SharesMicro, SignedSharesMicro, TickPrecision,
+    LatencyTracker, MarketDescriptor, MicroUsdc, MonotonicClock, ONE_DOLLAR_MICRO, ONE_SHARE_MICRO,
+    OrderSide, Outcome, SharesMicro, SignedSharesMicro, TickPrecision,
 };
 use feeds::{
     BinanceSpotEvent, BookMaintainer, DEFAULT_RING_CAPACITY, FeedHealthEvent, FeedId,
@@ -29,10 +29,11 @@ use paper_sim::{
 };
 use risk_lifecycle::{
     ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerReason, BreakerStatus,
-    CancelReason, CircuitBreakers, CorePinning, DollarNotionalRiskEngine, EpochLifecycleController,
-    EpochPhase, ExecutionCommand, FaultInjection, FlattenAction, HysteresisConfig, HysteresisGate,
-    LifecycleConfig, OrderAction, OrderRegistrySnapshot, OrderSlotState, QuoteProposal, RiskActor,
-    RiskActorTrace, RiskConfig, RiskTier,
+    CancelReason, CircuitBreakers, CorePinning, DeficitHedgeOverrideLatch,
+    DollarNotionalRiskEngine, EpochLifecycleController, EpochPhase, ExecutionCommand,
+    FaultInjection, FlattenAction, HysteresisConfig, HysteresisGate, LifecycleConfig, OrderAction,
+    OrderRegistrySnapshot, OrderSlotState, QuoteProposal, RiskActor, RiskActorTrace, RiskConfig,
+    RiskTier,
 };
 use rtrb::RingBuffer;
 use tokio::sync::{mpsc, oneshot};
@@ -482,6 +483,7 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
         mandatory_flatten_secs: 30,
         terminal_lockout_secs: 15,
         min_order_size_shares: 5,
+        ..Default::default()
     };
     let lifecycle = EpochLifecycleController::new(lifecycle_config)?;
 
@@ -1082,6 +1084,9 @@ struct LivePaperSimulator {
     base_size_shares: u64,
     max_entry_prob: Option<f64>,
     max_entry_price: Option<f64>,
+    tier1_hedge_trigger_micro: Option<MicroUsdc>,
+    cap_tier1_reducing_to_delta: bool,
+    deficit_hedge_latch: DeficitHedgeOverrideLatch,
     cumulative_merged_cost_micro: u64,
     step_count: u64,
     current_phase: Option<EpochPhase>,
@@ -1110,6 +1115,8 @@ impl LivePaperSimulator {
         base_size_shares: u64,
         max_entry_prob: Option<f64>,
         max_entry_price: Option<f64>,
+        tier1_hedge_trigger_price: Option<f64>,
+        cap_tier1_reducing_to_delta: bool,
         display: LifecycleDisplayMode,
         verbose_latency: bool,
         harness: ActorPipelineHarness,
@@ -1122,6 +1129,8 @@ impl LivePaperSimulator {
         let telemetry =
             BaselineTelemetry::new(broker_config, desc.fee_schedule, base_shares_micro)?;
         let strike_usd = desc.strike_price_usd.map(|f| f.get());
+        let tier1_hedge_trigger_micro = tier1_hedge_trigger_price
+            .map(|p| MicroUsdc(((p * ONE_DOLLAR_MICRO as f64) + 1e-9).floor() as u64));
 
         let sim = Self {
             desc,
@@ -1151,6 +1160,9 @@ impl LivePaperSimulator {
             base_size_shares,
             max_entry_prob,
             max_entry_price,
+            tier1_hedge_trigger_micro,
+            cap_tier1_reducing_to_delta,
+            deficit_hedge_latch: DeficitHedgeOverrideLatch::new(),
             cumulative_merged_cost_micro: 0,
             step_count: 0,
             current_phase: None,
@@ -1417,6 +1429,10 @@ impl LivePaperSimulator {
             self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
         }
         let inv_after = self.ledger.net_inventory();
+        if inv_after.0.unsigned_abs() < self.desc.min_order_size_micro.as_u64() {
+            // A fill can flatten the position between pricing ticks; drop any stale override.
+            self.deficit_hedge_latch.reset();
+        }
 
         let mid_at_fill = match fill.outcome {
             Outcome::Up => self
@@ -1943,10 +1959,23 @@ impl LivePaperSimulator {
             cost_context: CostContext {
                 avg_cost_up: self.ledger.avg_cost_up(),
                 avg_cost_dn: self.ledger.avg_cost_dn(),
-                allow_cross_tick_override: risk_lifecycle::allows_cross_tick_override(
-                    self.current_tier,
-                    self.current_phase,
-                ),
+                allow_cross_tick_override: {
+                    // Evaluate the latch on every tick, before the tier override, so Tier-3/4
+                    // ticks still clear a stale Tier-1 latch instead of short-circuiting it.
+                    let deficit_hedge_active = self.deficit_hedge_latch.evaluate(
+                        self.current_tier,
+                        inventory_q,
+                        self.desc.min_order_size_micro,
+                        snap_up.best_ask().map(|l| l.price),
+                        snap_dn.best_ask().map(|l| l.price),
+                        self.tier1_hedge_trigger_micro,
+                        self.cap_tier1_reducing_to_delta,
+                    );
+                    risk_lifecycle::allows_cross_tick_override(
+                        self.current_tier,
+                        self.current_phase,
+                    ) || deficit_hedge_active
+                },
             },
             spot_ticks: std::mem::take(&mut self.pending_spot_ticks),
             up_trade_sizes: std::mem::take(&mut self.pending_up_trades),
@@ -2405,6 +2434,7 @@ impl LivePaperSimulator {
         self.pending_tick_sync_ack = false;
         self.current_phase = None;
         self.current_tier = RiskTier::Tier1Normal;
+        self.deficit_hedge_latch.reset();
         self.market_resolved_flag = false;
         self.epoch_settled = false;
         self.stats.epoch_rollovers = self.stats.epoch_rollovers.saturating_add(1);
@@ -2536,6 +2566,11 @@ impl LivePaperSimulator {
         self.stats.fees_paid_micro = self.ledger.fees_paid_micro;
         self.stats.estimated_rebate_micro = self.ledger.estimated_rebate_micro;
         self.stats.total_pairs_merged = self.ledger.total_pairs_merged;
+        self.stats.total_shares_bought_micro = self.ledger.total_shares_bought_micro;
+        self.stats.volume_in_micro = self.ledger.volume_in_micro;
+        self.stats.total_merge_gain_micro = self.ledger.total_merge_gain_micro;
+        self.stats.positive_merge_gain_micro = self.ledger.positive_merge_gain_micro;
+        self.stats.negative_merge_loss_micro = self.ledger.negative_merge_loss_micro;
         self.stats
             .set_final_inventory(self.ledger.filled_up, self.ledger.filled_dn);
         self.stats.rpm_60s = self.telemetry.rpm_60s(now_ms);
@@ -2556,6 +2591,8 @@ const REPLAY_MANDATORY_FLATTEN_SECS: u64 = 30;
 fn build_risk_actor(
     harness: ActorPipelineHarness,
     risk_config: RiskConfig,
+    entry_open_delay_secs: u64,
+    entry_cutoff_secs: Option<u64>,
     initial_tick_size: MicroUsdc,
     now_ns: u64,
     fault: FaultInjection,
@@ -2571,6 +2608,9 @@ fn build_risk_actor(
         mandatory_flatten_secs: REPLAY_MANDATORY_FLATTEN_SECS,
         terminal_lockout_secs: 15,
         min_order_size_shares,
+        entry_open_delay_secs,
+        entry_cutoff_secs,
+        ..Default::default()
     })?;
     let breakers = CircuitBreakers::new(BreakerConfig::default(), initial_tick_size, now_ns);
     Ok(RiskActor::new(
@@ -2621,6 +2661,8 @@ fn spawn_managed_session(
             cap_tier1_reducing_to_delta: cfg.cap_tier1_reducing_to_delta,
             ..Default::default()
         },
+        cfg.entry_open_delay_secs,
+        cfg.entry_cutoff_secs,
         desc.tick_size_micro,
         initial_now_ns,
         args.fault.into(),
@@ -2642,6 +2684,8 @@ fn spawn_managed_session(
         args.base_size,
         cfg.max_entry_prob,
         cfg.max_entry_price,
+        cfg.tier1_hedge_trigger_price,
+        cfg.cap_tier1_reducing_to_delta,
         args.display,
         args.verbose_latency,
         harness.clone(),
@@ -2723,7 +2767,7 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
     let t = theme::current();
     println!("{}", t.section("Active Config's Parameters"));
 
-    let rows: [(&str, String, &str); 18] = [
+    let rows: [(&str, String, &str); 21] = [
         (
             "Gamma",
             cfg.gamma.to_string(),
@@ -2814,6 +2858,25 @@ fn print_engine_config_banner(cfg: &EngineConfig) {
             "Cap Tier-1 Reducing",
             cfg.cap_tier1_reducing_to_delta.to_string(),
             "Limit Tier-1 reduce size to |delta q|",
+        ),
+        (
+            "Tier-1 Hedge Trigger",
+            cfg.tier1_hedge_trigger_price
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "off".to_string()),
+            "Opposing ask unlocking T1/T2 deficit hedge",
+        ),
+        (
+            "Entry Open Delay",
+            format!("{} s", cfg.entry_open_delay_secs),
+            "Opening seconds skipping fresh Leg-1 entries",
+        ),
+        (
+            "Entry Cutoff",
+            cfg.entry_cutoff_secs
+                .map(|s| format!("{s} s"))
+                .unwrap_or_else(|| "off".to_string()),
+            "Elapsed seconds stopping fresh Leg-1 entries",
         ),
         (
             "Execution Mode",
@@ -4073,6 +4136,8 @@ mod tests {
                 min_order_size_shares: 5,
                 ..Default::default()
             },
+            0,
+            None,
             desc.tick_size_micro,
             1_000,
             FaultInjection::None,
@@ -4095,6 +4160,8 @@ mod tests {
             base_size,
             cfg.max_entry_prob,
             cfg.max_entry_price,
+            cfg.tier1_hedge_trigger_price,
+            cfg.cap_tier1_reducing_to_delta,
             LifecycleDisplayMode::Stream,
             false,
             harness.clone(),
@@ -5239,6 +5306,7 @@ mod tests {
                 min_spread_ticks: Some(1),
                 max_combined_bid_micro: Some(990_000),
                 fee_spread_floor: Some(false),
+                entry_open_delay_secs: Some(0),
                 ..Default::default()
             },
             pinning: CorePinning::default(),
@@ -5277,6 +5345,7 @@ mod tests {
                 min_spread_ticks: Some(1),
                 max_combined_bid_micro: Some(990_000),
                 fee_spread_floor: Some(false),
+                entry_open_delay_secs: Some(0),
                 ..Default::default()
             },
             pinning: CorePinning::default(),
@@ -5298,6 +5367,11 @@ mod tests {
             "orders_held",
             "fills_count",
             "merges_count",
+            "total_shares_bought_micro",
+            "volume_in_micro",
+            "total_merge_gain_micro",
+            "positive_merge_gain_micro",
+            "negative_merge_loss_micro",
             "realized_pnl_micro",
             "unrealized_pnl_micro",
             "baseline_pnl_micro",
@@ -5305,6 +5379,8 @@ mod tests {
             assert_eq!(sum_a[key], sum_b[key], "mismatch on {key}");
         }
         assert!(sum_a["fills_count"].as_u64().unwrap() >= 1);
+        assert!(sum_a["volume_in_micro"].as_u64().unwrap() > 0);
+        assert!(sum_a["total_shares_bought_micro"].as_u64().unwrap() > 0);
 
         let _ = std::fs::remove_file(&fixture);
         let _ = std::fs::remove_file(&out_a);

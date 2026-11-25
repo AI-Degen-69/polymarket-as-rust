@@ -35,8 +35,8 @@ pub use runtime::{
     QuoteProposal, RiskActor, RiskActorTrace, pin_thread_to_core,
 };
 pub use station7_risk::{
-    DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot, RiskConfig, RiskDecision,
-    RiskEvaluationInput, RiskTier, allows_cross_tick_override,
+    DeficitHedgeOverrideLatch, DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot,
+    RiskConfig, RiskDecision, RiskEvaluationInput, RiskTier, allows_cross_tick_override,
 };
 pub use station8_hysteresis::{
     CancelReason, HysteresisConfig, HysteresisGate, HysteresisInput, OrderAction, OrderSlotState,
