@@ -33,7 +33,44 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use core_types::{KappaMode, NexWsVersion, SgMode, VarianceMode};
+use core_types::{
+    DefaultQueueDecay, EngineConfig, KappaMode, MICRO_SCALE, NexWsVersion, SgMode, VarianceMode,
+    default_simulation_settings,
+};
+
+fn micro_to_whole_units(field: &str, micro: u64, fallback: u64) -> u64 {
+    if micro >= MICRO_SCALE && micro.is_multiple_of(MICRO_SCALE) {
+        micro / MICRO_SCALE
+    } else {
+        eprintln!(
+            "warning: DEFAULTS.json {field} ({micro}) is not a positive whole-unit multiple of {MICRO_SCALE}; using fallback {fallback}"
+        );
+        fallback
+    }
+}
+
+fn default_v_max_usd() -> u64 {
+    micro_to_whole_units(
+        "max_notional_per_leg_micro",
+        EngineConfig::default().max_notional_per_leg_micro.as_u64(),
+        50,
+    )
+}
+
+fn default_base_size_shares() -> u64 {
+    micro_to_whole_units(
+        "base_order_size_shares",
+        EngineConfig::default().base_order_size_shares.as_u64(),
+        20,
+    )
+}
+
+fn default_cli_queue_decay() -> CliQueueDecay {
+    match default_simulation_settings().queue_decay {
+        DefaultQueueDecay::Conservative => CliQueueDecay::Conservative,
+        DefaultQueueDecay::Optimistic => CliQueueDecay::Optimistic,
+    }
+}
 
 use exec_cmd::{ExecArgs, ExecMode};
 use feeds_cmd::FeedsArgs;
@@ -494,17 +531,17 @@ enum Commands {
         /// Allow starting `--source live` mid-window instead of waiting idle for the next fresh 5-minute boundary.
         #[arg(long, default_value_t = false)]
         allow_mid_window: bool,
-        /// Maximum dollar position capital in USD (`$50` default).
-        #[arg(long, default_value_t = 50)]
+        /// Maximum dollar position capital in USD (`DEFAULTS.json`: `$50`).
+        #[arg(long, default_value_t = default_v_max_usd())]
         v_max: u64,
-        /// Base order size in whole shares (`20` default).
-        #[arg(long, default_value_t = 20)]
+        /// Base order size in whole shares (`DEFAULTS.json`: `20`).
+        #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
         /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
         #[arg(long, default_value_t = 40)]
         latency_ms: u64,
-        /// FIFO queue decay policy (`conservative` default or `optimistic`).
-        #[arg(long, value_enum, default_value_t = CliQueueDecay::Conservative)]
+        /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
+        #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
         queue_decay: CliQueueDecay,
         #[command(flatten)]
         math: MathOverrides,
@@ -538,14 +575,14 @@ enum Commands {
         /// Inject adversarial fault mode (`none`, `stale`, `tier4`, `tick-change`, `disconnect`).
         #[arg(long, value_enum, default_value_t = CliFaultModeArg::None, alias = "fault")]
         inject_fault: CliFaultModeArg,
-        /// Maximum dollar position capital in USD (`$50` default).
-        #[arg(long, default_value_t = 50)]
+        /// Maximum dollar position capital in USD (`DEFAULTS.json`: `$50`).
+        #[arg(long, default_value_t = default_v_max_usd())]
         v_max: u64,
-        /// Base order size in whole shares (`20` default).
-        #[arg(long, default_value_t = 20)]
+        /// Base order size in whole shares (`DEFAULTS.json`: `20`).
+        #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
-        /// FIFO queue decay policy (`conservative` default or `optimistic`).
-        #[arg(long, value_enum, default_value_t = CliQueueDecay::Conservative)]
+        /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
+        #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
         queue_decay: CliQueueDecay,
         #[command(flatten)]
         math: MathOverrides,
@@ -1652,5 +1689,17 @@ mod tests {
             }
             _ => panic!("expected Lifecycle"),
         }
+    }
+
+    #[test]
+    fn cli_defaults_are_positive_whole_units_matching_embedded_defaults() {
+        let cfg = EngineConfig::default();
+        let v_max_micro = cfg.max_notional_per_leg_micro.as_u64();
+        let base_micro = cfg.base_order_size_shares.as_u64();
+        assert!(v_max_micro >= MICRO_SCALE && v_max_micro.is_multiple_of(MICRO_SCALE));
+        assert!(base_micro >= MICRO_SCALE && base_micro.is_multiple_of(MICRO_SCALE));
+        assert_eq!(default_v_max_usd(), 50);
+        assert_eq!(default_base_size_shares(), 20);
+        assert_eq!(micro_to_whole_units("test_fractional", 50_500_000, 50), 50);
     }
 }

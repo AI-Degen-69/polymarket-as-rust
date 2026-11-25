@@ -27,7 +27,10 @@ pub mod sandbox;
 pub mod telemetry;
 
 pub use clock::{ClockOffsetEstimator, HighResTimerGuard, MonotonicClock};
-pub use config::{EngineConfig, LiveCredentials};
+pub use config::{
+    DefaultQueueDecay, EngineConfig, LiveCredentials, SimulationDefaults,
+    default_simulation_settings,
+};
 pub use error::{ClockError, ConfigError, MathError, ParseDecimalError, TelemetryError, WireError};
 pub use market::{
     BookLevel, ExecutionMode, FixedBook, KappaMode, MarketDescriptor, Outcome, ProtocolVersion,

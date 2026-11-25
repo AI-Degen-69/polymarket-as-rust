@@ -1,0 +1,37 @@
+{
+  "engine": {
+    "execution_mode": "Paper",
+    "dry_run": true,
+    "wallet_mode": "DepositWallet1271",
+    "relayer_url": "https://relayer-v2.polymarket.com/submit",
+    "gasless_relayer_enabled": true,
+    "polybolt_enabled": false,
+    "gamma": 0.12,
+    "max_notional_per_leg_micro": 50000000,
+    "base_order_size_shares": 20000000,
+    "min_combined_spread_micro": 10000,
+    "min_spread_ticks": 1,
+    "max_combined_bid_micro": 980000,
+    "hysteresis_tick_buffer": 0.25,
+    "variance_mode": "BinaryCara",
+    "kappa_mode": "TradeNormalizedDepth",
+    "sg_mode": "Causal",
+    "include_variance_spread": true,
+    "enforce_fee_floor": false,
+    "max_cross_tick_loss_micro": 80000,
+    "max_entry_prob": 0.80,
+    "max_entry_price": 0.60,
+    "lead_lag_cancel_threshold": 0.015,
+    "lead_lag_window_ms": 1000,
+    "lead_lag_cooldown_ms": 1000,
+    "lead_lag_directional": true,
+    "hedge_skew_mult": 1.0,
+    "cap_tier1_reducing_to_delta": false,
+    "clock_drift_max_ms": 1000
+  },
+  "simulation": {
+    "queue_decay": "conservative",
+    "maker_rebate_floor_e6": 0,
+    "maker_rebate_tier1_e6": 30000
+  }
+}

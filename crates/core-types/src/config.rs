@@ -1,7 +1,10 @@
 use std::fmt;
+use std::sync::OnceLock;
 
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
+
+const EMBEDDED_DEFAULTS_JSON: &str = include_str!("../../../DEFAULTS.json");
 
 use crate::error::{ConfigError, redact_presence};
 use crate::market::{ExecutionMode, KappaMode, SgMode, VarianceMode, WalletMode};
@@ -324,8 +327,160 @@ impl fmt::Debug for EngineConfig {
     }
 }
 
-impl Default for EngineConfig {
-    fn default() -> Self {
+/// Queue decay model default stored in `DEFAULTS.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DefaultQueueDecay {
+    /// Conservative queue-fill model (`DEFAULTS.json` simulation floor).
+    Conservative,
+    /// Optimistic queue-fill model.
+    Optimistic,
+}
+
+/// Simulation and maker-rebate defaults loaded from root `DEFAULTS.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SimulationDefaults {
+    /// Default queue decay policy (`conservative` or `optimistic`).
+    pub queue_decay: DefaultQueueDecay,
+    /// Strict live maker rebate floor below Tier-1 weighted volume (`0` = `0%`).
+    pub maker_rebate_floor_e6: u64,
+    /// Post-Nov-21 Tier-1 (`$200K–$1M` 30d wV) maker rebate share (`30_000` = `3%`).
+    pub maker_rebate_tier1_e6: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedEngineDefaults {
+    execution_mode: ExecutionMode,
+    dry_run: bool,
+    wallet_mode: WalletMode,
+    relayer_url: String,
+    gasless_relayer_enabled: bool,
+    polybolt_enabled: bool,
+    gamma: f64,
+    max_notional_per_leg_micro: MicroUsdc,
+    base_order_size_shares: SharesMicro,
+    min_combined_spread_micro: MicroUsdc,
+    min_spread_ticks: u32,
+    max_combined_bid_micro: MicroUsdc,
+    hysteresis_tick_buffer: f64,
+    variance_mode: VarianceMode,
+    kappa_mode: KappaMode,
+    sg_mode: SgMode,
+    include_variance_spread: bool,
+    enforce_fee_floor: bool,
+    max_cross_tick_loss_micro: Option<u64>,
+    max_entry_prob: Option<f64>,
+    max_entry_price: Option<f64>,
+    lead_lag_cancel_threshold: f64,
+    lead_lag_window_ms: u64,
+    lead_lag_cooldown_ms: u64,
+    lead_lag_directional: bool,
+    hedge_skew_mult: f64,
+    cap_tier1_reducing_to_delta: bool,
+    clock_drift_max_ms: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EmbeddedDefaultsFile {
+    engine: EmbeddedEngineDefaults,
+    simulation: SimulationDefaults,
+}
+
+#[derive(Clone)]
+struct DefaultBundle {
+    engine: EngineConfig,
+    simulation: SimulationDefaults,
+}
+
+impl DefaultBundle {
+    fn fallback() -> Self {
+        let engine = EngineConfig::hardcoded_fallback();
+        let simulation = SimulationDefaults {
+            queue_decay: DefaultQueueDecay::Conservative,
+            maker_rebate_floor_e6: 0,
+            maker_rebate_tier1_e6: 30_000,
+        };
+        Self { engine, simulation }
+    }
+}
+
+static DEFAULT_BUNDLE: OnceLock<DefaultBundle> = OnceLock::new();
+
+fn parse_defaults_bundle_from_str(json: &str) -> Result<DefaultBundle, ConfigError> {
+    let parsed: EmbeddedDefaultsFile =
+        serde_json::from_str(json).map_err(|err| ConfigError::InvalidValue {
+            key: "DEFAULTS.json",
+            value: "<embedded>".to_string(),
+            reason: err.to_string(),
+        })?;
+    let e = parsed.engine;
+    let engine = EngineConfig {
+        execution_mode: e.execution_mode,
+        dry_run: e.dry_run,
+        wallet_mode: e.wallet_mode,
+        proxy_address: None,
+        signer_address: None,
+        relayer_address: None,
+        relayer_url: e.relayer_url,
+        gasless_relayer_enabled: e.gasless_relayer_enabled,
+        polybolt_enabled: e.polybolt_enabled,
+        gamma: e.gamma,
+        max_notional_per_leg_micro: e.max_notional_per_leg_micro,
+        base_order_size_shares: e.base_order_size_shares,
+        min_combined_spread_micro: e.min_combined_spread_micro,
+        min_spread_ticks: e.min_spread_ticks,
+        max_combined_bid_micro: e.max_combined_bid_micro,
+        hysteresis_tick_buffer: e.hysteresis_tick_buffer,
+        variance_mode: e.variance_mode,
+        kappa_mode: e.kappa_mode,
+        sg_mode: e.sg_mode,
+        include_variance_spread: e.include_variance_spread,
+        enforce_fee_floor: e.enforce_fee_floor,
+        max_cross_tick_loss_micro: e.max_cross_tick_loss_micro,
+        max_entry_prob: e.max_entry_prob,
+        max_entry_price: e.max_entry_price,
+        lead_lag_cancel_threshold: e.lead_lag_cancel_threshold,
+        lead_lag_window_ms: e.lead_lag_window_ms,
+        lead_lag_cooldown_ms: e.lead_lag_cooldown_ms,
+        lead_lag_directional: e.lead_lag_directional,
+        hedge_skew_mult: e.hedge_skew_mult,
+        cap_tier1_reducing_to_delta: e.cap_tier1_reducing_to_delta,
+        clock_drift_max_ms: e.clock_drift_max_ms,
+        credentials: LiveCredentials::default(),
+    };
+    validate_modes(&engine)?;
+    validate_addresses(&engine)?;
+    validate_math_bounds(&engine)?;
+    Ok(DefaultBundle {
+        engine,
+        simulation: parsed.simulation,
+    })
+}
+
+fn parse_embedded_defaults_bundle() -> Result<DefaultBundle, ConfigError> {
+    parse_defaults_bundle_from_str(EMBEDDED_DEFAULTS_JSON)
+}
+
+fn default_bundle() -> &'static DefaultBundle {
+    DEFAULT_BUNDLE.get_or_init(|| {
+        parse_embedded_defaults_bundle().unwrap_or_else(|err| {
+            eprintln!("warning: embedded DEFAULTS.json failed to parse/validate ({err}); using hardcoded fallback");
+            DefaultBundle::fallback()
+        })
+    })
+}
+
+/// Returns simulation defaults loaded from repository root `DEFAULTS.json`.
+#[must_use]
+pub fn default_simulation_settings() -> SimulationDefaults {
+    default_bundle().simulation
+}
+
+impl EngineConfig {
+    fn hardcoded_fallback() -> Self {
         Self {
             execution_mode: ExecutionMode::Paper,
             dry_run: true,
@@ -360,6 +515,12 @@ impl Default for EngineConfig {
             clock_drift_max_ms: 1_000,
             credentials: LiveCredentials::default(),
         }
+    }
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        default_bundle().engine.clone()
     }
 }
 
@@ -399,7 +560,8 @@ impl EngineConfig {
 
     /// Validates cross-field mode latches, address shapes, credentials, and math/risk bounds.
     pub fn validate(&self) -> Result<(), ConfigError> {
-        validate_modes_and_credentials(self)?;
+        validate_modes(self)?;
+        validate_credentials(self)?;
         validate_addresses(self)?;
         validate_math_bounds(self)?;
         Ok(())
@@ -611,7 +773,7 @@ where
     })
 }
 
-fn validate_modes_and_credentials(cfg: &EngineConfig) -> Result<(), ConfigError> {
+fn validate_modes(cfg: &EngineConfig) -> Result<(), ConfigError> {
     if cfg.execution_mode == ExecutionMode::CanaryLive && cfg.dry_run {
         return Err(invariant(
             "canary-live mode cannot run with dry_run=true; set DRY_RUN=false explicitly",
@@ -622,6 +784,10 @@ fn validate_modes_and_credentials(cfg: &EngineConfig) -> Result<(), ConfigError>
             "paper and dry-run modes require dry_run=true to keep order gates armed",
         ));
     }
+    Ok(())
+}
+
+fn validate_credentials(cfg: &EngineConfig) -> Result<(), ConfigError> {
     if cfg.polybolt_enabled && !cfg.credentials.has_polybolt_credentials() {
         return Err(invariant(
             "polybolt_enabled=true requires CLOB_API_KEY, CLOB_API_SECRET, CLOB_API_PASSPHRASE, and CHAINLINK_API_KEY",
@@ -1076,6 +1242,50 @@ mod tests {
             hedge_skew_mult,
             cap_tier1_reducing_to_delta,
             clock_drift_max_ms,
+        );
+    }
+
+    #[test]
+    fn embedded_defaults_json_parses_validates_and_matches_default() {
+        let bundle =
+            parse_embedded_defaults_bundle().expect("DEFAULTS.json must parse and validate");
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.gamma, bundle.engine.gamma);
+        assert_eq!(
+            cfg.max_combined_bid_micro,
+            bundle.engine.max_combined_bid_micro
+        );
+        assert_eq!(cfg.max_entry_prob, bundle.engine.max_entry_prob);
+        assert_eq!(cfg.max_entry_price, bundle.engine.max_entry_price);
+        assert_eq!(
+            cfg.max_cross_tick_loss_micro,
+            bundle.engine.max_cross_tick_loss_micro
+        );
+        assert_eq!(cfg.gamma, 0.12);
+        assert_eq!(cfg.max_combined_bid_micro, MicroUsdc(980_000));
+        assert_eq!(cfg.max_entry_prob, Some(0.80));
+        assert_eq!(cfg.max_entry_price, Some(0.60));
+        assert_eq!(
+            default_simulation_settings().queue_decay,
+            DefaultQueueDecay::Conservative
+        );
+        assert_eq!(default_simulation_settings().maker_rebate_floor_e6, 0);
+        assert_eq!(default_simulation_settings().maker_rebate_tier1_e6, 30_000);
+    }
+
+    #[test]
+    fn embedded_defaults_parser_allows_polybolt_without_credentials() {
+        let json = EMBEDDED_DEFAULTS_JSON.replacen(
+            "\"polybolt_enabled\": false",
+            "\"polybolt_enabled\": true",
+            1,
+        );
+        let bundle = parse_defaults_bundle_from_str(&json)
+            .expect("embedded parser must allow polybolt_enabled=true before env credentials load");
+        assert!(bundle.engine.polybolt_enabled);
+        assert!(
+            bundle.engine.validate().is_err(),
+            "full EngineConfig::validate() must still require PolyBolt credentials"
         );
     }
 }
