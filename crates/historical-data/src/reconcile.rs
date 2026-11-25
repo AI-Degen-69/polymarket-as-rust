@@ -158,8 +158,8 @@ pub fn audit_pmdata_historical_market(
         })?;
     let no_rows = read_l2_parquet(no_path)?;
     let trade_rows = match &files.trades_path {
-        Some(p) if p.is_file() => read_trades_parquet(p)?,
-        _ => Vec::new(),
+        Some(p) => read_trades_parquet(p)?,
+        None => Vec::new(),
     };
 
     let mapping = OutcomeMapping::from_catalog(catalog_meta, &slug)?;
@@ -664,7 +664,8 @@ pub fn reconcile_live_vs_pmdata(
 
     // 3. Compare trades by `(exchange_ts_ms, outcome, side)` + check price/size diffs.
     let live_trades = collect_trades(&live_events);
-    let pm_trades = collect_trades(&pm_stream.events);
+    let mut pm_trades = collect_trades(&pm_stream.events);
+    pm_trades.sort_by_key(|t| t.exch_ms);
     let mut matched_trades = 0_usize;
     let mut trade_price_mismatches = 0_usize;
     let mut trade_size_mismatches = 0_usize;
@@ -672,11 +673,18 @@ pub fn reconcile_live_vs_pmdata(
     let mut pm_used = vec![false; pm_trades.len()];
 
     for lt in &live_trades {
+        let min_ms = lt.exch_ms.saturating_sub(1_000);
+        let max_ms = lt.exch_ms.saturating_add(1_000);
+        let start_idx = pm_trades.partition_point(|pt| pt.exch_ms < min_ms);
+        let end_idx = pm_trades.partition_point(|pt| pt.exch_ms <= max_ms);
         let mut best_match: Option<(usize, i64)> = None;
-        for (j, pt) in pm_trades.iter().enumerate() {
+        for j in start_idx..end_idx {
             if pm_used.get(j).copied().unwrap_or(true) {
                 continue;
             }
+            let Some(pt) = pm_trades.get(j) else {
+                continue;
+            };
             if lt.outcome == pt.outcome && lt.side == pt.side {
                 let diff = (pt.exch_ms as i64).saturating_sub(lt.exch_ms as i64);
                 if diff.abs() <= 1_000
@@ -747,6 +755,8 @@ pub fn reconcile_live_vs_pmdata(
         trade_price_mismatches,
         recon_checkpoints,
         recon_bbo_matches,
+        resolution_live,
+        resolution_pmdata,
         mode,
     );
 
@@ -889,13 +899,40 @@ pub fn render_historical_phase0_markdown(report: &HistoricalPhase0Report) -> Str
     }
     let _ = writeln!(out);
     let _ = writeln!(out, "## Research Suitability & Open Blockers");
+    let exact_snaps: usize = report
+        .markets
+        .iter()
+        .map(|m| m.yes_no_exact_mirror_snapshots)
+        .sum();
+    let matched_snaps: usize = report
+        .markets
+        .iter()
+        .map(|m| m.yes_no_matched_book_snapshots)
+        .sum();
+    let non_mono_total: usize = report
+        .markets
+        .iter()
+        .map(|m| m.l2_timestamp_non_monotonic)
+        .sum();
+    let trades_in_bbo: usize = report
+        .markets
+        .iter()
+        .map(|m| m.trades_within_causal_bbo)
+        .sum();
+    let trades_with_book: usize = report
+        .markets
+        .iter()
+        .map(|m| m.trades_total_with_prior_book)
+        .sum();
     let _ = writeln!(
         out,
-        "- **Verified Historical Properties:** Arrow/Parquet schema decoding (including pre-`2026-10-12` missing `trade_id` and post-update string-encoded `new_tick_size`), 100% Yes/No exact book snapshot complementarity across all audited samples, monotonic L2 ordering, and causal trade-within-BBO alignment."
+        "- **Verified Historical Properties:** {} market(s) audited; Arrow/Parquet schema decoding passed; Yes/No exact snapshot mirrors={exact_snaps}/{matched_snaps}; L2 non-monotonic timestamps={non_mono_total}; trades within causal BBO={trades_in_bbo}/{trades_with_book}.",
+        report.markets.len()
     );
     let _ = writeln!(
         out,
-        "- **Unverified Equivalence Blockers:** Overlapping Live JSONL vs. PMData reconciliation (`poly-as pmdata reconcile`) could NOT run yet because PMData's free tier blocks the trailing 21 days (`2026-11-22..25`, where all 20 existing 5m live captures live) and no live 15m captures exist yet."
+        "- **Unverified Equivalence Blockers:** {}",
+        report.disclaimer
     );
     let _ = writeln!(
         out,
@@ -996,6 +1033,8 @@ fn convert_book_vecs(
     }
     bids.sort_by_key(|a| std::cmp::Reverse(a.price));
     asks.sort_by_key(|a| a.price);
+    crate::normalizer::coalesce_book_levels(&mut bids);
+    crate::normalizer::coalesce_book_levels(&mut asks);
     Ok(ConvertedBookVecs {
         bids,
         asks,
@@ -1185,8 +1224,15 @@ fn classify_reconcile_verdict(
     trade_price_mismatches: usize,
     recon_checkpoints: usize,
     recon_bbo_matches: usize,
+    resolution_live: Option<Outcome>,
+    resolution_pmdata: Option<Outcome>,
     _mode: IngestionMode,
 ) -> FidelityVerdict {
+    if let (Some(live_win), Some(pm_win)) = (resolution_live, resolution_pmdata)
+        && live_win != pm_win
+    {
+        return FidelityVerdict::NotEquivalent;
+    }
     let has_book_and_trade_coverage = matched_snapshots > 0 || matched_pc > 0 || matched_trades > 0;
     if !has_book_and_trade_coverage {
         return FidelityVerdict::NotEquivalent;

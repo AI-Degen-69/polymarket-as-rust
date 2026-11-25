@@ -64,6 +64,7 @@ pub(crate) struct PaperArgs {
 struct PaperState {
     desc: Option<MarketDescriptor>,
     explicit_winning_outcome: Option<Outcome>,
+    epoch_settled: bool,
     book_up: BookMaintainer,
     book_dn: BookMaintainer,
     latest_up: Option<FixedBook<10>>,
@@ -93,6 +94,7 @@ impl PaperState {
         Self {
             desc: None,
             explicit_winning_outcome: None,
+            epoch_settled: false,
             book_up: BookMaintainer::new(Outcome::Up),
             book_dn: BookMaintainer::new(Outcome::Down),
             latest_up: None,
@@ -119,6 +121,7 @@ impl PaperState {
             self.strike_usd = self.spot_usd;
         }
         self.explicit_winning_outcome = None;
+        self.epoch_settled = false;
         self.twap_60s_usd = None;
         self.oracle_twap_60s_usd = None;
         self.book_up = BookMaintainer::new(Outcome::Up);
@@ -479,14 +482,43 @@ fn run_canonical_replay(
         base_size,
     )?;
 
+    let mut pending_resolutions: std::collections::HashMap<String, Outcome> =
+        std::collections::HashMap::new();
+    for ev in &filtered_events {
+        if let CanonicalEventKind::MarketResolution {
+            winning_outcome, ..
+        } = ev.kind
+        {
+            pending_resolutions.insert(ev.provenance.market_slug.clone(), winning_outcome);
+        }
+    }
+
     let mut epoch = 0_u64;
     let mut last_sim_ms = 0_u64;
+    let mut prev_sim_ms: Option<u64> = None;
 
     for ev in filtered_events {
         let cur_sim_ms = ev.timestamp.replay_order_ts_ms;
+        if let Some(prev) = prev_sim_ms
+            && cur_sim_ms < prev
+        {
+            return Err(format!(
+                "non-monotonic canonical replay_order_ts_ms: {cur_sim_ms} < {prev}"
+            )
+            .into());
+        }
+        prev_sim_ms = Some(cur_sim_ms);
         last_sim_ms = cur_sim_ms;
 
+        if let CanonicalEventKind::MarketResolution {
+            winning_outcome, ..
+        } = ev.kind
+        {
+            state.explicit_winning_outcome = Some(winning_outcome);
+        }
+
         if let Some(expiry_ms) = state.desc.as_ref().map(|d| d.expiry_ts_ms)
+            && !state.epoch_settled
             && cur_sim_ms >= expiry_ms
         {
             while state.next_eval_ms.is_some_and(|target| expiry_ms >= target) {
@@ -502,13 +534,35 @@ fn run_canonical_replay(
                     (&mut tracker, &mut jsonl, &clock),
                 )?;
             }
-            let _ = state.settle_expired_epoch(
+            if state.explicit_winning_outcome.is_none()
+                && let Some(slug) = state.desc.as_ref().map(|d| &d.slug)
+                && let Some(&win) = pending_resolutions.get(slug)
+            {
+                state.explicit_winning_outcome = Some(win);
+            }
+            if let Some(pending) = state.settle_expired_epoch(
                 expiry_ms,
                 &mut broker,
                 &mut ledger,
                 &mut telemetry,
                 &mut pipe,
-            );
+            ) {
+                let expiry_ns = clock.now_ns().unwrap_or(0);
+                let _ = record_epoch_rollover_jsonl(
+                    &mut jsonl,
+                    expiry_ms,
+                    expiry_ns,
+                    &pending.expired_slug,
+                    None,
+                    pending.winning_outcome,
+                    pending.settle_delta_micro,
+                    pending.total_realized_pnl_micro,
+                    pending.pairs_merged_micro,
+                    pending.fees_paid_micro,
+                    pending.estimated_rebate_micro,
+                );
+            }
+            state.epoch_settled = true;
         }
 
         match ev.kind {
@@ -533,7 +587,7 @@ fn run_canonical_replay(
                         );
                     }
                 } else {
-                    let _ = pipe.set_epoch_secs(epoch_secs);
+                    pipe.set_epoch_secs(epoch_secs)?;
                     ledger.set_fee_schedule(desc.fee_schedule);
                     telemetry
                         .naive_engine
@@ -556,22 +610,24 @@ fn run_canonical_replay(
                     CanonicalEvent::to_fixed_book_10(outcome, &bids, &asks, mono_ns, exch_ms)?;
                 match outcome {
                     Outcome::Up => {
-                        let _ = state.book_up.apply_snapshot(
+                        if let Ok(valid) = state.book_up.apply_snapshot(
                             fixed.bids_slice(),
                             fixed.asks_slice(),
                             mono_ns,
                             exch_ms,
-                        );
-                        state.latest_up = Some(fixed);
+                        ) {
+                            state.latest_up = Some(valid);
+                        }
                     }
                     Outcome::Down => {
-                        let _ = state.book_dn.apply_snapshot(
+                        if let Ok(valid) = state.book_dn.apply_snapshot(
                             fixed.bids_slice(),
                             fixed.asks_slice(),
                             mono_ns,
                             exch_ms,
-                        );
-                        state.latest_dn = Some(fixed);
+                        ) {
+                            state.latest_dn = Some(valid);
+                        }
                     }
                 }
             }
@@ -697,16 +753,33 @@ fn run_canonical_replay(
     }
 
     if let Some(desc) = state.desc.as_ref()
+        && !state.epoch_settled
         && (last_sim_ms >= desc.expiry_ts_ms || state.explicit_winning_outcome.is_some())
     {
         let settle_ts = last_sim_ms.max(desc.expiry_ts_ms);
-        let _ = state.settle_expired_epoch(
+        if let Some(pending) = state.settle_expired_epoch(
             settle_ts,
             &mut broker,
             &mut ledger,
             &mut telemetry,
             &mut pipe,
-        );
+        ) {
+            let now_ns = clock.now_ns().unwrap_or(0);
+            let _ = record_epoch_rollover_jsonl(
+                &mut jsonl,
+                settle_ts,
+                now_ns,
+                &pending.expired_slug,
+                None,
+                pending.winning_outcome,
+                pending.settle_delta_micro,
+                pending.total_realized_pnl_micro,
+                pending.pairs_merged_micro,
+                pending.fees_paid_micro,
+                pending.estimated_rebate_micro,
+            );
+        }
+        state.epoch_settled = true;
     }
 
     finalize_paper_output(
@@ -2904,7 +2977,21 @@ mod tests {
             jsonl: out_ok.clone(),
         })
         .unwrap();
-        assert!(out_ok.is_file());
+        let log_txt = std::fs::read_to_string(&out_ok).unwrap();
+        assert!(
+            log_txt.lines().any(|line| {
+                serde_json::from_str::<serde_json::Value>(line).is_ok_and(|v| {
+                    v["event"] == "summary"
+                        && v["payload"]["total_ticks"].as_u64().unwrap_or(0) >= 1
+                })
+            }),
+            "expected summary with total_ticks >= 1 in {log_txt}"
+        );
+        // Verify explicit MarketResolution (`Down`) was honored during epoch settlement.
+        assert!(
+            log_txt.contains("\"winning_outcome\":\"Down\""),
+            "expected settlement with winning_outcome=Down in {log_txt}"
+        );
 
         // Filtering for LiveOnly on pure PMData input fails cleanly.
         let err = run(PaperArgs {

@@ -184,6 +184,9 @@ pub(crate) enum PmdataCommands {
         /// Optional `markets.parquet` catalog path.
         #[arg(long)]
         catalog: Option<PathBuf>,
+        /// Optional market slug override when filename/parent directory does not encode the slug.
+        #[arg(long)]
+        market_slug: Option<String>,
         /// L2 mode (`full` or `quota-saving`).
         #[arg(long, value_enum, default_value_t = CliIngestionMode::Full)]
         mode: CliIngestionMode,
@@ -278,6 +281,7 @@ pub(crate) fn run(action: PmdataCommands) -> Result<(), Box<dyn Error>> {
             no_l2,
             trades,
             catalog,
+            market_slug,
             mode,
             report_out,
         } => run_reconcile(
@@ -286,6 +290,7 @@ pub(crate) fn run(action: PmdataCommands) -> Result<(), Box<dyn Error>> {
             no_l2.as_deref(),
             &trades,
             catalog.as_deref(),
+            market_slug.as_deref(),
             mode.into(),
             report_out.as_deref(),
         ),
@@ -647,8 +652,10 @@ fn run_normalize(p: NormalizeParams) -> Result<(), Box<dyn Error>> {
                 .market_slug
                 .or_else(|| infer_slug_from_path(&yes_l2))
                 .ok_or("cannot infer --market-slug; pass --market-slug explicitly")?;
+            let explicit_catalog = p.catalog.is_some();
             let catalog_path = p.catalog.unwrap_or_else(|| client.catalog_cache_path());
-            let catalog_entry = find_catalog_entry_if_present(&catalog_path, &slug)?;
+            let catalog_entry =
+                find_catalog_entry_if_present(&catalog_path, &slug, explicit_catalog)?;
             let files = PmdataMarketFiles {
                 market_slug: slug,
                 yes_l2_path: yes_l2,
@@ -711,6 +718,7 @@ fn run_verify_historical(
         cache_dir: cache_dir.clone(),
         ..cfg
     })?;
+    let explicit_catalog = catalog_opt.is_some();
     let catalog_path = catalog_opt
         .map(Path::to_path_buf)
         .unwrap_or_else(|| client.catalog_cache_path());
@@ -719,7 +727,7 @@ fn run_verify_historical(
     let mut audits = Vec::with_capacity(samples.len());
     for slug in samples {
         let files = locate_cached_market_files(&client, &manifest, slug)?;
-        let catalog_entry = find_catalog_entry_if_present(&catalog_path, slug)?;
+        let catalog_entry = find_catalog_entry_if_present(&catalog_path, slug, explicit_catalog)?;
         let audit = audit_pmdata_historical_market(&files, catalog_entry.as_ref())?;
         println!(
             "Verified historical `{}`: yes_l2={} (books={}, pc={}, mr={}) | no_l2={} (books={}, pc={}) | trades={} (missing_id={}) | exact_comp_snaps={}/{}",
@@ -761,23 +769,30 @@ fn run_verify_historical(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_reconcile(
     live_path: &Path,
     yes_l2_path: &Path,
     no_l2_path: Option<&Path>,
     trades_path: &Path,
     catalog_opt: Option<&Path>,
+    market_slug_opt: Option<&str>,
     mode: IngestionMode,
     report_out: Option<&Path>,
 ) -> Result<(), Box<dyn Error>> {
     let cfg = PmdataConfig::from_env()?;
     let client = PmdataClient::new(cfg)?;
-    let slug = infer_slug_from_path(yes_l2_path)
-        .ok_or("cannot infer market slug from --yes-l2 filename/parent directory")?;
+    let slug = market_slug_opt
+        .map(str::to_string)
+        .or_else(|| infer_slug_from_path(yes_l2_path))
+        .ok_or(
+            "cannot infer market slug from --yes-l2 filename/parent directory; pass --market-slug",
+        )?;
+    let explicit_catalog = catalog_opt.is_some();
     let catalog_path = catalog_opt
         .map(Path::to_path_buf)
         .unwrap_or_else(|| client.catalog_cache_path());
-    let catalog_entry = find_catalog_entry_if_present(&catalog_path, &slug)?;
+    let catalog_entry = find_catalog_entry_if_present(&catalog_path, &slug, explicit_catalog)?;
     let files = PmdataMarketFiles {
         market_slug: slug,
         yes_l2_path: yes_l2_path.to_path_buf(),
@@ -835,6 +850,44 @@ fn locate_cached_market_files(
         if disk_path.is_file() {
             return Some(disk_path);
         }
+        // Fallback: check extracted Day Bundle directories (`<cache_dir>/extracted/<YYYY-MM-DD>/*/`).
+        let extracted_date_dir = client
+            .config()
+            .cache_dir
+            .join("extracted")
+            .join(date.format("%Y-%m-%d").to_string());
+        if let Ok(entries) = fs::read_dir(&extracted_date_dir) {
+            let suffix = match (dataset, outcome) {
+                (PmdataDataset::L2, Some(PmdataL2Outcome::No)) => "_no",
+                (PmdataDataset::L2, _) => "_yes",
+                _ => "",
+            };
+            let needle_tag = format!("_{}", dataset.as_str());
+            for dir_ent in entries.flatten() {
+                let p = dir_ent.path();
+                if !p.is_dir() {
+                    continue;
+                }
+                let dir_name = dir_ent.file_name().to_string_lossy().to_string();
+                if !dir_name.contains(&needle_tag) {
+                    continue;
+                }
+                if dataset == PmdataDataset::L2 {
+                    let expect_no = outcome == Some(PmdataL2Outcome::No);
+                    if expect_no != dir_name.ends_with("_no") {
+                        continue;
+                    }
+                }
+                for candidate in [
+                    p.join(format!("{slug}{suffix}.parquet")),
+                    p.join(format!("{slug}.parquet")),
+                ] {
+                    if candidate.is_file() {
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
         None
     };
 
@@ -862,8 +915,16 @@ fn locate_cached_market_files(
 fn find_catalog_entry_if_present(
     catalog_path: &Path,
     slug: &str,
+    explicit: bool,
 ) -> Result<Option<CatalogEntry>, Box<dyn Error>> {
     if !catalog_path.is_file() {
+        if explicit {
+            return Err(format!(
+                "explicit --catalog file `{}` does not exist",
+                catalog_path.display()
+            )
+            .into());
+        }
         return Ok(None);
     }
     let rows = read_catalog_parquet_filtered(catalog_path, Some(slug))?;

@@ -1,12 +1,18 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use chrono::NaiveDate;
-use reqwest::header::{HeaderMap, HeaderValue, RANGE};
+use reqwest::header::{CONTENT_RANGE, HeaderMap, HeaderValue, RANGE};
 use sha2::{Digest, Sha256};
 use zip::ZipArchive;
+
+const MAX_ZIP_ENTRIES: usize = 10_000;
+const MAX_ZIP_ENTRY_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_ZIP_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+static TEMP_SEQ: AtomicU64 = AtomicU64::new(1);
 
 use crate::config::{IngestionMode, PmdataConfig, PmdataDataset, PmdataL2Outcome, UpDownInterval};
 use crate::error::{HistoricalError, sanitize_snippet};
@@ -283,19 +289,26 @@ impl PmdataClient {
             }
         } else {
             // Re-record reservation even when refreshing catalog (0 quota cost).
-            let _ = self.manifest.reserve(meta);
+            self.manifest.reserve(meta)?;
         }
 
         let bytes = match self.fetch_public_bytes(&self.config.catalog_url).await {
             Ok((status, b)) => (status, b),
             Err(err) => {
-                let _ = self.manifest.release_uncharged(
+                if let Err(merr) = self.manifest.release_uncharged(
                     &entry_key,
                     0,
                     None,
                     EntryStatus::FailedUncharged,
                     err.to_string(),
-                );
+                ) {
+                    return Err(HistoricalError::ManifestIo {
+                        path: self.manifest.path().to_path_buf(),
+                        detail: format!(
+                            "catalog fetch failed ({err}) and manifest release failed: {merr}"
+                        ),
+                    });
+                }
                 return Err(err);
             }
         };
@@ -373,12 +386,19 @@ impl PmdataClient {
                         })
                     }
                     Err(err) => {
-                        let _ = self.manifest.commit_ambiguous_failure(
+                        if let Err(merr) = self.manifest.commit_ambiguous_failure(
                             &entry_key,
                             1,
                             Some(status),
                             err.to_string(),
-                        );
+                        ) {
+                            return Err(HistoricalError::ManifestIo {
+                                path: self.manifest.path().to_path_buf(),
+                                detail: format!(
+                                    "market write failed ({err}) and manifest ambiguous commit failed: {merr}"
+                                ),
+                            });
+                        }
                         Err(err)
                     }
                 }
@@ -405,19 +425,34 @@ impl PmdataClient {
                 })
             }
             FetchResult::PreSendError(err) => {
-                let _ = self.manifest.release_uncharged(
+                if let Err(merr) = self.manifest.release_uncharged(
                     &entry_key,
                     1,
                     None,
                     EntryStatus::FailedUncharged,
                     err.to_string(),
-                );
+                ) {
+                    return Err(HistoricalError::ManifestIo {
+                        path: self.manifest.path().to_path_buf(),
+                        detail: format!(
+                            "pre-send fetch failed ({err}) and manifest release failed: {merr}"
+                        ),
+                    });
+                }
                 Err(err)
             }
             FetchResult::AmbiguousFailure { status, detail } => {
-                let _ =
+                if let Err(merr) =
                     self.manifest
-                        .commit_ambiguous_failure(&entry_key, 1, status, detail.clone());
+                        .commit_ambiguous_failure(&entry_key, 1, status, detail.clone())
+                {
+                    return Err(HistoricalError::ManifestIo {
+                        path: self.manifest.path().to_path_buf(),
+                        detail: format!(
+                            "ambiguous fetch failed ({detail}) and manifest commit failed: {merr}"
+                        ),
+                    });
+                }
                 Err(HistoricalError::Http {
                     endpoint: url,
                     detail,
@@ -498,12 +533,19 @@ impl PmdataClient {
                 if let Err(err) =
                     append_or_write_part(&part_path, range_start.is_some(), status, &bytes)
                 {
-                    let _ = self.manifest.commit_ambiguous_failure(
+                    if let Err(merr) = self.manifest.commit_ambiguous_failure(
                         &entry_key,
                         attempt_cost,
                         Some(status),
                         err.to_string(),
-                    );
+                    ) {
+                        return Err(HistoricalError::ManifestIo {
+                            path: self.manifest.path().to_path_buf(),
+                            detail: format!(
+                                "bundle part write failed ({err}) and manifest commit failed: {merr}"
+                            ),
+                        });
+                    }
                     return Err(err);
                 }
                 match verify_and_extract_zip(&part_path, &cache_path, &extract_dir) {
@@ -522,12 +564,24 @@ impl PmdataClient {
                         })
                     }
                     Err(err) => {
-                        let _ = self.manifest.commit_ambiguous_failure(
+                        if status == 200 {
+                            // Full 200 OK payload is corrupt; remove `.part` so retries do not
+                            // issue `Range: bytes=<corrupt_len>-` and wedge on HTTP 416.
+                            let _ = fs::remove_file(&part_path);
+                        }
+                        if let Err(merr) = self.manifest.commit_ambiguous_failure(
                             &entry_key,
                             attempt_cost,
                             Some(status),
                             err.to_string(),
-                        );
+                        ) {
+                            return Err(HistoricalError::ManifestIo {
+                                path: self.manifest.path().to_path_buf(),
+                                detail: format!(
+                                    "zip verify failed ({err}) and manifest commit failed: {merr}"
+                                ),
+                            });
+                        }
                         Err(err)
                     }
                 }
@@ -537,6 +591,9 @@ impl PmdataClient {
                 entry_status,
                 message,
             } => {
+                if status == 416 {
+                    let _ = fs::remove_file(&part_path);
+                }
                 let entry = self.manifest.release_uncharged(
                     &entry_key,
                     attempt_cost,
@@ -554,22 +611,36 @@ impl PmdataClient {
                 })
             }
             FetchResult::PreSendError(err) => {
-                let _ = self.manifest.release_uncharged(
+                if let Err(merr) = self.manifest.release_uncharged(
                     &entry_key,
                     attempt_cost,
                     None,
                     EntryStatus::FailedUncharged,
                     err.to_string(),
-                );
+                ) {
+                    return Err(HistoricalError::ManifestIo {
+                        path: self.manifest.path().to_path_buf(),
+                        detail: format!(
+                            "pre-send bundle fetch failed ({err}) and manifest release failed: {merr}"
+                        ),
+                    });
+                }
                 Err(err)
             }
             FetchResult::AmbiguousFailure { status, detail } => {
-                let _ = self.manifest.commit_ambiguous_failure(
+                if let Err(merr) = self.manifest.commit_ambiguous_failure(
                     &entry_key,
                     attempt_cost,
                     status,
                     detail.clone(),
-                );
+                ) {
+                    return Err(HistoricalError::ManifestIo {
+                        path: self.manifest.path().to_path_buf(),
+                        detail: format!(
+                            "ambiguous bundle fetch failed ({detail}) and manifest commit failed: {merr}"
+                        ),
+                    });
+                }
                 Err(HistoricalError::Http {
                     endpoint: url,
                     detail,
@@ -768,6 +839,11 @@ impl PmdataClient {
             match resp_res {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
+                    let content_range = resp
+                        .headers()
+                        .get(CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
                     let body = match resp.bytes().await {
                         Ok(b) => b,
                         Err(err) => {
@@ -780,7 +856,23 @@ impl PmdataClient {
                             };
                         }
                     };
-                    if status == 200 || status == 206 {
+                    if status == 206 {
+                        let expected_start = range_start.unwrap_or(0);
+                        if !valid_content_range_start(content_range.as_deref(), expected_start) {
+                            return FetchResult::AmbiguousFailure {
+                                status: Some(status),
+                                detail: format!(
+                                    "invalid or mismatched Content-Range {:?} for resume offset {expected_start}",
+                                    content_range.as_deref().unwrap_or("<missing>")
+                                ),
+                            };
+                        }
+                        return FetchResult::Ok {
+                            status,
+                            bytes: body.to_vec(),
+                        };
+                    }
+                    if status == 200 {
                         return FetchResult::Ok {
                             status,
                             bytes: body.to_vec(),
@@ -1008,14 +1100,50 @@ fn write_verified_parquet_atomic(
         return Err(err);
     }
     let (size, sha) = sha256_file(&tmp)?;
-    if dest.exists() {
-        let _ = fs::remove_file(dest);
+    if let Err(err) = fs::rename(&tmp, dest) {
+        let _ = fs::remove_file(&tmp);
+        return Err(HistoricalError::Io {
+            context: format!("move verified parquet to `{}`", dest.display()),
+            source: err,
+        });
     }
-    fs::rename(&tmp, dest).map_err(|source| HistoricalError::Io {
-        context: format!("move verified parquet to `{}`", dest.display()),
-        source,
-    })?;
     Ok((size, sha))
+}
+
+fn valid_content_range_start(header: Option<&str>, expected_start: u64) -> bool {
+    let Some(raw) = header else {
+        return false;
+    };
+    let Some(rest) = raw.trim().strip_prefix("bytes ") else {
+        return false;
+    };
+    let Some((start_str, _)) = rest.split_once('-') else {
+        return false;
+    };
+    start_str.trim().parse::<u64>().ok() == Some(expected_start)
+}
+
+struct TempDirGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
 }
 
 fn append_or_write_part(
@@ -1083,11 +1211,17 @@ pub fn verify_and_extract_zip(
             detail: "ZIP archive contains 0 entries".to_string(),
         });
     }
+    if archive.len() > MAX_ZIP_ENTRIES {
+        return Err(HistoricalError::InvalidZip {
+            path: part_path.to_path_buf(),
+            detail: format!(
+                "ZIP entry count {} exceeds safety limit {MAX_ZIP_ENTRIES}",
+                archive.len()
+            ),
+        });
+    }
 
-    let nanos = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp_extract = extract_dir.with_file_name(format!(
         "{}.tmp.{}.{}",
         extract_dir
@@ -1095,13 +1229,15 @@ pub fn verify_and_extract_zip(
             .and_then(|n| n.to_str())
             .unwrap_or("extract"),
         std::process::id(),
-        nanos
+        seq
     ));
     fs::create_dir_all(&tmp_extract).map_err(|source| HistoricalError::Io {
         context: format!("create temp extract dir `{}`", tmp_extract.display()),
         source,
     })?;
+    let mut tmp_guard = TempDirGuard::new(tmp_extract.clone());
 
+    let mut total_uncompressed = 0_u64;
     let mut extracted_rel = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive
@@ -1110,8 +1246,13 @@ pub fn verify_and_extract_zip(
                 path: part_path.to_path_buf(),
                 detail: format!("failed to open ZIP entry #{i}: {err}"),
             })?;
+        if entry.is_symlink() {
+            return Err(HistoricalError::InvalidZip {
+                path: part_path.to_path_buf(),
+                detail: format!("symlink entry `{}` is not permitted", entry.name()),
+            });
+        }
         let Some(safe_rel) = entry.enclosed_name() else {
-            let _ = fs::remove_dir_all(&tmp_extract);
             return Err(HistoricalError::InvalidZip {
                 path: part_path.to_path_buf(),
                 detail: format!("unsafe path traversal entry `{}`", entry.name()),
@@ -1126,26 +1267,50 @@ pub fn verify_and_extract_zip(
             continue;
         }
         ensure_parent(&out_path)?;
-        // Reading to end forces `zip::read::ZipFile` to verify full CRC32 integrity.
-        let mut buf = Vec::new();
-        entry
-            .read_to_end(&mut buf)
-            .map_err(|err| HistoricalError::InvalidZip {
-                path: part_path.to_path_buf(),
-                detail: format!("CRC/decompression error on `{}`: {err}", safe_rel.display()),
+        // Stream with explicit size caps while forcing full CRC32 verification on EOF.
+        let written = {
+            let out_file = File::create(&out_path).map_err(|source| HistoricalError::Io {
+                context: format!("create extracted file `{}`", out_path.display()),
+                source,
             })?;
-        fs::write(&out_path, &buf).map_err(|source| HistoricalError::Io {
-            context: format!("write extracted file `{}`", out_path.display()),
-            source,
-        })?;
+            let mut writer = BufWriter::new(out_file);
+            let mut bounded = (&mut entry).take(MAX_ZIP_ENTRY_BYTES.saturating_add(1));
+            let n = std::io::copy(&mut bounded, &mut writer).map_err(|err| {
+                HistoricalError::InvalidZip {
+                    path: part_path.to_path_buf(),
+                    detail: format!("CRC/decompression error on `{}`: {err}", safe_rel.display()),
+                }
+            })?;
+            writer.flush().map_err(|source| HistoricalError::Io {
+                context: format!("flush extracted file `{}`", out_path.display()),
+                source,
+            })?;
+            n
+        };
+        if written > MAX_ZIP_ENTRY_BYTES {
+            return Err(HistoricalError::InvalidZip {
+                path: part_path.to_path_buf(),
+                detail: format!(
+                    "ZIP entry `{}` exceeds per-entry cap ({MAX_ZIP_ENTRY_BYTES} bytes)",
+                    safe_rel.display()
+                ),
+            });
+        }
+        total_uncompressed = total_uncompressed.saturating_add(written);
+        if total_uncompressed > MAX_ZIP_TOTAL_BYTES {
+            return Err(HistoricalError::InvalidZip {
+                path: part_path.to_path_buf(),
+                detail: format!(
+                    "cumulative ZIP uncompressed size exceeds cap ({MAX_ZIP_TOTAL_BYTES} bytes)"
+                ),
+            });
+        }
         if out_path
             .extension()
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("parquet"))
-            && let Err(err) = verify_parquet_readable(&out_path)
         {
-            let _ = fs::remove_dir_all(&tmp_extract);
-            return Err(err);
+            verify_parquet_readable(&out_path)?;
         }
         extracted_rel.push(safe_rel);
     }
@@ -1161,6 +1326,7 @@ pub fn verify_and_extract_zip(
         context: format!("promote extract dir `{}`", extract_dir.display()),
         source,
     })?;
+    tmp_guard.disarm();
 
     let (size, sha) = sha256_file(part_path)?;
     ensure_parent(zip_dest)?;

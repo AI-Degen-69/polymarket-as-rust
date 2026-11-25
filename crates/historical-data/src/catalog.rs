@@ -25,7 +25,7 @@ impl OutcomeMapping {
         let Some(meta) = entry else {
             return Err(HistoricalError::Normalization {
                 context: slug.to_string(),
-                detail: "missing catalog outcome metadata; cannot validate Yes/No -> Up/Down mapping without metadata or explicit override".to_string(),
+                detail: "missing catalog outcome metadata; cannot validate Yes/No -> Up/Down mapping (run `pmdata catalog` first)".to_string(),
             });
         };
         match (meta.yes_outcome.as_deref(), meta.no_outcome.as_deref()) {

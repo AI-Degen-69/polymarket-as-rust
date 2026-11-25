@@ -3416,9 +3416,21 @@ async fn run_canonical_replay_epoch(
         );
     }
 
+    let mut pending_resolutions: std::collections::HashMap<String, Outcome> =
+        std::collections::HashMap::new();
+    for ev in &events {
+        if let CanonicalEventKind::MarketResolution {
+            winning_outcome, ..
+        } = ev.kind
+        {
+            pending_resolutions.insert(ev.provenance.market_slug.clone(), winning_outcome);
+        }
+    }
+
     let mut anchor_ts_ms: Option<u64> = None;
     let mut next_eval_ms: Option<u64> = None;
     let mut last_sim_ms = 0_u64;
+    let mut prev_sim_ms: Option<u64> = None;
     let mut last_sim_ns = 0_u64;
     let mut epoch = 0_u64;
     let mut session: Option<ManagedLifecycleSession> = None;
@@ -3426,6 +3438,15 @@ async fn run_canonical_replay_epoch(
 
     for ev in events {
         let cur_sim_ms = ev.timestamp.replay_order_ts_ms;
+        if let Some(prev) = prev_sim_ms
+            && cur_sim_ms < prev
+        {
+            return Err(format!(
+                "non-monotonic canonical replay_order_ts_ms: {cur_sim_ms} < {prev}"
+            )
+            .into());
+        }
+        prev_sim_ms = Some(cur_sim_ms);
         let base_ts = *anchor_ts_ms.get_or_insert(cur_sim_ms);
         let cur_sim_ns = cur_sim_ms.saturating_sub(base_ts).saturating_mul(1_000_000);
         last_sim_ms = cur_sim_ms;
@@ -3460,6 +3481,12 @@ async fn run_canonical_replay_epoch(
                     &mut jsonl,
                 )
                 .await?;
+            }
+            if sess.sim.explicit_winning_outcome.is_none()
+                && let Some(&win) = pending_resolutions.get(&sess.sim.desc.slug)
+            {
+                sess.sim.explicit_winning_outcome = Some(win);
+                sess.sim.market_resolved_flag = true;
             }
             let expiry_ns = expiry_ms.saturating_sub(base_ts).saturating_mul(1_000_000);
             sess.sim
@@ -3645,9 +3672,8 @@ async fn run_canonical_replay_epoch(
                 outcome,
                 new_tick_micro,
             } => {
-                if let Some(sess) = session.as_mut()
-                    && TickPrecision::from_micro(new_tick_micro).is_ok()
-                {
+                if let Some(sess) = session.as_mut() {
+                    TickPrecision::from_micro(new_tick_micro)?;
                     let exch_ms = ev.timestamp.exchange_ts_ms.unwrap_or(cur_sim_ms);
                     let mono_ns = ev.timestamp.mono_ns.unwrap_or(cur_sim_ns);
                     let pm_ev = PolyMarketEvent::TickSizeChange {

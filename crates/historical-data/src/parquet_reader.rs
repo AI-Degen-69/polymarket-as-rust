@@ -270,7 +270,10 @@ fn parse_catalog_batch(
 
     for row in 0..batch.num_rows() {
         let market_slug = get_req_str(path, col_market_slug, "market_slug", row)?;
-        let series = col_series.and_then(|c| get_opt_str(path, c, "series", row).ok().flatten());
+        let series = match col_series {
+            Some(c) => get_opt_str(path, c, "series", row)?,
+            None => None,
+        };
         if let Some(f) = filter {
             let f_lc = f.to_ascii_lowercase();
             let matches_series = series

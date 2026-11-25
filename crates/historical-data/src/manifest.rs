@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use chrono::Utc;
@@ -14,6 +15,7 @@ const MANIFEST_SCHEMA_VERSION: u16 = 1;
 const LOCK_STALE_SECS: u64 = 60;
 const LOCK_WAIT_ITERS: usize = 200;
 const LOCK_RETRY_MS: u64 = 25;
+static LOCK_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Logical endpoint family recorded in the persistent manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -174,11 +176,14 @@ pub struct ManifestStore {
 
 struct LockGuard {
     lock_path: PathBuf,
+    token: String,
 }
 
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.lock_path);
+        if fs::read_to_string(&self.lock_path).ok().as_deref() == Some(self.token.as_str()) {
+            let _ = fs::remove_file(&self.lock_path);
+        }
     }
 }
 
@@ -233,11 +238,35 @@ impl ManifestStore {
             return Ok((ReserveOutcome::AlreadyCached(Box::new(cached)), 0));
         }
 
+        if let Some(existing) = manifest.entries.get(&meta.entry_key)
+            && existing.status == EntryStatus::Reserved
+        {
+            // Reclaim an orphaned reservation from an interrupted process conservatively:
+            // treat the uncharged delta as ambiguously billed so total quota can never exceed 650.
+            let orphaned = meta.quota_cost.saturating_sub(existing.quota_units_charged);
+            manifest.reserved_units = manifest.reserved_units.saturating_sub(orphaned);
+            manifest.charged_units = manifest.charged_units.saturating_add(orphaned);
+            if let Some(entry_mut) = manifest.entries.get_mut(&meta.entry_key) {
+                entry_mut.quota_units_charged =
+                    entry_mut.quota_units_charged.saturating_add(orphaned);
+                entry_mut.status = EntryStatus::FailedAmbiguous;
+                entry_mut.error_detail =
+                    Some("recovered orphaned Reserved manifest entry conservatively".to_string());
+            }
+        }
+
         let prior_charged = if has_partial_file {
             manifest
                 .entries
                 .get(&meta.entry_key)
-                .filter(|e| e.status == EntryStatus::FailedAmbiguous && e.quota_units_charged > 0)
+                .filter(|e| {
+                    matches!(
+                        e.status,
+                        EntryStatus::FailedAmbiguous
+                            | EntryStatus::Forbidden
+                            | EntryStatus::FailedUncharged
+                    ) && e.quota_units_charged > 0
+                })
                 .map_or(0, |e| e.quota_units_charged)
         } else {
             0
@@ -425,26 +454,52 @@ impl ManifestStore {
         PathBuf::from(os)
     }
 
+    fn backup_path(&self) -> PathBuf {
+        let mut os = self.path.as_os_str().to_os_string();
+        os.push(".bak");
+        PathBuf::from(os)
+    }
+
     fn acquire_lock(&self) -> Result<LockGuard, HistoricalError> {
         self.ensure_parent_dir()?;
         let lock_path = self.lock_path();
+        let pid = std::process::id();
         for _ in 0..LOCK_WAIT_ITERS {
-            match OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
+            let seq = LOCK_SEQ.fetch_add(1, Ordering::Relaxed);
+            let token = format!("pid={pid};seq={seq}\n");
+            let claim_path = lock_path.with_extension(format!("claim.{pid}.{seq}"));
             {
-                Ok(mut f) => {
-                    let _ = writeln!(f, "pid={}", std::process::id());
-                    return Ok(LockGuard { lock_path });
-                }
+                let mut claim = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&claim_path)
+                    .map_err(|err| HistoricalError::ManifestLocked {
+                        path: lock_path.clone(),
+                        detail: format!("failed to create claim file: {err}"),
+                    })?;
+                claim.write_all(token.as_bytes()).map_err(|err| {
+                    HistoricalError::ManifestLocked {
+                        path: lock_path.clone(),
+                        detail: format!("failed to write lock token: {err}"),
+                    }
+                })?;
+                let _ = claim.sync_all();
+            }
+            let link_res = fs::hard_link(&claim_path, &lock_path);
+            let _ = fs::remove_file(&claim_path);
+
+            match link_res {
+                Ok(()) => return Ok(LockGuard { lock_path, token }),
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
                     if let Ok(meta) = fs::metadata(&lock_path)
                         && let Ok(modified) = meta.modified()
                         && let Ok(age) = SystemTime::now().duration_since(modified)
                         && age > Duration::from_secs(LOCK_STALE_SECS)
                     {
-                        let _ = fs::remove_file(&lock_path);
+                        let stale_path = lock_path.with_extension(format!("stale.{pid}.{seq}"));
+                        if fs::rename(&lock_path, &stale_path).is_ok() {
+                            let _ = fs::remove_file(&stale_path);
+                        }
                         continue;
                     }
                     std::thread::sleep(Duration::from_millis(LOCK_RETRY_MS));
@@ -464,8 +519,21 @@ impl ManifestStore {
     }
 
     fn load_unlocked(&self) -> Result<QuotaManifest, HistoricalError> {
+        let backup_path = self.backup_path();
         if !self.path.exists() {
-            return QuotaManifest::new(self.quota_cap);
+            if backup_path.exists() {
+                fs::rename(&backup_path, &self.path).map_err(|err| {
+                    HistoricalError::ManifestIo {
+                        path: self.path.clone(),
+                        detail: format!(
+                            "recover manifest from backup `{}` failed: {err}",
+                            backup_path.display()
+                        ),
+                    }
+                })?;
+            } else {
+                return QuotaManifest::new(self.quota_cap);
+            }
         }
         let raw = fs::read_to_string(&self.path).map_err(|err| HistoricalError::ManifestIo {
             path: self.path.clone(),
@@ -492,10 +560,7 @@ impl ManifestStore {
 
     fn save_unlocked(&self, manifest: &QuotaManifest) -> Result<(), HistoricalError> {
         self.ensure_parent_dir()?;
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
+        let seq = LOCK_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp_name = format!(
             "{}.tmp.{}.{}",
             self.path
@@ -503,7 +568,7 @@ impl ManifestStore {
                 .and_then(|n| n.to_str())
                 .unwrap_or("manifest.json"),
             std::process::id(),
-            nanos
+            seq
         );
         let tmp_path = self.path.with_file_name(tmp_name);
         let body =
@@ -526,34 +591,27 @@ impl ManifestStore {
                 source,
             })?;
         }
-        if self.path.exists() {
-            // On Windows, `fs::rename` fails or behaves inconsistently when replacing an existing file.
-            let backup_path = self.path.with_file_name(format!(
-                "{}.bak.{}.{}",
-                self.path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("manifest.json"),
-                std::process::id(),
-                nanos
-            ));
-            fs::rename(&self.path, &backup_path).map_err(|source| HistoricalError::Io {
-                context: format!("rotate manifest backup `{}`", backup_path.display()),
-                source,
-            })?;
-            if let Err(err) = fs::rename(&tmp_path, &self.path) {
-                let _ = fs::rename(&backup_path, &self.path);
-                return Err(HistoricalError::Io {
-                    context: format!("replace manifest `{}`", self.path.display()),
-                    source: err,
+        if fs::rename(&tmp_path, &self.path).is_err() {
+            if self.path.exists() {
+                let backup_path = self.backup_path();
+                fs::rename(&self.path, &backup_path).map_err(|source| HistoricalError::Io {
+                    context: format!("rotate manifest backup `{}`", backup_path.display()),
+                    source,
+                })?;
+                if let Err(err) = fs::rename(&tmp_path, &self.path) {
+                    let _ = fs::rename(&backup_path, &self.path);
+                    return Err(HistoricalError::Io {
+                        context: format!("replace manifest `{}`", self.path.display()),
+                        source: err,
+                    });
+                }
+                let _ = fs::remove_file(&backup_path);
+            } else {
+                return Err(HistoricalError::ManifestIo {
+                    path: self.path.clone(),
+                    detail: format!("failed to rename temp manifest `{}`", tmp_path.display()),
                 });
             }
-            let _ = fs::remove_file(&backup_path);
-        } else {
-            fs::rename(&tmp_path, &self.path).map_err(|source| HistoricalError::Io {
-                context: format!("write manifest `{}`", self.path.display()),
-                source,
-            })?;
         }
         Ok(())
     }

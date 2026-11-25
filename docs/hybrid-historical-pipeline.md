@@ -5,7 +5,7 @@
 The pipeline unifies two distinct data sources without erasing clock, precision, or execution-fidelity differences:
 
 1. **Live JSONL Recorder (`poly-as feeds --discover`) — Ground Truth**
-   - Captures local QPC monotonic nanoseconds (`mono_ns`), `clock_sync` offsets (`offset_ms`, `clob_offset_ms`, `binance_offset_ms`), 10-level L2 snapshots (`poly_book`), quote/level updates (`poly_price_change`), public trades (`poly_trade`), tick transitions (`poly_tick_size`), Binance spot ticks (`binance_tick`), and Chainlink oracle TWAP ticks (`polybolt_event`).
+   - Captures local QPC monotonic nanoseconds (`mono_ns`), `clock_sync` offsets (`offset_ms`, `clob_offset_ms`, `binance_offset_ms`), 10-level L2 snapshots (`poly_book`), quote/level updates (`poly_price_change`), public trades (`poly_trade`), tick transitions (`poly_tick_size`), Binance spot ticks (`binance_tick`), and Chainlink oracle TWAP ticks (`polybolt_event`). Note: `pmdata normalize --source live-jsonl` currently preserves market metadata, `clock_sync`, `binance_tick`, and `poly_*` events while skipping `polybolt_event`, `feed_health`, and `feeds_summary`.
    - Legacy `RawJsonlEnvelope` replay paths remain untouched for 100% backward compatibility.
 2. **PMData Historical Archive (`https://pmdata.dev`) — Broad Historical Coverage**
    - Downloads markets catalog metadata (`markets.parquet`, `0` quota), single-market Parquet files (`1` unit/request), and compressed Day Bundle ZIPs (`5m=72`, `15m=24`, `1h=6` units) under a persistent exclusive-lock quota ledger (`data/pmdata/manifest.json`) strictly bounded to **650 units**.
@@ -67,10 +67,10 @@ cargo run -p cli -- pmdata download --date 2026-10-28 --asset btc --interval 15m
 # 5a. Download a single market (3 quota units in full mode; 2 in quota-saving)
 cargo run -p cli -- pmdata download --market-slug btc-updown-15m-1793146500 --mode full
 
-# 5b. Download a full Day Bundle (requires explicit --yes confirmation)
-cargo run -p cli -- pmdata download --date 2026-10-28 --asset btc --interval 15m --mode full --yes
+# 5b. Download a full Day Bundle or date range (requires explicit --yes confirmation; optional --include-onchain)
+cargo run -p cli -- pmdata download --from-date 2026-10-28 --to-date 2026-10-28 --asset btc --interval 15m --mode full --yes
 
-# 6. Normalize PMData or Live JSONL into Canonical JSONL
+# 6a. Normalize PMData Parquets into Canonical JSONL (supply --resolution-override when market_resolved is absent)
 cargo run -p cli -- pmdata normalize `
   --source pmdata `
   --yes-l2 data/pmdata/markets/2026-10-28/l2/btc-updown-15m-1793146500_yes.parquet `
@@ -78,6 +78,9 @@ cargo run -p cli -- pmdata normalize `
   --trades data/pmdata/markets/2026-10-28/trades/btc-updown-15m-1793146500.parquet `
   --mode full `
   --output data/canonical/btc-updown-15m-1793146500.canonical.jsonl
+
+# 6b. Normalize a live capture JSONL into Canonical JSONL
+cargo run -p cli -- pmdata normalize --source live-jsonl --input logs/captures/<capture>.jsonl --output data/canonical/live.canonical.jsonl
 
 # 7. Replay canonical JSONL (auto-detected) through Paper or Lifecycle (uses 900s horizon for 15m)
 cargo run -p cli -- lifecycle --source replay `
@@ -93,9 +96,9 @@ cargo run -p cli -- pmdata verify-historical `
 # 9. Future 10-axis Live-vs-PMData reconciliation (once overlapping capture exits 21-day window)
 cargo run -p cli -- pmdata reconcile `
   --live logs/captures/<matching-live-capture>.jsonl `
-  --yes-l2 data/pmdata/markets/<YYYY>/<MM>/<DD>/<slug>_yes.parquet `
-  --no-l2 data/pmdata/markets/<YYYY>/<MM>/<DD>/<slug>_no.parquet `
-  --trades data/pmdata/markets/<YYYY>/<MM>/<DD>/<slug>.parquet `
+  --yes-l2 data/pmdata/markets/<YYYY-MM-DD>/l2/<slug>_yes.parquet `
+  --no-l2 data/pmdata/markets/<YYYY-MM-DD>/l2/<slug>_no.parquet `
+  --trades data/pmdata/markets/<YYYY-MM-DD>/trades/<slug>.parquet `
   --mode full `
   --report-out docs/pmdata-live-reconcile-<slug>.md
 ```
