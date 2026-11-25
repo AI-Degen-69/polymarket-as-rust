@@ -99,6 +99,102 @@ $AnsiBoldRed    = "$Esc[1;31m"
 $AnsiRed        = "$Esc[31m"
 $AnsiGray       = "$Esc[90m"
 $AnsiBoldWhite  = "$Esc[1;37m"
+$AnsiHudBg      = "$Esc[48;5;236;97m"
+
+$script:ActiveHudText = ""
+$script:HudVisible = $false
+
+function Get-TerminalDimensions {
+    try {
+        $w = [Console]::WindowWidth
+        $h = [Console]::WindowHeight
+        if ($w -gt 20 -and $h -gt 3) {
+            return @{ Width = $w; Height = $h }
+        }
+    } catch {}
+    return $null
+}
+
+function Draw-BottomRightHud {
+    param([string]$StatusText)
+    if (-not $UseAnsi -or [string]::IsNullOrEmpty($StatusText)) { return }
+    $dims = Get-TerminalDimensions
+    if ($null -eq $dims) { return }
+
+    $w = $dims.Width
+    $h = $dims.Height
+    $padded = " $StatusText "
+    if ($padded.Length -gt $w) {
+        $padded = $padded.Substring($padded.Length - $w)
+    }
+
+    # Read current cursor position from .NET Console (avoids DECSC/DECRC & DECSTBM overwriting lines)
+    $origLeft = [Console]::CursorLeft
+    $origTop  = [Console]::CursorTop
+
+    # If cursor is currently on the bottom row, scroll output up by 1 line so the badge never covers printed text
+    if ($origTop -ge ($h - 1)) {
+        [Console]::Write("`n")
+        $origTop = [Math]::Max(0, [Console]::CursorTop - 1)
+    }
+
+    $row = $h
+    $col = [Math]::Max(1, $w - $padded.Length + 1)
+    [Console]::Write("${Esc}[${row};1H${Esc}[2K${Esc}[${row};${col}H${AnsiHudBg}${padded}${AnsiReset}")
+    [Console]::SetCursorPosition([Math]::Min($w - 1, [Math]::Max(0, $origLeft)), [Math]::Min($h - 1, [Math]::Max(0, $origTop)))
+    try { [Console]::Out.Flush() } catch {}
+    $script:HudVisible = $true
+}
+
+function Update-BottomRightHud {
+    param(
+        [int]$ConfigIdx,
+        [int]$ConfigTotal,
+        [int]$FileIdx,
+        [int]$FileTotal
+    )
+    if (-not $UseAnsi) { return }
+    $script:ActiveHudText = "Config #$ConfigIdx/$ConfigTotal  |  File #$FileIdx/$FileTotal"
+    Draw-BottomRightHud -StatusText $script:ActiveHudText
+}
+
+function Clear-BottomRightHud {
+    if (-not $UseAnsi) { return }
+    if ($script:HudVisible) {
+        $dims = Get-TerminalDimensions
+        if ($null -ne $dims) {
+            $w = $dims.Width
+            $h = $dims.Height
+            $origLeft = [Console]::CursorLeft
+            $origTop  = [Console]::CursorTop
+            [Console]::Write("${Esc}[${h};1H${Esc}[2K")
+            [Console]::SetCursorPosition([Math]::Min($w - 1, [Math]::Max(0, $origLeft)), [Math]::Min($h - 1, [Math]::Max(0, $origTop)))
+            try { [Console]::Out.Flush() } catch {}
+        }
+        $script:HudVisible = $false
+    }
+    $script:ActiveHudText = ""
+}
+
+function Write-HostHud {
+    param([string]$Message = "")
+    if ($script:HudVisible) {
+        $dims = Get-TerminalDimensions
+        if ($null -ne $dims) {
+            $w = $dims.Width
+            $h = $dims.Height
+            $origLeft = [Console]::CursorLeft
+            $origTop  = [Console]::CursorTop
+            [Console]::Write("${Esc}[${h};1H${Esc}[2K")
+            [Console]::SetCursorPosition([Math]::Min($w - 1, [Math]::Max(0, $origLeft)), [Math]::Min($h - 1, [Math]::Max(0, $origTop)))
+        }
+        $script:HudVisible = $false
+    }
+    Write-Host $Message
+    if (-not [string]::IsNullOrEmpty($script:ActiveHudText)) {
+        Draw-BottomRightHud -StatusText $script:ActiveHudText
+    }
+}
 
 function Format-ColorText {
     param(
@@ -485,18 +581,18 @@ function Write-ConfigBanner {
         @("Hedge Skew", "Tier 1 Cap")
     )
 
-    Write-Host ""
-    Write-Host $topRule
-    Write-Host (Format-ColorText -Text "  [High-Level / Session Bounds]" -Code $AnsiGray)
+    Write-HostHud ""
+    Write-HostHud $topRule
+    Write-HostHud (Format-ColorText -Text "  [High-Level / Session Bounds]" -Code $AnsiGray)
     foreach ($pair in $highLevelPairs) {
         $kLeft = $pair[0]
         $kRight = $pair[1]
         $leftStr = Format-ParamCell -Label $kLeft -CurrVal ([string]$Curr[$kLeft]) -PrevVal "" -IsLeftColumn $true -IsHighLevel $true
         $rightStr = Format-ParamCell -Label $kRight -CurrVal ([string]$Curr[$kRight]) -PrevVal "" -IsLeftColumn $false -IsHighLevel $true
-        Write-Host ("  {0}{1}{2}" -f $leftStr, $pipe, $rightStr)
+        Write-HostHud ("  {0}{1}{2}" -f $leftStr, $pipe, $rightStr)
     }
-    Write-Host $subRule
-    Write-Host (Format-ColorText -Text "  [Swept / Strategy Parameters]" -Code $AnsiCyan)
+    Write-HostHud $subRule
+    Write-HostHud (Format-ColorText -Text "  [Swept / Strategy Parameters]" -Code $AnsiCyan)
     foreach ($pair in $sweptPairs) {
         $kLeft = $pair[0]
         $kRight = $pair[1]
@@ -504,9 +600,9 @@ function Write-ConfigBanner {
         $prevR = if ($null -ne $Prev) { [string]$Prev[$kRight] } else { "" }
         $leftStr = Format-ParamCell -Label $kLeft -CurrVal ([string]$Curr[$kLeft]) -PrevVal $prevL -IsLeftColumn $true -IsHighLevel $false
         $rightStr = Format-ParamCell -Label $kRight -CurrVal ([string]$Curr[$kRight]) -PrevVal $prevR -IsLeftColumn $false -IsHighLevel $false
-        Write-Host ("  {0}{1}{2}" -f $leftStr, $pipe, $rightStr)
+        Write-HostHud ("  {0}{1}{2}" -f $leftStr, $pipe, $rightStr)
     }
-    Write-Host $botRule
+    Write-HostHud $botRule
 }
 
 # ---------------------------------------------------------------------------
@@ -838,6 +934,7 @@ try {
                                             $hsTag = $hsStr.Replace(".", "p").Replace("-", "m")
                                             foreach ($capT1 in $parsedCapTier1) {
                                                 $runIdx++
+                                                Update-BottomRightHud -ConfigIdx $runIdx -ConfigTotal $totalRuns -FileIdx 1 -FileTotal $captures.Count
                                                 $currParamMap = @{
                                                     "V Max"       = "`$$VMax"
                                                     "Base Size"   = "${BaseSize}sh"
@@ -876,6 +973,7 @@ try {
                                                 $capRuns = [System.Collections.Generic.List[PSCustomObject]]::new()
 
                                                 for ($capIdx = 0; $capIdx -lt $captures.Count; $capIdx++) {
+                                                    Update-BottomRightHud -ConfigIdx $runIdx -ConfigTotal $totalRuns -FileIdx ($capIdx + 1) -FileTotal $captures.Count
                                                     $cap = $captures[$capIdx]
                                                     if ($isMultiCapture) {
                                                         $capOutDir = Join-Path $sweepDir $cap.Stem
@@ -891,7 +989,7 @@ try {
                                                     $fileTag = Format-ColorText -Text ("[FILE {0} / {1}]" -f ($capIdx + 1), $captures.Count) -Code $AnsiCyan
                                                     $winTagMuted = Format-ColorText -Text ("({0})" -f $winLabel) -Code $AnsiGray
                                                     $capDisplayName = "{0}.jsonl" -f $cap.Label
-                                                    Write-Host ("  📄 {0} {1} {2}" -f $fileTag, $capDisplayName, $winTagMuted)
+                                                    Write-HostHud ("  📄 {0} {1} {2}" -f $fileTag, $capDisplayName, $winTagMuted)
                                                     try { [Console]::Out.Flush() } catch {}
 
                                                     $capStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
@@ -1148,11 +1246,11 @@ try {
                                                     $netCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $finalNetUsd -Pct $netPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
 
                                                     # Line 1: Activity & Volume
-                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
+                                                    Write-HostHud ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
                                                         $treeBranch1, $doneCell, $sepBar, $qtyCell, $pairsCell, $winRateCell, $volInCell, $closeVolCell, $roiCell)
 
                                                     # Line 2: P&L Accounting Waterfall
-                                                    Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
+                                                    Write-HostHud ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
                                                         $treeBranch2, $pnlLabelCell, $sepBar, $grossCell, $rebateCell, $feesCell, $arrowSep, $netCell)
 
                                                     $capRuns.Add([PSCustomObject]@{
@@ -1280,13 +1378,13 @@ try {
                                                 $subFeesCell     = "Fees: " + (Format-FeeCell -FeePaidPositive $sumFeesPaid -Width 9 -Bold $true -IncludeDollar $true -Culture $inv)
                                                 $subNetCell      = "Net P&L: " + (Format-SignedPnlWithPctCell -Value $sumNetPlusReb -Pct $sumNetPct -Width 20 -Bold $true -IncludeDollar $true -Culture $inv)
 
-                                                Write-Host ""
-                                                Write-Host $subHeader
+                                                Write-HostHud ""
+                                                Write-HostHud $subHeader
                                                 # Line 1: Activity & Volume
-                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
+                                                Write-HostHud ("{0} {1}{2}{3}{2}{4}{2}{5}{2}{6}{2}{7}{2}{8}" -f `
                                                     $treeBranch1, $subDoneCell, $sepBar, $subQtyCell, $subPairsCell, $subWinRateCell, $subVolInCell, $subCloseVolCell, $subRoiCell)
                                                 # Line 2: P&L Accounting Waterfall
-                                                Write-Host ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
+                                                Write-HostHud ("{0} {1}{2}{3}{2}{4}{2}{5}{6}{7}" -f `
                                                     $treeBranch2, $subPnlLabelCell, $sepBar, $subGrossCell, $subRebateCell, $subFeesCell, $arrowSep, $subNetCell)
 
                                                 $grossSign = if ($sumGrossPnl -gt 1e-9) { "+" } elseif ($sumGrossPnl -lt -1e-9) { "-" } else { "+" }
@@ -1382,6 +1480,7 @@ try {
         }
     }
 
+    Clear-BottomRightHud
     $sweepStopwatch.Stop()
     $totalElapsedSec = [Math]::Max(0.001, $sweepStopwatch.Elapsed.TotalSeconds)
     $avgConfigSec = $totalElapsedSec / [Math]::Max(1, $totalRuns)
@@ -1666,5 +1765,6 @@ try {
     Write-Host ""
 }
 finally {
+    Clear-BottomRightHud
     Pop-Location
 }
