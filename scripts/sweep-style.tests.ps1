@@ -165,11 +165,18 @@ try {
     Assert-True ([Math]::Abs($survG45.MaxDD - 19.42) -lt 1e-6) 'MaxDD uses AllocatedCapital ($9.71 / $50 = 19.42%), not SumVolIn'
     Assert-True ([Math]::Abs($survG45.Drag - (23.62 / 89.03 * 100.0)) -lt 1e-6) "Expiry drag divides settlement loss by positive merge gains"
     Assert-True ([Math]::Abs($survG45.TailDrag - (34.04 / 89.03 * 100.0)) -lt 1e-6) "Tail drag adds negative merge losses to settlement losses"
+    $survPartialWindows = Get-SurvivalInputs -CapRuns @() -TotalWindows 6 -IsMultiCapture $false -CaptureCount 1 `
+        -SumVolIn 1000.0 -SumGross 10.0 -SumSettle 0.0 -SumUnreal 0.0 -WindowNets @(5.0, 5.0, 5.0, 5.0)
+    Assert-True ([double]::IsNaN($survPartialWindows.IS)) 'Partial window series (4 of 6 windows) is not scored as the full sample'
 
     $evalPass = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 26.5 -NbrVal 100.0 -TailDragVal 38.2
     Assert-True ($evalPass.Verdict -eq "APPROVED") "Config passing G1-G6 and TailDrag<=50% is APPROVED"
     $evalRelabelFail = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 20.9 -DragVal 12.1 -NbrVal 100.0 -TailDragVal 57.3
     Assert-True ($evalRelabelFail.G5 -eq "FAIL" -and $evalRelabelFail.Verdict -eq "FAIL(G5)") "High negative-merge TailDrag>50% fails G5 despite low settlement drag"
+    $evalUnknownTail = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 12.1 -NbrVal 100.0
+    Assert-True ($evalUnknownTail.G5 -eq "N/A" -and $evalUnknownTail.Verdict -eq "N/A") "Unknown TailDrag reports G5 N/A and is ineligible for APPROVED"
+    $evalZeroTail = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 12.1 -NbrVal 100.0 -TailDragVal 0.0
+    Assert-True ($evalZeroTail.G5 -eq "PASS" -and $evalZeroTail.Verdict -eq "APPROVED") "Measured zero TailDrag still passes G5"
 
     # --- G6 Manhattan-1 adjacency + OOS neighbor survival -----------------
     $mkRow = {
@@ -276,10 +283,16 @@ try {
         Assert-True ($stPending.Status -eq "Pending") "missing files classify as Pending"
 
         # Complete
-        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_done.jsonl") -Encoding utf8
-        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capB "cfg_done.jsonl") -Encoding utf8
+        '{"event":"summary","payload":{"realized_pnl_micro":0}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_done.jsonl") -Encoding utf8
+        '{"event":"summary","payload":{"realized_pnl_micro":0}}' | Set-Content -LiteralPath (Join-Path $capB "cfg_done.jsonl") -Encoding utf8
         $stDone = Get-ConfigDiskStatus -SweepDir $tmpRoot -Captures $fakeCaptures -IsMultiCapture $true -Stem "cfg_done"
-        Assert-True ($stDone.Status -eq "Complete" -and $stDone.ValidSummaryCount -eq 2) "all summary events classify as Complete"
+        Assert-True ($stDone.Status -eq "Complete" -and $stDone.ValidSummaryCount -eq 2) "readable summary events classify as Complete"
+
+        # A summary the metrics reader cannot parse is not resumable as Complete.
+        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_empty.jsonl") -Encoding utf8
+        '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capB "cfg_empty.jsonl") -Encoding utf8
+        $stEmpty = Get-ConfigDiskStatus -SweepDir $tmpRoot -Captures $fakeCaptures -IsMultiCapture $true -Stem "cfg_empty"
+        Assert-True ($stEmpty.Status -eq "Partial") "summary without readable fields classifies as Partial"
 
         # Partial (missing second capture)
         '{"event":"summary","payload":{}}' | Set-Content -LiteralPath (Join-Path $capA "cfg_part1.jsonl") -Encoding utf8

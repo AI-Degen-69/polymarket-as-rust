@@ -1429,6 +1429,10 @@ impl LivePaperSimulator {
             self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
         }
         let inv_after = self.ledger.net_inventory();
+        if inv_after.0.unsigned_abs() < self.desc.min_order_size_micro.as_u64() {
+            // A fill can flatten the position between pricing ticks; drop any stale override.
+            self.deficit_hedge_latch.reset();
+        }
 
         let mid_at_fill = match fill.outcome {
             Outcome::Up => self
@@ -1955,18 +1959,23 @@ impl LivePaperSimulator {
             cost_context: CostContext {
                 avg_cost_up: self.ledger.avg_cost_up(),
                 avg_cost_dn: self.ledger.avg_cost_dn(),
-                allow_cross_tick_override: risk_lifecycle::allows_cross_tick_override(
-                    self.current_tier,
-                    self.current_phase,
-                ) || self.deficit_hedge_latch.evaluate(
-                    self.current_tier,
-                    inventory_q,
-                    self.desc.min_order_size_micro,
-                    snap_up.best_ask().map(|l| l.price),
-                    snap_dn.best_ask().map(|l| l.price),
-                    self.tier1_hedge_trigger_micro,
-                    self.cap_tier1_reducing_to_delta,
-                ),
+                allow_cross_tick_override: {
+                    // Evaluate the latch on every tick, before the tier override, so Tier-3/4
+                    // ticks still clear a stale Tier-1 latch instead of short-circuiting it.
+                    let deficit_hedge_active = self.deficit_hedge_latch.evaluate(
+                        self.current_tier,
+                        inventory_q,
+                        self.desc.min_order_size_micro,
+                        snap_up.best_ask().map(|l| l.price),
+                        snap_dn.best_ask().map(|l| l.price),
+                        self.tier1_hedge_trigger_micro,
+                        self.cap_tier1_reducing_to_delta,
+                    );
+                    risk_lifecycle::allows_cross_tick_override(
+                        self.current_tier,
+                        self.current_phase,
+                    ) || deficit_hedge_active
+                },
             },
             spot_ticks: std::mem::take(&mut self.pending_spot_ticks),
             up_trade_sizes: std::mem::take(&mut self.pending_up_trades),

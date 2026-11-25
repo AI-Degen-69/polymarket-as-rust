@@ -4,7 +4,7 @@
 - **Source Sweep Directory:** `C:\Users\Tiger\Agents\Projects\AI Trading\polymarket-as-rust\logs\sweeps\25-11_21-55-50Z_boundary-9runs_20caps-226w`
 - **Summary Artifact:** `logs/sweeps/25-11_21-55-50Z_boundary-9runs_20caps-226w/summary.txt` *(git-ignored local sweep output)*
 - **Run Date / Runtime:** November 25–26, 2026 (`23:56` local start, `741.99s` across `6` parallel workers)
-- **Prior Baseline Reference:** [sweep-results-investigation.md](docs/sweep-results-investigation.md)
+- **Prior Baseline Reference:** [sweep-results-investigation.md](sweep-results-investigation.md)
 - **Classification:** **`Config #6/9` (`$0.65, 120s, T1=off`) selected as provisional research baseline** (`336` fills across `226` windows, below the `400`-fill validation bar).
 
 > [!NOTE]
@@ -143,7 +143,7 @@ Weights, normalization bounds, and survival eligibility were fixed **before rank
 
 ### 4.2 Comparing the Three `120s` Contenders (`#6` vs `#3` vs `#9`)
 
-All `120s` configs sit at the confirmed interior optimum for entry cutoff (`90s` and `105s` lose `-$17.87` to `-$26.14` Net P&L without preventing the `t = 15s` `-$9.60` stranding). Among the three `120s` candidates:
+All `120s` configs are the best entry cutoff tested in this sweep (`120s` is the sweep's upper boundary, so this is a tested-set result rather than an interior optimum) (`90s` and `105s` lose `-$17.87` to `-$26.14` Net P&L without preventing the `t = 15s` `-$9.60` stranding). Among the three `120s` candidates:
 
 1. **Why `#9/9` (`$0.70`) finishes third (`63.1`):** Despite strong diversification (`13/20` caps positive, `45%` Top-5 share, `$43.95` Ex-Best-Cap), it hits an OOS cliff in `Cap#20` (`+$9.73` vs `+$21.24` on `#3/#6`), cutting OOS Net0 nearly in half (`+$12.84`, `3.73%` OOS ROI vs `6.13%` IS ROI) and collapsing `MO5s` markout to `+23.8 bps` (versus `+87.2` and `+70.5 bps`).
 2. **Why `#6/9` (`$0.65`) edges out `#3/9` (`$0.60`) (`79.9` vs `77.7`):**
@@ -154,13 +154,13 @@ All `120s` configs sit at the confirmed interior optimum for entry cutoff (`90s`
 
 ### 4.3 Criticality: Why `#6/9` Is a *Provisional* Research Baseline (Not Production-Validated)
 
-The `+2.2`-point weighted margin (`79.9` vs `77.7`) over `#3/9` rests on a **226-window sample** with **`336` fills** (below [strategy-verification-spec.md](docs/strategy-verification-spec.md#L153)'s `400`-fill minimum) where `20` captures are heavily influenced by `Cap#20` (`+$21.24`, `36.1%` of `#6`'s total Net P&L). Therefore, `#6/9` is promoted strictly as the **next research baseline**, while `#3/9` remains the top benchmark challenger for independent sample validation.
+The `+2.2`-point weighted margin (`79.9` vs `77.7`) over `#3/9` rests on a **226-window sample** with **`336` fills** (below [strategy-verification-spec.md](strategy-verification-spec.md#L153)'s `400`-fill minimum) where `20` captures are heavily influenced by `Cap#20` (`+$21.24`, `36.1%` of `#6`'s total Net P&L). Therefore, `#6/9` is promoted strictly as the **next research baseline**, while `#3/9` remains the top benchmark challenger for independent sample validation.
 
 ---
 
 ## 5. Promoted Defaults & Reproducibility
 
-Promoted cleanly to [DEFAULTS.json](DEFAULTS.json) (with strict JSON `"provenance"` object validated by `DefaultsProvenance` in `crates/core-types/src/config.rs`) and synchronized across all six calibration files (`DEFAULTS.json`, `.env.example`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1` + `AGENTS.md` §7):
+Promoted cleanly to [DEFAULTS.json](../DEFAULTS.json) (with strict JSON `"provenance"` object validated by `DefaultsProvenance` in `crates/core-types/src/config.rs`) and synchronized across all six calibration files (`DEFAULTS.json`, `.env.example`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1` + `AGENTS.md` §7):
 - `max_entry_price = 0.65` (`MAX_ENTRY_PRICE=0.65`)
 - `entry_cutoff_secs = 120` (`ENTRY_CUTOFF_SECS=120`)
 - `entry_open_delay_secs = 15` (`ENTRY_OPEN_DELAY_SECS=15`)
@@ -220,5 +220,5 @@ Paper/replay gate approval is **not** sufficient for live trading. Before any `c
 | **1** | **Early-window jump/volatility entry veto** | `1795517700` filled at `t=15s` right before a vertical move to `$0.99`, costing `-$9.60` in all `9` configs. | High | Low |
 | **2** | **Bounded / price-capped T1 hedge redesign** | Current un-capped `T1` latch chases `$0.80–$0.89` cleanly, blowing tail merges (`$22–$48`). A bounded max pair cost (`<= $1.08–$1.12`) or single-shot budget might rescue `$0.48` positions safely. | High | Medium |
 | **3** | **Order-book imbalance (OBI) entry skew** | `Cap#14` / `Cap#20` divergence at `$0.65` vs `$0.70` shows taker toxicity increases on asymmetric thin opposite books. | Medium–High | Low–Medium |
-| **4** | **Dynamic inventory-aware hedge sizing** | Scaling deficit-leg aggression smoothly with `|q_up - q_dn|` and remaining time-to-cutoff instead of binary latch switches. | Medium | Medium |
+| **4** | **Dynamic inventory-aware hedge sizing** | Scaling deficit-leg aggression smoothly with `abs(q_up - q_dn)` and remaining time-to-cutoff instead of binary latch switches. | Medium | Medium |
 | **5** | **Residual-dust (`< 5sh`) aggregation / fill-floor guard** | `$14.02` (`#3`)–`$10+` (`#6`) structural settlement loss comes from un-flattenable `< 5sh` remainders. | Medium | Medium–High |

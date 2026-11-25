@@ -497,7 +497,10 @@ function Get-SurvivalInputs {
     # Preferred: actual per-window net PnL from the window lifecycle events the replay emits
     # (`window_end` or `epoch_rollover` realized + optional 3% rebate delta).
     # Capture-level prorating is only used when no window events exist.
-    if ($null -ne $WindowNets -and $WindowNets.Count -gt 0) {
+    # Use the per-window series only when it covers the whole sample: a partial series would
+    # describe a different sample than the capture totals the same row reports.
+    $windowSeriesComplete = ($TotalWindows -le 0) -or ($WindowNets.Count -eq $TotalWindows)
+    if ($null -ne $WindowNets -and $WindowNets.Count -gt 0 -and $windowSeriesComplete) {
         # IS/OOS needs >= 4 windows to split; drawdown is valid on any window series.
         if ($WindowNets.Count -ge 4) {
             $isTarget = [int][Math]::Floor($WindowNets.Count * 0.7)
@@ -580,9 +583,11 @@ function Evaluate-SurvivalGateRow {
     $g2 = if ([double]::IsNaN($OOSVal)) { "N/A" } elseif ($OOSVal -gt 0.0) { "PASS" } else { "FAIL" }
     $g3 = if ([double]::IsNaN($RetainVal) -or [double]::IsInfinity($RetainVal)) { "N/A" } elseif ($RetainVal -ge 50.0) { "PASS" } else { "FAIL" }
     $g4 = if ([double]::IsNaN($MaxDDVal)) { "N/A" } elseif ($MaxDDVal -le 25.0) { "PASS" } else { "FAIL" }
-    $g5ExpiryOk = ($DragVal -le 30.0)
-    $g5TailOk = ([double]::IsNaN($TailDragVal) -or ($TailDragVal -le 50.0))
-    $g5 = if ($g5ExpiryOk -and $g5TailOk) { "PASS" } else { "FAIL" }
+    $g5ExpiryOk = (-not [double]::IsNaN($DragVal)) -and ($DragVal -le 30.0)
+    $g5TailOk = (-not [double]::IsNaN($TailDragVal)) -and ($TailDragVal -le 50.0)
+    # Unknown tail drag (legacy/asymmetric summaries) cannot verify G5 and must not read as PASS.
+    $g5 = if ([double]::IsNaN($DragVal) -or [double]::IsNaN($TailDragVal)) { "N/A" }
+        elseif ($g5ExpiryOk -and $g5TailOk) { "PASS" } else { "FAIL" }
     $g6 = if ([double]::IsNaN($NbrVal)) { "N/A" } elseif ($NbrVal -ge 60.0) { "PASS" } else { "FAIL" }
     $failGate = ""
     foreach ($kv in @(@("G1", $g1), @("G2", $g2), @("G3", $g3), @("G4", $g4), @("G5", $g5), @("G6", $g6))) {
@@ -590,7 +595,7 @@ function Evaluate-SurvivalGateRow {
     }
     $verdict = if ($failGate -ne "") { "FAIL($failGate)" }
         elseif ($g1 -eq "N/A" -or $g2 -eq "N/A" -or $g3 -eq "N/A") { "NEEDS-OOS" }
-        elseif ($g4 -eq "N/A" -or $g6 -eq "N/A") { "N/A" }
+        elseif ($g4 -eq "N/A" -or $g5 -eq "N/A" -or $g6 -eq "N/A") { "N/A" }
         else { "APPROVED" }
     return @{ G1 = $g1; G2 = $g2; G3 = $g3; G4 = $g4; G5 = $g5; G6 = $g6; Verdict = $verdict }
 }
@@ -884,7 +889,9 @@ function Test-JsonlHasSummary {
             if ($trimmed -ne "") {
                 try {
                     $obj = $trimmed | ConvertFrom-Json
-                    return ($obj.event -eq "summary")
+                    if ($obj.event -ne "summary") { return $false }
+                    # A summary the metrics reader cannot parse is not a complete config.
+                    return ($null -ne $obj.payload -and $null -ne $obj.payload.PSObject.Properties["realized_pnl_micro"])
                 } catch {
                     return $false
                 }
@@ -1161,7 +1168,9 @@ function Read-CaptureJsonlMetrics {
     if ([double]::IsNaN($closeVolume)) {
         $closeVolume = [Math]::Max(0.0, $volumeIn + $grossPnl)
     }
-    if ($scannedMergeEvents -gt 0 -or $merges -eq 0) {
+    # Only trust the event scan when it accounts for every merge the summary reports: a partial
+    # scan understates negative merges and would let G5 pass on incomplete tail data.
+    if (($merges -eq 0) -or ($scannedMergeEvents -gt 0 -and $scannedMergeEvents -eq $merges)) {
         if ([double]::IsNaN($mergeNet)) { $mergeNet = $scannedMergeNet }
         if ([double]::IsNaN($mergePos)) { $mergePos = $scannedMergePos }
         if ([double]::IsNaN($mergeNegLoss)) { $mergeNegLoss = $scannedMergeNegLoss }
@@ -1999,6 +2008,56 @@ try {
     }
 
     # -----------------------------------------------------------------------
+    # Sweep Input Manifest (guards -ResumeDir against mismatched inputs)
+    # -----------------------------------------------------------------------
+    $axisNames = @(
+        "gamma", "var_spreads", "min_ticks", "cross_losses", "max_entry_probs", "max_entry_prices",
+        "ll_thresholds", "ll_windows", "ll_cooldowns", "ll_directionals", "hedge_skews",
+        "cap_tier1", "t1_triggers", "entry_delays", "entry_cutoffs"
+    )
+    $axisValues = @(
+        $parsedGammas, $parsedVarSpreads, $parsedMinTicks, $parsedCrossLosses, $parsedMaxEntryProbs,
+        $parsedMaxEntryPrices, $parsedLLThresholds, $parsedLLWindows, $parsedLLCooldowns,
+        $parsedLLDirectionals, $parsedHedgeSkews, $parsedCapTier1, $parsedT1Triggers,
+        $parsedEntryDelays, $parsedEntryCutoffs
+    )
+    $axisMap = [ordered]@{}
+    for ($ai = 0; $ai -lt $axisNames.Count; $ai++) {
+        $axisMap[$axisNames[$ai]] = @($axisValues[$ai] | ForEach-Object { [string]$_ })
+    }
+    $manifest = [ordered]@{
+        base_size     = [int]$BaseSize
+        v_max         = [double]$VMax
+        queue_decay   = [string]$QueueDecay
+        capture_stems = @($captures | ForEach-Object { [string]$_.Stem })
+        axes          = $axisMap
+    }
+    $manifestPath = Join-Path $sweepDir "sweep-manifest.json"
+    if (Test-Path -LiteralPath $manifestPath -PathType Leaf) {
+        if (-not [string]::IsNullOrWhiteSpace($ResumeDir)) {
+            $priorManifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+            $inputMismatch = [System.Collections.Generic.List[string]]::new()
+            if ([int]$priorManifest.base_size -ne [int]$BaseSize) { $inputMismatch.Add(("- base_size: prior={0} now={1}" -f $priorManifest.base_size, $BaseSize)) }
+            if ([Math]::Abs([double]$priorManifest.v_max - [double]$VMax) -gt 1e-9) { $inputMismatch.Add(("- v_max: prior={0} now={1}" -f $priorManifest.v_max, $VMax)) }
+            if ([string]$priorManifest.queue_decay -ne [string]$QueueDecay) { $inputMismatch.Add(("- queue_decay: prior={0} now={1}" -f $priorManifest.queue_decay, $QueueDecay)) }
+            if ((@($priorManifest.capture_stems) -join ",") -ne (@($manifest.capture_stems) -join ",")) {
+                $inputMismatch.Add(("- captures: prior={0} now={1}" -f (@($priorManifest.capture_stems) -join ","), (@($manifest.capture_stems) -join ",")))
+            }
+            foreach ($an in $axisNames) {
+                $priorProp = $priorManifest.axes.PSObject.Properties[$an]
+                $priorVals = if ($null -ne $priorProp) { @($priorProp.Value | ForEach-Object { [string]$_ }) -join "," } else { "" }
+                $nowVals = @($manifest.axes[$an] | ForEach-Object { [string]$_ }) -join ","
+                if ($priorVals -ne $nowVals) { $inputMismatch.Add(("- axis {0}: prior={1} now={2}" -f $an, $priorVals, $nowVals)) }
+            }
+            if ($inputMismatch.Count -gt 0) {
+                throw ("Resume safety abort — sweep inputs differ from the original run (write to a new directory instead):`n" + ($inputMismatch -join "`n"))
+            }
+        }
+    } else {
+        ($manifest | ConvertTo-Json -Depth 5) | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+    }
+
+    # -----------------------------------------------------------------------
     # Inspect Resume State (Before Launching Any Worker)
     # -----------------------------------------------------------------------
     $resumedSpecs = [System.Collections.Generic.List[PSCustomObject]]::new()
@@ -2071,6 +2130,7 @@ try {
     $tblSep         = $tblMeta[3]
 
     $sweepStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $replayStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     $resultsByIndex = @{}
     $stoppedEarly = $false
 
@@ -2314,12 +2374,13 @@ try {
         }
     }
 
+    $replayStopwatch.Stop()
     Clear-BottomRightHud
     $sweepStopwatch.Stop()
 
     if ($stoppedEarly) {
         Write-Host ""
-        Write-Host (Format-ColorText -Text ("⏹️  Sweep stopped at config boundary ({0}/{1} configs complete). Re-run with -ResumeDir `"{2}`" to finish." -f $resultsByIndex.Count, $totalRuns, $sweepDir) -Code $AnsiBoldYellow)
+        Write-Host (Format-ColorText -Text ("⏹️  Sweep stopped at config boundary ({0}/{1} configs complete). Remove `"{2}\.stop`" and re-run with the original capture/sweep options plus -ResumeDir `"{2}`" to finish." -f $resultsByIndex.Count, $totalRuns, $sweepDir) -Code $AnsiBoldYellow)
         return
     }
 
@@ -2333,9 +2394,13 @@ try {
 
     $totalElapsedSec = [Math]::Max(0.001, $sweepStopwatch.Elapsed.TotalSeconds)
     $avgConfigSec = $totalElapsedSec / [Math]::Max(1, $results.Count)
-    $totalReplayWindows = $results.Count * [Math]::Max(1, $totalWindows)
-    $throughputWinPerSec = $totalReplayWindows / $totalElapsedSec
-    $throughputText = if ($totalWindows -gt 0) { "{0:F2} win/s" -f $throughputWinPerSec } else { "n/a (windows unknown)" }
+    # Throughput covers replay work this invocation actually ran, not re-reading saved results.
+    $replayedConfigCount = [Math]::Max(0, $results.Count - $resumedSpecs.Count)
+    $replayElapsedSec = [Math]::Max(0.0, $replayStopwatch.Elapsed.TotalSeconds)
+    $throughputText = if ($totalWindows -le 0) { "n/a (windows unknown)" }
+        elseif ($replayedConfigCount -eq 0) { "n/a (no replays; resumed results only)" }
+        elseif ($replayElapsedSec -le 0.001) { "n/a (elapsed unmeasurable)" }
+        else { "{0:F2} win/s" -f (($replayedConfigCount * $totalWindows) / $replayElapsedSec) }
 
     # -----------------------------------------------------------------------
     # Phase 3: Final Aggregation & Split Tables (Parameters vs. Performance Metrics)

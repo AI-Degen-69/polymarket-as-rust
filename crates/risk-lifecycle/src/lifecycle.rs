@@ -250,7 +250,14 @@ impl EpochLifecycleController {
             (None, 0)
         };
 
-        let elapsed_secs = self.config.epoch_duration_secs.saturating_sub(tau_secs);
+        // Derive elapsed time from the millisecond remainder: truncating `tau_secs` first
+        // opened the entry window (and tripped the cutoff) up to 999ms early.
+        let elapsed_secs = self
+            .config
+            .epoch_duration_secs
+            .saturating_mul(1000)
+            .saturating_sub(tau_ms)
+            / 1000;
 
         match phase {
             EpochPhase::ActiveQuoting => {
@@ -624,12 +631,34 @@ mod tests {
             }
         );
 
+        // Sub-second boundaries: 14.999s elapsed is still inside the opening delay.
+        assert_eq!(
+            controller.evaluate(&make_input(14_999), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 285,
+                prohibit_accumulation: false,
+                block_new_entries: true,
+            }
+        );
+
         // Inside [15s, 120s): elapsed = 119s -> allowed.
         assert_eq!(
             controller.evaluate(&make_input(119_000), &snapshot),
             LifecycleAction::ContinueQuoting {
                 phase: EpochPhase::ActiveQuoting,
                 tau_secs: 181,
+                prohibit_accumulation: false,
+                block_new_entries: false,
+            }
+        );
+
+        // 119.999s elapsed is still before the 120s cutoff.
+        assert_eq!(
+            controller.evaluate(&make_input(119_999), &snapshot),
+            LifecycleAction::ContinueQuoting {
+                phase: EpochPhase::ActiveQuoting,
+                tau_secs: 180,
                 prohibit_accumulation: false,
                 block_new_entries: false,
             }

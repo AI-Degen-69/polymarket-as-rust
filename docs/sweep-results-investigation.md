@@ -1,14 +1,14 @@
 # Sweep Results Re-Evaluation: Corrected Telemetry, Repaired Gates G3–G6, and Promotion of Config #13
 
 > [!IMPORTANT]
-> **Follow-Up Promotion Notice:** A subsequent `9`-configuration boundary sweep (`logs/sweeps/25-11_21-55-50Z_boundary-9runs_20caps-226w`) promoted **Config `#6/9` (`max_entry_price = 0.65, entry_cutoff_secs = 120, tier1_hedge_trigger_price = off`)** to `DEFAULTS.json` as the provisional research baseline (`79.9` composite score vs `77.7` for Config `#13` / `#3/9`). See [boundary-sweep-selection-report.md](docs/boundary-sweep-selection-report.md).
-
+> **Follow-Up Promotion Notice:** A subsequent `9`-configuration boundary sweep (`logs/sweeps/25-11_21-55-50Z_boundary-9runs_20caps-226w`) promoted **Config `#6/9` (`max_entry_price = 0.65, entry_cutoff_secs = 120, tier1_hedge_trigger_price = off`)** to `DEFAULTS.json` as the provisional research baseline (`79.9` composite score vs `77.7` for Config `#13` / `#3/9`). See [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md).
+>
 > [!IMPORTANT]
-> **Supersession Notice:** This report **completely supersedes** the earlier `docs/sweep-results-investigation.md`. The prior investigation relied on broken G3–G6 survival gates and synthetic volume (`$9.80/fill`). Every metric, ranking, and gate verdict below is recomputed from the underlying event stream using the repaired Rust accounting telemetry and the repaired G3–G6 gates in [sweep-params.ps1](scripts/sweep-params.ps1).
+> **Supersession Notice:** This report **completely supersedes** the earlier `docs/sweep-results-investigation.md`. The prior investigation relied on broken G3–G6 survival gates and synthetic volume (`$9.80/fill`). Every metric, ranking, and gate verdict below is recomputed from the underlying event stream using the repaired Rust accounting telemetry and the repaired G3–G6 gates in [sweep-params.ps1](../scripts/sweep-params.ps1).
 
 - **Dataset:** `C:\Users\Tiger\Agents\Projects\AI Trading\polymarket-as-rust\logs\sweeps\25-11_16-21-55Z_18runs_20caps-226w` (`18` configurations × `20` captures = `360` JSONL files, `226` 5-minute windows, `QueueDecay=conservative`)
 - **Sweep Summary Artifact:** `logs/sweeps/25-11_16-21-55Z_18runs_20caps-226w/summary.txt` *(git-ignored local sweep output)* *(original sweep output using pre-fix gates)*
-- **Verification Standard:** [strategy-verification-spec.md](docs/strategy-verification-spec.md)
+- **Verification Standard:** [strategy-verification-spec.md](strategy-verification-spec.md)
 
 ---
 
@@ -16,7 +16,7 @@
 
 ### 1.1 Validation of New Telemetry Fields
 
-Five new accounting fields (`#[serde(default)]`) were added to `PaperLedger` ([accounting.rs](crates/paper-sim/src/accounting.rs#L140-L398)) and exported via `LifecycleSummaryEvent` ([lifecycle_report.rs](crates/cli/src/lifecycle_report.rs#L333-L371)) and `LivePaperSimulator::finalize_stats` ([lifecycle_cmd.rs](crates/cli/src/lifecycle_cmd.rs#L2532-L2554)):
+Five new accounting fields (`#[serde(default)]`) were added to `PaperLedger` ([accounting.rs](../crates/paper-sim/src/accounting.rs#L140-L398)) and exported via `LifecycleSummaryEvent` ([lifecycle_report.rs](../crates/cli/src/lifecycle_report.rs#L333-L371)) and `LivePaperSimulator::finalize_stats` ([lifecycle_cmd.rs](../crates/cli/src/lifecycle_cmd.rs#L2532-L2554)):
 
 | Field | Writer(s) | Validation Result |
 | --- | --- | --- |
@@ -24,11 +24,11 @@ Five new accounting fields (`#[serde(default)]`) were added to `PaperLedger` ([a
 | `volume_in_micro` | `record_fill` (`OrderSide::Buy`) and `record_taker_flatten_with_merge` (`OrderSide::Buy`) | **No double-counting:** `record_fill` only handles passive FIFO fills (`on_fill`), while `record_taker_flatten_with_merge` only handles `ExecuteFlattenFak`. Neither calls the other. Both use exact integer micro-USDC truncation (`(shares * price) / 1_000_000`). |
 | `total_merge_gain_micro` | `execute_pair_merge` | Signed net merge P&L across all pair merges (`redemption_micro - cost_up_deducted - cost_dn_deducted`). |
 | `positive_merge_gain_micro` | `execute_pair_merge` | Sum of `realized_gain_micro >= 0` across all merges. |
-| `negative_merge_loss_micro` | `execute_pair_merge` | Sum of `|realized_gain_micro|` where `realized_gain_micro < 0`. Reconciles identically: `total_merge_gain_micro == positive_merge_gain_micro - negative_merge_loss_micro`. |
+| `negative_merge_loss_micro` | `execute_pair_merge` | Sum of `abs(realized_gain_micro)` where `realized_gain_micro < 0`. Reconciles identically: `total_merge_gain_micro == positive_merge_gain_micro - negative_merge_loss_micro`. |
 
 **Determinism and test proof:**
-- Unit vector `test_vector_9_volume_in_and_signed_merge_gain_tracking` ([vectors.rs](crates/paper-sim/tests/vectors.rs#L409-L468)) verifies buy notional (`$30.50`) and signed merge splits (`+$1.00`, `-$1.50`, net `-$0.50`).
-- Replay determinism test `replay_is_deterministic_across_runs` ([lifecycle_cmd.rs](crates/cli/src/lifecycle_cmd.rs)) asserts bit-identical output across repeated runs for all five fields.
+- Unit vector `test_vector_9_volume_in_and_signed_merge_gain_tracking` ([vectors.rs](../crates/paper-sim/tests/vectors.rs#L409-L468)) verifies buy notional (`$30.50`) and signed merge splits (`+$1.00`, `-$1.50`, net `-$0.50`).
+- Replay determinism test `replay_is_deterministic_across_runs` ([lifecycle_cmd.rs](../crates/cli/src/lifecycle_cmd.rs)) asserts bit-identical output across repeated runs for all five fields.
 
 ### 1.2 Why No Sweep Rerun Was Needed
 
@@ -38,11 +38,11 @@ Event-level reconstruction across all `360` original JSONL files succeeded with 
   - `count(fill) == summary.fills_count` and `count(merge) == summary.merges_count`
   - `sum(merge.realized_gain_micro) + summary.settlement_pnl_micro - summary.fees_paid_micro == summary.realized_pnl_micro`
   - `sum(flatten.fee_micro) == summary.fees_paid_micro`
-- **Buy-side flatten correction (`9` events across the dataset):** Earlier ad-hoc totals summed only `"event":"fill"` notional (`$840.50` for `#13`, `$1,258.50` for `#14`). Nine mandatory buy-side flattens also occurred (`Cap#10` `btc-updown-5m-1795451400` BUY `7.38sh @ $0.06 = $0.4428` on `#2/#8/#14`; `Cap#20` `btc-updown-5m-1795613100` BUY `16.92sh @ $0.01 = $0.1692` on `#13–#18`). Including buy-side flattens matches Rust's `volume_in_micro` exactly (`$840.63` for `#13`, `$1,259.11` for `#14`).
+- **Buy-side flatten correction (`9` events across the dataset):** Earlier ad-hoc totals summed only `"event":"fill"` notional (`$840.46` for `#13`, `$1,258.49` for `#14`). Nine mandatory buy-side flattens also occurred (`Cap#10` `btc-updown-5m-1795451400` BUY `7.38sh @ $0.06 = $0.4428` on `#2/#8/#14`; `Cap#20` `btc-updown-5m-1795613100` BUY `16.92sh @ $0.01 = $0.1692` on `#13–#18`). Including buy-side flattens matches Rust's `volume_in_micro` exactly (`$840.63` for `#13`, `$1,259.11` for `#14`).
 
 ### 1.3 Safe Legacy JSONL Handling
 
-In `Read-CaptureJsonlMetrics` ([sweep-params.ps1](scripts/sweep-params.ps1)), legacy JSONL files missing the five new summary keys are reconstructed safely:
+In `Read-CaptureJsonlMetrics` ([sweep-params.ps1](../scripts/sweep-params.ps1)), legacy JSONL files missing the five new summary keys are reconstructed safely:
 1. When `volume_in_micro` or `total_shares_bought_micro` is absent from `summary`, the parser scans `"event":"fill"` (`filled_shares_micro`) and `"event":"flatten"` (`size_micro`) where `side == "BUY"`.
 2. When merge breakdown keys are absent, it scans `"event":"merge"` events (`realized_gain_micro`).
 3. **Missing vs. genuine zero protection:** Event-scan totals are only accepted when matching events exist (`scannedBuyEvents > 0` / `scannedMergeEvents > 0`) or when `summary` itself reports zero activity (`fills == 0 && flattens == 0` / `merges == 0`). If a summary-only JSONL reports nonzero `merges_count` or `fills_count` with no event rows, `MergePos`/`MergeNegLoss` stay `NaN` (not `0.0`), and `VolumeIn` uses the explicit synthetic fallback.
@@ -80,7 +80,7 @@ All `18` configurations span `MaxEntryPrice ∈ {0.50, 0.55, 0.60}` × `Tier1Hed
 
 ## 3. Repaired Survival Gates G1–G6: Numerator & Denominator Audit
 
-All gates are evaluated in `Get-SurvivalInputs`, `Evaluate-SurvivalGateRow`, and `Update-SurvivalVerdicts` ([sweep-params.ps1](scripts/sweep-params.ps1)):
+All gates are evaluated in `Get-SurvivalInputs`, `Evaluate-SurvivalGateRow`, and `Update-SurvivalVerdicts` ([sweep-params.ps1](../scripts/sweep-params.ps1)):
 
 - **G1 (`IS > 0`) & G2 (`OOS > 0`):** First `158` `window_end` events form In-Sample (`floor(226 * 0.7)`); remaining `68` form Out-of-Sample.
 - **G3 (`Retain >= 50%`):** Window-normalized retention: `(OOS / 68) / (IS / 158) * 100`.
@@ -125,7 +125,7 @@ All gates are evaluated in `Get-SurvivalInputs`, `Evaluate-SurvivalGateRow`, and
 | **G4 Max Drawdown** | `0%–1%` (`PASS`) on all 18 configs | `19.4%–36.6%` (`10` configs `FAIL` at 0%; `8` at 3%) | Divided single-window-curve dollar drawdown (`$9.71–$18.30`) by allocated `$50 VMax` instead of cumulative volume (`$1.57K–$4.26K`). |
 | **G3 Retention** | Falsely failed `#14` (`35%`), `#6` (`36%`), `#4` (`35%`) | `#14` `82.1%`, `#6` `83.4%`, `#4` `81.1%` (**all `PASS >= 50%`**) | Normalized OOS (`68w`) and IS (`158w`) by window counts before dividing; `#8, #2, #12, #10` still fail (`-40.4%` to `40.9%`). |
 | **G6 Neighbors** | All 18 reported `100%` (`5/5`) | `#16` `66.7%`, `#9` `75.0%`, `#12` `80.0%`, `#4` `66.7%`; others `100%` | Enforced ordered Manhattan-1 `±1` adjacency (`3–5` neighbors) and required neighbor `OOS > 0` (rejecting `#10`). |
-| **Actual `volume_in` (`#13`, `#14`)** | Fill-only `$840.50`, `$1,258.50` | Exact `$840.63` (`+0.17`), `$1,259.11` (`+0.61`) | Added BUY-side `flatten` notional matching `PaperLedger::record_taker_flatten_with_merge`. |
+| **Actual `volume_in` (`#13`, `#14`)** | Fill-only `$840.46`, `$1,258.49` | Exact `$840.63` (`+0.17`), `$1,259.11` (`+0.62`) | Added BUY-side `flatten` notional matching `PaperLedger::record_taker_flatten_with_merge`. |
 
 ---
 
@@ -135,7 +135,7 @@ All gates are evaluated in `Get-SurvivalInputs`, `Evaluate-SurvivalGateRow`, and
 
 All three single-parameter findings from the earlier investigation hold after full telemetry and gate recalculation:
 
-1. **`T1 Trigger` destroys risk-adjusted return across every tested pair:** At `($0.60, 120s)`, `#13 (T1=off)` earns `+$56.59` (`+6.73%` ROI, `38.2%` tail drag) versus `#17 ($0.70)` at `+$32.96` (`+3.63%`, `57.4%`) and `#15 ($0.65)` at `+$30.61` (`+3.35%`, `60.5%`). The cross-tick override latch in `DeficitHedgeOverrideLatch` ([station7_risk.rs](crates/risk-lifecycle/src/station7_risk.rs#L44-L124)) locks until imbalance drops below 5 shares, forcing expensive cross-tick merges (`$28.35–$29.36` vs `$10.42`) whenever spreads widen transiently.
+1. **`T1 Trigger` destroys risk-adjusted return across every tested pair:** At `($0.60, 120s)`, `#13 (T1=off)` earns `+$56.59` (`+6.73%` ROI, `38.2%` tail drag) versus `#17 ($0.70)` at `+$32.96` (`+3.63%`, `57.4%`) and `#15 ($0.65)` at `+$30.61` (`+3.35%`, `60.5%`). The cross-tick override latch in `DeficitHedgeOverrideLatch` ([station7_risk.rs](../crates/risk-lifecycle/src/station7_risk.rs#L44-L124)) locks until imbalance drops below 5 shares, forcing expensive cross-tick merges (`$28.35–$29.36` vs `$10.42`) whenever spreads widen transiently.
 2. **`120s` entry cutoff dominates `150s`:** At `($0.60, off)`, moving from `#13 (120s)` to `#14 (150s)` deploys `$418.48` extra capital (`+49.8%`) and adds `+$29.28` settlement loss for `-$2.44` lower Net P&L and a `FAIL(G4)` drawdown jump (`19.4% -> 28.8%`). Every single `150s` config fails `G4` at the 0% floor (`25.3%–36.6%`).
 3. **Raising `MaxEntryPrice` (`$0.50 -> $0.55 -> $0.60`) with `T1=off, 120s` improves P&L and efficiency monotonically:** Net P&L rises `+$32.97 (#1) -> +$40.21 (#7) -> +$56.59 (#13)`, actual ROI rises `+6.27% -> +6.35% -> +6.73%`, and drawdown drops (`27.2% -> 19.4% -> 19.4%`).
 4. **Repeatability vs. Config #5:** Config `#13` outperforms `#5` in total P&L (`2.70×`), ROI (`1.89×`), active windows (`66` vs `53`), active win rate (`57.6%` vs `50.9%`), dollar drawdown (`$9.71` vs `$10.45`), statistical significance (`t = 2.53` vs `1.47`), and profit excluding top 5 windows (`+$23.86` vs `-$0.55`).
@@ -157,12 +157,12 @@ Run a small `2 × 3` (or `3 × 3`) boundary follow-up holding `T1 = off`, `CapTi
 
 ### 6.1 Runtime Loading Path Verified
 
-Root [DEFAULTS.json](DEFAULTS.json) is promoted to **Config #6/9** (`max_entry_price: 0.65`, `tier1_hedge_trigger_price: null`, `entry_cutoff_secs: 120`, `cap_tier1_reducing_to_delta: true`, `entry_open_delay_secs: 15`) alongside all six calibration sync files (`AGENTS.md` §7). The earlier Config #13 (`$0.60`) baseline recorded in §2–§5 was superseded by the boundary sweep described in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md):
-- [DEFAULTS.json](DEFAULTS.json#L23-L32)
-- [.env.example](.env.example#L86-L104)
-- `EngineConfig::default()` / `EngineConfig::hardcoded_fallback()` ([config.rs](crates/core-types/src/config.rs#L509-L554)) embeds `DEFAULTS.json` at compile time via `include_str!("../../../DEFAULTS.json")`.
+Root [DEFAULTS.json](../DEFAULTS.json) is promoted to **Config #6/9** (`max_entry_price: 0.65`, `tier1_hedge_trigger_price: null`, `entry_cutoff_secs: 120`, `cap_tier1_reducing_to_delta: true`, `entry_open_delay_secs: 15`) alongside all six calibration sync files (`AGENTS.md` §7). The earlier Config #13 (`$0.60`) baseline recorded in §2–§5 was superseded by the boundary sweep described in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md):
+- [DEFAULTS.json](../DEFAULTS.json#L23-L32)
+- [.env.example](../.env.example#L86-L104)
+- `EngineConfig::default()` / `EngineConfig::hardcoded_fallback()` ([config.rs](../crates/core-types/src/config.rs#L509-L554)) embeds `DEFAULTS.json` at compile time via `include_str!("../../../DEFAULTS.json")`.
 - Live and replay CLI entrypoints (`lifecycle_cmd.rs`, `paper_cmd.rs`, `trace_cmd.rs`, `feeds_cmd.rs`, `doctor.rs`, `main.rs`) load `EngineConfig::from_env()?`, which starts from `EngineConfig::default()` (`DEFAULTS.json`). `lifecycle_cmd.rs` explicitly passes `cfg.cap_tier1_reducing_to_delta`, `cfg.entry_open_delay_secs`, `cfg.entry_cutoff_secs`, and `MathPipelineConfig::from_engine_config(cfg)`. `exec_cmd.rs` dry-run loads `MathPipelineConfig::try_default()?`, which calls `MathPipelineConfig::from_engine_config(&EngineConfig::default())`.
-- Verified by `embedded_defaults_json_parses_validates_and_matches_default` ([config.rs](crates/core-types/src/config.rs#L1344)), `config_locked_defaults_validate` ([lib.rs](crates/core-types/src/lib.rs#L227)), and `cli_lifecycle_and_pipeline_defaults_resolve_promoted_defaults` ([main.rs](crates/cli/src/main.rs)).
+- Verified by `embedded_defaults_json_parses_validates_and_matches_default` ([config.rs](../crates/core-types/src/config.rs#L1344)), `config_locked_defaults_validate` ([lib.rs](../crates/core-types/src/lib.rs#L227)), and `cli_lifecycle_and_pipeline_defaults_resolve_promoted_defaults` ([main.rs](../crates/cli/src/main.rs)).
 
 ### 6.2 Conflicting Library Struct Defaults (Non-Runtime)
 
@@ -170,6 +170,6 @@ Three standalone library constructors keep conservative/minimal struct defaults 
 
 | Struct & Constructor | Field(s) Differing from `DEFAULTS.json` | Impact at Runtime |
 | --- | --- | --- |
-| `RiskConfig::default()` ([station7_risk.rs](crates/risk-lifecycle/src/station7_risk.rs#L187-L199)) | `cap_tier1_reducing_to_delta: false` (`DEFAULTS.json` = `true`) | **None:** `spawn_managed_session` (`lifecycle_cmd.rs:2627`) overrides from `cfg.cap_tier1_reducing_to_delta`. |
-| `LifecycleConfig::default()` ([lifecycle.rs](crates/risk-lifecycle/src/lifecycle.rs#L91-L103)) | `entry_open_delay_secs: 0`, `entry_cutoff_secs: None` (`DEFAULTS.json` = `15`, `Some(120)`) | **None:** `build_risk_actor` (`lifecycle_cmd.rs:2577-2578`) overrides from `cfg.entry_open_delay_secs` and `cfg.entry_cutoff_secs`. |
-| `PricerConfig::from_gamma()` ([station4_6_pricer.rs](crates/math-engine/src/station4_6_pricer.rs#L37-L50)) | `max_cross_tick_loss_micro: None` (`DEFAULTS.json` = `Some(80_000)`); `max_entry_price: Some(0.60)` differs from `DEFAULTS.json` (`Some(0.65)`) | **None:** CLI and `PricerConfig::try_default()` construct from `EngineConfig`. |
+| `RiskConfig::default()` ([station7_risk.rs](../crates/risk-lifecycle/src/station7_risk.rs#L187-L199)) | `cap_tier1_reducing_to_delta: false` (`DEFAULTS.json` = `true`) | **None:** `spawn_managed_session` (`lifecycle_cmd.rs:2627`) overrides from `cfg.cap_tier1_reducing_to_delta`. |
+| `LifecycleConfig::default()` ([lifecycle.rs](../crates/risk-lifecycle/src/lifecycle.rs#L91-L103)) | `entry_open_delay_secs: 0`, `entry_cutoff_secs: None` (`DEFAULTS.json` = `15`, `Some(120)`) | **None:** `build_risk_actor` (`lifecycle_cmd.rs:2577-2578`) overrides from `cfg.entry_open_delay_secs` and `cfg.entry_cutoff_secs`. |
+| `PricerConfig::from_gamma()` ([station4_6_pricer.rs](../crates/math-engine/src/station4_6_pricer.rs#L37-L50)) | `max_cross_tick_loss_micro: None` (`DEFAULTS.json` = `Some(80_000)`); `max_entry_price: Some(0.60)` differs from `DEFAULTS.json` (`Some(0.65)`) | **None:** CLI and `PricerConfig::try_default()` construct from `EngineConfig`. |
