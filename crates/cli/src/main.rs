@@ -33,7 +33,25 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use core_types::{KappaMode, NexWsVersion, SgMode, VarianceMode};
+use core_types::{
+    DefaultQueueDecay, EngineConfig, KappaMode, MICRO_SCALE, NexWsVersion, SgMode, VarianceMode,
+    default_simulation_settings,
+};
+
+fn default_v_max_usd() -> u64 {
+    EngineConfig::default().max_notional_per_leg_micro.as_u64() / MICRO_SCALE
+}
+
+fn default_base_size_shares() -> u64 {
+    EngineConfig::default().base_order_size_shares.as_u64() / MICRO_SCALE
+}
+
+fn default_cli_queue_decay() -> CliQueueDecay {
+    match default_simulation_settings().queue_decay {
+        DefaultQueueDecay::Conservative => CliQueueDecay::Conservative,
+        DefaultQueueDecay::Optimistic => CliQueueDecay::Optimistic,
+    }
+}
 
 use exec_cmd::{ExecArgs, ExecMode};
 use feeds_cmd::FeedsArgs;
@@ -494,17 +512,17 @@ enum Commands {
         /// Allow starting `--source live` mid-window instead of waiting idle for the next fresh 5-minute boundary.
         #[arg(long, default_value_t = false)]
         allow_mid_window: bool,
-        /// Maximum dollar position capital in USD (`$50` default).
-        #[arg(long, default_value_t = 50)]
+        /// Maximum dollar position capital in USD (`DEFAULTS.json`: `$50`).
+        #[arg(long, default_value_t = default_v_max_usd())]
         v_max: u64,
-        /// Base order size in whole shares (`20` default).
-        #[arg(long, default_value_t = 20)]
+        /// Base order size in whole shares (`DEFAULTS.json`: `20`).
+        #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
         /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
         #[arg(long, default_value_t = 40)]
         latency_ms: u64,
-        /// FIFO queue decay policy (`conservative` default or `optimistic`).
-        #[arg(long, value_enum, default_value_t = CliQueueDecay::Conservative)]
+        /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
+        #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
         queue_decay: CliQueueDecay,
         #[command(flatten)]
         math: MathOverrides,
@@ -538,14 +556,14 @@ enum Commands {
         /// Inject adversarial fault mode (`none`, `stale`, `tier4`, `tick-change`, `disconnect`).
         #[arg(long, value_enum, default_value_t = CliFaultModeArg::None, alias = "fault")]
         inject_fault: CliFaultModeArg,
-        /// Maximum dollar position capital in USD (`$50` default).
-        #[arg(long, default_value_t = 50)]
+        /// Maximum dollar position capital in USD (`DEFAULTS.json`: `$50`).
+        #[arg(long, default_value_t = default_v_max_usd())]
         v_max: u64,
-        /// Base order size in whole shares (`20` default).
-        #[arg(long, default_value_t = 20)]
+        /// Base order size in whole shares (`DEFAULTS.json`: `20`).
+        #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
-        /// FIFO queue decay policy (`conservative` default or `optimistic`).
-        #[arg(long, value_enum, default_value_t = CliQueueDecay::Conservative)]
+        /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
+        #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
         queue_decay: CliQueueDecay,
         #[command(flatten)]
         math: MathOverrides,
