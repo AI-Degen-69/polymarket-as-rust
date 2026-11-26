@@ -91,6 +91,7 @@ pub(crate) struct LifecycleArgs {
     pub(crate) fault: CliFaultMode,
     pub(crate) v_max: u64,
     pub(crate) base_size: u64,
+    pub(crate) latency_ms: u64,
     pub(crate) queue_decay: paper_sim::QueueDecayPolicy,
     pub(crate) math: crate::MathOverrides,
     pub(crate) pinning: CorePinning,
@@ -2631,8 +2632,9 @@ fn spawn_managed_session(
     let math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
 
     let broker_cfg = FifoBrokerConfig {
+        order_latency_ms: args.latency_ms,
+        cancel_latency_ms: args.latency_ms,
         queue_decay_policy: args.queue_decay,
-        ..FifoBrokerConfig::default()
     };
     let sim = LivePaperSimulator::new(
         desc,
@@ -4991,6 +4993,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides {
                 gamma: Some(0.02),
@@ -5209,6 +5212,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5231,6 +5235,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5256,6 +5261,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Optimistic,
             math: crate::MathOverrides {
                 gamma: Some(0.02),
@@ -5295,6 +5301,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Optimistic,
             math: crate::MathOverrides {
                 gamma: Some(0.02),
@@ -5360,6 +5367,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5553,6 +5561,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5690,6 +5699,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),

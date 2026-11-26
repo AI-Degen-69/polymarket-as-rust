@@ -704,6 +704,9 @@ enum Commands {
         /// Base order size in whole shares (`DEFAULTS.json`: `20`).
         #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
+        /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
+        #[arg(long, default_value_t = 40)]
+        latency_ms: u64,
         /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
         #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
         queue_decay: CliQueueDecay,
@@ -870,6 +873,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             inject_fault,
             v_max,
             base_size,
+            latency_ms,
             queue_decay,
             math,
             pin_pricing_core,
@@ -901,6 +905,7 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             },
             v_max,
             base_size,
+            latency_ms,
             queue_decay: queue_decay.into(),
             math,
             pinning: risk_lifecycle::CorePinning {
@@ -2069,13 +2074,26 @@ mod tests {
     }
 
     #[test]
+    fn cli_lifecycle_latency_ms_override_parses() {
+        let cli = Cli::try_parse_from(["poly-as", "lifecycle", "--latency-ms", "75"]).unwrap();
+        match cli.command {
+            Commands::Lifecycle { latency_ms, .. } => assert_eq!(latency_ms, 75),
+            _ => panic!("expected Lifecycle"),
+        }
+    }
+
+    #[test]
     fn cli_lifecycle_and_pipeline_defaults_resolve_promoted_defaults() {
         let cli = Cli::try_parse_from(["poly-as", "lifecycle"]).unwrap();
         match cli.command {
             Commands::Lifecycle {
-                queue_decay, math, ..
+                queue_decay,
+                latency_ms,
+                math,
+                ..
             } => {
                 assert_eq!(queue_decay, CliQueueDecay::Conservative);
+                assert_eq!(latency_ms, 40);
                 assert!(!math.is_any_set());
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
