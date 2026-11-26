@@ -7,6 +7,12 @@ on:
   pull_request:
     branches:
       - main
+    # Docs-only PRs skip the Rust job: Markdown and docs/ cannot change compiled
+    # behavior, so the local fmt gate and PR review are enough for them.
+    paths-ignore:
+      - '*.md'
+      - '**/*.md'
+      - 'docs/**'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
