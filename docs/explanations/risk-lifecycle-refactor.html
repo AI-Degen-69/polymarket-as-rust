@@ -442,8 +442,10 @@ fn <span class="key">build_trace</span>(&amp;self, ctx: &amp;TraceCtx, exit: Tra
 
 <footer>
   Numbers taken from <code>git diff fecef0d...4aa69e1 -- crates/risk-lifecycle/src/runtime.rs</code> and two dumps of
-  <code>cargo run -q -p risk-lifecycle --example actor_equivalence</code> diffed line for line. There is no
-  <code>riskdiff.ps1</code> in the repository. main = fecef0d, branch = 4aa69e1.
+  <code>cargo run -q -p risk-lifecycle --example actor_equivalence -- out.jsonl</code> diffed line for line. There is no
+  <code>riskdiff.ps1</code> in the repository. main = fecef0d, branch = 4aa69e1. The example itself landed later, in
+  <code>f787654</code>, and is in neither of those commits, so each dump was produced by copying that one file into
+  the tree before the run.
 </footer>
 </div>
 
