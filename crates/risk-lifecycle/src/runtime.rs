@@ -12,7 +12,8 @@ use crate::breakers::{BreakerConfig, BreakerStatus, CircuitBreakers};
 use crate::error::RiskLifecycleError;
 use crate::lifecycle::{EpochLifecycleController, EpochPhase, LifecycleAction, LifecycleInput};
 use crate::station7_risk::{
-    DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot, RiskEvaluationInput, RiskTier,
+    DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot, RiskDecision,
+    RiskEvaluationInput, RiskTier,
 };
 use crate::station8_hysteresis::{
     CancelReason, HysteresisGate, HysteresisInput, OrderAction, OrderSlotState, SizedQuote,
@@ -165,6 +166,44 @@ pub enum FaultInjection {
 
 /// Default maximum duration (`2s`) a single-flight flatten lock remains active without ACK/clear.
 pub const DEFAULT_FLATTEN_IN_FLIGHT_TIMEOUT_NS: u64 = 2_000_000_000;
+
+/// Per-tick values shared by every trace exit, captured before the first check runs.
+struct TraceCtx {
+    now_ms: u64,
+    tau_secs: u64,
+    breaker: BreakerStatus,
+    best_bid_up: Option<MicroUsdc>,
+    best_ask_up: Option<MicroUsdc>,
+    best_bid_dn: Option<MicroUsdc>,
+    best_ask_dn: Option<MicroUsdc>,
+    started: std::time::Instant,
+}
+
+/// The parts of a trace that each exit path decides for itself.
+struct TraceExit {
+    phase: EpochPhase,
+    tier: RiskTier,
+    utilization_u_e6: u64,
+    action_up: OrderAction,
+    action_dn: OrderAction,
+    flatten_action: FlattenAction,
+    cancel_all_reason: Option<String>,
+}
+
+impl TraceExit {
+    /// Exit that ends before Station 7 measures exposure, so risk values stay at 0.
+    fn placeholder(phase: EpochPhase, tier: RiskTier, cancel_all_reason: Option<String>) -> Self {
+        Self {
+            phase,
+            tier,
+            utilization_u_e6: 0,
+            action_up: OrderAction::Hold,
+            action_dn: OrderAction::Hold,
+            flatten_action: FlattenAction::None,
+            cancel_all_reason,
+        }
+    }
+}
 
 /// Unified telemetry trace record emitted by the Risk Actor on every evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -536,6 +575,16 @@ impl RiskActor {
 
         // 2. Evaluate Circuit Breakers:
         let breaker_status = self.breakers.check_status(now_ns, clock_offset_ms);
+        let ctx = TraceCtx {
+            now_ms,
+            tau_secs,
+            breaker: breaker_status,
+            best_bid_up: proposal.best_bid_up,
+            best_ask_up: proposal.best_ask_up,
+            best_bid_dn: proposal.best_bid_dn,
+            best_ask_dn: proposal.best_ask_dn,
+            started: start_time,
+        };
         if let BreakerStatus::Tripped { reason } = breaker_status {
             let cancel_reason = format!("Circuit breaker tripped: {reason:?}");
             let _ = self
@@ -544,24 +593,14 @@ impl RiskActor {
                 .try_send(ExecutionCommand::CancelAll {
                     reason: cancel_reason.clone(),
                 });
-            return Ok(Some(RiskActorTrace {
-                now_ms,
-                tau_secs,
-                phase: EpochPhase::ActiveQuoting,
-                tier: RiskTier::Tier4HardStop,
-                utilization_u_e6: 0,
-                breaker: breaker_status,
-                action_up: OrderAction::Hold,
-                action_dn: OrderAction::Hold,
-                flatten_action: FlattenAction::None,
-                cancel_all_reason: Some(cancel_reason),
-                flatten_in_flight: self.flatten_in_flight,
-                best_bid_up: proposal.best_bid_up,
-                best_ask_up: proposal.best_ask_up,
-                best_bid_dn: proposal.best_bid_dn,
-                best_ask_dn: proposal.best_ask_dn,
-                risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-            }));
+            return Ok(Some(self.build_trace(
+                &ctx,
+                TraceExit::placeholder(
+                    EpochPhase::ActiveQuoting,
+                    RiskTier::Tier4HardStop,
+                    Some(cancel_reason),
+                ),
+            )));
         }
 
         // Clear stale or completed single-flight flatten guards before evaluating lifecycle/risk.
@@ -613,24 +652,10 @@ impl RiskActor {
                     .try_send(ExecutionCommand::CancelAll {
                         reason: reason.clone(),
                     });
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier1Normal,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action: FlattenAction::None,
-                    cancel_all_reason: Some(reason),
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit::placeholder(phase, RiskTier::Tier1Normal, Some(reason)),
+                )))
             }
             LifecycleAction::ExecuteFlattenFak {
                 outcome,
@@ -679,24 +704,14 @@ impl RiskActor {
                             )
                         }
                     };
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier4HardStop,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action,
-                    cancel_all_reason,
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit {
+                        flatten_action,
+                        cancel_all_reason,
+                        ..TraceExit::placeholder(phase, RiskTier::Tier4HardStop, None)
+                    },
+                )))
             }
             LifecycleAction::ResidualDustUnflattenable {
                 unhedged_shares,
@@ -710,27 +725,16 @@ impl RiskActor {
                     .try_send(ExecutionCommand::CancelAll {
                         reason: reason.clone(),
                     });
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier4HardStop,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action: FlattenAction::ResidualDust {
-                        unhedged_shares,
-                        min_order_size,
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit {
+                        flatten_action: FlattenAction::ResidualDust {
+                            unhedged_shares,
+                            min_order_size,
+                        },
+                        ..TraceExit::placeholder(phase, RiskTier::Tier4HardStop, Some(reason))
                     },
-                    cancel_all_reason: Some(reason),
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                )))
             }
             LifecycleAction::EpochRollover {
                 expired_expiry_ms,
@@ -746,24 +750,10 @@ impl RiskActor {
                     .try_send(ExecutionCommand::CancelAll {
                         reason: reason.clone(),
                     });
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier1Normal,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action: FlattenAction::None,
-                    cancel_all_reason: Some(reason),
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit::placeholder(phase, RiskTier::Tier1Normal, Some(reason)),
+                )))
             }
             LifecycleAction::ContinueQuoting {
                 prohibit_accumulation,
@@ -786,149 +776,20 @@ impl RiskActor {
                     flatten_in_flight: self.flatten_in_flight,
                 };
 
-                // Deduct each slot's own Live resting order from evaluation exposure/cash so a
-                // single-slot replacement does not stack against itself and trigger false churn or Tier4.
-                let mut eval_snapshot = snapshot;
-                for outcome in [Outcome::Up, Outcome::Down] {
-                    if let OrderSlotState::Live {
-                        price,
-                        remaining_size,
-                        ..
-                    } = self.hysteresis.state(outcome)
-                    {
-                        let slot_notional = ((remaining_size.0 as u128 * price.0 as u128)
-                            / core_types::MICRO_SCALE as u128)
-                            as u64;
-                        match outcome {
-                            Outcome::Up => {
-                                eval_snapshot.open_bid_shares_up = eval_snapshot
-                                    .open_bid_shares_up
-                                    .saturating_sub(*remaining_size);
-                                eval_snapshot.open_bid_notional_up = eval_snapshot
-                                    .open_bid_notional_up
-                                    .saturating_sub(MicroUsdc(slot_notional));
-                            }
-                            Outcome::Down => {
-                                eval_snapshot.open_bid_shares_dn = eval_snapshot
-                                    .open_bid_shares_dn
-                                    .saturating_sub(*remaining_size);
-                                eval_snapshot.open_bid_notional_dn = eval_snapshot
-                                    .open_bid_notional_dn
-                                    .saturating_sub(MicroUsdc(slot_notional));
-                            }
-                        }
-                        eval_snapshot.available_usdc_micro = MicroUsdc(
-                            eval_snapshot
-                                .available_usdc_micro
-                                .0
-                                .saturating_add(slot_notional),
-                        );
-                    }
-                }
-
+                let eval_snapshot = self.snapshot_without_own_slots(&snapshot);
                 let risk_decision = self.risk_engine.evaluate(&eval_snapshot, &risk_input)?;
 
-                let mut trace_flatten = risk_decision.flatten;
-                let mut cancel_all_reason = None;
-                if let FlattenAction::FlattenFak {
-                    outcome,
-                    price,
-                    size,
-                } = risk_decision.flatten
-                {
-                    let reason = "Station 7 Tier 4 Hard Stop flatten".to_string();
-                    match self
-                        .harness
-                        .priority_tx
-                        .try_send(ExecutionCommand::ExecuteFlattenFak {
-                            outcome,
-                            price,
-                            size,
-                            reason: reason.clone(),
-                        }) {
-                        Ok(()) => {
-                            self.flatten_in_flight = true;
-                            self.flatten_in_flight_since_ns = Some(now_ns);
-                        }
-                        Err(TrySendError::Full(_)) => {
-                            self.clear_flatten_in_flight();
-                            trace_flatten = FlattenAction::None;
-                            cancel_all_reason = Some(format!(
-                                "Flatten try_send failed (priority channel full): {reason}"
-                            ));
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            self.clear_flatten_in_flight();
-                            trace_flatten = FlattenAction::None;
-                            cancel_all_reason = Some(format!(
-                                "Flatten try_send failed (priority channel closed): {reason}"
-                            ));
-                        }
-                    }
-                }
+                let (trace_flatten, cancel_all_reason) =
+                    self.send_risk_flatten(risk_decision.flatten, now_ns);
 
-                // If accumulation prohibited in PreExpiryLockout, zero out the accumulating leg
-                // and strictly cap the reducing leg to the remaining offsetting delta.
-                let min_order_micro = self
-                    .risk_engine
-                    .config()
-                    .min_order_size_shares
-                    .saturating_mul(core_types::ONE_SHARE_MICRO);
-                let (mut auth_size_up, mut auth_size_dn) = if prohibit_accumulation {
-                    if snapshot.unhedged_up > snapshot.unhedged_dn {
-                        (
-                            None,
-                            cap_size_to_offset(
-                                risk_decision.size_dn,
-                                snapshot.unhedged_up,
-                                snapshot.unhedged_dn,
-                                min_order_micro,
-                            ),
-                        )
-                    } else if snapshot.unhedged_dn > snapshot.unhedged_up {
-                        (
-                            cap_size_to_offset(
-                                risk_decision.size_up,
-                                snapshot.unhedged_dn,
-                                snapshot.unhedged_up,
-                                min_order_micro,
-                            ),
-                            None,
-                        )
-                    } else {
-                        (None, None)
-                    }
-                } else if block_new_entries {
-                    // Entry-time guard: suppress fresh Leg-1 accumulation while allowing existing
-                    // inventory (including dust < 5 sh) to hedge or reduce.
-                    if snapshot.unhedged_up > snapshot.unhedged_dn {
-                        (None, risk_decision.size_dn)
-                    } else if snapshot.unhedged_dn > snapshot.unhedged_up {
-                        (risk_decision.size_up, None)
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (risk_decision.size_up, risk_decision.size_dn)
-                };
-
-                // Extreme-probability hedge exemption: cap reducing leg strictly to offsetting delta.
-                if proposal.hedge_only_up {
-                    auth_size_up = cap_size_to_offset(
-                        auth_size_up,
-                        snapshot.unhedged_dn,
-                        snapshot.unhedged_up,
-                        min_order_micro,
-                    );
-                }
-                if proposal.hedge_only_dn {
-                    auth_size_dn = cap_size_to_offset(
-                        auth_size_dn,
-                        snapshot.unhedged_up,
-                        snapshot.unhedged_dn,
-                        min_order_micro,
-                    );
-                }
+                let (auth_size_up, auth_size_dn) = self.apply_size_overlay(
+                    &snapshot,
+                    &risk_decision,
+                    prohibit_accumulation,
+                    block_new_entries,
+                    proposal.hedge_only_up,
+                    proposal.hedge_only_dn,
+                );
 
                 let (cancel_up, cancel_dn) =
                     if proposal.defensive_cancel_up || proposal.defensive_cancel_dn {
@@ -985,24 +846,18 @@ impl RiskActor {
 
                 self.last_processed_seq = proposal.seq;
 
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: risk_decision.tier,
-                    utilization_u_e6: risk_decision.utilization_u_e6,
-                    breaker: breaker_status,
-                    action_up,
-                    action_dn,
-                    flatten_action: trace_flatten,
-                    cancel_all_reason,
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit {
+                        phase,
+                        tier: risk_decision.tier,
+                        utilization_u_e6: risk_decision.utilization_u_e6,
+                        action_up,
+                        action_dn,
+                        flatten_action: trace_flatten,
+                        cancel_all_reason,
+                    },
+                )))
             }
         }
     }
@@ -1091,6 +946,199 @@ impl RiskActor {
     pub fn clear_flatten_in_flight(&mut self) {
         self.flatten_in_flight = false;
         self.flatten_in_flight_since_ns = None;
+    }
+
+    /// Builds the one trace record for this tick from the shared context and the exit's outcome.
+    fn build_trace(&self, ctx: &TraceCtx, exit: TraceExit) -> RiskActorTrace {
+        RiskActorTrace {
+            now_ms: ctx.now_ms,
+            tau_secs: ctx.tau_secs,
+            phase: exit.phase,
+            tier: exit.tier,
+            utilization_u_e6: exit.utilization_u_e6,
+            breaker: ctx.breaker,
+            action_up: exit.action_up,
+            action_dn: exit.action_dn,
+            flatten_action: exit.flatten_action,
+            cancel_all_reason: exit.cancel_all_reason,
+            flatten_in_flight: self.flatten_in_flight,
+            best_bid_up: ctx.best_bid_up,
+            best_ask_up: ctx.best_ask_up,
+            best_bid_dn: ctx.best_bid_dn,
+            best_ask_dn: ctx.best_ask_dn,
+            risk_eval_ns: ctx.started.elapsed().as_nanos() as u64,
+        }
+    }
+
+    /// Removes this actor's own live resting orders from a snapshot so a single-slot
+    /// replacement cannot count itself as external exposure or as committed cash.
+    fn snapshot_without_own_slots(
+        &self,
+        snapshot: &OrderRegistrySnapshot,
+    ) -> OrderRegistrySnapshot {
+        let mut eval_snapshot = *snapshot;
+        for outcome in [Outcome::Up, Outcome::Down] {
+            if let OrderSlotState::Live {
+                price,
+                remaining_size,
+                ..
+            } = self.hysteresis.state(outcome)
+            {
+                let slot_notional = ((remaining_size.0 as u128 * price.0 as u128)
+                    / core_types::MICRO_SCALE as u128) as u64;
+                match outcome {
+                    Outcome::Up => {
+                        eval_snapshot.open_bid_shares_up = eval_snapshot
+                            .open_bid_shares_up
+                            .saturating_sub(*remaining_size);
+                        eval_snapshot.open_bid_notional_up = eval_snapshot
+                            .open_bid_notional_up
+                            .saturating_sub(MicroUsdc(slot_notional));
+                    }
+                    Outcome::Down => {
+                        eval_snapshot.open_bid_shares_dn = eval_snapshot
+                            .open_bid_shares_dn
+                            .saturating_sub(*remaining_size);
+                        eval_snapshot.open_bid_notional_dn = eval_snapshot
+                            .open_bid_notional_dn
+                            .saturating_sub(MicroUsdc(slot_notional));
+                    }
+                }
+                eval_snapshot.available_usdc_micro = MicroUsdc(
+                    eval_snapshot
+                        .available_usdc_micro
+                        .0
+                        .saturating_add(slot_notional),
+                );
+            }
+        }
+        eval_snapshot
+    }
+
+    /// Sends a Station 7 Tier-4 flatten on the priority lane and reports how the trace
+    /// should describe it: the flatten action plus any channel-failure reason.
+    fn send_risk_flatten(
+        &mut self,
+        flatten: FlattenAction,
+        now_ns: u64,
+    ) -> (FlattenAction, Option<String>) {
+        let FlattenAction::FlattenFak {
+            outcome,
+            price,
+            size,
+        } = flatten
+        else {
+            return (flatten, None);
+        };
+        let reason = "Station 7 Tier 4 Hard Stop flatten".to_string();
+        match self
+            .harness
+            .priority_tx
+            .try_send(ExecutionCommand::ExecuteFlattenFak {
+                outcome,
+                price,
+                size,
+                reason: reason.clone(),
+            }) {
+            Ok(()) => {
+                self.flatten_in_flight = true;
+                self.flatten_in_flight_since_ns = Some(now_ns);
+                (flatten, None)
+            }
+            Err(TrySendError::Full(_)) => {
+                self.clear_flatten_in_flight();
+                (
+                    FlattenAction::None,
+                    Some(format!(
+                        "Flatten try_send failed (priority channel full): {reason}"
+                    )),
+                )
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.clear_flatten_in_flight();
+                (
+                    FlattenAction::None,
+                    Some(format!(
+                        "Flatten try_send failed (priority channel closed): {reason}"
+                    )),
+                )
+            }
+        }
+    }
+
+    /// Applies the phase overlay (no accumulation near expiry, entry-time guard) and the
+    /// hedge-only caps to Station 7's authorized sizes.
+    fn apply_size_overlay(
+        &self,
+        snapshot: &OrderRegistrySnapshot,
+        decision: &RiskDecision,
+        prohibit_accumulation: bool,
+        block_new_entries: bool,
+        hedge_only_up: bool,
+        hedge_only_dn: bool,
+    ) -> (Option<SharesMicro>, Option<SharesMicro>) {
+        let min_order_micro = self
+            .risk_engine
+            .config()
+            .min_order_size_shares
+            .saturating_mul(core_types::ONE_SHARE_MICRO);
+        let (mut size_up, mut size_dn) = if prohibit_accumulation {
+            if snapshot.unhedged_up > snapshot.unhedged_dn {
+                (
+                    None,
+                    cap_size_to_offset(
+                        decision.size_dn,
+                        snapshot.unhedged_up,
+                        snapshot.unhedged_dn,
+                        min_order_micro,
+                    ),
+                )
+            } else if snapshot.unhedged_dn > snapshot.unhedged_up {
+                (
+                    cap_size_to_offset(
+                        decision.size_up,
+                        snapshot.unhedged_dn,
+                        snapshot.unhedged_up,
+                        min_order_micro,
+                    ),
+                    None,
+                )
+            } else {
+                (None, None)
+            }
+        } else if block_new_entries {
+            // Entry-time guard: suppress fresh Leg-1 accumulation while allowing existing
+            // inventory (including dust < 5 sh) to hedge or reduce.
+            if snapshot.unhedged_up > snapshot.unhedged_dn {
+                (None, decision.size_dn)
+            } else if snapshot.unhedged_dn > snapshot.unhedged_up {
+                (decision.size_up, None)
+            } else {
+                (None, None)
+            }
+        } else {
+            (decision.size_up, decision.size_dn)
+        };
+
+        // Extreme-probability hedge exemption: cap reducing leg strictly to offsetting delta.
+        if hedge_only_up {
+            size_up = cap_size_to_offset(
+                size_up,
+                snapshot.unhedged_dn,
+                snapshot.unhedged_up,
+                min_order_micro,
+            );
+        }
+        if hedge_only_dn {
+            size_dn = cap_size_to_offset(
+                size_dn,
+                snapshot.unhedged_up,
+                snapshot.unhedged_dn,
+                min_order_micro,
+            );
+        }
+
+        (size_up, size_dn)
     }
 
     /// Records receipt of a Polymarket feed message for the staleness breaker.
@@ -1324,8 +1372,27 @@ mod tests {
             }
         );
 
+        // Characterization: the breaker exits before exposure is measured, so the trace
+        // carries placeholder risk values and emits no per-leg order actions.
+        assert_eq!(trace.phase, EpochPhase::ActiveQuoting);
+        assert_eq!(trace.tier, RiskTier::Tier4HardStop);
+        assert_eq!(trace.utilization_u_e6, 0);
+        assert_eq!(trace.action_up, OrderAction::Hold);
+        assert_eq!(trace.action_dn, OrderAction::Hold);
+        assert_eq!(trace.flatten_action, FlattenAction::None);
+        assert!(!trace.flatten_in_flight);
+        assert_eq!(
+            trace.cancel_all_reason.as_deref(),
+            Some("Circuit breaker tripped: PolymarketFeedStale")
+        );
+
         let cmd = priority_rx.try_recv().unwrap();
-        assert!(matches!(cmd, ExecutionCommand::CancelAll { .. }));
+        assert_eq!(
+            cmd,
+            ExecutionCommand::CancelAll {
+                reason: "Circuit breaker tripped: PolymarketFeedStale".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1563,6 +1630,14 @@ mod tests {
                 size: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
             }
         );
+        // Characterization: the flatten exit reports placeholder risk values, holds both
+        // legs, and carries no cancel-all reason once the FAK is accepted.
+        assert_eq!(trace_recovered.phase, EpochPhase::MandatoryFlatten);
+        assert_eq!(trace_recovered.tier, RiskTier::Tier4HardStop);
+        assert_eq!(trace_recovered.utilization_u_e6, 0);
+        assert_eq!(trace_recovered.action_up, OrderAction::Hold);
+        assert_eq!(trace_recovered.action_dn, OrderAction::Hold);
+        assert!(trace_recovered.cancel_all_reason.is_none());
 
         let cmd = priority_rx.try_recv().unwrap();
         assert_eq!(
@@ -1572,6 +1647,329 @@ mod tests {
                 price: MicroUsdc(520_000),
                 size: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
                 reason: "Mandatory flatten BUY UP at ask".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_mandatory_flatten_residual_dust_is_unflattenable() {
+        // 3 unhedged UP shares sit below the 5-share market minimum: the flatten window
+        // cannot trade out of it, so the actor cancels everything and reports the dust.
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(3 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(1_500_000), // $1.50 acquisition cost
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+
+        let expiry_ms = 300_000;
+        harness.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: expiry_ms - 20_000, // T-20s -> MandatoryFlatten
+            expiry_ms,
+            tick_size_micro: MicroUsdc(10_000),
+            best_bid_up: Some(MicroUsdc(490_000)),
+            best_ask_up: Some(MicroUsdc(510_000)),
+            best_bid_dn: Some(MicroUsdc(460_000)),
+            best_ask_dn: Some(MicroUsdc(480_000)),
+            ..Default::default()
+        });
+
+        let trace = risk_actor.step(1_000_000, 0).unwrap().unwrap();
+
+        assert_eq!(trace.phase, EpochPhase::MandatoryFlatten);
+        assert_eq!(
+            trace.flatten_action,
+            FlattenAction::ResidualDust {
+                unhedged_shares: SharesMicro::from_raw(3 * core_types::ONE_SHARE_MICRO),
+                min_order_size: SharesMicro::from_raw(5 * core_types::ONE_SHARE_MICRO),
+            }
+        );
+        assert_eq!(
+            trace.cancel_all_reason.as_deref(),
+            Some("Residual dust below min order size")
+        );
+        assert!(!trace.flatten_in_flight);
+        assert_eq!(trace.action_up, OrderAction::Hold);
+        assert_eq!(trace.action_dn, OrderAction::Hold);
+        assert_eq!(trace.tier, RiskTier::Tier4HardStop);
+        assert_eq!(trace.utilization_u_e6, 0);
+
+        assert_eq!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAll {
+                reason: "Residual dust below min order size".to_string(),
+            }
+        );
+    }
+
+    fn actor_for_snapshot_tests() -> RiskActor {
+        let (harness, _priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+        RiskActor::new(
+            harness,
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        )
+    }
+
+    fn slot_live(price: u64, placed: u64, remaining: u64) -> OrderSlotState {
+        OrderSlotState::Live {
+            order_id: "order".to_string(),
+            price: MicroUsdc(price),
+            original_size: SharesMicro::from_raw(placed * core_types::ONE_SHARE_MICRO),
+            remaining_size: SharesMicro::from_raw(remaining * core_types::ONE_SHARE_MICRO),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_deducts_both_live_legs_and_releases_cash() {
+        let mut actor = actor_for_snapshot_tests();
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 20));
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Down, slot_live(460_000, 10, 10));
+
+        let snapshot = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(9_600_000),
+            open_bid_shares_dn: SharesMicro::from_raw(10 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_dn: MicroUsdc(4_600_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+
+        let eval = actor.snapshot_without_own_slots(&snapshot);
+
+        // Our own resting orders are not external exposure and not committed cash.
+        assert_eq!(eval.open_bid_shares_up, SharesMicro::ZERO);
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc::ZERO);
+        assert_eq!(eval.open_bid_shares_dn, SharesMicro::ZERO);
+        assert_eq!(eval.open_bid_notional_dn, MicroUsdc::ZERO);
+        // Released notional returns to available cash: 9.60 + 4.60.
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(114_200_000));
+        // The caller's snapshot is untouched.
+        assert_eq!(snapshot.open_bid_notional_up, MicroUsdc(9_600_000));
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_uses_remaining_size_not_original() {
+        let mut actor = actor_for_snapshot_tests();
+        // 20 placed, 6 filled: only the 14 still resting may be removed.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 14));
+
+        let snapshot = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(6 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(2_880_000),
+            open_bid_shares_up: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(9_600_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+
+        let eval = actor.snapshot_without_own_slots(&snapshot);
+
+        assert_eq!(
+            eval.open_bid_shares_up,
+            SharesMicro::from_raw(6 * core_types::ONE_SHARE_MICRO)
+        );
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc(2_880_000));
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(106_720_000));
+        // Filled inventory is real exposure and must survive the subtraction.
+        assert_eq!(
+            eval.unhedged_up,
+            SharesMicro::from_raw(6 * core_types::ONE_SHARE_MICRO)
+        );
+        assert_eq!(eval.unhedged_cost_up_micro, MicroUsdc(2_880_000));
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_leaves_external_exposure_alone() {
+        let mut actor = actor_for_snapshot_tests();
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 20));
+
+        // 40 shares resting at the exchange, only 20 of them ours.
+        let shared = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(40 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(19_200_000),
+            available_usdc_micro: MicroUsdc(50_000_000),
+            ..Default::default()
+        };
+        let eval = actor.snapshot_without_own_slots(&shared);
+        assert_eq!(
+            eval.open_bid_shares_up,
+            SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO)
+        );
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc(9_600_000));
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(59_600_000));
+
+        // Idle slot: a cancelled order that is still listed is not ours to remove.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, OrderSlotState::Idle);
+        let eval_idle = actor.snapshot_without_own_slots(&shared);
+        assert_eq!(eval_idle.open_bid_shares_up, shared.open_bid_shares_up);
+        assert_eq!(eval_idle.open_bid_notional_up, shared.open_bid_notional_up);
+        assert_eq!(eval_idle.available_usdc_micro, shared.available_usdc_micro);
+
+        // Zero-size resting order: subtracts nothing, releases nothing.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 0));
+        let eval_zero = actor.snapshot_without_own_slots(&shared);
+        assert_eq!(eval_zero.open_bid_shares_up, shared.open_bid_shares_up);
+        assert_eq!(eval_zero.open_bid_notional_up, shared.open_bid_notional_up);
+        assert_eq!(eval_zero.available_usdc_micro, shared.available_usdc_micro);
+
+        // Residual stub (3 shares, below the market minimum) is still removed.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 3));
+        let stub = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(3 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(1_440_000),
+            available_usdc_micro: MicroUsdc(10_000_000),
+            ..Default::default()
+        };
+        let eval_stub = actor.snapshot_without_own_slots(&stub);
+        assert_eq!(eval_stub.open_bid_shares_up, SharesMicro::ZERO);
+        assert_eq!(eval_stub.open_bid_notional_up, MicroUsdc::ZERO);
+        assert_eq!(eval_stub.available_usdc_micro, MicroUsdc(11_440_000));
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_uses_slot_price_after_replacement() {
+        let mut actor = actor_for_snapshot_tests();
+        // The slot already carries the replacement price; the snapshot still shows the
+        // old order's notional. Subtraction follows the slot, so a stale snapshot
+        // cannot strand cash.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(490_000, 20, 20));
+        let snapshot = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(9_600_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+
+        let eval = actor.snapshot_without_own_slots(&snapshot);
+
+        assert_eq!(eval.open_bid_shares_up, SharesMicro::ZERO);
+        // The stale snapshot notional is 9.60 at the old price; the slot releases 9.80.
+        // Saturating subtraction floors the leftover notional at zero rather than wrapping.
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc::ZERO);
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(109_800_000));
+    }
+
+    #[test]
+    fn test_epoch_rollover_emits_terminal_lockout_cancel_all() {
+        // First step at/after expiry emits the one-shot rollover (clearing any flatten
+        // guard); the following step in the same epoch falls back to a plain cancel-all.
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(10 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(5_000_000),
+            unhedged_dn: SharesMicro::from_raw(4 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_dn_micro: MicroUsdc(1_880_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+
+        let expiry_ms = 300_000;
+        harness.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: expiry_ms, // tau = 0
+            expiry_ms,
+            tick_size_micro: MicroUsdc(10_000),
+            ..Default::default()
+        });
+
+        let rollover = risk_actor.step(1_000_000, 0).unwrap().unwrap();
+
+        assert_eq!(rollover.phase, EpochPhase::TerminalLockout);
+        assert_eq!(rollover.tau_secs, 0);
+        assert!(!rollover.flatten_in_flight);
+        assert_eq!(rollover.flatten_action, FlattenAction::None);
+        assert_eq!(rollover.action_up, OrderAction::Hold);
+        assert_eq!(rollover.action_dn, OrderAction::Hold);
+        assert_eq!(rollover.tier, RiskTier::Tier1Normal);
+        assert_eq!(rollover.utilization_u_e6, 0);
+        let rollover_reason = rollover
+            .cancel_all_reason
+            .clone()
+            .expect("rollover must carry a cancel-all reason");
+        assert!(rollover_reason.starts_with("Epoch rollover for expiry 300000"));
+        assert!(rollover_reason.contains("paired"));
+
+        assert_eq!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAll {
+                reason: rollover_reason,
+            }
+        );
+
+        // Second step in the expired epoch: no second rollover, plain terminal cancel-all.
+        harness.publish_quote(QuoteProposal {
+            seq: 2,
+            now_ms: expiry_ms,
+            expiry_ms,
+            tick_size_micro: MicroUsdc(10_000),
+            ..Default::default()
+        });
+        let terminal = risk_actor.step(2_000_000, 0).unwrap().unwrap();
+        assert_eq!(terminal.phase, EpochPhase::TerminalLockout);
+        assert_eq!(
+            terminal.cancel_all_reason.as_deref(),
+            Some("Market expired (tau = 0s)")
+        );
+        assert_eq!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAll {
+                reason: "Market expired (tau = 0s)".to_string(),
             }
         );
     }
@@ -1724,6 +2122,10 @@ mod tests {
 
         let trace = risk_actor.step(1_000_000, 0).unwrap().unwrap();
         assert_eq!(trace.tier, RiskTier::Tier1Normal);
+        // Characterization: the normal-path trace reports the measured tier and utilization.
+        assert_eq!(trace.phase, EpochPhase::ActiveQuoting);
+        assert_eq!(trace.utilization_u_e6, 10_000); // $0.50 / $50.00 = 1%
+        assert_eq!(trace.flatten_action, FlattenAction::None);
         assert_eq!(
             trace.action_dn,
             OrderAction::SubmitNew {
