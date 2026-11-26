@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>האסטרטגיה שנבחרה — 65¢, 120 שניות</title>
+<style>
+  :root{
+    --ink:#0d1014;
+    --panel:#151a21;
+    --panel-2:#1b222b;
+    --line:#2a333f;
+    --text:#e8edf3;
+    --muted:#93a1b1;
+    --amber:#f5b544;
+    --amber-dim:#7a5a1e;
+    --mint:#43d9a3;
+    --red:#ff6b6b;
+    --radius:14px;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--ink);
+    color:var(--text);
+    font-family:system-ui,-apple-system,"Segoe UI",Roboto,"Heebo",Arial,sans-serif;
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1080px;margin:0 auto;padding:32px 20px 72px}
+  a{color:var(--amber)}
+  .ltr{direction:ltr;unicode-bidi:isolate;display:inline-block}
+  code{
+    direction:ltr;unicode-bidi:isolate;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:.88em;
+    background:var(--panel-2);
+    border:1px solid var(--line);
+    border-radius:6px;
+    padding:1px 6px;
+    white-space:nowrap;
+  }
+  header{margin-bottom:28px}
+  .kicker{
+    font-size:13px;letter-spacing:.08em;color:var(--amber);
+    text-transform:uppercase;margin-bottom:10px;
+  }
+  h1{font-size:clamp(28px,4.4vw,46px);line-height:1.15;margin:0 0 12px;letter-spacing:-.01em}
+  h1 .num{color:var(--amber)}
+  .lede{font-size:clamp(16px,2vw,19px);color:#c3cedb;max-width:62ch;margin:0 0 18px}
+  .meta{display:flex;flex-wrap:wrap;gap:8px;font-size:13px;color:var(--muted)}
+  .meta a,.meta span{
+    border:1px solid var(--line);border-radius:999px;padding:4px 12px;
+    text-decoration:none;background:var(--panel);
+  }
+  .meta a:hover{border-color:var(--amber)}
+
+  section{margin-top:44px}
+  h2{font-size:20px;margin:0 0 6px}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 18px}
+
+  /* ---- centerpiece ---- */
+  .stage{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:20px;
+  }
+  .grid-head{
+    display:flex;justify-content:space-between;align-items:baseline;
+    gap:12px;flex-wrap:wrap;margin-bottom:12px;
+  }
+  .grid-head strong{font-size:14px;font-weight:600}
+  .grid-head .hint{font-size:12.5px;color:var(--muted)}
+  .plot{
+    display:grid;
+    grid-template-columns:auto repeat(3,minmax(0,1fr));
+    gap:8px;
+  }
+  .axis-label{
+    font-size:12px;color:var(--muted);display:flex;align-items:center;justify-content:center;
+    text-align:center;
+  }
+  .axis-y{writing-mode:vertical-rl;transform:rotate(180deg);padding:6px 0}
+  .cell{
+    position:relative;
+    appearance:none;
+    border:1px solid var(--line);
+    background:var(--panel-2);
+    color:var(--text);
+    border-radius:11px;
+    padding:12px 10px 10px;
+    cursor:pointer;
+    text-align:right;
+    font:inherit;
+    transition:border-color .15s,transform .15s,background .15s;
+    min-height:104px;
+  }
+  .cell:hover{border-color:#3d4a5a;transform:translateY(-1px)}
+  .cell:focus-visible{outline:2px solid var(--amber);outline-offset:2px}
+  .cell .px{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .cell .net{font-size:20px;font-weight:700;font-variant-numeric:tabular-nums;margin-top:2px}
+  .cell .tag{font-size:11.5px;color:var(--muted);margin-top:4px;display:block}
+  .cell.pass{border-color:#244a3c}
+  .cell.fail{opacity:.62}
+  .cell.winner{
+    border-color:var(--amber);
+    background:#241d10;
+    box-shadow:0 0 0 1px var(--amber-dim) inset;
+    opacity:1;
+  }
+  .cell.winner .net{color:var(--amber)}
+  .cell.selected{outline:2px solid #5f7183;outline-offset:2px}
+  .badge{
+    position:absolute;top:8px;left:8px;font-size:10.5px;
+    border-radius:999px;padding:1px 8px;border:1px solid;
+  }
+  .badge.ok{color:var(--mint);border-color:#245a48}
+  .badge.no{color:var(--red);border-color:#5c2a2a}
+  .badge.win{color:#1a1206;background:var(--amber);border-color:var(--amber);font-weight:700}
+
+  /* ---- readout ---- */
+  .readout{
+    margin-top:16px;border-top:1px solid var(--line);padding-top:16px;
+    display:grid;grid-template-columns:1.1fr 1fr;gap:18px;
+  }
+  @media (max-width:720px){.readout{grid-template-columns:1fr}}
+  .readout h3{margin:0 0 8px;font-size:15px}
+  .facts{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px 14px;margin:0}
+  .facts div{display:flex;justify-content:space-between;gap:8px;font-size:13.5px;border-bottom:1px dashed #222b36;padding-bottom:5px}
+  .facts dt{color:var(--muted);margin:0}
+  .facts dd{margin:0;font-variant-numeric:tabular-nums;font-weight:600}
+  .verdict{margin-top:10px;font-size:13px;color:#c3cedb}
+
+  /* ---- window strip ---- */
+  .win-title{display:flex;justify-content:space-between;font-size:12.5px;color:var(--muted);margin-bottom:6px}
+  .strip{
+    position:relative;height:58px;border:1px solid var(--line);border-radius:10px;
+    background:#10151b;overflow:hidden;
+  }
+  .strip .band{
+    position:absolute;top:0;bottom:0;background:#1d4436;
+    border-inline:1px solid #2f7a5d;
+  }
+  .strip .tick{position:absolute;top:0;bottom:0;width:1px;background:#2a333f}
+  .strip .tick.major{background:#3b4757}
+  .strip .lbl{position:absolute;bottom:4px;font-size:10.5px;color:var(--muted);transform:translateX(50%)}
+  .strip-legend{display:flex;gap:14px;font-size:12px;color:var(--muted);margin-top:8px;flex-wrap:wrap}
+  .sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-inline-end:5px;vertical-align:middle}
+  .sw.on{background:#2f7a5d}
+  .sw.off{background:#242d38}
+
+  /* ---- knobs table ---- */
+  .knobs{width:100%;border-collapse:collapse;font-size:14px}
+  .knobs th{
+    text-align:right;font-size:12px;color:var(--muted);font-weight:600;
+    border-bottom:1px solid var(--line);padding:8px 10px;
+  }
+  .knobs td{border-bottom:1px solid #1e2630;padding:12px 10px;vertical-align:top}
+  .knobs tr:last-child td{border-bottom:none}
+  .knobs .val{white-space:nowrap;font-variant-numeric:tabular-nums;color:var(--amber);font-weight:600}
+  .knobs .why{color:#b9c5d2;font-size:13.5px}
+  .tablewrap{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:4px 6px}
+
+  /* ---- honesty ---- */
+  .honest{
+    border:1px solid #52401c;background:#1a1610;border-radius:var(--radius);
+    padding:18px 20px;
+  }
+  .honest h2{margin:0 0 8px;color:var(--amber);font-size:17px}
+  .honest p{margin:0 0 8px;font-size:14px;color:#d8cfbe}
+  .honest p:last-child{margin-bottom:0}
+  .honest b{color:#fff}
+
+  /* ---- runway ---- */
+  .steps{counter-reset:s;list-style:none;padding:0;margin:0}
+  .steps li{
+    counter-increment:s;position:relative;padding:0 46px 20px 0;
+  }
+  .steps li::before{
+    content:counter(s);position:absolute;right:0;top:0;
+    width:30px;height:30px;border-radius:50%;
+    border:1px solid var(--line);background:var(--panel);
+    display:flex;align-items:center;justify-content:center;
+    font-size:13px;color:var(--amber);font-weight:700;
+  }
+  .steps li::after{
+    content:"";position:absolute;right:15px;top:32px;bottom:0;width:1px;background:#222b36;
+  }
+  .steps li:last-child{padding-bottom:0}
+  .steps li:last-child::after{display:none}
+  .steps h3{margin:4px 0 4px;font-size:15px}
+  .steps p{margin:0 0 6px;font-size:14px;color:#c3cedb}
+  .cmds{
+    background:#090c10;border:1px solid var(--line);border-radius:10px;
+    padding:12px 14px;direction:ltr;text-align:left;overflow-x:auto;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:12.5px;line-height:1.7;color:#cdd8e4;
+  }
+  .cmds .c{color:#5d6b7a}
+  .cmds .k{color:var(--amber)}
+
+  footer{margin-top:48px;padding-top:18px;border-top:1px solid var(--line);font-size:12.5px;color:var(--muted)}
+  footer a{text-decoration:none}
+  @media (prefers-reduced-motion:reduce){
+    *{transition:none!important;animation:none!important}
+    .cell:hover{transform:none}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="kicker">הגדרות ברירת־המחדל שנכנסו לתוקף</div>
+    <h1>עכשיו קונים רק עד <span class="num">65¢</span>, ורק ב־<span class="num">120</span> השניות הראשונות</h1>
+    <p class="lede">
+      עד היום המערכת נכנסה לעסקה בכל רגע בחלון ובדיוק בכל מחיר שהיה זמין.
+      עכשיו היא מחכה 15 שניות, נכנסת רק כשהמחיר זול מ־65 סנט, ומפסיקה לפתוח עסקאות חדשות 120 שניות אחרי הפתיחה.
+    </p>
+    <div class="meta">
+      <a href="https://github.com/AI-Degen-69/polymarket-as-rust/pull/58" target="_blank" rel="noopener">השינוי שנכנס לאוויר — #58</a>
+      <span>נבחר מתוך 9 אפשרויות שנבדקו על 226 חלונות אמת</span>
+      <span>תוקף: בסיס מחקר, לא כסף אמיתי</span>
+    </div>
+  </header>
+
+  <section>
+    <h2>למה דווקא 65¢ ו־120 שניות</h2>
+    <p class="sub">
+      כל ריבוע הוא ניסוי אמיתי: מחיר מקסימלי לכניסה (שורות) מול מתי מפסיקים להיכנס (עמודות).
+      לחיצה על ריבוע מציגה מה הוא השיג — ומה היה קורה אילו בחרנו בו.
+    </p>
+
+    <div class="stage">
+      <div class="grid-head">
+        <strong>9 האפשרויות שנבדקו — רווח נקי וחוסן</strong>
+        <span class="hint">ריבוע מוזהב = מה שנבחר · ריבוע אטום = נכשל בבדיקות הסיכון</span>
+      </div>
+
+      <div class="plot" id="plot" role="group" aria-label="מפת תשע התצורות"></div>
+
+      <div class="readout">
+        <div>
+          <h3 id="ro-title">התצורה הנבחרת</h3>
+          <dl class="facts" id="ro-facts"></dl>
+          <p class="verdict" id="ro-verdict"></p>
+        </div>
+        <div>
+          <div class="win-title">
+            <span>חלון של 300 שניות — מתי מותר לפתוח עסקה</span>
+            <span id="win-tag"></span>
+          </div>
+          <div class="strip" id="strip" aria-hidden="true"></div>
+          <div class="strip-legend">
+            <span><i class="sw on"></i>מותר להיכנס</span>
+            <span><i class="sw off"></i>לא נפתחות עסקאות חדשות</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>מה בדיוק נכנס לתוקף</h2>
+    <p class="sub">חמישה כפתורים. אלה הערכים שנקבעו, וזה מה שכל אחד מהם עושה בפועל.</p>
+    <div class="tablewrap">
+      <table class="knobs">
+        <thead>
+          <tr><th>הגדרה</th><th>ערך</th><th>מה זה עושה</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>MAX_ENTRY_PRICE</code></td>
+            <td class="val">0.65</td>
+            <td class="why">לא נפתחת עסקה חדשה במחיר גבוה מ־65 סנט. רגל זולה והשלמות עדיין מותרות — רק לא כניסה יקרה.</td>
+          </tr>
+          <tr>
+            <td><code>ENTRY_CUTOFF_SECS</code></td>
+            <td class="val">120</td>
+            <td class="why">120 שניות אחרי פתיחת החלון מפסיקים לפתוח עסקאות חדשות. 180 השניות האחרונות משמשות רק לסגירה ולהשלמה.</td>
+          </tr>
+          <tr>
+            <td><code>ENTRY_OPEN_DELAY_SECS</code></td>
+            <td class="val">15</td>
+            <td class="why">15 השניות הראשונות שקטות. זה מונע כניסה לרעש של הפתיחה, שבו המחיר עוד קופץ.</td>
+          </tr>
+          <tr>
+            <td><code>CAP_TIER1_REDUCING_TO_DELTA</code></td>
+            <td class="val">true</td>
+            <td class="why">כשמשלימים את הרגל החסרה, קונים רק לפי גודל הפער — לא יותר. פחות חשיפה מיותרת.</td>
+          </tr>
+          <tr>
+            <td><code>TIER1_HEDGE_TRIGGER_PRICE</code></td>
+            <td class="val">off</td>
+            <td class="why">מנגנון ההשלמה היזומה לפי מחיר כבוי. משלימים רק כשהמערכת כבר מזהה חוסר — לא לפי טריגר מחיר.</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section>
+    <div class="honest">
+      <h2>מה עוד לא סגור</h2>
+      <p>הזכייה קטנה: <b>79.9 מול 77.7</b> לנקודה של המתחרה הישיר (<code>MAX_ENTRY_PRICE=0.60</code> עם אותו cutoff).</p>
+      <p>המדגם עדיין דק — <b>336 עסקאות</b> מול יעד של 400, ו־<b>36%</b> מהרווח מגיעים מחלון אחד חזק במיוחד.</p>
+      <p>לכן זה <b>בסיס מחקר</b>. הוא לא אישור להפעיל כסף אמיתי, והמתחרה נשאר על השולחן להשוואה על נתונים חדשים.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>איך בודקים שזה באמת רץ כך</h2>
+    <p class="sub">שלושה צעדים במערכת עצמה. אין כאן בדיקות אוטומטיות — רק מה שרואים בעיניים.</p>
+    <ol class="steps">
+      <li>
+        <h3>פותחים את קובץ ברירת־המחדל</h3>
+        <p>בתיקיית הפרויקט, בקובץ <code>DEFAULTS.json</code>, מחפשים את הבלוק <code>engine</code>. אמורים להופיע בדיוק הערכים האלה:</p>
+        <div class="cmds">"max_entry_price": <span class="k">0.65</span>
+"entry_cutoff_secs": <span class="k">120</span>
+"entry_open_delay_secs": <span class="k">15</span>
+"cap_tier1_reducing_to_delta": <span class="k">true</span>
+"tier1_hedge_trigger_price": <span class="k">null</span></div>
+      </li>
+      <li>
+        <h3>מריצים הקלטה חוזרת ורואים את הכותרת</h3>
+        <p>מריצים מחדש הקלטה קיימת. בשורות הראשונות מופיעים שני השמות האלה עם הערכים — <code>Dollar Cap (V_max): $50.00</code> ו־<code>Base Order Size: 20 shares</code>:</p>
+        <div class="cmds">poly-as lifecycle --source replay <span class="c">--input logs/captures/&lt;capture&gt;.jsonl</span></div>
+      </li>
+      <li>
+        <h3>מסתכלים על שורת הסיכום בסוף</h3>
+        <p>בסוף הריצה נכתבת שורת <code>"event":"summary"</code>. חמשת השדות האלה חייבים להופיע, ולהתאים למה שקרה בפועל:</p>
+        <div class="cmds">total_shares_bought_micro
+volume_in_micro
+total_merge_gain_micro
+positive_merge_gain_micro
+negative_merge_loss_micro</div>
+        <p>בדיקה מהירה: <code>positive_merge_gain_micro</code> פחות <code>negative_merge_loss_micro</code> חייב לצאת בדיוק <code>total_merge_gain_micro</code>.</p>
+      </li>
+    </ol>
+  </section>
+
+  <footer>
+    מבוסס על סקירת הגבולות <span class="ltr">boundary-9runs_20caps-226w</span> · 20 הקלטות, 226 חלונות, 3 מחירים × 3 זמני עצירה ·
+    <a href="https://github.com/AI-Degen-69/polymarket-as-rust/pull/58" target="_blank" rel="noopener">השינוי המלא</a>
+  </footer>
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  var CONFIGS = [
+    {id:"#1", px:0.60, cut:90,  net:36.57, net3:36.98, oos:16.99, roi:6.84, dd:19.4, drag:33.1, tail:41.8, fills:195, score:56.4, pass:false, why:"נכשל: עלות סגירה 33.1% (התקרה 30%)"},
+    {id:"#2", px:0.60, cut:105, net:38.72, net3:39.25, oos:21.47, roi:5.58, dd:19.4, drag:36.0, tail:47.2, fills:249, score:50.5, pass:false, why:"נכשל: עלות סגירה 36.0% (התקרה 30%)"},
+    {id:"#3", px:0.60, cut:120, net:56.59, net3:57.22, oos:23.47, roi:6.73, dd:19.4, drag:26.5, tail:38.2, fills:285, score:77.7, pass:true,  why:"המתחרה הישיר: תשואה טובה יותר על ההון, פחות הפסדי איחוד"},
+    {id:"#4", px:0.65, cut:90,  net:32.65, net3:33.12, oos:17.71, roi:5.15, dd:22.3, drag:26.4, tail:50.04, fills:227, score:39.8, pass:false, why:"נכשל: זנב 50.04% (התקרה 50%)"},
+    {id:"#5", px:0.65, cut:105, net:39.00, net3:39.61, oos:22.19, roi:4.67, dd:22.9, drag:28.0, tail:51.0, fills:292, score:41.5, pass:false, why:"נכשל: זנב 51.0% (התקרה 50%)"},
+    {id:"#6", px:0.65, cut:120, net:58.79, net3:59.53, oos:24.19, roi:5.82, dd:19.4, drag:19.8, tail:40.9, fills:336, score:79.9, pass:true,  why:"הזוכה: הכי הרבה רווח, הכי הרבה עסקאות, הכי פחות עלות סגירה"},
+    {id:"#7", px:0.70, cut:90,  net:29.08, net3:29.55, oos:6.76,  roi:4.52, dd:20.5, drag:29.9, tail:45.0, fills:227, score:25.6, pass:true,  why:"כשיר אבל החלש מכולם: כמעט כל הרווח נעלם מחוץ למדגם"},
+    {id:"#8", px:0.70, cut:105, net:36.48, net3:37.10, oos:11.59, roi:4.25, dd:20.5, drag:29.9, tail:46.3, fills:298, score:38.9, pass:true,  why:"כשיר אבל חלש מחוץ למדגם — 11.59 מול 24+ אצל המובילים"},
+    {id:"#9", px:0.70, cut:120, net:55.53, net3:56.29, oos:12.84, roi:5.34, dd:20.5, drag:20.9, tail:36.9, fills:346, score:63.1, pass:true,  why:"הרווח גדול אבל קורס מחוץ למדגם: 12.84 בלבד"}
+  ];
+
+  var PRICES = [0.70, 0.65, 0.60];   /* top to bottom */
+  var CUTS   = [90, 105, 120];
+
+  var selected = "#6";
+
+  function fmtUsd(v, sign){
+    var s = (sign && v > 0 ? "+" : "") + "$" + Math.abs(v).toFixed(2);
+    return v < 0 ? "-$" + Math.abs(v).toFixed(2) : s;
+  }
+  function find(px, cut){
+    for (var i = 0; i < CONFIGS.length; i++){
+      if (CONFIGS[i].px === px && CONFIGS[i].cut === cut) return CONFIGS[i];
+    }
+    return null;
+  }
+  function el(tag, cls, txt){
+    var n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (txt !== undefined) n.textContent = txt;
+    return n;
+  }
+
+  var plot = document.getElementById("plot");
+
+  function buildGrid(){
+    plot.innerHTML = "";
+    plot.appendChild(el("div", "axis-label", "מחיר מקס׳"));
+
+    for (var c = 0; c < CUTS.length; c++){
+      plot.appendChild(el("div", "axis-label", "עצירה ב־" + CUTS[c] + "s"));
+    }
+
+    for (var r = 0; r < PRICES.length; r++){
+      plot.appendChild(el("div", "axis-label axis-y", PRICES[r].toFixed(2) + "$"));
+      for (var k = 0; k < CUTS.length; k++){
+        var cfg = find(PRICES[r], CUTS[k]);
+        var b = el("button", "cell");
+        b.type = "button";
+        b.setAttribute("data-id", cfg.id);
+        b.setAttribute("aria-pressed", "false");
+        b.appendChild(el("span", "px", "$" + PRICES[r].toFixed(2) + " · " + CUTS[k] + "s"));
+        var net = el("span", "net", fmtUsd(cfg.net, true));
+        b.appendChild(net);
+        b.appendChild(el("span", "tag", "ציון " + cfg.score.toFixed(1) + " · " + cfg.fills + " עסקאות"));
+
+        var badge = el("span", "badge");
+        if (cfg.id === "#6"){ badge.className = "badge win"; badge.textContent = "נבחר"; }
+        else if (cfg.pass){ badge.className = "badge ok"; badge.textContent = "כשיר"; }
+        else { badge.className = "badge no"; badge.textContent = "נפסל"; }
+        b.appendChild(badge);
+
+        b.classList.add(cfg.pass ? "pass" : "fail");
+        if (cfg.id === "#6") b.classList.add("winner");
+
+        b.addEventListener("click", function(id){
+          return function(){ select(id); };
+        }(cfg.id));
+
+        plot.appendChild(b);
+      }
+    }
+    paint();
+  }
+
+  function paint(){
+    var cells = plot.querySelectorAll(".cell");
+    for (var i = 0; i < cells.length; i++){
+      var on = cells[i].getAttribute("data-id") === selected;
+      cells[i].classList.toggle("selected", on);
+      cells[i].setAttribute("aria-pressed", on ? "true" : "false");
+    }
+  }
+
+  function select(id){
+    selected = id;
+    paint();
+    render();
+  }
+
+  var strip = document.getElementById("strip");
+  var facts = document.getElementById("ro-facts");
+  var title = document.getElementById("ro-title");
+  var verdict = document.getElementById("ro-verdict");
+  var winTag = document.getElementById("win-tag");
+
+  function render(){
+    var cfg = null;
+    for (var i = 0; i < CONFIGS.length; i++) if (CONFIGS[i].id === selected) cfg = CONFIGS[i];
+
+    title.textContent = cfg.id === "#6" ? "התצורה הנבחרת — " + cfg.id : "תצורה " + cfg.id;
+
+    facts.innerHTML = "";
+    var rows = [
+      ["רווח נטו", fmtUsd(cfg.net, true)],
+      ["רווח מחוץ למדגם", fmtUsd(cfg.oos, true)],
+      ["תשואה על ההון", cfg.roi.toFixed(2) + "%"],
+      ["שקיעה מקסימלית", cfg.dd.toFixed(1) + "%"],
+      ["עלות סגירה", cfg.drag.toFixed(1) + "%"],
+      ["עסקאות", String(cfg.fills)],
+      ["ציון כולל", cfg.score.toFixed(1)]
+    ];
+    for (var r = 0; r < rows.length; r++){
+      var d = el("div");
+      d.appendChild(el("dt", null, rows[r][0]));
+      d.appendChild(el("dd", null, rows[r][1]));
+      facts.appendChild(d);
+    }
+
+    verdict.textContent = cfg.why;
+    winTag.textContent = "כניסה " + 15 + "s → " + cfg.cut + "s";
+
+    drawStrip(cfg.cut);
+  }
+
+  function drawStrip(cut){
+    strip.innerHTML = "";
+    var TOTAL = 300;
+    var delay = 15;
+
+    function pct(sec){ return (sec / TOTAL) * 100; }
+
+    var band = el("div", "band");
+    band.style.right = pct(delay) + "%";
+    band.style.width = pct(Math.max(0, cut - delay)) + "%";
+    strip.appendChild(band);
+
+    [0, 60, 120, 180, 240, 300].forEach(function(sec){
+      var t = el("div", "tick" + (sec % 60 === 0 ? " major" : ""));
+      t.style.right = pct(sec) + "%";
+      strip.appendChild(t);
+      var l = el("div", "lbl", sec + "s");
+      l.style.right = pct(sec) + "%";
+      l.style.transform = "translateX(50%)";
+      strip.appendChild(l);
+    });
+  }
+
+  buildGrid();
+  render();
+
+  document.addEventListener("keydown", function(e){
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    var idx = -1;
+    for (var i = 0; i < CONFIGS.length; i++) if (CONFIGS[i].id === selected) idx = i;
+    if (idx < 0) return;
+    idx = e.key === "ArrowLeft" ? (idx + 1) % CONFIGS.length : (idx + CONFIGS.length - 1) % CONFIGS.length;
+    select(CONFIGS[idx].id);
+  });
+})();
+</script>
+</body>
+</html>
