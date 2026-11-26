@@ -238,47 +238,14 @@ fn encode(cmd: &ExecutionCommand) -> Value {
     }
 }
 
+/// The whole slot state, serialized as-is rather than copied field by field: the `sent_ns`
+/// of an in-flight place or cancel and the raw/capped price of a queued next quote are all
+/// deterministic here (the rig drives `step` with fixed stamps), so dropping them would let
+/// two different slot states compare as identical.
 fn encode_slot(state: &OrderSlotState) -> Value {
-    match state {
-        OrderSlotState::Idle => json!({ "kind": "Idle" }),
-        OrderSlotState::PendingPlace {
-            seq, price, size, ..
-        } => json!({
-            "kind": "PendingPlace",
-            "seq": seq,
-            "price": price.0,
-            "size": size.0,
-        }),
-        OrderSlotState::Live {
-            order_id,
-            price,
-            original_size,
-            remaining_size,
-        } => json!({
-            "kind": "Live",
-            "order_id": order_id,
-            "price": price.0,
-            "original_size": original_size.0,
-            "remaining_size": remaining_size.0,
-        }),
-        OrderSlotState::PendingCancel {
-            order_id,
-            next_quote,
-            reason,
-            ..
-        } => json!({
-            "kind": "PendingCancel",
-            "order_id": order_id,
-            "next_quote": next_quote.map(|q| json!({
-                "price": q.price.0,
-                "size": q.size.0,
-            })),
-            "reason": format!("{reason:?}"),
-        }),
-        OrderSlotState::PendingReconcile { order_id } => json!({
-            "kind": "PendingReconcile",
-            "order_id": order_id,
-        }),
+    match serde_json::to_value(state) {
+        Ok(value) => value,
+        Err(err) => json!({ "encode_error": err.to_string() }),
     }
 }
 
@@ -825,6 +792,20 @@ fn scenario_expiry_ladder(out: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
     ));
     rig.step(3_000_000_000, "t-26-empty-book");
 
+    // Guard released while the down ask is still empty: liquidity is only on the UP bid,
+    // so the fallback has to sell UP at the bid instead of buying DN at the ask.
+    rig.actor.clear_flatten_in_flight();
+    rig.quote(proposal(
+        4,
+        EXP - 24_000,
+        EXP,
+        Some(470_000),
+        Some(470_000),
+        None,
+        None,
+    ));
+    rig.step(3_500_000_000, "t-24-empty-book-fallback");
+
     // Partial fill of the flatten: 6 of 19 done.
     rig.snapshot(OrderRegistrySnapshot {
         unhedged_up: sh(13),
@@ -834,7 +815,7 @@ fn scenario_expiry_ladder(out: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
     });
     rig.actor.clear_flatten_in_flight();
     rig.quote(proposal(
-        4,
+        5,
         EXP - 20_000,
         EXP,
         Some(480_000),
@@ -846,7 +827,7 @@ fn scenario_expiry_ladder(out: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
 
     // Liquidity returns, wider spread.
     rig.quote(proposal(
-        5,
+        6,
         EXP - 14_000,
         EXP,
         Some(480_000),
