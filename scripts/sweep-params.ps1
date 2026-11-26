@@ -465,9 +465,9 @@ function Format-GateMoneyText {
 }
 
 function Format-VerdictCell {
-    param([string]$Verdict, [int]$Width = 10)
+    param([string]$Verdict, [int]$Width = 12)
     $raw = $Verdict.PadLeft($Width)
-    $code = switch -Wildcard ($Verdict) { "APPROVED" { $AnsiBoldGreen; break } "FAIL*" { $AnsiBoldRed; break } "NEEDS-*" { $AnsiBoldYellow; break } default { $AnsiGray } }
+    $code = switch -Wildcard ($Verdict) { "APPROVED" { $AnsiBoldGreen; break } "FAIL*" { $AnsiBoldRed; break } "UNDER*" { $AnsiBoldYellow; break } "NEEDS-*" { $AnsiBoldYellow; break } default { $AnsiGray } }
     return (Format-ColorText -Text $raw -Code $code)
 }
 
@@ -569,6 +569,11 @@ function Get-SurvivalInputs {
     return $out
 }
 
+# Spec Filter 4 - Minimum Sample Size ([strategy-verification-spec.md](../docs/strategy-verification-spec.md)):
+# under this many fills the G1-G6 thresholds cannot decide either way, so the verdict must not read
+# as PASS or FAIL. The gate cells keep their measured state so the sample's shape stays visible.
+$script:MinValidationFills = 400
+
 function Evaluate-SurvivalGateRow {
     param(
         [double]$ISVal,
@@ -577,7 +582,8 @@ function Evaluate-SurvivalGateRow {
         [double]$MaxDDVal,
         [double]$DragVal,
         [double]$NbrVal,
-        [double]$TailDragVal = [double]::NaN
+        [double]$TailDragVal = [double]::NaN,
+        [double]$TotalFills = [double]::NaN
     )
     $g1 = if ([double]::IsNaN($ISVal)) { "N/A" } elseif ($ISVal -gt 0.0) { "PASS" } else { "FAIL" }
     $g2 = if ([double]::IsNaN($OOSVal)) { "N/A" } elseif ($OOSVal -gt 0.0) { "PASS" } else { "FAIL" }
@@ -593,11 +599,14 @@ function Evaluate-SurvivalGateRow {
     foreach ($kv in @(@("G1", $g1), @("G2", $g2), @("G3", $g3), @("G4", $g4), @("G5", $g5), @("G6", $g6))) {
         if ($kv[1] -eq "FAIL") { $failGate = $kv[0]; break }
     }
-    $verdict = if ($failGate -ne "") { "FAIL($failGate)" }
+    # Unknown fill count (legacy callers) stays on the old behaviour rather than silently under-powering.
+    $underpowered = (-not [double]::IsNaN($TotalFills)) -and ($TotalFills -lt $script:MinValidationFills)
+    $verdict = if ($underpowered) { "UNDERPOWERED" }
+        elseif ($failGate -ne "") { "FAIL($failGate)" }
         elseif ($g1 -eq "N/A" -or $g2 -eq "N/A" -or $g3 -eq "N/A") { "NEEDS-OOS" }
         elseif ($g4 -eq "N/A" -or $g5 -eq "N/A" -or $g6 -eq "N/A") { "N/A" }
         else { "APPROVED" }
-    return @{ G1 = $g1; G2 = $g2; G3 = $g3; G4 = $g4; G5 = $g5; G6 = $g6; Verdict = $verdict }
+    return @{ G1 = $g1; G2 = $g2; G3 = $g3; G4 = $g4; G5 = $g5; G6 = $g6; Underpowered = $underpowered; Verdict = $verdict }
 }
 
 function Get-AxisSortRank {
@@ -666,14 +675,16 @@ function Update-SurvivalVerdicts {
         }
         $grow.NbrNum = if ($tot -gt 0) { ($prof0 / $tot) * 100.0 } else { [double]::NaN }
         $tailDrag0 = if ($null -ne $grow.PSObject.Properties["TailDragNum"]) { [double]$grow.TailDragNum } else { [double]::NaN }
-        $eval0 = Evaluate-SurvivalGateRow -ISVal $grow.ISNum -OOSVal $grow.OOSNum -RetainVal $grow.RetainNum -MaxDDVal $grow.MaxDDNum -DragVal $grow.DragNum -NbrVal $grow.NbrNum -TailDragVal $tailDrag0
+        $fillsProp = $grow.PSObject.Properties["FillsNum"]
+        $totalFills = if ($null -ne $fillsProp -and $null -ne $fillsProp.Value) { [double]$fillsProp.Value } else { [double]::NaN }
+        $eval0 = Evaluate-SurvivalGateRow -ISVal $grow.ISNum -OOSVal $grow.OOSNum -RetainVal $grow.RetainNum -MaxDDVal $grow.MaxDDNum -DragVal $grow.DragNum -NbrVal $grow.NbrNum -TailDragVal $tailDrag0 -TotalFills $totalFills
         $grow.G1 = $eval0.G1; $grow.G2 = $eval0.G2; $grow.G3 = $eval0.G3
         $grow.G4 = $eval0.G4; $grow.G5 = $eval0.G5; $grow.G6 = $eval0.G6
         $grow.Verdict = $eval0.Verdict
 
         if ($null -ne $grow.PSObject.Properties["ISNum3"]) {
             $grow.NbrNum3 = if ($tot -gt 0) { ($prof3 / $tot) * 100.0 } else { [double]::NaN }
-            $eval3 = Evaluate-SurvivalGateRow -ISVal $grow.ISNum3 -OOSVal $grow.OOSNum3 -RetainVal $grow.RetainNum3 -MaxDDVal $grow.MaxDDNum3 -DragVal $grow.DragNum -NbrVal $grow.NbrNum3 -TailDragVal $tailDrag0
+            $eval3 = Evaluate-SurvivalGateRow -ISVal $grow.ISNum3 -OOSVal $grow.OOSNum3 -RetainVal $grow.RetainNum3 -MaxDDVal $grow.MaxDDNum3 -DragVal $grow.DragNum -NbrVal $grow.NbrNum3 -TailDragVal $tailDrag0 -TotalFills $totalFills
             $grow.G1_3 = $eval3.G1; $grow.G2_3 = $eval3.G2; $grow.G3_3 = $eval3.G3
             $grow.G4_3 = $eval3.G4; $grow.G5_3 = $eval3.G5; $grow.G6_3 = $eval3.G6
             $grow.Verdict3 = $eval3.Verdict
@@ -1392,6 +1403,7 @@ function Complete-ConfigRunAggregation {
         ElapsedSec     = $CfgElapsedSec
         Time           = ("{0:F2}s" -f $CfgElapsedSec)
         QuantityNum    = $sumQty
+        FillsNum       = $sumFills
         Quantity       = $qtyPlain
         PairsNum       = $sumPairs
         Pairs          = $sumPairs.ToString("F2", $Culture)
@@ -2603,10 +2615,11 @@ try {
     $plainSummary.Add("")
     $plainSummary.Add("  STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (Dual 0% Floor vs. 3% Tier-1)")
     $plainSummary.Add("  G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=50% | G4 Max Drawdown<=25% | G5 Drag<=30%/50% | G6 Neighbors>=60% | QueueDecay=$QueueDecay (promotion requires conservative)")
+    $plainSummary.Add("  Filter 4 (minimum sample size): a config needs >= $($script:MinValidationFills) fills across the sample; below that its Verdict reads UNDERPOWERED and is neither a pass nor a failure.")
     if (-not $isMultiCapture) {
         $plainSummary.Add("  NOTE: single-capture run - In Sample / Out Sample + Max Drawdown report N/A. Re-run with -AllCaptures (or multi -InputPath) for full walk-forward verdicts.")
     }
-    $vWidths = @(4, 5, 10, 10, 9, 12, 11, 9, 10)
+    $vWidths = @(4, 5, 10, 10, 9, 12, 11, 9, 12)
     $vFmtParts = for ($vi = 0; $vi -lt $vWidths.Count; $vi++) { "{$vi,$($vWidths[$vi])}" }
     $vFmt = $vFmtParts -join " "
     $vHeaders = @("Rank", "Tier", "In Sample", "Out Sample", "Retention", "Max Drawdown", "Drag / Tail", "Neighbors", "Verdict")
@@ -2632,7 +2645,8 @@ try {
     $plainSummary.Add(("  " + ($vFmt -f $vDashes)))
     $approved0Count = @($sorted | Where-Object { $_.Verdict -eq "APPROVED" }).Count
     $approved3Count = @($sorted | Where-Object { $_.Verdict3 -eq "APPROVED" }).Count
-    $plainSummary.Add(("  Verdicts: @0% {0}/{2} APPROVED | @3% {1}/{2} APPROVED | FAIL(Gx) = first failed gate | NEEDS-OOS = re-run multi-capture | N/A = under-powered proxy" -f $approved0Count, $approved3Count, $sorted.Count))
+    $underpoweredCount = @($sorted | Where-Object { $_.Verdict -eq "UNDERPOWERED" -or $_.Verdict3 -eq "UNDERPOWERED" }).Count
+    $plainSummary.Add(("  Verdicts: @0% {0}/{3} APPROVED | @3% {1}/{3} APPROVED | {2} UNDERPOWERED (<{4} fills) | FAIL(Gx) = first failed gate | NEEDS-OOS = re-run multi-capture | N/A = inputs incomplete" -f $approved0Count, $approved3Count, $underpoweredCount, $sorted.Count, $script:MinValidationFills))
     # Write the leaderboard before printing, so an interrupted console dump still leaves the ranked artifact.
     $plainSummary | Set-Content -LiteralPath $summaryPath -Encoding utf8
 
@@ -2668,6 +2682,7 @@ try {
     Write-Host ""
     Write-Host (Format-ColorText -Text "🛡️  STRATEGY VERIFICATION - G1-G6 SURVIVAL GATES (Dual 0% Floor vs. 3% Tier-1)" -Code $AnsiBoldCyan)
     Write-Host (Format-ColorText -Text "  G1 In Sample>0 | G2 Out Sample>0 | G3 Retention>=50% | G4 Max Drawdown<=25% | G5 Drag<=30%/50% | G6 Neighbors>=60%" -Code $AnsiGray)
+    Write-Host (Format-ColorText -Text ("  Filter 4 minimum sample size: under {0} fills the Verdict reads UNDERPOWERED, not PASS or FAIL (gate cells stay measured)." -f $script:MinValidationFills) -Code $AnsiGray)
     if ($QueueDecay -ne "conservative") {
         Write-Host (Format-ColorText -Text ("  NOTE: QueueDecay={0} (exploratory) - promotion requires -QueueDecay conservative." -f $QueueDecay) -Code $AnsiBoldYellow)
     }
@@ -2691,12 +2706,12 @@ try {
             $ddCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$tierSpec.DD)) -Pass ($tierSpec.G4 -eq "PASS") -IsNA ($tierSpec.G4 -eq "N/A") -Width 12
             $dragCell = Format-GateCell -RawText $dragConsoleText -Pass ($tierSpec.G5 -eq "PASS") -IsNA $false -Width 11
             $nbrCell = Format-GateCell -RawText ("{0:F0}%" -f ([double]$tierSpec.Nbr)) -Pass ($tierSpec.G6 -eq "PASS") -IsNA ($tierSpec.G6 -eq "N/A") -Width 9
-            $verCell = Format-VerdictCell -Verdict ([string]$tierSpec.Ver) -Width 10
+            $verCell = Format-VerdictCell -Verdict ([string]$tierSpec.Ver) -Width 12
             Write-Host ("  {0} {1} {2} {3} {4} {5} {6} {7} {8}" -f $rkRaw, $tierCell, $isCell, $oosCell, $retCell, $ddCell, $dragCell, $nbrCell, $verCell)
         }
     }
     Write-Host (Format-ColorText -Text ("  " + ($vFmt -f $vDashes)) -Code $AnsiGray)
-    Write-Host ("  Verdicts: @0% {0}/{2} APPROVED  |  @3% {1}/{2} APPROVED  |  FAIL(Gx) = first failed gate  |  NEEDS-OOS = re-run multi-capture" -f $approved0Count, $approved3Count, $sorted.Count)
+    Write-Host ("  Verdicts: @0% {0}/{3} APPROVED  |  @3% {1}/{3} APPROVED  |  {2} UNDERPOWERED  |  FAIL(Gx) = first failed gate  |  NEEDS-OOS = re-run multi-capture" -f $approved0Count, $approved3Count, $underpoweredCount, $sorted.Count)
 
     Write-Host ""
 }
