@@ -21,7 +21,7 @@ Event-level verification across all `180` (`9 × 20`) JSONL files confirmed **`0
 - **Buy-volume identity (`volMismatch = 0`):** Re-summing integer micro-USDC buy notional across `"event":"fill"` (`filled_shares_micro * price_micro / 1e6`) and `"event":"flatten"` (`size_micro * price_micro / 1e6`) matched `summary.volume_in_micro` identically in every capture.
 - **Merge-gain identity (`mergeMismatch = 0`):** Summing `"event":"merge"` `realized_gain_micro` matched `summary.total_merge_gain_micro == summary.positive_merge_gain_micro - summary.negative_merge_loss_micro` in every capture.
 - **Realized-PnL identity (`pnlMismatch = 0`):** `total_merge_gain_micro + settlement_pnl_micro - fees_paid_micro == realized_pnl_micro` held in all `180` files.
-- **Cross-sweep anchor determinism:** Config `#3/9` (`$0.60, 120s, T1=off`) reproduced Config `#13/18` from `logs/sweeps/25-11_16-21-55Z_18runs_20caps-226w` to the micro-dollar (`+$56.59` Net0, `$840.63` deployed, `285` fills, `19.4%` DD, `26.5% / 38.2%` drag/tail).
+- **Cross-sweep anchor determinism:** Config `#3/9` (`$0.60, 120s, T1=off`) reproduced Config `#13/18` from the earlier 18-configuration sweep (`logs/sweeps/25-11_16-21-55Z_18runs_20caps-226w`, raw output since pruned) to the micro-dollar (`+$56.59` Net0, `$840.63` deployed, `285` fills, `19.4%` DD, `26.5% / 38.2%` drag/tail).
 
 ---
 
