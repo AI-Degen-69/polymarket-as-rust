@@ -38,7 +38,7 @@ Run all four checks before every commit:
 3. `rtk cargo test --workspace`
 4. Inspect `git diff --cached` and confirm zero `.env` files, secrets, private keys, or `logs/` artifacts are staged.
 
-A documentation-only change is the single exception to this gate: see [Docs-Only Fast Path](#docs-only-fast-path) under §5, where checks 2 and 3 are replaced by `cargo fmt --all -- --check` alone.
+A documentation-only change is the single exception to this gate: see [Docs-Only Micro-Changes](#docs-only-micro-changes-commit-straight-to-main) under §5, where checks 2 and 3 are replaced by `cargo fmt --all -- --check` alone and the change lands directly on `main`.
 
 The tracked hook automates checks 1 and 4. Enable it once per clone:
 
@@ -66,15 +66,25 @@ git tag -a phase-<N>-complete -m "Phase <N> verified and merged"
 rtk git push origin phase-<N>-complete
 ```
 
-### Docs-Only Fast Path
+### Docs-Only Micro-Changes: Commit Straight to `main`
 
-A pull request whose entire diff against `main` is documentation (`*.md`, or anything under `docs/`) is not a phase deliverable and skips the full gate:
+A change whose entire diff against `main` is documentation (`*.md`, or anything under `docs/`) is not a phase deliverable and does not need the branch/PR/merge cycle. Commit it directly to `main`:
 
-- Confirm it really is docs-only first: `git diff --name-only origin/main...HEAD` must list nothing outside `*.md` and `docs/`.
-- Pre-commit gate (§4): run only `rtk cargo fmt --all -- --check`; clippy and the test suite cannot observe a Markdown diff.
-- Pull request (§5): skip the Phase Verification Scorecard, the OCR delegation review, the `rust-reviewer` and `silent-failure-hunter` sign-offs, and the CodeRabbit request. State in the PR body which phase-gate items were intentionally skipped and why.
-- Merge as soon as checks report (`gh pr merge --merge --delete-branch`), without waiting for a review round.
-- CI skips the Rust job for these PRs through the `paths-ignore` filter in [.github/workflows/ci.yml](.github/workflows/ci.yml). If `main` ever becomes protected with `Format, Clippy & Test (Windows)` as a required check, a skipped workflow leaves the PR stuck at *Expected*; keep a same-named always-run job that exits 0 when the diff is docs-only instead of widening the filter.
+1. Confirm it really is docs-only: `rtk git diff --name-only` (against `origin/main` if you are on a branch) must list nothing outside `*.md` and `docs/`.
+2. Pre-commit gate (§4): run only `rtk cargo fmt --all -- --check`; clippy and the test suite cannot observe a Markdown diff. The tracked hook still enforces check 4.
+3. Stage by explicit path, commit as `docs(<scope>): <imperative summary>`, and push straight to `main`:
+
+```powershell
+rtk git pull --ff-only origin main
+rtk git add docs/<file>.md
+rtk git diff --cached --stat
+rtk git commit -m "docs(<scope>): <imperative summary>"
+rtk git push origin main
+```
+
+**Boundary: a micro-change edits prose, not behaviour.** Anything touching code, tests, `DEFAULTS.json`, `crates/core-types/src/config.rs`, `scripts/`, `.github/`, `.env.example`, or the six-file calibration surface (§7) is not a micro-change: it takes a branch, the full gate, and a PR. If a reviewer would have to reason about runtime behaviour, it is not a micro-change.
+
+Everything else in this section still applies, and §6 stays absolute: never force-push `main`, never `--no-verify`, and never land a docs commit that also drags in code, secrets, or `logs/` artifacts. `main` currently has no branch protection and no required status checks, which is what makes the direct push possible; if that ever changes, push the docs commit to a short-lived branch and merge it with `gh pr merge --merge --delete-branch`. CI skips the Rust job for documentation-only diffs through the `paths-ignore` filter in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 
 ## 6. Hard Prohibitions
 
