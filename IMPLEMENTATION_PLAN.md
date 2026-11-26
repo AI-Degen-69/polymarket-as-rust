@@ -343,7 +343,7 @@ polymarket-as-rust/
 
 ---
 
-### Phase 3: Event-Driven FIFO Queue-Aware Paper Simulator & Replay Harness (`paper-sim`, `cli paper`)
+### Phase 3: Event-Driven FIFO Queue-Aware Paper Simulator & Replay Harness (`paper-sim`, `poly-as lifecycle`)
 
 #### [3.1 DO]
 - Add `crates/paper-sim/` to workspace:
