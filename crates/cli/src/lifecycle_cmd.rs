@@ -397,6 +397,14 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
+    if args.source == LifecycleSourceMode::SimEpoch && args.latency_ms != crate::DEFAULT_LATENCY_MS
+    {
+        return Err(
+            "`--latency-ms` applies only to `--source live` or `--source replay`; \
+             sim-epoch has no broker fill model, so wire latency is not simulated"
+                .into(),
+        );
+    }
     let replay_input = if args.source == LifecycleSourceMode::Replay {
         if args.fault != CliFaultMode::None {
             return Err("`--inject-fault` is not supported with `--source replay`".into());
@@ -5008,6 +5016,34 @@ mod tests {
         assert!(
             err.to_string().contains("sim-epoch"),
             "expected sim-epoch error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sim_epoch_rejects_custom_latency_explicitly() {
+        let err = run(LifecycleArgs {
+            source: LifecycleSourceMode::SimEpoch,
+            display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
+            input: None,
+            duration: "10s".to_string(),
+            allow_mid_window: false,
+            fast_forward: true,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            latency_ms: 250,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
+            jsonl: temp_jsonl_path("sim_epoch_rejects_latency"),
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--latency-ms"),
+            "expected a --latency-ms error message, got: {err}"
         );
     }
 

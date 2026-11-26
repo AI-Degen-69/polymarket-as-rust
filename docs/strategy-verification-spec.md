@@ -112,7 +112,7 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
                        │
                        ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Filter 1: Zero-Edge & Conservative Queue                │  --> Fails if Net+Reb <= 0 or AlphaEdge <= 0
+│  Filter 1: Zero-Edge & Conservative Queue                │  --> Fails if Net+Reb <= 0 (AlphaEdge deferred, see 3.1)
 └──────────────────────┬───────────────────────────────────┘
                        │ Pass
                        ▼

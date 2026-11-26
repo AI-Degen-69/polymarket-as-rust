@@ -708,7 +708,8 @@ enum Commands {
         /// Base order size in whole shares (`DEFAULTS.json`: `20`).
         #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
-        /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
+        /// Simulated wire placement & cancel latency in milliseconds (`40ms` default;
+        /// `--source live` / `--source replay` only).
         #[arg(long, default_value_t = DEFAULT_LATENCY_MS)]
         latency_ms: u64,
         /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
