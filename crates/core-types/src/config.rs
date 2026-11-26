@@ -419,6 +419,10 @@ pub struct DefaultsProvenance {
     pub dataset: String,
     /// Selected configuration and promoted override parameters.
     pub selected_config: String,
+    /// How the selection was derived: scoring rule, survival gates, and the swept grid.
+    pub selection_method: String,
+    /// Known limits of the evidence behind the selection (sample size, concentration).
+    pub validation_notes: String,
     /// Supporting selection and roadmap report path.
     pub report: String,
     /// Validation status tag (e.g., provisional research baseline).

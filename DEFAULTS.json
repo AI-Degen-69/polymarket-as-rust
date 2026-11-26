@@ -3,8 +3,10 @@
     "source_sweep": "logs/sweeps/25-11_21-55-50Z_boundary-9runs_20caps-226w",
     "run_id": "boundary-9runs_20caps-226w",
     "date": "2026-11-25 to 2026-11-26",
-    "dataset": "20 captures / 226 windows",
+    "dataset": "20 captures / 226 windows (158 in-sample / 68 out-of-sample, QueueDecay=conservative, VMax=$50, BaseSize=20sh, MaxPair=$0.98)",
     "selected_config": "Config #6/9 (max_entry_price=0.65, entry_cutoff_secs=120, tier1_hedge_trigger_price=off)",
+    "selection_method": "Ranked 1st of the 9 boundary-grid configs by the pre-committed balanced score (79.9 vs 77.7 for runner-up #3/9) after the G1-G6 survival gates; grid = MaxEntryPrice {0.60, 0.65, 0.70} x EntryCutoff {90s, 105s, 120s}, Tier1 trigger off, 180 replays over the 20 captures",
+    "validation_notes": "336 fills across 20 captures is below the 400-fill validation bar and capture #20 supplies 36% of net PnL; provisional research baseline, not a production-validated strategy",
     "report": "docs/boundary-sweep-selection-report.md",
     "status": "provisional-research-baseline"
   },
