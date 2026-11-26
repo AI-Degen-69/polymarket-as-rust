@@ -9,15 +9,14 @@ use clap::ValueEnum;
 use core_types::MicroUsdc;
 use risk_lifecycle::{EpochPhase, RiskTier};
 
+pub(crate) use crate::width::{
+    EPOCH_RULE_WIDTH, PHASE_RULE_WIDTH, RULE_WIDTH, pad_visible_left, pad_visible_right,
+    visible_width,
+};
+
 const STATE_UNINIT: u8 = 0;
 const STATE_PLAIN: u8 = 1;
 const STATE_STYLED: u8 = 2;
-
-const RULE_WIDTH: usize = 82;
-/// Width of the frame drawn around phase transitions (fits a standard terminal).
-const PHASE_RULE_WIDTH: usize = 124;
-/// Epoch blocks use the same width so both frames line up in scrollback.
-const EPOCH_RULE_WIDTH: usize = PHASE_RULE_WIDTH;
 
 static THEME_STATE: AtomicU8 = AtomicU8::new(STATE_UNINIT);
 
@@ -506,46 +505,6 @@ fn latency_us_raw(ns: u64) -> String {
     format!("{whole}.{digits}us")
 }
 
-/// Strips ANSI CSI/SGR escape sequences (`\x1b[...<final>`) while preserving Unicode scalars.
-pub(crate) fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch == '\x1b' && chars.peek() == Some(&'[') {
-            chars.next();
-            for seq_ch in chars.by_ref() {
-                if ('@'..='~').contains(&seq_ch) {
-                    break;
-                }
-            }
-            continue;
-        }
-        out.push(ch);
-    }
-    out
-}
-
-/// Counts visible Unicode scalar positions after stripping ANSI escape sequences.
-pub(crate) fn visible_width(s: &str) -> usize {
-    strip_ansi(s).chars().count()
-}
-
-/// Pads `s` on the right with spaces so its visible width reaches at least `width`.
-/// Right-aligned counterpart of [`pad_visible_right`], ignoring ANSI escapes.
-pub(crate) fn pad_visible_left(s: &str, width: usize) -> String {
-    let pad = width.saturating_sub(visible_width(s));
-    format!("{}{s}", " ".repeat(pad))
-}
-
-pub(crate) fn pad_visible_right(s: &str, width: usize) -> String {
-    let pad = width.saturating_sub(visible_width(s));
-    if pad == 0 {
-        s.to_string()
-    } else {
-        format!("{s}{}", " ".repeat(pad))
-    }
-}
-
 /// Returns `true` if `NO_COLOR` is set to a non-empty value.
 pub(crate) fn no_color_env() -> bool {
     std::env::var_os("NO_COLOR").is_some_and(|val| !val.is_empty())
@@ -586,6 +545,7 @@ pub(crate) fn current() -> Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::width::strip_ansi;
 
     #[test]
     fn color_choice_matrix_respects_tty_and_no_color() {
