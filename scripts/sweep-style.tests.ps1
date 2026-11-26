@@ -178,6 +178,16 @@ try {
     $evalZeroTail = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 12.1 -NbrVal 100.0 -TailDragVal 0.0
     Assert-True ($evalZeroTail.G5 -eq "PASS" -and $evalZeroTail.Verdict -eq "APPROVED") "Measured zero TailDrag still passes G5"
 
+    # --- Filter 4: minimum sample size (UNDERPOWERED verdict) --------------
+    $evalUnder = Evaluate-SurvivalGateRow -ISVal 31.68 -OOSVal 1.61 -RetainVal 11.66 -MaxDDVal 24.49 -DragVal 39.11 -NbrVal 100.0 -TailDragVal 63.08 -TotalFills 351
+    Assert-True ($evalUnder.Verdict -eq "UNDERPOWERED") "351 fills reports UNDERPOWERED instead of FAIL/APPROVED"
+    Assert-True ($evalUnder.G3 -eq "FAIL" -and $evalUnder.G5 -eq "FAIL") "UNDERPOWERED still shows the measured gate cells"
+    $evalUnderPass = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 26.5 -NbrVal 100.0 -TailDragVal 38.2 -TotalFills 399
+    Assert-True ($evalUnderPass.Verdict -eq "UNDERPOWERED") "399 fills is still below the 400-fill bar"
+    $evalAtBar = Evaluate-SurvivalGateRow -ISVal 10.0 -OOSVal 10.0 -RetainVal 70.0 -MaxDDVal 19.4 -DragVal 26.5 -NbrVal 100.0 -TailDragVal 38.2 -TotalFills 400
+    Assert-True ($evalAtBar.Verdict -eq "APPROVED") "400 fills meets the bar and can be APPROVED"
+    Assert-True ((Get-VisibleText (Format-VerdictCell -Verdict "UNDERPOWERED" -Width 12)).Length -eq 12) "UNDERPOWERED fits the widened 12-column verdict field"
+
     # --- G6 Manhattan-1 adjacency + OOS neighbor survival -----------------
     $mkRow = {
         param([string]$px, [string]$t1, [double]$isv, [double]$oosv, [double]$netv)
@@ -198,6 +208,12 @@ try {
     Update-SurvivalVerdicts -Sorted $gridRows
     Assert-True ([Math]::Abs($gridRows[0].NbrNum - 0.0) -lt 1e-9) 'G6 Manhattan-1 skips non-adjacent $0.60 and rejects OOS-negative $0.55'
     Assert-True ([Math]::Abs($gridRows[1].NbrNum - 100.0) -lt 1e-9) "G6 interior cell sees both immediate neighbors"
+
+    # A row's fill count must reach the verdict, or a sweep would still print APPROVED.
+    $gridRows[0] | Add-Member -NotePropertyName FillsNum -NotePropertyValue 351
+    Update-SurvivalVerdicts -Sorted @($gridRows[0], $gridRows[1])
+    Assert-True ($gridRows[0].Verdict -eq "UNDERPOWERED") "Update-SurvivalVerdicts forwards the row's FillsNum into the verdict"
+    Assert-True ($gridRows[1].Verdict -ne "UNDERPOWERED") "A row without a fill count keeps the legacy verdict path"
 
     $capRuns = @(
         [PSCustomObject]@{ Windows = 2; NetPlusRebNum = 5.0 },
