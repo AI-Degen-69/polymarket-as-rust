@@ -399,13 +399,13 @@ impl DollarNotionalRiskEngine {
                     Some(Outcome::Up) => {
                         // We are long UP: can sell UP at best_bid_up or buy DOWN at best_ask_dn.
                         // Buy DOWN at ask if available, otherwise sell UP at bid.
-                        if let Some(ask_dn) = input.best_ask_dn {
+                        if let Some(ask_dn) = input.best_ask_dn.filter(|p| p.0 > 0) {
                             FlattenAction::FlattenFak {
                                 outcome: Outcome::Down,
                                 price: ask_dn,
                                 size: delta_shares_micro,
                             }
-                        } else if let Some(bid_up) = input.best_bid_up {
+                        } else if let Some(bid_up) = input.best_bid_up.filter(|p| p.0 > 0) {
                             FlattenAction::FlattenFak {
                                 outcome: Outcome::Up,
                                 price: bid_up,
@@ -417,13 +417,13 @@ impl DollarNotionalRiskEngine {
                     }
                     Some(Outcome::Down) => {
                         // We are long DOWN: buy UP at best_ask_up or sell DOWN at best_bid_dn.
-                        if let Some(ask_up) = input.best_ask_up {
+                        if let Some(ask_up) = input.best_ask_up.filter(|p| p.0 > 0) {
                             FlattenAction::FlattenFak {
                                 outcome: Outcome::Up,
                                 price: ask_up,
                                 size: delta_shares_micro,
                             }
-                        } else if let Some(bid_dn) = input.best_bid_dn {
+                        } else if let Some(bid_dn) = input.best_bid_dn.filter(|p| p.0 > 0) {
                             FlattenAction::FlattenFak {
                                 outcome: Outcome::Down,
                                 price: bid_dn,
@@ -1007,5 +1007,36 @@ mod tests {
         ));
         latch.reset();
         assert!(!latch.is_latched());
+    }
+
+    #[test]
+    fn tier4_ignores_zero_top_of_book_prices() {
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let snapshot_up = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(10 * ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(48_000_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+        let input_zero = RiskEvaluationInput {
+            best_ask_dn: Some(MicroUsdc::ZERO),
+            best_bid_up: Some(MicroUsdc::ZERO),
+            best_ask_up: Some(MicroUsdc::ZERO),
+            best_bid_dn: Some(MicroUsdc::ZERO),
+            ..Default::default()
+        };
+        let dec_up = engine.evaluate(&snapshot_up, &input_zero).unwrap();
+        assert_eq!(dec_up.tier, RiskTier::Tier4HardStop);
+        assert_eq!(dec_up.flatten, FlattenAction::None);
+
+        let snapshot_dn = OrderRegistrySnapshot {
+            unhedged_dn: SharesMicro::from_raw(10 * ONE_SHARE_MICRO),
+            unhedged_cost_dn_micro: MicroUsdc(48_000_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+        let dec_dn = engine.evaluate(&snapshot_dn, &input_zero).unwrap();
+        assert_eq!(dec_dn.tier, RiskTier::Tier4HardStop);
+        assert_eq!(dec_dn.flatten, FlattenAction::None);
     }
 }
