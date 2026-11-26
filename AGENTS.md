@@ -38,6 +38,8 @@ Run all four checks before every commit:
 3. `rtk cargo test --workspace`
 4. Inspect `git diff --cached` and confirm zero `.env` files, secrets, private keys, or `logs/` artifacts are staged.
 
+A documentation-only change is the single exception to this gate: see [Docs-Only Fast Path](#docs-only-fast-path) under §5, where checks 2 and 3 are replaced by `cargo fmt --all -- --check` alone.
+
 The tracked hook automates checks 1 and 4. Enable it once per clone:
 
 ```powershell
