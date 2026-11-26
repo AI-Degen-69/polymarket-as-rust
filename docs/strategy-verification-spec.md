@@ -91,10 +91,10 @@ Agents use `scripts/sweep-params.ps1` (driving `poly-as lifecycle --source repla
 
 To prove PnL is structural spread-capture edge rather than favorable drift or binary settlement luck, strategies must beat two benchmark twins inside `crates/paper-sim`.
 
-### 3.1 Twin 1: The Symmetric / Naive Quoting Twin `[Implemented]`
+### 3.1 Twin 1: The Symmetric / Naive Quoting Twin `[Removed]`
 * **Purpose:** Isolates whether Stations 1–6 (SG denoising, $\kappa$, A-S spread/skew, lead-lag cancel) generate alpha over passive quoting.
-* **Mechanism:** `NaiveBaselineEngine` (`crates/paper-sim/src/telemetry.rs`) runs in parallel on the same feed and `FifoBrokerConfig`, quoting `mid - 1 tick` passively on both legs without inventory skew or lead-lag defensive cancels.
-* **Requirement:** The candidate strategy's `Net+Reb` and `AlphaEdge` (`Strategy Net - Baseline Net`) must outperform `NaiveBaselineEngine` with paired bootstrap / one-sided `p < 0.05` (`t >= 1.65`) across multi-session windows.
+* **Mechanism:** The `NaiveBaselineEngine` that quoted `mid - 1 tick` passively on both legs without inventory skew or lead-lag defensive cancels has been **removed**. It duplicated broker, ledger and rollover handling inside both the `paper` and `lifecycle` loops (the standalone `paper` command has since been removed; `lifecycle` is the only replay entrypoint), and neither summary nor JSONL emits `baseline_pnl` or `AlphaEdge` any more. The `AlphaEdge` clauses in §5.1 Filter 1 and the Section 6 checklist are therefore not evaluable until Twin 1 is reinstated; they stay in the document as the target, not as a current gate.
+* **Requirement (when reinstated):** The candidate strategy's `Net+Reb` and `AlphaEdge` (`Strategy Net - Baseline Net`) must outperform Twin 1 with paired bootstrap / one-sided `p < 0.05` (`t >= 1.65`) across multi-session windows.
 
 ### 3.2 Twin 2: The Jittered-Timing Twin `[Planned]`
 * **Purpose:** Tests whether edge survives WebSocket jitter and REST roundtrip spikes.
@@ -112,7 +112,7 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
                        │
                        ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Filter 1: Zero-Edge & Conservative Queue                │  --> Fails if Net+Reb <= 0 or AlphaEdge <= 0
+│  Filter 1: Zero-Edge & Conservative Queue                │  --> Fails if Net+Reb <= 0 (AlphaEdge deferred, see 3.1)
 └──────────────────────┬───────────────────────────────────┘
                        │ Pass
                        ▼
@@ -147,7 +147,7 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
 ### 5.1 Detailed Filter Criteria
 
 1. **Zero-Edge & Conservative Queue Baseline:**
-   * Under `-QueueDecay conservative`, `Net+Reb` (Net PnL + Maker Rebates) must strictly exceed `$0`, and `AlphaEdge` over `NaiveBaselineEngine` must exceed `$0`.
+   * Under `-QueueDecay conservative`, `Net+Reb` (Net PnL + Maker Rebates) must strictly exceed `$0`. The `AlphaEdge` half of this filter is unmeasurable until Twin 1 is reinstated (§3.1).
 2. **Binary Expiry Drag, `V_max` & Drawdown Cap:**
    * Maximum Drawdown across a session must stay below **25%** of allocated working capital.
    * Unhedged notional and final-minute risk must stay strictly within `V_max` (`max_notional_per_leg_micro`) and `LifecycleConfig` bounds enforced by `crates/risk-lifecycle/src/station7_risk.rs`, `lifecycle.rs`, and `breakers.rs`.
@@ -210,7 +210,7 @@ Before opening a Pull Request that alters trading math, risk filters, or executi
   * `rtk cargo clippy --workspace --all-targets -- -D warnings`
   * `rtk cargo test --workspace` (including `crates/paper-sim/tests/adversarial.rs`, `vectors.rs`, and `crates/math-engine/tests/zero_alloc.rs`).
 - [ ] Offline sweep verified with `scripts/sweep-params.ps1 -QueueDecay conservative` (and 70/30 OOS split once enabled).
-- [ ] Candidate strategy outperforms `NaiveBaselineEngine` (`AlphaEdge > 0`) and passes the **Six Filtering Checks** (Zero-Edge + Conservative Queue, Drawdown/WinCap/Expiry Drag, OOS Retention, Sample Size, Plateau Stability, `MO1s > 0`).
+- [ ] Candidate strategy outperforms Twin 1 once reinstated (`AlphaEdge > 0`; see §3.1) and passes the **Six Filtering Checks** (Zero-Edge + Conservative Queue, Drawdown/WinCap/Expiry Drag, OOS Retention, Sample Size, Plateau Stability, `MO1s > 0`).
 - [ ] For execution or lifecycle changes, validated order lifecycle against NEX Sandbox:
   * `rtk cargo run -p cli --bin poly-as -- sandbox health`
   * `rtk cargo run -p cli --bin poly-as -- sandbox validate --asset-id <id> --confirm-sandbox-trade`

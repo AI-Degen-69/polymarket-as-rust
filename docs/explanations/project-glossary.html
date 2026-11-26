@@ -609,13 +609,13 @@ tr.section-row td {
         </tr>
         <tr class="data-row" data-cat="metrics">
           <td class="c-term"><span class="term-title">Baseline PnL</span><span class="cat-tag">04 · Benchmark</span></td>
-          <td class="c-def">Net PnL ($P_{\mathrm{base}}$) of the naive baseline engine replayed on the exact same market capture. Serves as the benchmark for AlphaEdge.</td>
+          <td class="c-def">Net PnL ($P_{\mathrm{base}}$) of the naive baseline engine replayed on the exact same market capture. Serves as the benchmark for AlphaEdge. <strong>Retired:</strong> that engine was removed, so this metric is no longer emitted.</td>
           <td class="c-he">רווח נטו (<span class="math-inline">$P_{\mathrm{base}}$</span>) של מנוע הבסיס הנאיבי על אותה הקלטת שוק בדיוק. משמש כנקודת הייחוס לחישוב ה-<span class="en">AlphaEdge</span>.</td>
           <td class="c-ex">הבסיס הנאיבי קונה ומחזיק, ולכן משמש כנקודת השוואה.</td>
         </tr>
         <tr class="data-row" data-cat="metrics">
           <td class="c-term"><span class="term-title">AlphaEdge</span><span class="cat-tag">04 · Edge</span></td>
-          <td class="c-def">Excess strategy return over the naive baseline:
+          <td class="c-def">Excess strategy return over the naive baseline (<strong>retired</strong> — the naive baseline engine was removed):
             <span class="math-block">$$\mathrm{AlphaEdge} = P_{\mathrm{net}} - P_{\mathrm{base}}$$</span>
           </td>
           <td class="c-he">התשואה העודפת של האסטרטגיה על פני מנוע הבסיס הנאיבי: <span class="math-inline">$\mathrm{AlphaEdge} = P_{\mathrm{net}} - P_{\mathrm{base}}$</span>.</td>

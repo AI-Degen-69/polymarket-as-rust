@@ -217,7 +217,7 @@ try {
         $fakeCap = [PSCustomObject]@{ Name = "cap.jsonl"; Stem = "cap"; Windows = 1 }
         $fullPath = Join-Path $tmpMetricDir "full.jsonl"
         @(
-            '{"event":"summary","payload":{"realized_pnl_micro":5000000,"unrealized_pnl_micro":0,"net_pnl_micro":5000000,"estimated_rebate_micro":100000,"baseline_pnl_micro":0,"total_pairs_merged_micro":20000000,"fills_count":2,"merges_count":1,"rpm_60s":2,"markout_1s_bps":0,"markout_5s_bps":0,"total_shares_bought_micro":40000000,"volume_in_micro":19500000,"total_merge_gain_micro":5000000,"positive_merge_gain_micro":5500000,"negative_merge_loss_micro":500000}}'
+            '{"event":"summary","payload":{"realized_pnl_micro":5000000,"unrealized_pnl_micro":0,"net_pnl_micro":5000000,"estimated_rebate_micro":100000,"total_pairs_merged_micro":20000000,"fills_count":2,"merges_count":1,"rpm_60s":2,"markout_1s_bps":0,"markout_5s_bps":0,"total_shares_bought_micro":40000000,"volume_in_micro":19500000,"total_merge_gain_micro":5000000,"positive_merge_gain_micro":5500000,"negative_merge_loss_micro":500000}}'
         ) | Set-Content -LiteralPath $fullPath -Encoding utf8
         $mFull = (Read-CaptureJsonlMetrics -OutJsonl $fullPath -Cap $fakeCap -CapIdx 0 -BaseSize 20 -MaxCombinedBidMicro 980000 -WinColW 12 -TblSep " | ").CapRun
         Assert-True ([Math]::Abs($mFull.QuantityNum - 40.0) -lt 1e-6) "summary telemetry supplies total_shares_bought_micro"
@@ -232,7 +232,7 @@ try {
             '{"event":"merge","payload":{"realized_gain_micro":1200000}}',
             '{"event":"merge","payload":{"realized_gain_micro":-300000}}',
             '{"event":"window_end","payload":{"slug":"w1","net_pnl_micro":900000}}',
-            '{"event":"summary","payload":{"realized_pnl_micro":900000,"unrealized_pnl_micro":0,"net_pnl_micro":900000,"estimated_rebate_micro":0,"baseline_pnl_micro":0,"total_pairs_merged_micro":20000000,"fills_count":2,"flattens_executed":1,"merges_count":2,"rpm_60s":1,"markout_1s_bps":0,"markout_5s_bps":0,"settlement_pnl_micro":0}}'
+            '{"event":"summary","payload":{"realized_pnl_micro":900000,"unrealized_pnl_micro":0,"net_pnl_micro":900000,"estimated_rebate_micro":0,"total_pairs_merged_micro":20000000,"fills_count":2,"flattens_executed":1,"merges_count":2,"rpm_60s":1,"markout_1s_bps":0,"markout_5s_bps":0,"settlement_pnl_micro":0}}'
         ) | Set-Content -LiteralPath $legacyPath -Encoding utf8
         $mLeg = (Read-CaptureJsonlMetrics -OutJsonl $legacyPath -Cap $fakeCap -CapIdx 0 -BaseSize 20 -MaxCombinedBidMicro 980000 -WinColW 12 -TblSep " | ").CapRun
         Assert-True ([Math]::Abs($mLeg.QuantityNum - 40.0) -lt 1e-6) "legacy scan sums BUY fill + BUY flatten shares (40sh)"
@@ -241,7 +241,7 @@ try {
 
         $summaryOnlyPath = Join-Path $tmpMetricDir "summary_only.jsonl"
         @(
-            '{"event":"summary","payload":{"realized_pnl_micro":2000000,"unrealized_pnl_micro":0,"net_pnl_micro":2000000,"estimated_rebate_micro":0,"baseline_pnl_micro":0,"total_pairs_merged_micro":10000000,"fills_count":5,"merges_count":2,"rpm_60s":1,"markout_1s_bps":0,"markout_5s_bps":0,"settlement_pnl_micro":0}}'
+            '{"event":"summary","payload":{"realized_pnl_micro":2000000,"unrealized_pnl_micro":0,"net_pnl_micro":2000000,"estimated_rebate_micro":0,"total_pairs_merged_micro":10000000,"fills_count":5,"merges_count":2,"rpm_60s":1,"markout_1s_bps":0,"markout_5s_bps":0,"settlement_pnl_micro":0}}'
         ) | Set-Content -LiteralPath $summaryOnlyPath -Encoding utf8
         $mSummOnly = (Read-CaptureJsonlMetrics -OutJsonl $summaryOnlyPath -Cap $fakeCap -CapIdx 0 -BaseSize 20 -MaxCombinedBidMicro 980000 -WinColW 12 -TblSep " | ").CapRun
         Assert-True ([double]::IsNaN($mSummOnly.MergePosNum) -and [double]::IsNaN($mSummOnly.MergeNegLossNum)) "summary-only legacy JSONL with merges>0 does not mistake missing merge events for 0.0"

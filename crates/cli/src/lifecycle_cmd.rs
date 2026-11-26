@@ -24,8 +24,8 @@ use math_engine::{
     CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
 };
 use paper_sim::{
-    BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, MergeEvent, NewOrderParams, PaperLedger,
-    SimFill, SimOrderStatus, TrajectorySnapshot,
+    FifoBrokerConfig, FifoPaperBroker, MergeEvent, NewOrderParams, PaperLedger, SimFill,
+    SimOrderStatus, SimTelemetry, TrajectorySnapshot,
 };
 use risk_lifecycle::{
     ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerReason, BreakerStatus,
@@ -91,6 +91,7 @@ pub(crate) struct LifecycleArgs {
     pub(crate) fault: CliFaultMode,
     pub(crate) v_max: u64,
     pub(crate) base_size: u64,
+    pub(crate) latency_ms: u64,
     pub(crate) queue_decay: paper_sim::QueueDecayPolicy,
     pub(crate) math: crate::MathOverrides,
     pub(crate) pinning: CorePinning,
@@ -393,6 +394,14 @@ pub(crate) fn run(args: LifecycleArgs) -> Result<(), Box<dyn Error>> {
         return Err(
             "--pin-pricing-core/--pin-risk-core apply to the live actor topology; \
              sim-epoch runs a deterministic single-thread epoch loop"
+                .into(),
+        );
+    }
+    if args.source == LifecycleSourceMode::SimEpoch && args.latency_ms != crate::DEFAULT_LATENCY_MS
+    {
+        return Err(
+            "`--latency-ms` applies only to `--source live` or `--source replay`; \
+             sim-epoch has no broker fill model, so wire latency is not simulated"
                 .into(),
         );
     }
@@ -1075,7 +1084,7 @@ struct LivePaperSimulator {
     pending_tick_sync_ack: bool,
     broker: FifoPaperBroker,
     ledger: PaperLedger,
-    telemetry: BaselineTelemetry,
+    telemetry: SimTelemetry,
     harness: ActorPipelineHarness,
     priority_rx: mpsc::Receiver<ExecutionCommand>,
     routine_rx: mpsc::Receiver<ExecutionCommand>,
@@ -1124,7 +1133,7 @@ impl LivePaperSimulator {
         routine_rx: mpsc::Receiver<ExecutionCommand>,
     ) -> Result<Self, Box<dyn Error>> {
         let ledger = PaperLedger::new(desc.fee_schedule);
-        let telemetry = BaselineTelemetry::new()?;
+        let telemetry = SimTelemetry::new()?;
         let strike_usd = desc.strike_price_usd.map(|f| f.get());
         let tier1_hedge_trigger_micro = tier1_hedge_trigger_price
             .map(|p| MicroUsdc(((p * ONE_DOLLAR_MICRO as f64) + 1e-9).floor() as u64));
@@ -2631,8 +2640,9 @@ fn spawn_managed_session(
     let math_pipeline = MathPipeline::new(pipe_cfg, clock)?;
 
     let broker_cfg = FifoBrokerConfig {
+        order_latency_ms: args.latency_ms,
+        cancel_latency_ms: args.latency_ms,
         queue_decay_policy: args.queue_decay,
-        ..FifoBrokerConfig::default()
     };
     let sim = LivePaperSimulator::new(
         desc,
@@ -4991,6 +5001,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides {
                 gamma: Some(0.02),
@@ -5005,6 +5016,34 @@ mod tests {
         assert!(
             err.to_string().contains("sim-epoch"),
             "expected sim-epoch error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sim_epoch_rejects_custom_latency_explicitly() {
+        let err = run(LifecycleArgs {
+            source: LifecycleSourceMode::SimEpoch,
+            display: LifecycleDisplayMode::Stream,
+            verbose_latency: false,
+            input: None,
+            duration: "10s".to_string(),
+            allow_mid_window: false,
+            fast_forward: true,
+            fault: CliFaultMode::None,
+            v_max: 50,
+            base_size: 20,
+            latency_ms: 250,
+            queue_decay: paper_sim::QueueDecayPolicy::Conservative,
+            math: crate::MathOverrides::default(),
+            pinning: CorePinning::default(),
+            source_filter: SourceFilter::All,
+            min_book_quality: BookQualityFilter::Any,
+            jsonl: temp_jsonl_path("sim_epoch_rejects_latency"),
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--latency-ms"),
+            "expected a --latency-ms error message, got: {err}"
         );
     }
 
@@ -5209,6 +5248,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5231,6 +5271,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5256,6 +5297,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Optimistic,
             math: crate::MathOverrides {
                 gamma: Some(0.02),
@@ -5295,6 +5337,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Optimistic,
             math: crate::MathOverrides {
                 gamma: Some(0.02),
@@ -5360,6 +5403,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5553,6 +5597,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),
@@ -5690,6 +5735,7 @@ mod tests {
             fault: CliFaultMode::None,
             v_max: 50,
             base_size: 20,
+            latency_ms: 40,
             queue_decay: paper_sim::QueueDecayPolicy::Conservative,
             math: crate::MathOverrides::default(),
             pinning: CorePinning::default(),

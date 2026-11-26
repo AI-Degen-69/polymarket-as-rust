@@ -26,7 +26,6 @@ All subcommands read `.env` (if present) and validated process env; see [`.env.e
 | Capture live feed data (record) | `poly-as feeds --discover --windows 2` |
 | Replay recorded data | `poly-as feeds --replay logs/captures/<file>.jsonl` |
 | Watch math-engine ticks | `poly-as trace --source replay --input <file>.jsonl` |
-| Paper trade (FIFO queue) | `poly-as paper --source replay --input <file>.jsonl --duration 300s` |
 | Compare configs / performance sweep | `pwsh -File scripts/sweep-params.ps1` (see below) |
 | Full risk/lifecycle epoch | `poly-as lifecycle --source sim-epoch` |
 | Verify signing + settlement mechanics | `poly-as exec` |
@@ -123,35 +122,6 @@ Log default: `logs/trace/<DD-MM_HH-MM-SSZ>.jsonl`.
 
 ---
 
-## Phase 3 — Paper simulator
-
-### `paper` (alias `sim`)
-FIFO queue-aware paper trading against live WebSockets or replayed logs.
-
-```powershell
-poly-as paper --source replay --input logs/captures/<file>.jsonl --duration 300s
-poly-as paper --source live --duration 60s --v-max 50 --base-size 20
-```
-
-Flags:
-
-| Flag | Meaning |
-|---|---|
-| `--source live\|replay` | Feed source (default `live`) |
-| `--input PATH` | Input JSONL for `--source replay` |
-| `--duration <60s\|300s\|5m>` | Simulation duration (default `60s`) |
-| `--allow-mid-window` | Start `--source live` mid-window |
-| `--v-max USD` | Max position capital (default `$50`) |
-| `--base-size shares` | Base order size in whole shares (default `20`) |
-| `--latency-ms` | Simulated wire place/cancel latency (default `40ms`) |
-| `--queue-decay conservative\|optimistic` | FIFO queue decay policy (default `conservative`) |
-| Math overrides | See shared table below |
-| `--jsonl PATH` | Output telemetry path |
-
-Log default: `logs/paper/<DD-MM_HH-MM-SSZ>.jsonl`.
-
----
-
 ## Phase 4 — Risk & lifecycle actor pipeline
 
 ### `lifecycle`
@@ -176,6 +146,7 @@ Flags:
 | `--inject-fault <none\|stale\|tier4\|tick-change\|disconnect>` | Adversarial fault injection (default `none`; alias `--fault`) |
 | `--v-max USD` | Max position capital (default `$50`) |
 | `--base-size shares` | Base order size (default `20`) |
+| `--latency-ms` | Simulated wire place/cancel latency, applied to both placement and cancel (default `40ms`) |
 | `--queue-decay conservative\|optimistic` | FIFO queue decay policy (default `conservative`) |
 | `--pin-pricing-core N` | Pin Pricing actor OS thread to CPU core N |
 | `--pin-risk-core N` | Pin Risk actor OS thread to CPU core N |
@@ -235,7 +206,7 @@ poly-as sandbox feeds --up-asset-id <ID> --dn-asset-id <ID> [--duration 20s] [--
 
 ---
 
-## Shared math overrides (trace / paper / lifecycle)
+## Shared math overrides (trace / lifecycle)
 
 Defaults shown are the calibrated repo defaults (mirrored in `.env.example` and `EngineConfig::default()`).
 
@@ -264,7 +235,6 @@ Defaults shown are the calibrated repo defaults (mirrored in `.env.example` and 
 | doctor | `logs/doctor/<stamp>.jsonl` |
 | feeds (capture) | `logs/captures/<stamp>_<dur>.inprogress.jsonl` |
 | trace | `logs/trace/<stamp>.jsonl` |
-| paper | `logs/paper/<stamp>.jsonl` |
 | lifecycle | `logs/lifecycle/<stamp>.jsonl` |
 | exec | `logs/exec/<stamp>.jsonl` |
 | sweeps | `logs/sweeps/<stamp>_<N>runs_<capture>` (per-run `summary.txt`) |
@@ -276,6 +246,6 @@ Defaults shown are the calibrated repo defaults (mirrored in `.env.example` and 
 ## Safety notes
 
 - **`exec`** is dry-run only. `canary-live` is hard-gated in this build (refused even with all latches passed).
-- **`lifecycle --source sim-epoch` / `paper`** never touch real capital.
+- **`lifecycle --source sim-epoch`** never touches real capital.
 - **`sandbox validate`** places a real test-pUSD order on Amoy — it requires `--confirm-sandbox-trade`.
 - Secrets (private keys) live only in `.env`; never commit them. `.env.example` documents every key with no secrets.
