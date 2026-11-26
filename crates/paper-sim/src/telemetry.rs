@@ -1,28 +1,11 @@
 use std::collections::VecDeque;
 
 use core_types::{
-    FeeSchedule, LatencySummary, LatencyTracker, MicroUsdc, OrderSide, Outcome, SharesMicro,
-    SignedSharesMicro, TickPrecision,
+    LatencySummary, LatencyTracker, MicroUsdc, OrderSide, Outcome, SharesMicro, SignedSharesMicro,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::accounting::PaperLedger;
-use crate::fifo_book::{FifoBrokerConfig, FifoPaperBroker, NewOrderParams, SimFill};
-
-/// Input parameters for updating naive baseline quotes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NaiveQuotesInput {
-    pub mid_up: Option<MicroUsdc>,
-    pub mid_dn: Option<MicroUsdc>,
-    pub best_bid_up: Option<MicroUsdc>,
-    pub best_ask_up: Option<MicroUsdc>,
-    pub best_bid_dn: Option<MicroUsdc>,
-    pub best_ask_dn: Option<MicroUsdc>,
-    pub tick: TickPrecision,
-    pub depth_up: SharesMicro,
-    pub depth_dn: SharesMicro,
-    pub now_ms: u64,
-}
+use crate::fifo_book::SimFill;
 
 /// Snapshot of skew and spread trajectory at a point in time.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -57,194 +40,8 @@ pub struct FillMarkoutProbe {
     pub checked_5s: bool,
 }
 
-/// Naive static-spread (`mid ± 1 tick`) benchmark engine running in parallel.
-#[derive(Debug, Clone)]
-pub struct NaiveBaselineEngine {
-    pub broker: FifoPaperBroker,
-    pub ledger: PaperLedger,
-    pub base_size: SharesMicro,
-    pub active_up_id: Option<u64>,
-    pub active_dn_id: Option<u64>,
-}
-
-impl NaiveBaselineEngine {
-    /// Constructs a naive static-spread benchmark engine with the same latency config.
-    #[must_use]
-    pub const fn new(
-        config: FifoBrokerConfig,
-        fee_schedule: FeeSchedule,
-        base_size: SharesMicro,
-    ) -> Self {
-        Self {
-            broker: FifoPaperBroker::new(config),
-            ledger: PaperLedger::new(fee_schedule),
-            base_size,
-            active_up_id: None,
-            active_dn_id: None,
-        }
-    }
-
-    /// Computes the tick-quantized `mid - 1 tick` passive bid, clamped strictly below `best_ask`.
-    #[must_use]
-    pub const fn target_bid_price(
-        mid: Option<MicroUsdc>,
-        best_ask: Option<MicroUsdc>,
-        tick: TickPrecision,
-    ) -> Option<MicroUsdc> {
-        let Some(mid_px) = mid else {
-            return None;
-        };
-        let tick_raw = tick.tick_micro().0;
-        if mid_px.0 <= tick_raw {
-            return None;
-        }
-        let raw_target = mid_px.0.saturating_sub(tick_raw);
-        let mut aligned = (raw_target / tick_raw) * tick_raw;
-        if let Some(ask) = best_ask {
-            let max_passive = (ask.0.saturating_sub(tick_raw) / tick_raw) * tick_raw;
-            if aligned > max_passive {
-                aligned = max_passive;
-            }
-        }
-        if aligned < tick_raw {
-            None
-        } else {
-            Some(MicroUsdc(aligned))
-        }
-    }
-
-    /// Updates naive quotes pegged to tick-quantized `mid - 1 tick` on both sides.
-    pub fn update_quotes(&mut self, input: NaiveQuotesInput) {
-        let up_target = Self::target_bid_price(input.mid_up, input.best_ask_up, input.tick);
-        self.update_leg_quote(
-            Outcome::Up,
-            up_target,
-            input.best_bid_up,
-            input.best_ask_up,
-            input.depth_up,
-            input.now_ms,
-        );
-
-        let dn_target = Self::target_bid_price(input.mid_dn, input.best_ask_dn, input.tick);
-        self.update_leg_quote(
-            Outcome::Down,
-            dn_target,
-            input.best_bid_dn,
-            input.best_ask_dn,
-            input.depth_dn,
-            input.now_ms,
-        );
-    }
-
-    fn update_leg_quote(
-        &mut self,
-        outcome: Outcome,
-        target: Option<MicroUsdc>,
-        best_bid: Option<MicroUsdc>,
-        best_ask: Option<MicroUsdc>,
-        depth: SharesMicro,
-        now_ms: u64,
-    ) {
-        let active_id = match outcome {
-            Outcome::Up => self.active_up_id,
-            Outcome::Down => self.active_dn_id,
-        };
-        let Some(target_price) = target else {
-            if let Some(old_id) = active_id {
-                let _ = self.broker.cancel(old_id, now_ms);
-                match outcome {
-                    Outcome::Up => self.active_up_id = None,
-                    Outcome::Down => self.active_dn_id = None,
-                }
-            }
-            return;
-        };
-
-        let should_replace = match active_id.and_then(|id| self.broker.get_order(id)) {
-            Some(order) => order.price != target_price || !order.status.is_active(),
-            None => true,
-        };
-        if !should_replace {
-            return;
-        }
-        if let Some(old_id) = active_id {
-            let _ = self.broker.cancel(old_id, now_ms);
-        }
-        let next_id = self
-            .broker
-            .submit_new(NewOrderParams {
-                outcome,
-                side: OrderSide::Buy,
-                price: target_price,
-                size: self.base_size,
-                now_ms,
-                current_best_bid: best_bid,
-                current_best_ask: best_ask,
-                book_depth_at_price: depth,
-            })
-            .ok();
-        match outcome {
-            Outcome::Up => self.active_up_id = next_id,
-            Outcome::Down => self.active_dn_id = next_id,
-        }
-    }
-
-    /// Evaluates public trade against naive resting orders.
-    pub fn on_public_trade(
-        &mut self,
-        outcome: Outcome,
-        trade_price: MicroUsdc,
-        trade_size: SharesMicro,
-        now_ms: u64,
-    ) {
-        let fills = self
-            .broker
-            .on_public_trade(outcome, trade_price, trade_size, now_ms);
-        for fill in &fills {
-            let _ = self.ledger.record_fill(fill);
-        }
-    }
-
-    /// Evaluates directional public trade against naive resting orders.
-    pub fn on_public_trade_with_side(
-        &mut self,
-        outcome: Outcome,
-        trade_side: OrderSide,
-        trade_price: MicroUsdc,
-        trade_size: SharesMicro,
-        now_ms: u64,
-    ) {
-        let fills = self.broker.on_public_trade_with_side(
-            outcome,
-            trade_side,
-            trade_price,
-            trade_size,
-            now_ms,
-        );
-        for fill in &fills {
-            let _ = self.ledger.record_fill(fill);
-        }
-    }
-
-    /// Cancels all active naive baseline quotes and immediately halts pending fills on expiry.
-    pub fn cancel_all(&mut self, now_ms: u64) -> usize {
-        let mut cancelled = 0_usize;
-        if let Some(id) = self.active_up_id.take()
-            && self.broker.cancel(id, now_ms).is_ok()
-        {
-            cancelled = cancelled.saturating_add(1);
-        }
-        if let Some(id) = self.active_dn_id.take()
-            && self.broker.cancel(id, now_ms).is_ok()
-        {
-            cancelled = cancelled.saturating_add(1);
-        }
-        cancelled.saturating_add(self.broker.force_cancel_all())
-    }
-}
-
-/// Baseline telemetry tracker collecting RPM, trajectories, paired latency,
-/// fill ratios, post-fill markouts, and null-baseline comparative performance.
+/// Telemetry tracker collecting RPM, trajectories, paired latency, fill ratios,
+/// and post-fill markouts.
 pub struct BaselineTelemetry {
     cancel_replace_timestamps_ms: VecDeque<u64>,
     trajectories: Vec<TrajectorySnapshot>,
@@ -257,16 +54,11 @@ pub struct BaselineTelemetry {
     markout_1s_count: u64,
     markout_5s_sum_micro: i64,
     markout_5s_count: u64,
-    pub naive_engine: NaiveBaselineEngine,
 }
 
 impl BaselineTelemetry {
     /// Constructs a new baseline telemetry engine.
-    pub fn new(
-        config: FifoBrokerConfig,
-        fee_schedule: FeeSchedule,
-        base_size: SharesMicro,
-    ) -> Result<Self, core_types::TelemetryError> {
+    pub fn new() -> Result<Self, core_types::TelemetryError> {
         let pair_latency_tracker = LatencyTracker::new()?;
         Ok(Self {
             cancel_replace_timestamps_ms: VecDeque::with_capacity(1024),
@@ -280,7 +72,6 @@ impl BaselineTelemetry {
             markout_1s_count: 0,
             markout_5s_sum_micro: 0,
             markout_5s_count: 0,
-            naive_engine: NaiveBaselineEngine::new(config, fee_schedule, base_size),
         })
     }
 
@@ -443,139 +234,5 @@ impl BaselineTelemetry {
     #[must_use]
     pub fn pending_markout_probe_count(&self) -> usize {
         self.markout_probes.len()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use core_types::ONE_SHARE_MICRO;
-
-    use crate::fifo_book::{QueueDecayPolicy, SimOrderStatus};
-
-    use super::*;
-
-    #[test]
-    fn naive_baseline_quantizes_half_cent_mid_and_respects_volume_ahead() {
-        let cfg = FifoBrokerConfig {
-            order_latency_ms: 0,
-            cancel_latency_ms: 0,
-            queue_decay_policy: QueueDecayPolicy::Conservative,
-        };
-        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
-        let mut engine = NaiveBaselineEngine::new(cfg, FeeSchedule::btc_5m_default(), base_size);
-
-        engine.update_quotes(NaiveQuotesInput {
-            mid_up: Some(MicroUsdc(345_000)),
-            mid_dn: None,
-            best_bid_up: Some(MicroUsdc(340_000)),
-            best_ask_up: Some(MicroUsdc(350_000)),
-            best_bid_dn: None,
-            best_ask_dn: None,
-            tick: TickPrecision::Cent,
-            depth_up: SharesMicro(50 * ONE_SHARE_MICRO),
-            depth_dn: SharesMicro::ZERO,
-            now_ms: 1_000,
-        });
-
-        let up_id = engine.active_up_id.unwrap();
-        let order = engine.broker.get_order(up_id).unwrap();
-        assert_eq!(order.price, MicroUsdc(330_000));
-        assert_eq!(order.price.0 % 10_000, 0);
-        assert_eq!(order.volume_ahead, SharesMicro(50 * ONE_SHARE_MICRO));
-
-        // 30-share print at $0.33 consumes queue ahead only (0 fills).
-        engine.on_public_trade_with_side(
-            Outcome::Up,
-            OrderSide::Sell,
-            MicroUsdc(330_000),
-            SharesMicro(30 * ONE_SHARE_MICRO),
-            1_000,
-        );
-        assert_eq!(engine.ledger.total_fills_count, 0);
-        let order_after_1 = engine.broker.get_order(up_id).unwrap();
-        assert_eq!(order_after_1.remaining_size, base_size);
-        assert_eq!(
-            order_after_1.volume_ahead,
-            SharesMicro(20 * ONE_SHARE_MICRO)
-        );
-
-        // 25-share print at $0.33 drains remaining 20sh ahead and fills 5sh.
-        engine.on_public_trade_with_side(
-            Outcome::Up,
-            OrderSide::Sell,
-            MicroUsdc(330_000),
-            SharesMicro(25 * ONE_SHARE_MICRO),
-            1_100,
-        );
-        assert_eq!(engine.ledger.total_fills_count, 1);
-        let order_after_2 = engine.broker.get_order(up_id).unwrap();
-        assert_eq!(order_after_2.volume_ahead, SharesMicro::ZERO);
-        assert_eq!(
-            order_after_2.remaining_size,
-            SharesMicro(base_size.0 - 5 * ONE_SHARE_MICRO)
-        );
-    }
-
-    #[test]
-    fn naive_baseline_clamps_below_best_ask_and_cancels_when_unquotable() {
-        assert_eq!(
-            NaiveBaselineEngine::target_bid_price(
-                Some(MicroUsdc(500_000)),
-                Some(MicroUsdc(480_000)),
-                TickPrecision::Cent,
-            ),
-            Some(MicroUsdc(470_000))
-        );
-        assert_eq!(
-            NaiveBaselineEngine::target_bid_price(
-                Some(MicroUsdc(345_000)),
-                Some(MicroUsdc(10_000)),
-                TickPrecision::Cent,
-            ),
-            None
-        );
-
-        let cfg = FifoBrokerConfig {
-            order_latency_ms: 0,
-            cancel_latency_ms: 0,
-            queue_decay_policy: QueueDecayPolicy::Conservative,
-        };
-        let mut engine = NaiveBaselineEngine::new(
-            cfg,
-            FeeSchedule::btc_5m_default(),
-            SharesMicro(20 * ONE_SHARE_MICRO),
-        );
-        engine.update_quotes(NaiveQuotesInput {
-            mid_up: Some(MicroUsdc(500_000)),
-            mid_dn: None,
-            best_bid_up: Some(MicroUsdc(490_000)),
-            best_ask_up: Some(MicroUsdc(510_000)),
-            best_bid_dn: None,
-            best_ask_dn: None,
-            tick: TickPrecision::Cent,
-            depth_up: SharesMicro::ZERO,
-            depth_dn: SharesMicro::ZERO,
-            now_ms: 1_000,
-        });
-        let order_id = engine.active_up_id.unwrap();
-
-        // best_ask == $0.01 leaves no legal passive tick -> cancel active order.
-        engine.update_quotes(NaiveQuotesInput {
-            mid_up: Some(MicroUsdc(500_000)),
-            mid_dn: None,
-            best_bid_up: None,
-            best_ask_up: Some(MicroUsdc(10_000)),
-            best_bid_dn: None,
-            best_ask_dn: None,
-            tick: TickPrecision::Cent,
-            depth_up: SharesMicro::ZERO,
-            depth_dn: SharesMicro::ZERO,
-            now_ms: 1_100,
-        });
-        assert!(engine.active_up_id.is_none());
-        assert_eq!(
-            engine.broker.get_order(order_id).unwrap().status,
-            SimOrderStatus::Cancelled
-        );
     }
 }

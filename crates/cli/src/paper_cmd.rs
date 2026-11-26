@@ -19,8 +19,8 @@ use historical_data::{
 };
 use math_engine::{CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 use paper_sim::{
-    BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, NaiveQuotesInput, NewOrderParams,
-    PaperLedger, TrajectorySnapshot,
+    BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, NewOrderParams, PaperLedger,
+    TrajectorySnapshot,
 };
 use rtrb::RingBuffer;
 use tokio::sync::mpsc;
@@ -210,7 +210,6 @@ impl PaperState {
             telemetry.record_cancel_replace(now_ms);
         }
         let _ = broker.force_cancel_all();
-        let _ = telemetry.naive_engine.cancel_all(now_ms);
 
         if let Some(twap) = pipe.settlement_twap_usd(now_ms, expiry_ts_ms) {
             self.twap_60s_usd = Some(twap);
@@ -218,7 +217,6 @@ impl PaperState {
 
         let winning_outcome = self.resolve_winning_outcome();
         let settle_delta = ledger.settle_epoch(winning_outcome);
-        let _ = telemetry.naive_engine.ledger.settle_epoch(winning_outcome);
         telemetry.reset_epoch();
 
         Some(PendingEpochSettlement {
@@ -243,13 +241,6 @@ impl PaperState {
     ) {
         let broker_cfg = *broker.config();
         *broker = FifoPaperBroker::new(broker_cfg);
-        telemetry.naive_engine.broker = FifoPaperBroker::new(broker_cfg);
-        telemetry.naive_engine.active_up_id = None;
-        telemetry.naive_engine.active_dn_id = None;
-        telemetry
-            .naive_engine
-            .ledger
-            .set_fee_schedule(next_desc.fee_schedule);
         ledger.set_fee_schedule(next_desc.fee_schedule);
         telemetry.reset_epoch();
 
@@ -365,14 +356,9 @@ fn run_replay(
         cancel_latency_ms: args.latency_ms,
         queue_decay_policy: args.queue_decay,
     };
-    let base_size = SharesMicro(args.base_size * ONE_SHARE_MICRO);
     let mut broker = FifoPaperBroker::new(broker_config);
     let mut ledger = PaperLedger::new(core_types::FeeSchedule::btc_5m_default());
-    let mut telemetry = BaselineTelemetry::new(
-        broker_config,
-        core_types::FeeSchedule::btc_5m_default(),
-        base_size,
-    )?;
+    let mut telemetry = BaselineTelemetry::new()?;
 
     let reader = BufReader::new(File::open(input_path)?);
     for line_res in reader.lines() {
@@ -474,14 +460,9 @@ fn run_canonical_replay(
         cancel_latency_ms: args.latency_ms,
         queue_decay_policy: args.queue_decay,
     };
-    let base_size = SharesMicro(args.base_size * ONE_SHARE_MICRO);
     let mut broker = FifoPaperBroker::new(broker_config);
     let mut ledger = PaperLedger::new(core_types::FeeSchedule::btc_5m_default());
-    let mut telemetry = BaselineTelemetry::new(
-        broker_config,
-        core_types::FeeSchedule::btc_5m_default(),
-        base_size,
-    )?;
+    let mut telemetry = BaselineTelemetry::new()?;
 
     let mut pending_resolutions: std::collections::HashMap<String, Outcome> =
         std::collections::HashMap::new();
@@ -643,10 +624,6 @@ fn run_canonical_replay(
                 } else {
                     pipe.set_epoch_secs(epoch_secs)?;
                     ledger.set_fee_schedule(desc.fee_schedule);
-                    telemetry
-                        .naive_engine
-                        .ledger
-                        .set_fee_schedule(desc.fee_schedule);
                     state.set_market(desc);
                     state.next_eval_ms = Some(
                         cur_sim_ms.max(state.desc.as_ref().map_or(cur_sim_ms, |d| d.start_ts_ms)),
@@ -939,9 +916,6 @@ fn handle_replay_trade_print(
         telemetry.record_fill(fill, inv_before, inv_after, mid_at_fill);
     }
 
-    telemetry
-        .naive_engine
-        .on_public_trade_with_side(outcome, side, price, size, exch_ts_ms);
     Ok(())
 }
 
@@ -970,7 +944,6 @@ fn finalize_paper_output(
         .unwrap_or(MicroUsdc(500_000));
 
     let unrealized = ledger.unrealized_pnl_micro(mid_up, mid_dn);
-    let baseline_pnl = telemetry.naive_engine.ledger.net_pnl_micro(mid_up, mid_dn);
     let latency_sum = tracker.summary();
 
     let disp = PaperSummaryDisplay {
@@ -986,7 +959,6 @@ fn finalize_paper_output(
         fill_ratio: telemetry.fill_ratio(),
         markout_1s_bps: telemetry.avg_markout_1s_bps(),
         markout_5s_bps: telemetry.avg_markout_5s_bps(),
-        baseline_pnl,
         latency: &latency_sum,
     };
 
@@ -1194,11 +1166,6 @@ fn process_replay_env(
                         let inv_after = ledger.net_inventory();
                         telemetry.record_fill(fill, inv_before, inv_after, mid_at_fill);
                     }
-
-                    // Feed directional public trade into naive baseline engine
-                    telemetry
-                        .naive_engine
-                        .on_public_trade_with_side(outcome, side, price, size, exch_ts_ms);
                 }
                 ReplayPolyEvent::TickSizeChange { new_tick_micro, .. } => {
                     if let Some(desc) = state.desc.as_mut() {
@@ -1268,7 +1235,6 @@ fn process_replay_env(
                     .and_then(fixed_book_mid)
                     .unwrap_or(MicroUsdc(500_000));
                 let unrealized = ledger.unrealized_pnl_micro(mid_up, mid_dn);
-                let baseline_pnl = telemetry.naive_engine.ledger.net_pnl_micro(mid_up, mid_dn);
                 let latency_sum = tracker.summary();
 
                 let disp = PaperSummaryDisplay {
@@ -1284,7 +1250,6 @@ fn process_replay_env(
                     fill_ratio: telemetry.fill_ratio(),
                     markout_1s_bps: telemetry.avg_markout_1s_bps(),
                     markout_5s_bps: telemetry.avg_markout_5s_bps(),
-                    baseline_pnl,
                     latency: &latency_sum,
                 };
 
@@ -1515,27 +1480,8 @@ fn eval_sim_step(
         }
     }
 
-    // Update naive baseline quotes
     let mid_up = fixed_book_mid(up_book);
     let mid_dn = fixed_book_mid(dn_book);
-    let tick_prec = core_types::TickPrecision::from_micro(desc.tick_size_micro)
-        .unwrap_or(core_types::TickPrecision::Cent);
-    let naive_up_px =
-        paper_sim::NaiveBaselineEngine::target_bid_price(mid_up, best_ask_up, tick_prec);
-    let naive_dn_px =
-        paper_sim::NaiveBaselineEngine::target_bid_price(mid_dn, best_ask_dn, tick_prec);
-    telemetry.naive_engine.update_quotes(NaiveQuotesInput {
-        mid_up,
-        mid_dn,
-        best_bid_up,
-        best_ask_up,
-        best_bid_dn,
-        best_ask_dn,
-        tick: tick_prec,
-        depth_up: naive_up_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(up_book, px)),
-        depth_dn: naive_dn_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(dn_book, px)),
-        now_ms,
-    });
 
     // Update markouts
     if let (Some(m_up), Some(m_dn)) = (mid_up, mid_dn) {
@@ -1614,10 +1560,9 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
         cancel_latency_ms: args.latency_ms,
         queue_decay_policy: args.queue_decay,
     };
-    let base_size = SharesMicro(args.base_size * ONE_SHARE_MICRO);
     let mut broker = FifoPaperBroker::new(broker_config);
     let mut ledger = PaperLedger::new(desc.fee_schedule);
-    let mut telemetry = BaselineTelemetry::new(broker_config, desc.fee_schedule, base_size)?;
+    let mut telemetry = BaselineTelemetry::new()?;
 
     let (poly_prod, mut poly_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (bin_prod, mut binance_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
@@ -1876,7 +1821,6 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                     let mid_up = state.latest_up.as_ref().and_then(fixed_book_mid).unwrap_or(MicroUsdc(500_000));
                     let mid_dn = state.latest_dn.as_ref().and_then(fixed_book_mid).unwrap_or(MicroUsdc(500_000));
                     let unrealized = ledger.unrealized_pnl_micro(mid_up, mid_dn);
-                    let baseline_pnl = telemetry.naive_engine.ledger.net_pnl_micro(mid_up, mid_dn);
                     let latency_sum = tracker.summary();
 
                     let disp = PaperSummaryDisplay {
@@ -1892,7 +1836,6 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
                         fill_ratio: telemetry.fill_ratio(),
                         markout_1s_bps: telemetry.avg_markout_1s_bps(),
                         markout_5s_bps: telemetry.avg_markout_5s_bps(),
-                        baseline_pnl,
                         latency: &latency_sum,
                     };
 
@@ -1921,7 +1864,6 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
         let _ = broker.cancel(id, shutdown_ms);
     }
     let _ = broker.force_cancel_all();
-    let _ = telemetry.naive_engine.cancel_all(shutdown_ms);
 
     shutdown_actors(handles, cfg.polybolt_enabled).await;
 
@@ -2101,10 +2043,6 @@ fn handle_live_poly_event(
                 let inv_after = ledger.net_inventory();
                 telemetry.record_fill(fill, inv_before, inv_after, mid_at_fill);
             }
-
-            telemetry
-                .naive_engine
-                .on_public_trade_with_side(outcome, side, price, size, exch_ts_ms);
         }
         PolyMarketEvent::TickSizeChange { new_tick_micro, .. } => {
             if let Some(d) = state.desc.as_mut() {
@@ -2185,8 +2123,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry =
-            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let mut telemetry = BaselineTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2326,11 +2263,9 @@ mod tests {
         state.set_market(market1.clone());
 
         let broker_config = FifoBrokerConfig::default();
-        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry =
-            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let mut telemetry = BaselineTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2445,11 +2380,9 @@ mod tests {
         state.strike_usd = Some(95_000.0);
 
         let broker_config = FifoBrokerConfig::default();
-        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market.fee_schedule);
-        let mut telemetry =
-            BaselineTelemetry::new(broker_config, market.fee_schedule, base_size).unwrap();
+        let mut telemetry = BaselineTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2475,7 +2408,7 @@ mod tests {
     }
 
     #[test]
-    fn test_settlement_cancels_both_primary_and_naive_brokers_without_post_expiry_fills() {
+    fn test_settlement_cancels_primary_broker_without_post_expiry_fills() {
         let clock = MonotonicClock::start();
         let start_ms = 1_700_000_000_000_u64;
         let expiry_ms = start_ms + 300_000;
@@ -2494,8 +2427,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market.fee_schedule);
-        let mut telemetry =
-            BaselineTelemetry::new(broker_config, market.fee_schedule, base_size).unwrap();
+        let mut telemetry = BaselineTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2516,23 +2448,7 @@ mod tests {
             .unwrap();
         state.active_up_id = Some(up_id);
 
-        // Place active quotes in naive baseline engine as well.
-        telemetry.naive_engine.update_quotes(NaiveQuotesInput {
-            mid_up: Some(MicroUsdc(500_000)),
-            mid_dn: Some(MicroUsdc(500_000)),
-            best_bid_up: Some(MicroUsdc(490_000)),
-            best_ask_up: Some(MicroUsdc(510_000)),
-            best_bid_dn: Some(MicroUsdc(490_000)),
-            best_ask_dn: Some(MicroUsdc(510_000)),
-            tick: core_types::TickPrecision::Cent,
-            depth_up: SharesMicro::ZERO,
-            depth_dn: SharesMicro::ZERO,
-            now_ms: start_ms,
-        });
-        assert!(telemetry.naive_engine.active_up_id.is_some());
-        assert!(telemetry.naive_engine.active_dn_id.is_some());
-
-        // Settle at expiry: both primary and naive active orders must be cancelled and unfillable.
+        // Settle at expiry: the primary active order must be cancelled and unfillable.
         let _ = state
             .settle_expired_epoch(
                 expiry_ms,
@@ -2545,26 +2461,10 @@ mod tests {
 
         assert_eq!(state.active_up_id, None);
         assert_eq!(state.active_dn_id, None);
-        assert_eq!(telemetry.naive_engine.active_up_id, None);
-        assert_eq!(telemetry.naive_engine.active_dn_id, None);
         assert!(broker.active_order(Outcome::Up, OrderSide::Buy).is_none());
-        assert!(
-            telemetry
-                .naive_engine
-                .broker
-                .active_order(Outcome::Up, OrderSide::Buy)
-                .is_none()
-        );
-        assert!(
-            telemetry
-                .naive_engine
-                .broker
-                .active_order(Outcome::Down, OrderSide::Buy)
-                .is_none()
-        );
 
         // Trade prints arriving immediately after settlement (even within 40ms cancel latency)
-        // must produce zero fills on either broker.
+        // must produce zero fills.
         let post_fills = broker.on_public_trade(
             Outcome::Up,
             MicroUsdc(470_000),
@@ -2572,14 +2472,6 @@ mod tests {
             expiry_ms + 10,
         );
         assert!(post_fills.is_empty());
-        telemetry.naive_engine.on_public_trade(
-            Outcome::Up,
-            MicroUsdc(470_000),
-            SharesMicro(50 * ONE_SHARE_MICRO),
-            expiry_ms + 10,
-        );
-        assert_eq!(telemetry.naive_engine.ledger.filled_up, SharesMicro::ZERO);
-        assert_eq!(telemetry.naive_engine.ledger.total_fills_count, 0);
     }
 
     #[test]
@@ -2598,8 +2490,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry =
-            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let mut telemetry = BaselineTelemetry::new().unwrap();
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
         let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
@@ -2658,11 +2549,9 @@ mod tests {
         state.set_market(market1.clone());
 
         let broker_config = FifoBrokerConfig::default();
-        let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry =
-            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let mut telemetry = BaselineTelemetry::new().unwrap();
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
         let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
@@ -2743,8 +2632,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry =
-            BaselineTelemetry::new(broker_config, market1.fee_schedule, base_size).unwrap();
+        let mut telemetry = BaselineTelemetry::new().unwrap();
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
         let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();

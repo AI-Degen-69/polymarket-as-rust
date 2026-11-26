@@ -22,7 +22,7 @@ pub mod accounting;
 pub mod error;
 /// Strict FIFO queue priority matching engine with simulated wire latency.
 pub mod fifo_book;
-/// Performance, fill ratio, markout, and null-baseline comparative telemetry.
+/// Performance, fill ratio, and markout telemetry.
 pub mod telemetry;
 
 pub use accounting::{MergeEvent, PaperLedger};
@@ -31,6 +31,4 @@ pub use fifo_book::{
     FifoBrokerConfig, FifoPaperBroker, NewOrderParams, QueueDecayPolicy, SimFill, SimOrder,
     SimOrderStatus,
 };
-pub use telemetry::{
-    BaselineTelemetry, FillMarkoutProbe, NaiveBaselineEngine, NaiveQuotesInput, TrajectorySnapshot,
-};
+pub use telemetry::{BaselineTelemetry, FillMarkoutProbe, TrajectorySnapshot};

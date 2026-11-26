@@ -110,7 +110,6 @@ pub(crate) struct LifecycleReportStats {
     pub(crate) fill_ratio: f64,
     pub(crate) markout_1s_bps: f64,
     pub(crate) markout_5s_bps: f64,
-    pub(crate) baseline_pnl_micro: i64,
 }
 
 impl LifecycleReportStats {
@@ -162,7 +161,6 @@ impl Default for LifecycleReportStats {
             fill_ratio: 0.0,
             markout_1s_bps: 0.0,
             markout_5s_bps: 0.0,
-            baseline_pnl_micro: 0,
         }
     }
 }
@@ -364,7 +362,6 @@ struct LifecycleSummaryEvent<'a> {
     fill_ratio: f64,
     markout_1s_bps: f64,
     markout_5s_bps: f64,
-    baseline_pnl_micro: i64,
     pricing_latency: LatencySummary,
     risk_latency: LatencySummary,
     total_latency: LatencySummary,
@@ -1838,16 +1835,11 @@ fn format_lifecycle_summary(
     } else {
         t.muted(&flattens_raw)
     };
-    let baseline = t.fmt_pnl(stats.baseline_pnl_micro);
     push_summary_section(&mut out, t, "RISK & BREAKERS");
     push_summary_row(
         &mut out,
         t,
-        &[
-            ("Breakers", &breakers),
-            ("Flattens", &flattens),
-            ("Baseline PnL", &baseline),
-        ],
+        &[("Breakers", &breakers), ("Flattens", &flattens)],
     );
 
     out.push_str("\n\n");
@@ -2257,7 +2249,6 @@ pub(crate) fn record_lifecycle_summary_jsonl(
             fill_ratio: stats.fill_ratio,
             markout_1s_bps: stats.markout_1s_bps,
             markout_5s_bps: stats.markout_5s_bps,
-            baseline_pnl_micro: stats.baseline_pnl_micro,
             pricing_latency: *pricing_lat,
             risk_latency: *risk_lat,
             total_latency: *total_lat,
@@ -3264,7 +3255,6 @@ mod summary_tests {
             fill_ratio: 0.42,
             markout_1s_bps: 1.2,
             markout_5s_bps: -0.4,
-            baseline_pnl_micro: 0,
             ..Default::default()
         }
     }
