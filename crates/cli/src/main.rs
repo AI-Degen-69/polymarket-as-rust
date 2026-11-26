@@ -66,6 +66,10 @@ fn default_base_size_shares() -> u64 {
     )
 }
 
+/// Simulated wire place/cancel delay shared by `paper` and `lifecycle`. Not a
+/// `DEFAULTS.json` calibration knob: it models venue latency, not the strategy.
+const DEFAULT_LATENCY_MS: u64 = 40;
+
 fn default_cli_queue_decay() -> CliQueueDecay {
     match default_simulation_settings().queue_decay {
         DefaultQueueDecay::Conservative => CliQueueDecay::Conservative,
@@ -655,7 +659,7 @@ enum Commands {
         #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
         /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
-        #[arg(long, default_value_t = 40)]
+        #[arg(long, default_value_t = DEFAULT_LATENCY_MS)]
         latency_ms: u64,
         /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
         #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
@@ -705,7 +709,7 @@ enum Commands {
         #[arg(long, default_value_t = default_base_size_shares())]
         base_size: u64,
         /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
-        #[arg(long, default_value_t = 40)]
+        #[arg(long, default_value_t = DEFAULT_LATENCY_MS)]
         latency_ms: u64,
         /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
         #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
