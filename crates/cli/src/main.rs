@@ -318,7 +318,7 @@ pub(crate) struct MathOverrides {
     /// Override extreme-probability entry guard in `(0.5, 1.0)` (`0.80` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_prob_override)]
     pub(crate) max_entry_prob: Option<MaxEntryProbOverride>,
-    /// Override upper-only favorite entry price cap in `(0.0, 1.0)` (`0.60` default; pass `off` or `none` to disable).
+    /// Override upper-only favorite entry price cap in `(0.0, 1.0)` (`0.65` default; pass `off` or `none` to disable).
     #[arg(long, value_parser = parse_max_entry_price_override)]
     pub(crate) max_entry_price: Option<MaxEntryPriceOverride>,
     /// Override Binance lead-lag `|delta_p_star|` threshold in `(0.0, 1.0)` (`0.015` default).
@@ -336,7 +336,7 @@ pub(crate) struct MathOverrides {
     /// Override asymmetric reducing-leg skew multiplier in `[0.0, 1.0]` (`1.0` default).
     #[arg(long)]
     pub(crate) hedge_skew_mult: Option<f64>,
-    /// Override whether Tier-1 caps reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (`false` default).
+    /// Override whether Tier-1 caps reducing-leg size to `|Delta_q|` when `|Delta_q| >= 1` share (`true` default).
     #[arg(long)]
     pub(crate) cap_tier1_hedge: Option<bool>,
     /// Override opposing-ask trigger price in `(0.0, 1.0)` unlocking Tier-1/Tier-2 passive 1:1 deficit cross-tick override (`off` disables).
