@@ -63,12 +63,16 @@ Agents use `scripts/sweep-params.ps1` (driving `poly-as lifecycle --source repla
 | :--- | :--- | :--- |
 | **Risk Aversion ($\gamma$)** | `[0.02, 0.05, 0.08, 0.12, 0.15, 0.25]` (`USD^-1`) | `crates/math-engine/src/station4_6_pricer.rs` (`-Gammas`) `[Implemented]` |
 | **Spread & Pair-Cost Bounds** | `include_variance_spread` (`false`/`true`), `min_spread_ticks` (`1`, `2`), `max_combined_bid_micro` (`980000`, `990000`) | `crates/math-engine/src/station4_6_pricer.rs` `[Implemented]` |
-| **Entry Guards** | `max_entry_price` (`0.65`, `off`), `max_entry_prob` (`0.80`, `off`), `max_cross_tick_loss_micro` (`80000`) | `crates/math-engine/src/station4_6_pricer.rs` `[Implemented]` |
+| **Entry Guards** | `max_entry_price` (`0.65` promoted; `off` disables), `max_entry_prob` (`0.80`, `off`), `max_cross_tick_loss_micro` (`80000`) | `crates/math-engine/src/station4_6_pricer.rs` `[Implemented]` |
+| **Entry-Price Cap Boundary** | `max_entry_price` ∈ `{0.60, 0.65, 0.70}` — the promotion `3×3` grid | `crates/math-engine/src/station4_6_pricer.rs`, env `MAX_ENTRY_PRICE` `[Implemented]` |
+| **Entry-Cutoff Boundary** | `entry_cutoff_secs` ∈ `{90, 105, 120}` — the promotion `3×3` grid | `crates/risk-lifecycle/src/lifecycle.rs`, env `ENTRY_CUTOFF_SECS` `[Implemented]` |
 | **Entry Timing Window** | `entry_open_delay_secs` (`15`; `0` disables the opening skip), `entry_cutoff_secs` (`120`; `off` disables the cutoff) | `crates/risk-lifecycle/src/lifecycle.rs` (`LifecycleConfig`), wired from `EngineConfig` by `crates/cli/src/lifecycle_cmd.rs` `[Implemented]` |
 | **Binance Lead-Lag Cancel** | `lead_lag_cancel_threshold` (`0.015`), `lead_lag_window_ms` (`1000`), `lead_lag_cooldown_ms` (`1000`), `lead_lag_directional` (`true`) | `crates/math-engine/src/station2_twap.rs` `[Implemented]` |
 | **Hedge Skew & Tier-1 Cap** | `hedge_skew_mult` (`0.0..1.0`), `cap_tier1_reducing_to_delta` (`false`/`true`) | `crates/risk-lifecycle/src/station7_risk.rs` `[Implemented]` |
 | **Hysteresis Deadband** | `hysteresis_tick_buffer` in **ticks** (e.g. `[0.10, 0.25, 0.50]` ticks; `$0.01` = `100` bps) | `crates/risk-lifecycle/src/station8_hysteresis.rs` `[Planned for sweep CLI]` |
 | **Expiry Lifecycle Cutoffs** | `pre_expiry_lockout_secs` (`60s`), `mandatory_flatten_secs` (`30s`), `terminal_lockout_secs` (`15s`) | `crates/risk-lifecycle/src/lifecycle.rs` (`LifecycleConfig`) `[Planned for sweep CLI]` |
+
+> **Promotion grid (boundary sweep):** promotion is decided on a full `3×3` grid — `MaxEntryPrice ∈ {0.60, 0.65, 0.70}` × `EntryCutoff ∈ {90s, 105s, 120s}` at `Tier1HedgeTrigger = off` — run over the same `20` live captures (`226` windows, `158` IS / `68` OOS), i.e. `9` configurations × `20` captures = `180` replays. This grid, not a single-axis sweep, produced the promoted `#6/9` (`$0.65 / 120s`); the ranking, scoring and `G1–G6` verdicts are in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md).
 
 > **Design Exclusions & Module Note:**
 > * **No static $\kappa$ sweep (`0.5..10.0`):** `crates/math-engine/src/station3_kappa.rs` estimates $\kappa$ dynamically from live L2 depth and clamps it to `[15.0, 200.0]` (fallback `50.0`); values in `0.5..10.0` blow up quoted spreads beyond `[0, 1]`.
@@ -113,7 +117,7 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
                        │ Pass
                        ▼
 ┌──────────────────────────────────────────────────────────┐
-│  Filter 2: Expiry Drag, WinCap & Drawdown Cap            │  --> Fails if MaxDD >= 25% or Unhedged Drag >= 50%
+│  Filter 2: Expiry Drag, WinCap & Drawdown Cap            │  --> Fails if MaxDD > 25% or Drag > 30% or TailDrag > 50%
 └──────────────────────┬───────────────────────────────────┘
                        │ Pass
                        ▼
@@ -147,7 +151,8 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
 2. **Binary Expiry Drag, `V_max` & Drawdown Cap:**
    * Maximum Drawdown across a session must stay below **25%** of allocated working capital.
    * Unhedged notional and final-minute risk must stay strictly within `V_max` (`max_notional_per_leg_micro`) and `LifecycleConfig` bounds enforced by `crates/risk-lifecycle/src/station7_risk.rs`, `lifecycle.rs`, and `breakers.rs`.
-   * Track unhedged expiry settlement drag explicitly: flag any candidate whose net unhedged settlement losses erase `>= 50%` of gross pair-merge spread gains (per findings in `docs/post-run-analysis/24-11_58w/REPORT.md`).
+   * **G5a — unhedged expiry drag `<= 30%`:** net unhedged settlement losses must erase at most **30%** of gross positive pair-merge gains (`Drag = unhedged settlement loss / positive merge gains`). This is the rule the boundary sweep actually applied: Config `#1/9` is ineligible at `33.1%` and `#2/9` at `36.0%` ([boundary-sweep-selection-report.md](boundary-sweep-selection-report.md) §3.4). The drag leak itself was first measured in `docs/post-run-analysis/24-11_58w/REPORT.md`.
+   * **G5b — tail drag `<= 50%` (separate rule):** once negative merge losses are added to the settlement loss (`TailDrag`), at most **50%** of gross positive pair-merge gains may be erased. This is what disqualifies `#4/9` (`50.04%`) and `#5/9` (`51.0%`). `TailDrag` must be measured: an unknown value reports `G5 = N/A` and can never read as `PASS`.
 3. **Out-of-Sample Consistency ($\ge 50\%$ Retention) `[Planned gate]`:**
    * The hidden 30% out-of-sample window set must retain at least **50%** of the `Net+Reb` per window achieved during the 70% in-sample run.
 4. **Minimum Sample Size:**

@@ -264,7 +264,7 @@ p { margin-bottom: 14px; color: var(--txt); }
       <tr>
         <td class="code-cell">G3</td>
         <td>יחס שימור (OOS Retain)</td>
-        <td><code class="en">OOS / IS &ge; 40%</code></td>
+        <td><code class="en">OOS / IS &ge; 50%</code></td>
         <td>מונע רווחיות "מזויפת" שבה ה-OOS רווחי רק ב-1¢ לעומת דולרים באימון.</td>
       </tr>
       <tr>
@@ -384,9 +384,9 @@ function updateSim() {
   } else if (oos <= 0) {
     failedGate = 'G2';
     reason = 'נכשל G2: הפסד במבחן עיוור (OOS <= 0)';
-  } else if ((oos / (is * 0.43)) < 0.4 && (oos / is) < 0.4) {
+  } else if ((oos / (is * 0.43)) < 0.5 && (oos / is) < 0.5) {
     failedGate = 'G3';
-    reason = 'נכשל G3: יחס שימור נמוך מ-40% במבחן עיוור';
+    reason = 'נכשל G3: יחס שימור נמוך מ-50% במבחן עיוור';
   } else if (dd > 25) {
     failedGate = 'G4';
     reason = 'נכשל G4: נפילה מקסימלית (Drawdown) מעל 25%';
