@@ -841,6 +841,158 @@ fn scenario_expiry_ladder(out: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// 10. A partial fill lands while the flatten FAK is still in flight: the single-flight
+//     guard must keep it armed (inventory changed, exposure is not flat), so the actor
+//     cancels resting quotes instead of firing a second FAK; only the 2s guard timeout
+//     releases it, and the refire is for the remaining size, not the original one.
+fn scenario_flatten_partial_fill(out: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
+    let mut rig = Rig::new(16, FaultInjection::None, gate()?, "flatten_partial_fill")?;
+    rig.snapshot(OrderRegistrySnapshot {
+        unhedged_up: sh(19),
+        unhedged_cost_up_micro: us(9_120_000),
+        available_usdc_micro: us(100_000_000),
+        ..Default::default()
+    });
+    rig.quote(proposal(
+        1,
+        EXP - 28_000,
+        EXP,
+        Some(480_000),
+        Some(480_000),
+        Some(510_000),
+        Some(512_000),
+    ));
+    rig.step(1_000_000_000, "t-28-flatten");
+
+    // 6 of 19 filled by the FAK: unhedged is now 13, so `unhedged_up != unhedged_dn`
+    // and the guard is not cleared by the flat check.
+    rig.snapshot(OrderRegistrySnapshot {
+        unhedged_up: sh(13),
+        unhedged_cost_up_micro: us(6_240_000),
+        available_usdc_micro: us(100_000_000),
+        ..Default::default()
+    });
+    rig.quote(proposal(
+        2,
+        EXP - 27_500,
+        EXP,
+        Some(480_000),
+        Some(480_000),
+        Some(510_000),
+        Some(512_000),
+    ));
+    rig.step(1_500_000_000, "partial-fill-in-flight");
+
+    // 2.5s after the FAK went out: the guard has timed out, so the refire is allowed,
+    // and it sizes off the remaining 13 shares rather than the original 19.
+    rig.quote(proposal(
+        3,
+        EXP - 20_000,
+        EXP,
+        Some(480_000),
+        Some(480_000),
+        Some(520_000),
+        Some(522_000),
+    ));
+    rig.step(3_500_000_000, "guard-timeout-refire");
+
+    // The refire filled the rest: equal unhedged legs clear the guard by the flat check.
+    rig.snapshot(OrderRegistrySnapshot {
+        available_usdc_micro: us(100_000_000),
+        ..Default::default()
+    });
+    rig.quote(proposal(
+        4,
+        EXP - 19_000,
+        EXP,
+        Some(480_000),
+        Some(480_000),
+        Some(520_000),
+        Some(522_000),
+    ));
+    rig.step(4_000_000_000, "flatten-complete");
+    rig.state("end");
+    rig.finish(out);
+    Ok(())
+}
+
+// 11. Two flatten sends fail in a row on a full priority lane. A dropped FAK must leave
+//     no armed guard, so the retry is not suppressed by single-flight, and the third
+//     attempt is the one that actually reaches the lane.
+fn scenario_flatten_retry_after_failure(out: &mut Vec<String>) -> Result<(), Box<dyn Error>> {
+    let mut rig = Rig::new(
+        1,
+        FaultInjection::None,
+        gate()?,
+        "flatten_retry_after_failure",
+    )?;
+    rig.snapshot(OrderRegistrySnapshot {
+        unhedged_dn: sh(19),
+        unhedged_cost_dn_micro: us(9_120_000),
+        available_usdc_micro: us(100_000_000),
+        ..Default::default()
+    });
+    rig.harness
+        .priority_tx
+        .try_send(ExecutionCommand::CancelAll {
+            reason: "saturate priority channel (attempt 1)".to_string(),
+        })?;
+    rig.quote(proposal(
+        1,
+        EXP - 27_000,
+        EXP,
+        Some(480_000),
+        Some(470_000),
+        Some(500_000),
+        Some(490_000),
+    ));
+    rig.step(1_000_000, "attempt-1-dropped");
+    rig.state("after-attempt-1");
+
+    rig.harness
+        .priority_tx
+        .try_send(ExecutionCommand::CancelAll {
+            reason: "saturate priority channel (attempt 2)".to_string(),
+        })?;
+    rig.quote(proposal(
+        2,
+        EXP - 26_500,
+        EXP,
+        Some(480_000),
+        Some(470_000),
+        Some(500_000),
+        Some(490_000),
+    ));
+    rig.step(2_000_000, "attempt-2-dropped");
+    rig.state("after-attempt-2");
+
+    rig.quote(proposal(
+        3,
+        EXP - 26_000,
+        EXP,
+        Some(480_000),
+        Some(470_000),
+        Some(500_000),
+        Some(490_000),
+    ));
+    rig.step(3_000_000, "attempt-3-sent");
+
+    // Now that a FAK is genuinely in flight, the guard holds and only cancels are sent.
+    rig.quote(proposal(
+        4,
+        EXP - 25_000,
+        EXP,
+        Some(480_000),
+        Some(470_000),
+        Some(500_000),
+        Some(490_000),
+    ));
+    rig.step(3_100_000, "in-flight-after-retry");
+    rig.state("end");
+    rig.finish(out);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let path = std::env::args()
         .nth(1)
@@ -856,6 +1008,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     scenario_normal_path(&mut lines)?;
     scenario_own_slots(&mut lines)?;
     scenario_expiry_ladder(&mut lines)?;
+    scenario_flatten_partial_fill(&mut lines)?;
+    scenario_flatten_retry_after_failure(&mut lines)?;
 
     let mut body = String::new();
     for line in &lines {
