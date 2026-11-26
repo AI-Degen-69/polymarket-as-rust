@@ -15,7 +15,6 @@ core_affinity.workspace = true
 core-types = { path = "../core-types" }
 hdrhistogram.workspace = true
 math-engine = { path = "../math-engine" }
-paper-sim = { path = "../paper-sim" }
 rtrb.workspace = true
 serde.workspace = true
 serde_json.workspace = true
