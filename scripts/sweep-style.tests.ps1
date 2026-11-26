@@ -124,10 +124,14 @@ try {
     Assert-True ((Get-DisplayWidth $leftUnchanged) -eq ((Get-VisibleText $leftUnchanged).Length)) "unchanged left cell has no double-width glyphs"
 
     # --- Entry-price sweep detection -------------------------------------
-    Assert-True (-not (Test-EntryPriceSwept -Prices @("off"))) "single 'off' entry price hides the MaxPx column"
-    Assert-True (-not (Test-EntryPriceSwept -Prices @("0.65"))) "default 0.65 entry price hides the MaxPx column"
-    Assert-True (Test-EntryPriceSwept -Prices @("0.60")) "non-default 0.60 entry price shows the MaxPx column"
-    Assert-True (Test-EntryPriceSwept -Prices @("off", "0.65")) "two entry prices show the MaxPx column"
+    Assert-True (-not (Test-EntryPriceSwept -Prices @("off") -DefaultEntryPrice 0.65)) "single 'off' entry price hides the MaxPx column"
+    Assert-True (-not (Test-EntryPriceSwept -Prices @("0.65") -DefaultEntryPrice 0.65)) "configured 0.65 entry price hides the MaxPx column"
+    Assert-True (Test-EntryPriceSwept -Prices @("0.60") -DefaultEntryPrice 0.65) "non-default 0.60 entry price shows the MaxPx column"
+    Assert-True (Test-EntryPriceSwept -Prices @("off", "0.65") -DefaultEntryPrice 0.65) "two entry prices show the MaxPx column"
+    Assert-True (-not (Test-EntryPriceSwept -Prices @("off") -DefaultEntryPrice ([double]::NaN))) "cap-off default (NaN) still hides an all-'off' column"
+    $sweptThrew = $false
+    try { $null = Test-EntryPriceSwept -Prices @("0.65") } catch { $sweptThrew = $true }
+    Assert-True $sweptThrew "Test-EntryPriceSwept refuses a call without -DefaultEntryPrice (no hardcoded 0.65)"
 
     # --- Plain mode ------------------------------------------------------
     $script:UseAnsi = $false

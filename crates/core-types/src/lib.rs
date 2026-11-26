@@ -247,6 +247,16 @@ mod tests {
         assert_eq!(cfg.tier1_hedge_trigger_price, None);
         assert_eq!(cfg.entry_open_delay_secs, 15);
         assert_eq!(cfg.entry_cutoff_secs, Some(120));
+        assert_eq!(cfg.execution_mode, ExecutionMode::Paper);
+        assert!(cfg.dry_run);
+        assert_eq!(cfg.relayer_url, "https://relayer-v2.polymarket.com/submit");
+        assert!(cfg.gasless_relayer_enabled);
+        assert_eq!(cfg.hysteresis_tick_buffer, 0.25);
+        assert_eq!(cfg.lead_lag_cancel_threshold, 0.015);
+        assert_eq!(cfg.lead_lag_window_ms, 1_000);
+        assert_eq!(cfg.lead_lag_cooldown_ms, 1_000);
+        assert!(cfg.lead_lag_directional);
+        assert_eq!(cfg.clock_drift_max_ms, 1_000);
 
         let json = serde_json::to_string(&cfg).unwrap();
         let roundtrip: EngineConfig = serde_json::from_str(&json).unwrap();
