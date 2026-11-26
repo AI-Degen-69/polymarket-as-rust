@@ -16,7 +16,7 @@
 
 ### 1.1 Validation of New Telemetry Fields
 
-Five new accounting fields (`#[serde(default)]`) were added to `PaperLedger` ([accounting.rs](../crates/paper-sim/src/accounting.rs#L140-L398)) and exported via `LifecycleSummaryEvent` ([lifecycle_report.rs](../crates/cli/src/lifecycle_report.rs#L333-L371)) and `LivePaperSimulator::finalize_stats` ([lifecycle_cmd.rs](../crates/cli/src/lifecycle_cmd.rs#L2532-L2554)):
+Five new accounting fields (`#[serde(default)]`) were added to `PaperLedger` ([accounting.rs](../crates/paper-sim/src/accounting.rs#L59-L73)) and exported via `LifecycleSummaryEvent` ([lifecycle_report.rs](../crates/cli/src/lifecycle_report.rs#L333-L371)) and `LivePaperSimulator::finalize_stats` ([lifecycle_cmd.rs](../crates/cli/src/lifecycle_cmd.rs#L2459-L2586)):
 
 | Field | Writer(s) | Validation Result |
 | --- | --- | --- |
@@ -66,8 +66,8 @@ Three standalone library constructors keep conservative/minimal struct defaults 
 
 | Struct & Constructor | Field(s) Differing from `DEFAULTS.json` | Impact at Runtime |
 | --- | --- | --- |
-| `RiskConfig::default()` ([station7_risk.rs](../crates/risk-lifecycle/src/station7_risk.rs#L187-L199)) | `cap_tier1_reducing_to_delta: false` (`DEFAULTS.json` = `true`) | **None:** `spawn_managed_session` (`lifecycle_cmd.rs:2627`) overrides from `cfg.cap_tier1_reducing_to_delta`. |
-| `LifecycleConfig::default()` ([lifecycle.rs](../crates/risk-lifecycle/src/lifecycle.rs#L91-L103)) | `entry_open_delay_secs: 0`, `entry_cutoff_secs: None` (`DEFAULTS.json` = `15`, `Some(120)`) | **None:** `build_risk_actor` (`lifecycle_cmd.rs:2577-2578`) overrides from `cfg.entry_open_delay_secs` and `cfg.entry_cutoff_secs`. |
+| `RiskConfig::default()` ([station7_risk.rs](../crates/risk-lifecycle/src/station7_risk.rs#L187-L199)) | `cap_tier1_reducing_to_delta: false` (`DEFAULTS.json` = `true`) | **None:** `spawn_managed_session` (`lifecycle_cmd.rs:2661`) overrides from `cfg.cap_tier1_reducing_to_delta`. |
+| `LifecycleConfig::default()` ([lifecycle.rs](../crates/risk-lifecycle/src/lifecycle.rs#L91-L103)) | `entry_open_delay_secs: 0`, `entry_cutoff_secs: None` (`DEFAULTS.json` = `15`, `Some(120)`) | **None:** `build_risk_actor` (`lifecycle_cmd.rs:2664-2665`) overrides from `cfg.entry_open_delay_secs` and `cfg.entry_cutoff_secs`. |
 | `PricerConfig::from_gamma()` ([station4_6_pricer.rs](../crates/math-engine/src/station4_6_pricer.rs#L37-L50)) | `max_cross_tick_loss_micro: None` (`DEFAULTS.json` = `Some(80_000)`); `max_entry_price: Some(0.60)` differs from `DEFAULTS.json` (`Some(0.65)`) | **None:** CLI and `PricerConfig::try_default()` construct from `EngineConfig`. |
 
 ---

@@ -154,7 +154,7 @@ All `120s` configs are the best entry cutoff tested in this sweep (`120s` is the
 
 ### 4.3 Criticality: Why `#6/9` Is a *Provisional* Research Baseline (Not Production-Validated)
 
-The `+2.2`-point weighted margin (`79.9` vs `77.7`) over `#3/9` rests on a **226-window sample** with **`336` fills** (below [strategy-verification-spec.md](strategy-verification-spec.md#L153)'s `400`-fill minimum) where `20` captures are heavily influenced by `Cap#20` (`+$21.24`, `36.1%` of `#6`'s total Net P&L). Therefore, `#6/9` is promoted strictly as the **next research baseline**, while `#3/9` remains the top benchmark challenger for independent sample validation.
+The `+2.2`-point weighted margin (`79.9` vs `77.7`) over `#3/9` rests on a **226-window sample** with **`336` fills** (below [strategy-verification-spec.md](strategy-verification-spec.md#L159)'s `400`-fill minimum) where `20` captures are heavily influenced by `Cap#20` (`+$21.24`, `36.1%` of `#6`'s total Net P&L). Therefore, `#6/9` is promoted strictly as the **next research baseline**, while `#3/9` remains the top benchmark challenger for independent sample validation.
 
 ---
 
