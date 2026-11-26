@@ -166,6 +166,44 @@ pub enum FaultInjection {
 /// Default maximum duration (`2s`) a single-flight flatten lock remains active without ACK/clear.
 pub const DEFAULT_FLATTEN_IN_FLIGHT_TIMEOUT_NS: u64 = 2_000_000_000;
 
+/// Per-tick values shared by every trace exit, captured before the first check runs.
+struct TraceCtx {
+    now_ms: u64,
+    tau_secs: u64,
+    breaker: BreakerStatus,
+    best_bid_up: Option<MicroUsdc>,
+    best_ask_up: Option<MicroUsdc>,
+    best_bid_dn: Option<MicroUsdc>,
+    best_ask_dn: Option<MicroUsdc>,
+    started: std::time::Instant,
+}
+
+/// The parts of a trace that each exit path decides for itself.
+struct TraceExit {
+    phase: EpochPhase,
+    tier: RiskTier,
+    utilization_u_e6: u64,
+    action_up: OrderAction,
+    action_dn: OrderAction,
+    flatten_action: FlattenAction,
+    cancel_all_reason: Option<String>,
+}
+
+impl TraceExit {
+    /// Exit that ends before Station 7 measures exposure, so risk values stay at 0.
+    fn placeholder(phase: EpochPhase, tier: RiskTier, cancel_all_reason: Option<String>) -> Self {
+        Self {
+            phase,
+            tier,
+            utilization_u_e6: 0,
+            action_up: OrderAction::Hold,
+            action_dn: OrderAction::Hold,
+            flatten_action: FlattenAction::None,
+            cancel_all_reason,
+        }
+    }
+}
+
 /// Unified telemetry trace record emitted by the Risk Actor on every evaluation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RiskActorTrace {
@@ -536,6 +574,16 @@ impl RiskActor {
 
         // 2. Evaluate Circuit Breakers:
         let breaker_status = self.breakers.check_status(now_ns, clock_offset_ms);
+        let ctx = TraceCtx {
+            now_ms,
+            tau_secs,
+            breaker: breaker_status,
+            best_bid_up: proposal.best_bid_up,
+            best_ask_up: proposal.best_ask_up,
+            best_bid_dn: proposal.best_bid_dn,
+            best_ask_dn: proposal.best_ask_dn,
+            started: start_time,
+        };
         if let BreakerStatus::Tripped { reason } = breaker_status {
             let cancel_reason = format!("Circuit breaker tripped: {reason:?}");
             let _ = self
@@ -544,24 +592,14 @@ impl RiskActor {
                 .try_send(ExecutionCommand::CancelAll {
                     reason: cancel_reason.clone(),
                 });
-            return Ok(Some(RiskActorTrace {
-                now_ms,
-                tau_secs,
-                phase: EpochPhase::ActiveQuoting,
-                tier: RiskTier::Tier4HardStop,
-                utilization_u_e6: 0,
-                breaker: breaker_status,
-                action_up: OrderAction::Hold,
-                action_dn: OrderAction::Hold,
-                flatten_action: FlattenAction::None,
-                cancel_all_reason: Some(cancel_reason),
-                flatten_in_flight: self.flatten_in_flight,
-                best_bid_up: proposal.best_bid_up,
-                best_ask_up: proposal.best_ask_up,
-                best_bid_dn: proposal.best_bid_dn,
-                best_ask_dn: proposal.best_ask_dn,
-                risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-            }));
+            return Ok(Some(self.build_trace(
+                &ctx,
+                TraceExit::placeholder(
+                    EpochPhase::ActiveQuoting,
+                    RiskTier::Tier4HardStop,
+                    Some(cancel_reason),
+                ),
+            )));
         }
 
         // Clear stale or completed single-flight flatten guards before evaluating lifecycle/risk.
@@ -613,24 +651,10 @@ impl RiskActor {
                     .try_send(ExecutionCommand::CancelAll {
                         reason: reason.clone(),
                     });
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier1Normal,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action: FlattenAction::None,
-                    cancel_all_reason: Some(reason),
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit::placeholder(phase, RiskTier::Tier1Normal, Some(reason)),
+                )))
             }
             LifecycleAction::ExecuteFlattenFak {
                 outcome,
@@ -679,24 +703,14 @@ impl RiskActor {
                             )
                         }
                     };
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier4HardStop,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action,
-                    cancel_all_reason,
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit {
+                        flatten_action,
+                        cancel_all_reason,
+                        ..TraceExit::placeholder(phase, RiskTier::Tier4HardStop, None)
+                    },
+                )))
             }
             LifecycleAction::ResidualDustUnflattenable {
                 unhedged_shares,
@@ -710,27 +724,16 @@ impl RiskActor {
                     .try_send(ExecutionCommand::CancelAll {
                         reason: reason.clone(),
                     });
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier4HardStop,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action: FlattenAction::ResidualDust {
-                        unhedged_shares,
-                        min_order_size,
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit {
+                        flatten_action: FlattenAction::ResidualDust {
+                            unhedged_shares,
+                            min_order_size,
+                        },
+                        ..TraceExit::placeholder(phase, RiskTier::Tier4HardStop, Some(reason))
                     },
-                    cancel_all_reason: Some(reason),
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                )))
             }
             LifecycleAction::EpochRollover {
                 expired_expiry_ms,
@@ -746,24 +749,10 @@ impl RiskActor {
                     .try_send(ExecutionCommand::CancelAll {
                         reason: reason.clone(),
                     });
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: RiskTier::Tier1Normal,
-                    utilization_u_e6: 0,
-                    breaker: breaker_status,
-                    action_up: OrderAction::Hold,
-                    action_dn: OrderAction::Hold,
-                    flatten_action: FlattenAction::None,
-                    cancel_all_reason: Some(reason),
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit::placeholder(phase, RiskTier::Tier1Normal, Some(reason)),
+                )))
             }
             LifecycleAction::ContinueQuoting {
                 prohibit_accumulation,
@@ -985,24 +974,18 @@ impl RiskActor {
 
                 self.last_processed_seq = proposal.seq;
 
-                Ok(Some(RiskActorTrace {
-                    now_ms,
-                    tau_secs,
-                    phase,
-                    tier: risk_decision.tier,
-                    utilization_u_e6: risk_decision.utilization_u_e6,
-                    breaker: breaker_status,
-                    action_up,
-                    action_dn,
-                    flatten_action: trace_flatten,
-                    cancel_all_reason,
-                    flatten_in_flight: self.flatten_in_flight,
-                    best_bid_up: proposal.best_bid_up,
-                    best_ask_up: proposal.best_ask_up,
-                    best_bid_dn: proposal.best_bid_dn,
-                    best_ask_dn: proposal.best_ask_dn,
-                    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
-                }))
+                Ok(Some(self.build_trace(
+                    &ctx,
+                    TraceExit {
+                        phase,
+                        tier: risk_decision.tier,
+                        utilization_u_e6: risk_decision.utilization_u_e6,
+                        action_up,
+                        action_dn,
+                        flatten_action: trace_flatten,
+                        cancel_all_reason,
+                    },
+                )))
             }
         }
     }
@@ -1091,6 +1074,28 @@ impl RiskActor {
     pub fn clear_flatten_in_flight(&mut self) {
         self.flatten_in_flight = false;
         self.flatten_in_flight_since_ns = None;
+    }
+
+    /// Builds the one trace record for this tick from the shared context and the exit's outcome.
+    fn build_trace(&self, ctx: &TraceCtx, exit: TraceExit) -> RiskActorTrace {
+        RiskActorTrace {
+            now_ms: ctx.now_ms,
+            tau_secs: ctx.tau_secs,
+            phase: exit.phase,
+            tier: exit.tier,
+            utilization_u_e6: exit.utilization_u_e6,
+            breaker: ctx.breaker,
+            action_up: exit.action_up,
+            action_dn: exit.action_dn,
+            flatten_action: exit.flatten_action,
+            cancel_all_reason: exit.cancel_all_reason,
+            flatten_in_flight: self.flatten_in_flight,
+            best_bid_up: ctx.best_bid_up,
+            best_ask_up: ctx.best_ask_up,
+            best_bid_dn: ctx.best_bid_dn,
+            best_ask_dn: ctx.best_ask_dn,
+            risk_eval_ns: ctx.started.elapsed().as_nanos() as u64,
+        }
     }
 
     /// Records receipt of a Polymarket feed message for the staleness breaker.
