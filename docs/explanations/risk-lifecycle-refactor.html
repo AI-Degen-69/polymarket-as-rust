@@ -1,0 +1,467 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Risk lifecycle refactor — what is actually changing</title>
+<style>
+  :root{
+    --bg:#0b0f14; --panel:#121a23; --panel-2:#0f151d; --line:#22303d;
+    --text:#e6edf3; --muted:#93a3b3; --teal:#2dd4bf; --amber:#f0b429;
+    --red:#f87171; --green:#4ade80; --violet:#a78bfa;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:radial-gradient(1200px 600px at 15% -10%,#12202b 0%,transparent 60%),var(--bg);
+    color:var(--text);
+    font:16px/1.6 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1060px;margin:0 auto;padding:0 24px 96px}
+  a{color:var(--teal)}
+  h1,h2,h3{line-height:1.2;letter-spacing:-.01em;margin:0}
+  h1{font-size:clamp(28px,4.4vw,46px);font-weight:750}
+  h2{font-size:clamp(21px,2.6vw,28px);font-weight:700;margin:0 0 6px}
+  h3{font-size:17px;font-weight:650;margin:0 0 6px}
+  p{margin:10px 0}
+  code,kbd{font-family:var(--mono);font-size:.9em}
+  .inline-code{background:#1b2632;border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-family:var(--mono);font-size:.86em;color:#cfe6f5}
+
+  header.hero{padding:72px 0 40px;border-bottom:1px solid var(--line)}
+  .eyebrow{font-family:var(--mono);font-size:12.5px;letter-spacing:.16em;text-transform:uppercase;color:var(--teal);margin-bottom:16px}
+  .lede{font-size:clamp(16px,1.9vw,19px);color:#c3d0dd;max-width:72ch;margin-top:18px}
+  .lede strong{color:#fff}
+
+  .verdict{
+    margin-top:30px;display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;
+  }
+  .vcard{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .vcard .k{font-family:var(--mono);font-size:11.5px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+  .vcard .v{font-size:19px;font-weight:650;margin-top:4px}
+  .vcard.is-good{border-color:#1f4d3f;background:linear-gradient(180deg,#10241f,#121a23)}
+
+  section{padding:54px 0;border-bottom:1px solid var(--line)}
+  section:last-of-type{border-bottom:none}
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin-bottom:10px}
+
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  .grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+  @media(max-width:820px){.grid-2,.grid-3{grid-template-columns:1fr}}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px}
+  .panel.sub{background:var(--panel-2)}
+
+  pre{
+    margin:10px 0 0;background:#0a1017;border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;overflow:auto;font-family:var(--mono);font-size:12.5px;line-height:1.65;color:#c8d6e3;
+  }
+  pre .add{color:#7ee2b8}
+  pre .del{color:#ff9d9d}
+  pre .cmt{color:#6b7d8f}
+  pre .key{color:#8fd3ff}
+
+  .tag{display:inline-block;font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+    padding:2px 8px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .tag.teal{color:var(--teal);border-color:#1d4f49;background:#0d2523}
+  .tag.amber{color:var(--amber);border-color:#4d3c14;background:#251f0d}
+  .tag.red{color:var(--red);border-color:#4d1f1f;background:#250f0f}
+
+  /* step flow diagram */
+  .flow{display:flex;flex-direction:column;gap:0}
+  .fnode{
+    display:grid;grid-template-columns:44px 1fr auto;gap:14px;align-items:center;
+    background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 16px;
+  }
+  .fnode .n{font-family:var(--mono);font-size:12px;color:var(--muted);text-align:center;
+    border:1px solid var(--line);border-radius:8px;padding:4px 0}
+  .fnode .t{font-weight:600;font-size:14.5px}
+  .fnode .d{color:var(--muted);font-size:13px}
+  .fnode.hot{border-color:#4d3c14;background:linear-gradient(180deg,#1c1a10,#121a23)}
+  .fnode.cool{border-color:#1d4f49;background:linear-gradient(180deg,#0e2422,#121a23)}
+  .fnode .badge{font-family:var(--mono);font-size:11px;color:var(--muted)}
+  .farrow{height:18px;width:2px;background:linear-gradient(180deg,var(--line),transparent);margin-left:38px}
+
+  /* before/after columns */
+  .ba{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.ba{grid-template-columns:1fr}}
+  .ba h3{display:flex;align-items:center;gap:8px}
+
+  /* metrics */
+  .metric{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .metric .num{font-family:var(--mono);font-size:30px;font-weight:600;letter-spacing:-.02em}
+  .metric .lbl{color:var(--muted);font-size:13px;margin-top:2px}
+  .metric .delta{font-family:var(--mono);font-size:12px;margin-top:8px}
+  .up{color:var(--amber)} .down{color:var(--green)}
+
+  /* bar chart */
+  .bars{display:flex;flex-direction:column;gap:14px;margin-top:16px}
+  .barrow{display:grid;grid-template-columns:150px 1fr 62px;gap:12px;align-items:center;font-size:13.5px}
+  .track{background:#0a1017;border:1px solid var(--line);border-radius:6px;height:22px;overflow:hidden}
+  .fill{height:100%;border-radius:5px 0 0 5px;transition:width .9s cubic-bezier(.3,.8,.2,1)}
+  .fill.old{background:linear-gradient(90deg,#5b3b3b,#7c4d4d)}
+  .fill.new{background:linear-gradient(90deg,#1c5f56,#2dd4bf)}
+  .barrow .val{font-family:var(--mono);text-align:right;color:#cfe6f5}
+  .barrow .lbl{color:var(--muted)}
+
+  /* pipeline */
+  .pipe{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-top:18px}
+  @media(max-width:820px){.pipe{grid-template-columns:1fr 1fr}}
+  .pstep{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px}
+  .pstep .i{font-family:var(--mono);font-size:11px;color:var(--teal)}
+  .pstep .h{font-weight:650;font-size:14px;margin:4px 0 2px}
+  .pstep .b{color:var(--muted);font-size:12.5px}
+
+  table{width:100%;border-collapse:collapse;margin-top:14px;font-size:14px}
+  th,td{text-align:left;padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{font-family:var(--mono);font-size:11.5px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:500}
+  td.mono{font-family:var(--mono);font-size:12.5px;color:#cfe6f5}
+  tbody tr:hover{background:#101822}
+
+  .callout{border-left:3px solid var(--teal);background:#0d1b20;border-radius:0 10px 10px 0;padding:14px 18px;margin:18px 0}
+  .callout.warn{border-left-color:var(--amber);background:#1c1a10}
+  .callout.bad{border-left-color:var(--red);background:#1c1213}
+  .callout .h{font-weight:650;margin-bottom:4px}
+
+  .timeline{position:relative;margin-top:20px;padding-left:26px}
+  .timeline:before{content:"";position:absolute;left:7px;top:6px;bottom:6px;width:2px;background:var(--line)}
+  .tl{position:relative;margin:0 0 22px}
+  .tl:before{content:"";position:absolute;left:-24px;top:7px;width:10px;height:10px;border-radius:50%;
+    background:var(--teal);box-shadow:0 0 0 4px #0b0f14}
+  .tl .sha{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .tl .t{font-weight:650;margin:2px 0 4px}
+  .tl .b{color:#bccbd8;font-size:14px}
+
+  .tabs{display:flex;gap:6px;margin-top:14px;flex-wrap:wrap}
+  .tabbtn{font:inherit;font-size:13px;padding:6px 12px;border-radius:999px;border:1px solid var(--line);
+    background:#0f151d;color:var(--muted);cursor:pointer}
+  .tabbtn[aria-selected="true"]{color:#08211d;background:var(--teal);border-color:var(--teal);font-weight:650}
+  .tabbtn:focus-visible{outline:2px solid var(--teal);outline-offset:2px}
+  .tabpanel[hidden]{display:none}
+
+  footer{padding:44px 0 0;color:var(--muted);font-size:13px}
+  .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:10px;font-size:12.5px;color:var(--muted)}
+  .legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:middle}
+  @media(prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important;scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="hero">
+  <div class="eyebrow">crates/risk-lifecycle/src/runtime.rs</div>
+  <h1>What the refactor actually changes — and what the riskdiff is for</h1>
+  <p class="lede">
+    Two separate things keep getting mixed together. The <strong>refactor</strong> makes one 512-line function
+    readable and removes six copies of a 29-field struct. The <strong>riskdiff</strong> is not part of that change:
+    it is the evidence that the change did not alter behaviour. This page shows both, with the real numbers.
+  </p>
+
+  <div class="verdict">
+    <div class="vcard"><div class="k">Files changed</div><div class="v">1 &nbsp;<span style="color:var(--muted);font-size:14px">runtime.rs</span></div>
+      <div style="color:var(--muted);font-size:13px;margin-top:4px">+483 / −252 lines</div></div>
+    <div class="vcard"><div class="k"><code>step</code> size</div><div class="v">512 → 328 lines</div>
+      <div style="color:var(--muted);font-size:13px;margin-top:4px">−36% in the hot function</div></div>
+    <div class="vcard"><div class="k">Trace struct literals</div><div class="v">6 → 1</div>
+      <div style="color:var(--muted);font-size:13px;margin-top:4px">in <code>step</code>'s exit paths</div></div>
+    <div class="vcard is-good"><div class="k">Behaviour</div><div class="v" style="color:var(--green)">Unchanged</div>
+      <div style="color:var(--muted);font-size:13px;margin-top:4px">traces identical on 2 captures</div></div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="kicker">The starting point</div>
+  <h2>One function did everything, and every exit rebuilt the whole trace</h2>
+  <p>
+    <span class="inline-code">RiskActor::step</span> is the risk actor's per-tick entry point: it checks circuit breakers,
+    runs the lifecycle phase machine, measures exposure, decides whether to quote, reduce or flatten, and emits a
+    <span class="inline-code">RiskActorTrace</span> — 29 fields of telemetry — on the way out.
+  </p>
+  <p>
+    On <span class="inline-code">main</span> that function was 512 lines with <em>six</em> different return points.
+    Each return point wrote its own full <span class="inline-code">RiskActorTrace { … }</span> literal, listing the
+    same 16 tick-invariant values by hand. That is the actual defect being fixed: not style, but
+    <strong>six places that must agree</strong>.
+  </p>
+
+  <div class="grid-2" style="margin-top:22px">
+    <div class="panel">
+      <h3>What that costs</h3>
+      <p style="color:#bccbd8;font-size:14.5px;margin-bottom:0">
+        Add one field to the trace and you edit six literals. Miss one exit and that path silently reports a
+        different shape than the others — a telemetry bug that no test catches unless the test targets
+        <em>that specific</em> exit. Two exits had no actor-level test at all: residual dust in the flatten
+        window, and the one-shot epoch rollover.
+      </p>
+    </div>
+    <div class="panel">
+      <h3>Why it was never noticed</h3>
+      <p style="color:#bccbd8;font-size:14.5px;margin-bottom:0">
+        The exits almost always produce the same values, because most of the trace is copied from inputs.
+        A divergence only shows up on a rare path — one that fires once per epoch, or only when a position is
+        too small to flatten. Those are precisely the paths this refactor touches.
+      </p>
+    </div>
+  </div>
+</section>
+
+<section id="trace">
+  <div class="kicker">Change 1 · commit b54db8b</div>
+  <h2>Build the trace once per tick, let each exit describe only its decision</h2>
+  <p>
+    The trace splits into two halves: what is true for the whole tick, and what this particular exit decided.
+    The first half is captured once into a <span class="inline-code">TraceCtx</span>; the second is a small
+    <span class="inline-code">TraceExit</span>. One builder assembles both into the 29-field record.
+  </p>
+
+  <div class="grid-3" style="margin-top:20px">
+    <div class="panel sub">
+      <div class="tag teal">TraceCtx</div>
+      <h3 style="margin-top:10px">tick-invariant</h3>
+      <p style="color:var(--muted);font-size:13.5px;margin:6px 0 0">
+        now_ms, tau_secs, breaker, the four best bid/ask quotes, start Instant.
+        Captured once, identical for every exit by construction.
+      </p>
+    </div>
+    <div class="panel sub">
+      <div class="tag amber">TraceExit</div>
+      <h3 style="margin-top:10px">what this exit decided</h3>
+      <p style="color:var(--muted);font-size:13.5px;margin:6px 0 0">
+        phase, tier, utilization, action_up, action_dn, flatten_action, cancel_all_reason — 7 fields.
+        <span class="inline-code">TraceExit::placeholder()</span> covers the exits that return before Station 7
+        measures exposure.
+      </p>
+    </div>
+    <div class="panel sub">
+      <div class="tag">build_trace()</div>
+      <h3 style="margin-top:10px">the only place a full record is written</h3>
+      <p style="color:var(--muted);font-size:13.5px;margin:6px 0 0">
+        A new field now means one edit in one function. The six exits cannot disagree any more,
+        because none of them builds the record.
+      </p>
+    </div>
+  </div>
+
+  <div class="tabs" role="tablist" aria-label="Trace construction before and after">
+    <button class="tabbtn" role="tab" id="t-before" aria-controls="p-before" aria-selected="true">Before · 6 literals</button>
+    <button class="tabbtn" role="tab" id="t-after" aria-controls="p-after" aria-selected="false">After · 1 builder</button>
+  </div>
+
+  <div class="tabpanel" id="p-before" role="tabpanel" aria-labelledby="t-before">
+<pre><span class="cmt">// one of six, at each exit — main (fecef0d)</span>
+return Ok(Some(<span class="key">RiskActorTrace</span> {
+    now_ms, tau_secs, phase, tier,
+    utilization_u_e6, breaker: breaker_status,
+    action_up: OrderAction::Hold,
+    action_dn: OrderAction::Hold,
+    flatten_action: FlattenAction::None,
+    cancel_all_reason: Some(reason.clone()),
+    flatten_in_flight: self.flatten_in_flight,
+    best_bid_up, best_ask_up, best_bid_dn, best_ask_dn,
+    risk_eval_ns: start_time.elapsed().as_nanos() as u64,
+}));</pre>
+    <p style="color:var(--muted);font-size:13px;margin-top:8px">
+      × 6 exits. 16 fields copied by hand each time; 29 fields on the struct since some are only set elsewhere.
+    </p>
+  </div>
+
+  <div class="tabpanel" id="p-after" role="tabpanel" aria-labelledby="t-after" hidden>
+<pre><span class="cmt">// each exit now states only what it decided — branch (4aa69e1)</span>
+Ok(Some(self.<span class="key">build_trace</span>(
+    &amp;ctx,
+    <span class="key">TraceExit</span> {
+        tier: RiskTier::Tier4HardStop,
+        flatten_action: FlattenAction::FlattenFak { .. },
+        ..TraceExit::<span class="key">placeholder</span>(phase, RiskTier::Tier4HardStop, None)
+    },
+)))
+
+<span class="cmt">// and once, in one place:</span>
+fn <span class="key">build_trace</span>(&amp;self, ctx: &amp;TraceCtx, exit: TraceExit) -&gt; RiskActorTrace {
+    RiskActorTrace { now_ms: ctx.now_ms, tau_secs: ctx.tau_secs, .., .. }
+}</pre>
+    <p style="color:var(--muted);font-size:13px;margin-top:8px">
+      Struct-update syntax means an exit overrides only its own fields; everything else comes from the placeholder.
+    </p>
+  </div>
+
+  <table>
+    <thead><tr><th>Metric</th><th>main · fecef0d</th><th>branch · 4aa69e1</th></tr></thead>
+    <tbody>
+      <tr><td>Full trace literals inside <code>step</code></td><td class="mono">6</td><td class="mono" style="color:var(--green)">0</td></tr>
+      <tr><td>Functions that build a trace</td><td class="mono">6 (inline)</td><td class="mono" style="color:var(--green)">1</td></tr>
+      <tr><td>Fields a new exit must restate</td><td class="mono">16</td><td class="mono" style="color:var(--green)">1–7</td></tr>
+      <tr><td>Actor-level exit tests</td><td class="mono">4</td><td class="mono" style="color:var(--green)">6</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section id="step">
+  <div class="kicker">Change 2 · commit 4aa69e1</div>
+  <h2>Lift the dense blocks out of <code>step</code> into named owners</h2>
+  <p>
+    Three blocks in the middle of <span class="inline-code">step</span> carried long inline reasoning. Each became a
+    named helper with a single job and a doc comment, which is also what makes them individually testable.
+  </p>
+
+  <div class="grid-3" style="margin-top:20px">
+    <div class="panel">
+      <div class="tag teal">fn snapshot_without_own_slots</div>
+      <h3 style="margin-top:10px">measure exposure without counting yourself</h3>
+      <p style="color:#bccbd8;font-size:14px;margin:6px 0 0">
+        Subtracts the actor's own live resting orders from the registry snapshot — shares, notional and the
+        released cash — so a single-slot replacement cannot look like external exposure or committed cash.
+      </p>
+    </div>
+    <div class="panel">
+      <div class="tag amber">fn send_risk_flatten</div>
+      <h3 style="margin-top:10px">Tier-4 flatten send, with its failure path</h3>
+      <p style="color:#bccbd8;font-size:14px;margin:6px 0 0">
+        Sends the flatten on the priority lane and reports a channel failure as a trace reason instead of
+        dropping it. Before, that reporting was tangled into the branch that decides to flatten.
+      </p>
+    </div>
+    <div class="panel">
+      <div class="tag">fn apply_size_overlay</div>
+      <h3 style="margin-top:10px">phase and hedge size overlay</h3>
+      <p style="color:#bccbd8;font-size:14px;margin:6px 0 0">
+        Applies the epoch-phase size rules and hedge skew to the risk engine's sizing decision, in one place
+        instead of interleaved with quoting logic.
+      </p>
+    </div>
+  </div>
+
+  <h3 style="margin-top:34px">The exit paths, and where the record is built now</h3>
+  <p style="color:var(--muted);font-size:14px">Six returns; one of them falls through to the measured path.</p>
+  <div class="flow" style="margin-top:14px">
+    <div class="fnode"><div class="n">1</div><div><div class="t">Circuit breaker tripped</div>
+      <div class="d">Cancels everything on the priority lane, exits before exposure is measured</div></div>
+      <div class="badge">placeholder</div></div>
+    <div class="farrow"></div>
+    <div class="fnode"><div class="n">2</div><div><div class="t">Terminal lockout action</div>
+      <div class="d">Epoch is inside the final 15s; lifecycle emergency command is emitted</div></div>
+      <div class="badge">placeholder</div></div>
+    <div class="farrow"></div>
+    <div class="fnode hot"><div class="n">3</div><div><div class="t">Tier-4 hard stop → flatten</div>
+      <div class="d">Utilization over the hard-stop threshold; sends ExecuteFlattenFak</div></div>
+      <div class="badge">Tier4HardStop</div></div>
+    <div class="farrow"></div>
+    <div class="fnode hot"><div class="n">4</div><div><div class="t">Tier-4 flatten send failed</div>
+      <div class="d">Priority channel refused the command; reason is carried into the trace</div></div>
+      <div class="badge">Tier4HardStop + reason</div></div>
+    <div class="farrow"></div>
+    <div class="fnode"><div class="n">5</div><div><div class="t">Residual dust unflattenable</div>
+      <div class="d">Net delta below the exchange minimum order size — cannot be flattened</div></div>
+      <div class="badge">placeholder</div></div>
+    <div class="farrow"></div>
+    <div class="fnode cool"><div class="n">6</div><div><div class="t">Normal evaluation</div>
+      <div class="d">Station 7 runs; utilization and quote actions are the real ones</div></div>
+      <div class="badge">measured</div></div>
+  </div>
+
+  <div class="bars">
+    <div class="barrow"><div class="lbl"><code>step</code> on main</div>
+      <div class="track"><div class="fill old" data-w="100%" style="width:0"></div></div><div class="val">512</div></div>
+    <div class="barrow"><div class="lbl"><code>step</code> on branch</div>
+      <div class="track"><div class="fill new" data-w="64%" style="width:0"></div></div><div class="val">328</div></div>
+  </div>
+  <p style="color:var(--muted);font-size:13px;margin-top:10px">
+    The 184 lines did not disappear — they moved into the three helpers and the trace builder, each with one owner.
+  </p>
+</section>
+
+<section id="safety">
+  <div class="kicker">Change 3 · commit 1e54c4a</div>
+  <h2>Nothing above is provable by reading it — so first, a fingerprint</h2>
+  <p>
+    The first commit is the one that makes the other two safe: it adds tests for the two uncovered exits
+    (residual dust, epoch rollover) and asserts the <em>full trace shape</em> — tier, utilization, both quote
+    actions, flatten state, cancel-all reason — on the breaker, flatten and normal paths. That gives every exit a
+    behaviour fingerprint to preserve.
+  </p>
+
+  <div class="timeline">
+    <div class="tl"><div class="sha">1e54c4a</div><div class="t">test: pin every RiskActor exit path</div>
+      <div class="b">2 new exit tests, full-trace assertions on 3 existing ones. No production code changes.</div></div>
+    <div class="tl"><div class="sha">b54db8b</div><div class="t">refactor: build the risk trace once per tick</div>
+      <div class="b">6 literals → 1 builder. TraceCtx / TraceExit split. Tests must still see identical values.</div></div>
+    <div class="tl"><div class="sha">4aa69e1</div><div class="t">refactor: lift the sizing seams out of step</div>
+      <div class="b">3 helpers extracted, step 512 → 328 lines. Same traces, field for field.</div></div>
+  </div>
+
+  <h3 style="margin-top:34px">Then, evidence at the level unit tests cannot reach</h3>
+  <div class="pipe">
+    <div class="pstep"><div class="i">01</div><div class="h">Build both</div><div class="b">CLI from main and from the branch</div></div>
+    <div class="pstep"><div class="i">02</div><div class="h">Replay</div><div class="b">Same recorded market data into each; main twice</div></div>
+    <div class="pstep"><div class="i">03</div><div class="h">Normalize</div><div class="b">Drop timestamps and latency histograms only</div></div>
+    <div class="pstep"><div class="i">04</div><div class="h">Noise floor</div><div class="b">main vs main: must be identical, else nothing means anything</div></div>
+    <div class="pstep"><div class="i">05</div><div class="h">Compare</div><div class="b">main vs branch, line for line</div></div>
+  </div>
+
+  <table>
+    <thead><tr><th>Capture</th><th>Size of input</th><th>Trace lines, both sides</th><th>Result</th></tr></thead>
+    <tbody>
+      <tr><td>Real recording <code>24-11_11-40-00Z</code></td><td class="mono">1.83 GB · 88,512 order actions</td>
+        <td class="mono">88,628</td><td><span class="tag teal">identical</span></td></tr>
+      <tr><td>Synthetic <code>synth.jsonl</code></td><td class="mono">458 lines · 1 fill, 1 cancel_all, 1 flatten</td>
+        <td class="mono">6,054</td><td><span class="tag teal">identical</span></td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout">
+    <div class="h">Why both captures</div>
+    The real recording proves the branch behaves like main across 88,512 order events — but it never holds a
+    one-sided position into the final 30 seconds, so it never flattens. None of the 21 recordings on disk does.
+    The synthetic capture exists for exactly the exits the real data cannot reach: a fill, then expiry with the
+    position open, which produced <code>cancel_all</code> at T−30 and a real <code>flatten</code> order.
+  </div>
+</section>
+
+<section id="limits">
+  <div class="kicker">What this is not</div>
+  <h2>Scope, honestly</h2>
+  <table>
+    <thead><tr><th>Claim</th><th>Status</th></tr></thead>
+    <tbody>
+      <tr><td>Behaviour unchanged on 88k real order events</td><td><span class="tag teal">verified</span></td></tr>
+      <tr><td>Flatten and cancel-all paths produce identical traces</td><td><span class="tag teal">verified</span></td></tr>
+      <tr><td>Faster execution</td><td><span class="tag amber">not claimed, not measured</span></td></tr>
+      <tr><td>Residual-dust flatten path</td><td><span class="tag amber">unit test only</span></td></tr>
+      <tr><td>Multi-window rollover under load</td><td><span class="tag amber">single window only</span></td></tr>
+      <tr><td>Live behaviour against the exchange</td><td><span class="tag red">not covered</span></td></tr>
+    </tbody>
+  </table>
+  <p style="color:var(--muted);font-size:14px">
+    The synthetic flatten that fired is the hedge variant — buy the opposite outcome at the ask — not the
+    residual-dust variant. That one is pinned by <code>test_mandatory_flatten_residual_dust_is_unflattenable</code>.
+  </p>
+</section>
+
+<footer>
+  Numbers taken from <code>git diff fecef0d...4aa69e1 -- crates/risk-lifecycle/src/runtime.rs</code> and two
+  <code>riskdiff.ps1</code> runs. main = fecef0d, branch = 4aa69e1.
+</footer>
+</div>
+
+<script>
+  // tabs
+  const tabs = [document.getElementById('t-before'), document.getElementById('t-after')];
+  const panels = [document.getElementById('p-before'), document.getElementById('p-after')];
+  tabs.forEach((btn, i) => btn.addEventListener('click', () => {
+    tabs.forEach((b, j) => { b.setAttribute('aria-selected', String(i === j)); panels[j].hidden = i !== j; });
+  }));
+
+  // bar chart grows once visible
+  const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  const fills = document.querySelectorAll('.fill');
+  if (reduce) { fills.forEach(f => f.style.width = f.dataset.w); }
+  else {
+    const io = new IntersectionObserver(entries => {
+      entries.forEach(e => { if (e.isIntersecting) { e.target.style.width = e.target.dataset.w; io.unobserve(e.target); } });
+    }, { threshold: .4 });
+    fills.forEach(f => io.observe(f));
+  }
+</script>
+</body>
+</html>
