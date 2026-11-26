@@ -93,7 +93,7 @@ To prove PnL is structural spread-capture edge rather than favorable drift or bi
 
 ### 3.1 Twin 1: The Symmetric / Naive Quoting Twin `[Removed]`
 * **Purpose:** Isolates whether Stations 1–6 (SG denoising, $\kappa$, A-S spread/skew, lead-lag cancel) generate alpha over passive quoting.
-* **Mechanism:** The `NaiveBaselineEngine` that quoted `mid - 1 tick` passively on both legs without inventory skew or lead-lag defensive cancels has been **removed**. It duplicated broker, ledger and rollover handling inside both the `paper` and `lifecycle` loops, and neither summary nor JSONL emits `baseline_pnl` or `AlphaEdge` any more. The `AlphaEdge` clauses in §5.1 Filter 1 and the Section 6 checklist are therefore not evaluable until Twin 1 is reinstated; they stay in the document as the target, not as a current gate.
+* **Mechanism:** The `NaiveBaselineEngine` that quoted `mid - 1 tick` passively on both legs without inventory skew or lead-lag defensive cancels has been **removed**. It duplicated broker, ledger and rollover handling inside both the `paper` and `lifecycle` loops (the standalone `paper` command has since been removed; `lifecycle` is the only replay entrypoint), and neither summary nor JSONL emits `baseline_pnl` or `AlphaEdge` any more. The `AlphaEdge` clauses in §5.1 Filter 1 and the Section 6 checklist are therefore not evaluable until Twin 1 is reinstated; they stay in the document as the target, not as a current gate.
 * **Requirement (when reinstated):** The candidate strategy's `Net+Reb` and `AlphaEdge` (`Strategy Net - Baseline Net`) must outperform Twin 1 with paired bootstrap / one-sided `p < 0.05` (`t >= 1.65`) across multi-session windows.
 
 ### 3.2 Twin 2: The Jittered-Timing Twin `[Planned]`

@@ -15,7 +15,7 @@ The pipeline unifies two distinct data sources without erasing clock, precision,
 3. **Unified Canonical Schema (`CanonicalEvent` v1)**
    - Normalized JSONL (`data/canonical/*.canonical.jsonl`) carries explicit provenance (`DataSource::{LiveJsonl, Pmdata}`, `TimingQuality`, `BookDerivation`, `QualityFlag` list, and separated `CanonicalTimestamp` clocks).
    - Strictly separates incremental quote/book updates (`PriceChange`) from executed trades (`TradePrint`) and on-chain settlements (`OnchainFill`).
-   - Automatically detects canonical vs. legacy live JSONL inside `poly-as paper --source replay` and `poly-as lifecycle --source replay`, and dynamically scales `Station2Config::epoch_secs` to `300.0` (5m), `900.0` (15m), or `3600.0` (1h) from contract `(expiry_ts_ms - start_ts_ms)`.
+   - Automatically detects canonical vs. legacy live JSONL inside `poly-as lifecycle --source replay`, and dynamically scales `Station2Config::epoch_secs` to `300.0` (5m), `900.0` (15m), or `3600.0` (1h) from contract `(expiry_ts_ms - start_ts_ms)`.
 
 ## 2. L2 Ingestion Modes (`full` vs. `quota-saving`)
 
@@ -84,7 +84,7 @@ cargo run -p cli -- pmdata normalize `
 # 6b. Normalize a live capture JSONL into Canonical JSONL
 cargo run -p cli -- pmdata normalize --source live-jsonl --input logs/captures/<capture>.jsonl --output data/canonical/live.canonical.jsonl
 
-# 7. Replay canonical JSONL (auto-detected) through Paper or Lifecycle (`--min-book-quality direct-both` verifies every market has direct Up+Down books)
+# 7. Replay canonical JSONL (auto-detected) through Lifecycle (`--min-book-quality direct-both` verifies every market has direct Up+Down books)
 cargo run -p cli -- lifecycle --source replay `
   --input data/canonical/btc-updown-15m-1793146500.canonical.jsonl `
   --source-filter pmdata `

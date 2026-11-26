@@ -19,8 +19,6 @@ mod feeds_report;
 mod lifecycle_cmd;
 mod lifecycle_report;
 mod log_paths;
-mod paper_cmd;
-mod paper_report;
 mod pmdata_cmd;
 mod preflight;
 mod sandbox_cmd;
@@ -66,7 +64,7 @@ fn default_base_size_shares() -> u64 {
     )
 }
 
-/// Simulated wire place/cancel delay shared by `paper` and `lifecycle`. Not a
+/// Simulated wire place/cancel delay used by `lifecycle` replay and live runs. Not a
 /// `DEFAULTS.json` calibration knob: it models venue latency, not the strategy.
 const DEFAULT_LATENCY_MS: u64 = 40;
 
@@ -637,45 +635,6 @@ enum Commands {
         #[arg(long)]
         jsonl: Option<PathBuf>,
     },
-    /// Phase 3 paper simulator: run FIFO queue-aware paper trading against live WebSockets or replayed JSONL logs.
-    #[command(alias = "sim")]
-    Paper {
-        /// Feed source (`live` WebSockets or `replay` JSONL log).
-        #[arg(long, value_enum, default_value_t = CliTraceSource::Live)]
-        source: CliTraceSource,
-        /// Input JSONL path used when `--source replay` (defaults to newest capture in `logs/captures/`).
-        #[arg(long)]
-        input: Option<PathBuf>,
-        /// Simulation duration (`60s`, `300s`, `5m`).
-        #[arg(long, default_value = "60s")]
-        duration: String,
-        /// Allow starting `--source live` mid-window instead of waiting idle for the next fresh 5-minute boundary.
-        #[arg(long, default_value_t = false)]
-        allow_mid_window: bool,
-        /// Maximum dollar position capital in USD (`DEFAULTS.json`: `$50`).
-        #[arg(long, default_value_t = default_v_max_usd())]
-        v_max: u64,
-        /// Base order size in whole shares (`DEFAULTS.json`: `20`).
-        #[arg(long, default_value_t = default_base_size_shares())]
-        base_size: u64,
-        /// Simulated wire placement & cancel latency in milliseconds (`40ms` default).
-        #[arg(long, default_value_t = DEFAULT_LATENCY_MS)]
-        latency_ms: u64,
-        /// FIFO queue decay policy (`DEFAULTS.json`: `conservative`).
-        #[arg(long, value_enum, default_value_t = default_cli_queue_decay())]
-        queue_decay: CliQueueDecay,
-        #[command(flatten)]
-        math: MathOverrides,
-        /// Source filter for canonical replay (`all`, `live`, `pmdata`).
-        #[arg(long, value_enum, default_value_t = CliSourceFilter::All)]
-        source_filter: CliSourceFilter,
-        /// Minimum book derivation quality for canonical replay (`any`, `direct-yes`, `direct-both`).
-        #[arg(long, value_enum, default_value_t = CliBookQualityFilter::Any)]
-        min_book_quality: CliBookQualityFilter,
-        /// Output path for structured JSONL telemetry log (defaults to `logs/paper/<DD-MM_HH-MM-SSZ>.jsonl`).
-        #[arg(long)]
-        jsonl: Option<PathBuf>,
-    },
     /// Phase 4 risk & lifecycle actor pipeline: run deterministic 300s epoch, live feeds, or offline replay with 4-tier risk limits.
     Lifecycle {
         /// Source mode (`live` WebSockets, `sim-epoch` simulated 300s epoch, or `replay` JSONL log).
@@ -772,7 +731,6 @@ impl Commands {
         match self {
             Self::Feeds { discover, .. } => *discover,
             Self::Trace { source, .. } => matches!(source, CliTraceSource::Live),
-            Self::Paper { source, .. } => matches!(source, CliTraceSource::Live),
             Self::Lifecycle { source, .. } => matches!(source, CliLifecycleSource::Live),
             Self::Exec { mode, .. } => matches!(mode, CliExecMode::CanaryLive),
             Self::Doctor { .. } | Self::Sandbox { .. } | Self::Pmdata { .. } => false,
@@ -836,36 +794,6 @@ fn dispatch_cli(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             inventory,
             math,
             jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("trace")),
-        }),
-        Commands::Paper {
-            source,
-            input,
-            duration,
-            allow_mid_window,
-            v_max,
-            base_size,
-            latency_ms,
-            queue_decay,
-            math,
-            source_filter,
-            min_book_quality,
-            jsonl,
-        } => paper_cmd::run(paper_cmd::PaperArgs {
-            source: match source {
-                CliTraceSource::Live => TraceSourceMode::Live,
-                CliTraceSource::Replay => TraceSourceMode::Replay,
-            },
-            input,
-            duration,
-            allow_mid_window,
-            v_max,
-            base_size,
-            latency_ms,
-            queue_decay: queue_decay.into(),
-            math,
-            source_filter: source_filter.into(),
-            min_book_quality: min_book_quality.into(),
-            jsonl: jsonl.unwrap_or_else(|| log_paths::default_feature_log_path("paper")),
         }),
         Commands::Lifecycle {
             source,
@@ -1266,90 +1194,6 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_paper_and_sim_alias_flags() {
-        let paper = Cli::try_parse_from([
-            "poly-as",
-            "paper",
-            "--source",
-            "live",
-            "--duration",
-            "60s",
-            "--v-max",
-            "100",
-            "--base-size",
-            "25",
-            "--latency-ms",
-            "50",
-            "--jsonl",
-            "logs/phase3-paper.jsonl",
-        ])
-        .unwrap();
-        match paper.command {
-            Commands::Paper {
-                source,
-                duration,
-                allow_mid_window,
-                v_max,
-                base_size,
-                latency_ms,
-                jsonl,
-                ..
-            } => {
-                assert!(matches!(source, CliTraceSource::Live));
-                assert_eq!(duration, "60s");
-                assert!(!allow_mid_window);
-                assert_eq!(v_max, 100);
-                assert_eq!(base_size, 25);
-                assert_eq!(latency_ms, 50);
-                assert_eq!(jsonl, Some(PathBuf::from("logs/phase3-paper.jsonl")));
-            }
-            _ => panic!("expected Paper"),
-        }
-
-        let paper_mid =
-            Cli::try_parse_from(["poly-as", "paper", "--source", "live", "--allow-mid-window"])
-                .unwrap();
-        match paper_mid.command {
-            Commands::Paper {
-                source,
-                allow_mid_window,
-                ..
-            } => {
-                assert!(matches!(source, CliTraceSource::Live));
-                assert!(allow_mid_window);
-            }
-            _ => panic!("expected Paper"),
-        }
-
-        let sim = Cli::try_parse_from([
-            "poly-as",
-            "sim",
-            "--source",
-            "replay",
-            "--input",
-            "logs/custom.jsonl",
-        ])
-        .unwrap();
-        match sim.command {
-            Commands::Paper {
-                source,
-                input,
-                v_max,
-                base_size,
-                latency_ms,
-                ..
-            } => {
-                assert!(matches!(source, CliTraceSource::Replay));
-                assert_eq!(input, Some(PathBuf::from("logs/custom.jsonl")));
-                assert_eq!(v_max, 50);
-                assert_eq!(base_size, 20);
-                assert_eq!(latency_ms, 40);
-            }
-            _ => panic!("expected Paper"),
-        }
-    }
-
-    #[test]
     fn cli_parses_math_competitiveness_and_queue_decay_overrides() {
         let lc = Cli::try_parse_from([
             "poly-as",
@@ -1399,9 +1243,9 @@ mod tests {
             _ => panic!("expected Lifecycle"),
         }
 
-        let paper_default = Cli::try_parse_from(["poly-as", "paper"]).unwrap();
-        match paper_default.command {
-            Commands::Paper {
+        let lifecycle_default = Cli::try_parse_from(["poly-as", "lifecycle"]).unwrap();
+        match lifecycle_default.command {
+            Commands::Lifecycle {
                 queue_decay, math, ..
             } => {
                 assert_eq!(queue_decay, CliQueueDecay::Conservative);
@@ -1421,7 +1265,7 @@ mod tests {
                 assert_eq!(cfg.entry_open_delay_secs, 15);
                 assert_eq!(cfg.entry_cutoff_secs, Some(120));
             }
-            _ => panic!("expected Paper"),
+            _ => panic!("expected Lifecycle"),
         }
 
         let trace_legacy = Cli::try_parse_from([
@@ -1593,21 +1437,22 @@ mod tests {
         }
 
         let zero_loss =
-            Cli::try_parse_from(["poly-as", "paper", "--max-cross-tick-loss-micro", "0"]).unwrap();
+            Cli::try_parse_from(["poly-as", "lifecycle", "--max-cross-tick-loss-micro", "0"])
+                .unwrap();
         match zero_loss.command {
-            Commands::Paper { math, .. } => {
+            Commands::Lifecycle { math, .. } => {
                 let mut cfg = core_types::EngineConfig::default();
                 math.apply_to(&mut cfg).unwrap();
                 assert_eq!(cfg.max_cross_tick_loss_micro, Some(0));
                 assert_eq!(cfg.max_entry_prob, Some(0.80));
             }
-            _ => panic!("expected Paper"),
+            _ => panic!("expected Lifecycle"),
         }
 
         for off_flag in ["off", "none"] {
             let parsed_off = Cli::try_parse_from([
                 "poly-as",
-                "paper",
+                "lifecycle",
                 "--max-cross-tick-loss-micro",
                 off_flag,
                 "--max-entry-prob",
@@ -1615,7 +1460,7 @@ mod tests {
             ])
             .unwrap();
             match parsed_off.command {
-                Commands::Paper { math, .. } => {
+                Commands::Lifecycle { math, .. } => {
                     assert!(math.is_any_set());
                     assert_eq!(
                         math.max_cross_tick_loss_micro,
@@ -1627,7 +1472,7 @@ mod tests {
                     assert_eq!(cfg.max_cross_tick_loss_micro, None);
                     assert_eq!(cfg.max_entry_prob, None);
                 }
-                _ => panic!("expected Paper"),
+                _ => panic!("expected Lifecycle"),
             }
         }
 
@@ -1672,9 +1517,10 @@ mod tests {
 
         for off_flag in ["off", "none"] {
             let parsed_off =
-                Cli::try_parse_from(["poly-as", "paper", "--max-entry-price", off_flag]).unwrap();
+                Cli::try_parse_from(["poly-as", "lifecycle", "--max-entry-price", off_flag])
+                    .unwrap();
             match parsed_off.command {
-                Commands::Paper { math, .. } => {
+                Commands::Lifecycle { math, .. } => {
                     assert_eq!(math.max_entry_price, Some(MaxEntryPriceOverride::Off));
                     let mut cfg = core_types::EngineConfig {
                         max_entry_price: Some(0.60),
@@ -1683,7 +1529,7 @@ mod tests {
                     math.apply_to(&mut cfg).unwrap();
                     assert_eq!(cfg.max_entry_price, None);
                 }
-                _ => panic!("expected Paper"),
+                _ => panic!("expected Lifecycle"),
             }
         }
 
@@ -1800,7 +1646,7 @@ mod tests {
         for (mult_str, cap_str) in [("0.0", "false"), ("1.0", "true")] {
             let mut args = vec![
                 "poly-as",
-                "paper",
+                "lifecycle",
                 "--hedge-skew-mult",
                 mult_str,
                 "--cap-tier1-hedge",
@@ -1811,13 +1657,13 @@ mod tests {
             }
             let cli = Cli::try_parse_from(args).unwrap();
             match cli.command {
-                Commands::Paper { math, .. } => {
+                Commands::Lifecycle { math, .. } => {
                     let mut cfg = core_types::EngineConfig::default();
                     math.apply_to(&mut cfg).unwrap();
                     assert_eq!(cfg.hedge_skew_mult, mult_str.parse::<f64>().unwrap());
                     assert_eq!(cfg.cap_tier1_reducing_to_delta, cap_str == "true");
                 }
-                _ => panic!("expected Paper"),
+                _ => panic!("expected Lifecycle"),
             }
         }
 
@@ -1947,9 +1793,9 @@ mod tests {
         .unwrap();
         assert!(!rec.command.needs_host_clock());
 
-        let paper_f = Cli::try_parse_from([
+        let lc_pmdata_f = Cli::try_parse_from([
             "poly-as",
-            "paper",
+            "lifecycle",
             "--source",
             "replay",
             "--source-filter",
@@ -1958,8 +1804,8 @@ mod tests {
             "direct-both",
         ])
         .unwrap();
-        match paper_f.command {
-            Commands::Paper {
+        match lc_pmdata_f.command {
+            Commands::Lifecycle {
                 source_filter,
                 min_book_quality,
                 ..
@@ -1973,7 +1819,7 @@ mod tests {
                     historical_data::BookQualityFilter::DirectBothRequired
                 );
             }
-            _ => panic!("expected Paper"),
+            _ => panic!("expected Lifecycle"),
         }
 
         let lc_f = Cli::try_parse_from([
