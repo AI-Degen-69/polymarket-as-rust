@@ -72,7 +72,7 @@ Agents use `scripts/sweep-params.ps1` (driving `poly-as lifecycle --source repla
 | **Hysteresis Deadband** | `hysteresis_tick_buffer` in **ticks** (e.g. `[0.10, 0.25, 0.50]` ticks; `$0.01` = `100` bps) | `crates/risk-lifecycle/src/station8_hysteresis.rs` `[Planned for sweep CLI]` |
 | **Expiry Lifecycle Cutoffs** | `pre_expiry_lockout_secs` (`60s`), `mandatory_flatten_secs` (`30s`), `terminal_lockout_secs` (`15s`) | `crates/risk-lifecycle/src/lifecycle.rs` (`LifecycleConfig`) `[Planned for sweep CLI]` |
 
-> **Promotion grid (boundary sweep):** promotion is decided on a full `3×3` grid — `MaxEntryPrice ∈ {0.60, 0.65, 0.70}` × `EntryCutoff ∈ {90s, 105s, 120s}` at `Tier1HedgeTrigger = off` — run over the same `20` live captures (`226` windows, `158` IS / `68` OOS), i.e. `9` configurations × `20` captures = `180` replays. This grid, not a single-axis sweep, produced the promoted `#6/9` (`$0.65 / 120s`); the ranking, scoring and `G1–G6` verdicts are in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md).
+> **Promotion grid (boundary sweep):** promotion is decided on a full `3×3` grid — `MaxEntryPrice ∈ {0.60, 0.65, 0.70}` × `EntryCutoff ∈ {90s, 105s, 120s}` at `Tier1HedgeTrigger = off` — run over the same `20` live captures (`226` windows, `158` IS / `68` OOS), i.e. `9` configurations × `20` captures = `180` replays. This grid, not a single-axis sweep, produced the promoted `#6/9` (`$0.65 / 120s`); the ranking, scoring and `G1–G6` gate output are in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md). **None of those `180` replays clears Filter 4:** the winning sample is `336` fills against the `400`-fill bar, and the `21`-capture revalidation is `351` fills (`21` captures, `241` windows), so the runner reports `UNDERPOWERED` rather than a pass or a failure for both.
 
 > **Design Exclusions & Module Note:**
 > * **No static $\kappa$ sweep (`0.5..10.0`):** `crates/math-engine/src/station3_kappa.rs` estimates $\kappa$ dynamically from live L2 depth and clamps it to `[15.0, 200.0]` (fallback `50.0`); values in `0.5..10.0` blow up quoted spreads beyond `[0, 1]`.
@@ -105,7 +105,7 @@ To prove PnL is structural spread-capture edge rather than favorable drift or bi
 
 ## 5. Stage 4: The Six Filtering Checks (Market-Making Edition)
 
-Candidate configurations generated from `scripts/sweep-params.ps1` must pass all six survival gates before promotion.
+Candidate configurations generated from `scripts/sweep-params.ps1` must pass all six filtering checks before promotion. Not all six are enforced yet: **Filter 3 (OOS retention) is `[Planned]`** — the runner computes a retention scoreboard from the chronological 70/30 split, but there is no pre-registered, untouched holdout gate — and Filter 5's plateau test is only the `G6` neighbour-profitability proxy (no `±1` collapse test). Filter 4 is `[Implemented]` as an `UNDERPOWERED` verdict.
 
 ```text
        [ Candidate Strategy Sweep Matrix ]
@@ -144,6 +144,8 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
        [ Promoted Candidate Strategy ]
 ```
 
+> **Status of the six filters `[Observed]`:** the runner enforces Filters 1–2 and 4 (`G1–G5` plus the `UNDERPOWERED` sample check). **Filter 3 is `[Planned]`** — a retention scoreboard exists, a locked-holdout gate does not. Filters 5 and 6 are not gated: `G6` is a neighbor-profitability proxy with no `±1` collapse test, and `MO1s` is reported but never rejected on. A sweep therefore cannot currently produce a fully qualified promotion; the strongest available verdict on an adequate sample is "`G1–G6` pass with OOS retention and `MO1s` still to be gated".
+
 ### 5.1 Detailed Filter Criteria
 
 1. **Zero-Edge & Conservative Queue Baseline:**
@@ -155,12 +157,16 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
    * **G5b — tail drag `<= 50%` (separate rule):** once negative merge losses are added to the settlement loss (`TailDrag`), at most **50%** of gross positive pair-merge gains may be erased. This is what disqualifies `#4/9` (`50.04%`) and `#5/9` (`51.0%`). `TailDrag` must be measured: an unknown value reports `G5 = N/A` and can never read as `PASS`.
 3. **Out-of-Sample Consistency ($\ge 50\%$ Retention) `[Planned gate]`:**
    * The hidden 30% out-of-sample window set must retain at least **50%** of the `Net+Reb` per window achieved during the 70% in-sample run.
-4. **Minimum Sample Size:**
+   * **Current status — planned, not enforced.** `Evaluate-SurvivalGateRow` computes `G3` from the chronological `70/30` split, but that segment is not a locked, untouched holdout, so a `G3` result is a scoreboard reading rather than a satisfied gate. The promoted `#6/9` reported `162%` on the original `20` captures, `99.88%` on the same `20` captures replayed on the corrected `5cf74b9` binary, and `11.66%` (`FAIL`) once `Cap #21` is added — a range that shows the reading is not yet a stable measurement.
+4. **Minimum Sample Size `[Implemented]`:**
    * Target **150–200+ completed 300s windows** across multiple UTC regimes (`~400–500` filled maker orders at observed `~2.5` fills/window), providing statistical power (`t >= 1.65`, one-sided `p < 0.05`) across both `Up` and `Down` outcomes.
+   * **Enforcement:** `Evaluate-SurvivalGateRow` takes the config's `FillsNum` (from `summary.fills_count`) and, below `400` fills, replaces the verdict with **`UNDERPOWERED`** — never `APPROVED` or `FAIL(Gx)` — while keeping the per-gate cells visible. Neither sample behind the promoted defaults clears the bar: `336` fills on the `20`-capture boundary grid, `351` fills on the `21`-capture revalidation, whose `G3/G5` failures are therefore reported as `UNDERPOWERED` ([sweep-results-investigation.md](sweep-results-investigation.md) Part III).
 5. **Parameter Stability (Plateau Neighborhood):**
    * Performance must not depend on isolated spikes. Immediate neighbor cells in `scripts/sweep-params.ps1` ($\pm 1$ step in $\gamma$, entry price/prob caps, or lead-lag thresholds) must remain profitable.
 6. **Adverse-Selection Markout Stress Margin:**
    * Evaluates post-fill toxicity via `FillMarkoutProbe` (`crates/paper-sim/src/telemetry.rs`). `MO1s` must remain strictly positive (`MO1s > 0`) alongside positive net merge spread. Monitor `MO5s` as a toxicity diagnostic rather than a hard rejection filter (in binary pair-merge MM, positive `MO1s` + strong pair-merge spread remains profitable even when `MO5s` is slightly negative).
+
+> **Promotion status of the current baseline `[Observed]`:** `DEFAULTS.json` carries `Config #6/9` (`max_entry_price = 0.65`, `entry_cutoff_secs = 120`, `tier1_hedge_trigger_price = null`, `entry_open_delay_secs = 15`, `cap_tier1_reducing_to_delta = true`, `execution_mode = Paper`, `dry_run = true`) as a **provisional research baseline**. It has **not** earned a survival pass: its selection sample is `336` fills (below Filter 4), its `21`-capture revalidation at `351` fills fails `G3`/`G5` and is also below the bar (`UNDERPOWERED`), and Filter 3 remains `[Planned]`. No config value changed as a result of either finding, and no threshold was relaxed. Next step is more captures, not a re-promotion — see [sweep-results-investigation.md](sweep-results-investigation.md) Part III.
 
 ---
 
@@ -210,7 +216,7 @@ Before opening a Pull Request that alters trading math, risk filters, or executi
   * `rtk cargo clippy --workspace --all-targets -- -D warnings`
   * `rtk cargo test --workspace` (including `crates/paper-sim/tests/adversarial.rs`, `vectors.rs`, and `crates/math-engine/tests/zero_alloc.rs`).
 - [ ] Offline sweep verified with `scripts/sweep-params.ps1 -QueueDecay conservative` (and 70/30 OOS split once enabled).
-- [ ] Candidate strategy outperforms Twin 1 once reinstated (`AlphaEdge > 0`; see §3.1) and passes the **Six Filtering Checks** (Zero-Edge + Conservative Queue, Drawdown/WinCap/Expiry Drag, OOS Retention, Sample Size, Plateau Stability, `MO1s > 0`).
+- [ ] Candidate strategy outperforms Twin 1 once reinstated (`AlphaEdge > 0`; see §3.1) and passes the **Six Filtering Checks** (Zero-Edge + Conservative Queue, Drawdown/WinCap/Expiry Drag, OOS Retention, Sample Size, Plateau Stability, `MO1s > 0`). Report Filter 3 honestly as `[Planned]` and do not describe a sample under `400` fills as `APPROVED` — the runner will call it `UNDERPOWERED`.
 - [ ] For execution or lifecycle changes, validated order lifecycle against NEX Sandbox:
   * `rtk cargo run -p cli --bin poly-as -- sandbox health`
   * `rtk cargo run -p cli --bin poly-as -- sandbox validate --asset-id <id> --confirm-sandbox-trade`

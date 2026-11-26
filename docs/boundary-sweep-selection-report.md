@@ -6,6 +6,7 @@
 - **Run Date / Runtime:** November 25–26, 2026 (`23:56` local start, `741.99s` across `6` parallel workers)
 - **Prior Baseline Reference:** [sweep-results-investigation.md](sweep-results-investigation.md)
 - **Classification:** **`Config #6/9` (`$0.65, 120s, T1=off`) selected as provisional research baseline** (`336` fills across `226` windows, below the `400`-fill validation bar).
+- **No qualifying survival pass was earned.** The `21`-capture replay on the corrected `5cf74b9` binary (`351` fills, `26-11_07-55-07Z_1runs_21caps-241w`) fails G3 and G5, and is itself below the `400`-fill bar, so under spec Filter 4 the result reads **`UNDERPOWERED`** — neither a pass nor a failure. Values are unchanged. Analysis: [sweep-results-investigation.md](sweep-results-investigation.md) Part III.
 
 > [!NOTE]
 > **Epistemic Labeling Throughout This Report:** Sections and columns explicitly distinguish **(Observed)** raw event/summary data from the `180` JSONL files, **(Derived)** ratios and normalized scores, **(Interpretation)** causal trade-offs, and **(Recommendations)** for the next research phase.
@@ -39,6 +40,9 @@ Weights, normalization bounds, and survival eligibility were fixed **before rank
 | **D. Consistency & Robustness** | **20%** | Rewards broad capture/window breadth, top-window non-concentration, and Manhattan-1 neighbor plateau stability. |
 
 **Mandatory Eligibility Gate:** A configuration must pass **all six unmodified survival gates (`G1–G6`)** at `QueueDecay=conservative` to be promoted, regardless of composite score.
+
+> [!IMPORTANT]
+> **This sweep does not clear Filter 4.** Every gate figure below was produced on a `336`-fill sample, under spec Filter 4's `400`-fill minimum ([strategy-verification-spec.md](strategy-verification-spec.md) §5.1.4). `scripts/sweep-params.ps1` now reports such a sample as `UNDERPOWERED`, so the `APPROVED` cells in §3.4 and §3.5 are **measured gate output**, not an earned eligibility. `#6/9` was selected as a research baseline on that basis; it is not a validated strategy and its values have not changed since.
 
 ### 2.2 Sub-Metric Weights and Normalization
 
@@ -102,7 +106,7 @@ Weights, normalization bounds, and survival eligibility were fixed **before rank
 
 ### 3.4 Dimension D — Consistency, Robustness & Existing G1–G6 Verdicts *(Observed & Derived)*
 
-| Cfg | `(MaxPx, Cut)` | Profit Caps / 20 | Active Win% (`W/Tot`) | Top 1 / 3 / 5 Share | Ex-Best Cap | Ex-Worst Cap | Manhattan-1 Mean Net0 (`k`) | `MO1s / MO5s` (`bps`) | G1–G6 Verdict (`0% / 3%`) |
+| Cfg | `(MaxPx, Cut)` | Profit Caps / 20 | Active Win% (`W/Tot`) | Top 1 / 3 / 5 Share | Ex-Best Cap | Ex-Worst Cap | Manhattan-1 Mean Net0 (`k`) | `MO1s / MO5s` (`bps`) | G1–G6 Gate Output † (`0% / 3%`) |
 |---:|---|---:|---:|---|---:|---:|---:|---|---|
 | `#1` | `($0.60, 90s)` | `9/20` (45%) | 59.5% (`25/42`) | `30% / 62% / 87%` | +$18.97 | +$41.87 | +$35.69 (`2`) | +56.4 / +109.5 | FAIL(G5) / FAIL(G5) |
 | `#2` | `($0.60, 105s)` | `9/20` (45%) | 55.6% (`30/54`) | `28% / 59% / 82%` | +$17.48 | +$43.57 | +$44.05 (`3`) | +43.0 / +89.4 | FAIL(G5) / FAIL(G5) |
@@ -116,9 +120,11 @@ Weights, normalization bounds, and survival eligibility were fixed **before rank
 
 *(In all nine configs, G1, G2, G3, G4, and G6 = `100%` PASS. Failures in `#1, #2, #4, #5` are strictly G5: `Drag > 30%` on `#1/#2` and `TailDrag >= 50.04%` / `51.0%` on `#4/#5`.)*
 
+**† Measured gate output, not an eligibility pass.** All nine rows carry `336` fills against spec Filter 4's `400`-fill bar, so under the enforcement added in `scripts/sweep-params.ps1` (`Evaluate-SurvivalGateRow -TotalFills`, PR #77) each of them reads **`UNDERPOWERED`** rather than `APPROVED` or `FAIL(G5)`. The per-gate cells are kept because they still describe the sample's shape; they do not establish that the thresholds were met on an adequate sample.
+
 ### 3.5 Final Scored Ranking Table *(Derived)*
 
-| Final Rank | Cfg | `(MaxPx, Cut)` | Dim A `(25%)` | Dim B `(30%)` | Dim C `(25%)` | Dim D `(20%)` | Weighted Total | Equal-Weight `(25/25/25/25)` | G1–G6 Eligibility | Selection Status |
+| Final Rank | Cfg | `(MaxPx, Cut)` | Dim A `(25%)` | Dim B `(30%)` | Dim C `(25%)` | Dim D `(20%)` | Weighted Total | Equal-Weight `(25/25/25/25)` | G1–G6 Gate Output † | Selection Status |
 |---:|---:|---|---:|---:|---:|---:|---:|---:|---|---|
 | **1** | **`#6/9`** | **`($0.65, 120s)`** | `81.5` | **`79.8`** | `79.5` | `78.4` | **`79.9`** | **`79.8`** | **APPROVED** | **Selected Winner (Provisional)** |
 | **2** | `#3/9` | `($0.60, 120s)` | **`91.2`** | `79.6` | `75.1` | `61.5` | `77.7` | `76.8` | **APPROVED** | Runner-Up / Primary Challenger |
@@ -130,6 +136,8 @@ Weights, normalization bounds, and survival eligibility were fixed **before rank
 | **8** | `#8/9` | `($0.70, 105s)` | `16.8` | `34.4` | `60.5` | `46.5` | `38.9` | `39.5` | **APPROVED** | Low Volume / Weak OOS |
 | **9** | `#7/9` | `($0.70, 90s)` | `7.8` | `14.0` | `43.9` | `42.3` | `25.6` | `27.0` | **APPROVED** | Lowest P&L & OOS |
 
+† As in §3.4: every rank in this table rests on `336` fills, so under Filter 4 each row is `UNDERPOWERED`. The ranking orders candidates by score; it does not certify any of them as survival-approved.
+
 ---
 
 ## 4. Winner Justification & `120s` Head-to-Head Trade-Off Analysis *(Interpretation)*
@@ -138,7 +146,7 @@ Weights, normalization bounds, and survival eligibility were fixed **before rank
 
 - **Highest Raw Net P&L (`+$58.79` @ 0%, `+$59.53` @ 3%):** Config `#6/9` (`$0.65, 120s`).
 - **Highest Capital ROI:** Config `#1/9` (`+6.84%`, **ineligible** — fails G5 at `33.1%`); highest *eligible* ROI is Config `#3/9` (`+6.73%`).
-- **Best Balanced & Risk-Adjusted Eligible Configuration (`79.9` Weighted / `79.8` Equal):** Config **`#6/9`**.
+- **Best Balanced & Risk-Adjusted Configuration of the Grid (`79.9` Weighted / `79.8` Equal):** Config **`#6/9`** — highest composite score, on a `336`-fill sample that no configuration in the grid clears Filter 4 with.
 - **Final Selected Baseline for `DEFAULTS.json`:** Config **`#6/9`** (provisional research baseline, with `#3/9` held as the active challenger).
 
 ### 4.2 Comparing the Three `120s` Contenders (`#6` vs `#3` vs `#9`)
@@ -156,11 +164,13 @@ All `120s` configs are the best entry cutoff tested in this sweep (`120s` is the
 
 The `+2.2`-point weighted margin (`79.9` vs `77.7`) over `#3/9` rests on a **226-window sample** with **`336` fills** (below [strategy-verification-spec.md](strategy-verification-spec.md#L159)'s `400`-fill minimum) where `20` captures are heavily influenced by `Cap#20` (`+$21.24`, `36.1%` of `#6`'s total Net P&L). Therefore, `#6/9` is promoted strictly as the **next research baseline**, while `#3/9` remains the top benchmark challenger for independent sample validation.
 
+**This holds after revalidation.** Replaying `21` captures on the corrected `5cf74b9` binary (`351` fills, `241` windows) gives `+$31.68` IS / `+$1.61` OOS, `11.66%` retention and `39.11% / 63.08%` drag/tail — a G3 and G5 failure. That failure is not evidence against `$0.65 / 120s`: it is the same config on both sides of the comparison, and at `351` fills the estimate is undecidable. One `-$9.00` mandatory flatten moves retention from `12%` to `78%`; leave-one-capture-out spans `-30.7%` to `78.1%`; the OOS mean is `+$0.0220`/window with `t = 0.13` (`95%` CI `[-$0.3247, +$0.3686]`). Under Filter 4 the verdict is therefore `UNDERPOWERED`. Consequences: keep the values, gather captures past the `400`-fill bar with OOS spread across several days, **do not** re-promote from this grid (its ranking still contains `Cap#20`'s `-$10.50` timing-bug profit, which `5cf74b9` removed), and **do not** loosen the `50% / 30% / 50%` thresholds. Full analysis: [sweep-results-investigation.md](sweep-results-investigation.md) Part III.
+
 ---
 
 ## 5. Promoted Defaults & Reproducibility
 
-Promoted cleanly to [DEFAULTS.json](../DEFAULTS.json) (with strict JSON `"provenance"` object validated by `DefaultsProvenance` in `crates/core-types/src/config.rs`) and synchronized across all six calibration files (`DEFAULTS.json`, `.env.example`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1` + `AGENTS.md` §7):
+Promoted cleanly to [DEFAULTS.json](../DEFAULTS.json) (with strict JSON `"provenance"` object validated by `DefaultsProvenance` in `crates/core-types/src/config.rs`) — a provisional promotion: the values are unchanged and remain unvalidated at the `400`-fill bar (§4.3), and synchronized across all six calibration files (`DEFAULTS.json`, `.env.example`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1` + `AGENTS.md` §7):
 - `max_entry_price = 0.65` (`MAX_ENTRY_PRICE=0.65`)
 - `entry_cutoff_secs = 120` (`ENTRY_CUTOFF_SECS=120`)
 - `entry_open_delay_secs = 15` (`ENTRY_OPEN_DELAY_SECS=15`)
