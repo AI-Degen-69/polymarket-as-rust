@@ -298,6 +298,16 @@ struct LifecycleFlattenEvent<'a> {
 }
 
 #[derive(Serialize)]
+struct LifecycleFlattenUnfilledEvent<'a> {
+    market_slug: &'a str,
+    outcome: Outcome,
+    side: &'a str,
+    limit_price_micro: u64,
+    requested_size_micro: u64,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
 struct EpochRolloverEvent<'a> {
     expired_slug: &'a str,
     next_slug: Option<&'a str>,
@@ -2140,6 +2150,34 @@ pub(crate) fn record_lifecycle_flatten_jsonl(
             requested_size_micro: requested_size.0,
             fee_micro,
             realized_pnl_micro,
+            reason,
+        },
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_lifecycle_flatten_unfilled_jsonl(
+    jsonl: &mut JsonlWriter,
+    now_ms: u64,
+    mono_ns: u64,
+    market_slug: &str,
+    outcome: Outcome,
+    side: OrderSide,
+    limit_price: MicroUsdc,
+    requested_size: SharesMicro,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    jsonl.write_event(
+        now_ms,
+        mono_ns,
+        "flatten_unfilled",
+        &LifecycleFlattenUnfilledEvent {
+            market_slug,
+            outcome,
+            side: side.as_str(),
+            limit_price_micro: limit_price.0,
+            requested_size_micro: requested_size.0,
             reason,
         },
     )?;
