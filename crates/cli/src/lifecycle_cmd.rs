@@ -42,13 +42,14 @@ use crate::feeds_cmd::{parse_duration_arg, shutdown_actors, spawn_actors};
 use crate::feeds_report::{RawJsonlEnvelope, ReplayPolyEvent};
 use crate::lifecycle_report::{
     CancelAllRecord, LifecycleDisplayMode, LifecycleReportStats, LifecycleStepRow,
-    LifecycleStreamReporter, OrderActionTelemetry, SuppressionContext, print_breaker_trip,
-    print_epoch_banner, print_epoch_rollover, print_lifecycle_fill, print_lifecycle_flatten,
-    print_lifecycle_header, print_lifecycle_merge, print_lifecycle_summary, print_phase_transition,
-    print_tier_transition, record_breaker_jsonl, record_cancel_all_jsonl,
-    record_epoch_rollover_jsonl, record_lifecycle_fill_jsonl, record_lifecycle_flatten_jsonl,
-    record_lifecycle_merge_jsonl, record_lifecycle_summary_jsonl, record_order_action_jsonl,
-    record_phase_transition_jsonl, record_risk_tier_jsonl, record_window_end_jsonl,
+    LifecycleStreamReporter, OrderActionTelemetry, SuppressionContext, WindowEndEvent,
+    print_breaker_trip, print_epoch_banner, print_epoch_rollover, print_lifecycle_fill,
+    print_lifecycle_flatten, print_lifecycle_header, print_lifecycle_merge,
+    print_lifecycle_summary, print_phase_transition, print_tier_transition, record_breaker_jsonl,
+    record_cancel_all_jsonl, record_epoch_rollover_jsonl, record_lifecycle_fill_jsonl,
+    record_lifecycle_flatten_jsonl, record_lifecycle_merge_jsonl, record_lifecycle_summary_jsonl,
+    record_order_action_jsonl, record_phase_transition_jsonl, record_risk_tier_jsonl,
+    record_window_end_jsonl,
 };
 use crate::theme::{self, Badge};
 
@@ -701,8 +702,12 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                         let net_delta_raw =
                             target_shares.as_u64().abs_diff(opposite_shares.as_u64());
                         let flatten_raw = size.as_u64().min(net_delta_raw);
+                        stats.flatten_attempts = stats.flatten_attempts.saturating_add(1);
                         if flatten_raw > 0 {
-                            stats.flattens_executed += 1;
+                            stats.flattens_executed = stats.flattens_executed.saturating_add(1);
+                            stats.flatten_shares_filled_micro = stats
+                                .flatten_shares_filled_micro
+                                .saturating_add(flatten_raw);
                             let side = if target_shares > opposite_shares {
                                 OrderSide::Sell
                             } else {
@@ -764,6 +769,7 @@ async fn run_sim_epoch(args: LifecycleArgs, clock: MonotonicClock) -> Result<(),
                                 side,
                                 price,
                                 SharesMicro::from_raw(flatten_raw),
+                                size,
                                 0,
                                 0,
                                 &reason,
@@ -1034,6 +1040,45 @@ fn fixed_book_depth_at(book: &FixedBook<10>, price: MicroUsdc) -> SharesMicro {
     SharesMicro::ZERO
 }
 
+/// Matches a simulated FAK flatten order against visible L2 levels at or better than `limit_price`.
+fn match_fak_against_book(
+    book: &FixedBook<10>,
+    side: OrderSide,
+    limit_price: MicroUsdc,
+    requested_shares: u64,
+) -> Vec<(MicroUsdc, u64)> {
+    if requested_shares == 0 || limit_price.0 == 0 {
+        return Vec::new();
+    }
+    let mut remaining = requested_shares;
+    let mut fills = Vec::new();
+    let levels = match side {
+        OrderSide::Buy => book.asks_slice(),
+        OrderSide::Sell => book.bids_slice(),
+    };
+    for lvl in levels {
+        if lvl.size.0 == 0 || lvl.price.0 == 0 {
+            continue;
+        }
+        let price_ok = match side {
+            OrderSide::Buy => lvl.price.0 <= limit_price.0,
+            OrderSide::Sell => lvl.price.0 >= limit_price.0,
+        };
+        if !price_ok {
+            break;
+        }
+        let take = remaining.min(lvl.size.0);
+        if take > 0 {
+            fills.push((lvl.price, take));
+            remaining -= take;
+        }
+        if remaining == 0 {
+            break;
+        }
+    }
+    fills
+}
+
 struct LiveLatencies<'a> {
     pricing: &'a mut LatencyTracker,
     risk: &'a mut LatencyTracker,
@@ -1111,6 +1156,12 @@ struct LivePaperSimulator {
     window_start_pairs_micro: u64,
     window_start_fills: u64,
     window_start_merges: u64,
+    window_start_flatten_attempts: usize,
+    window_start_flattens_executed: usize,
+    window_start_flatten_shares_micro: u64,
+    window_start_flatten_unavailable_ticks: usize,
+    window_start_residual_dust_ticks: usize,
+    window_max_abs_unpaired_micro: u64,
     reporter: LifecycleStreamReporter,
     stats: LifecycleReportStats,
 }
@@ -1184,6 +1235,12 @@ impl LivePaperSimulator {
             window_start_pairs_micro: 0,
             window_start_fills: 0,
             window_start_merges: 0,
+            window_start_flatten_attempts: 0,
+            window_start_flattens_executed: 0,
+            window_start_flatten_shares_micro: 0,
+            window_start_flatten_unavailable_ticks: 0,
+            window_start_residual_dust_ticks: 0,
+            window_max_abs_unpaired_micro: 0,
             reporter: LifecycleStreamReporter::new(display, theme::current())
                 .with_verbose_latency(verbose_latency),
             stats: LifecycleReportStats::default(),
@@ -1431,6 +1488,7 @@ impl LivePaperSimulator {
         if let Some(merge) = self.ledger.record_fill(fill)? {
             self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
         }
+        self.update_window_max_unpaired();
         let inv_after = self.ledger.net_inventory();
         if inv_after.0.unsigned_abs() < self.desc.min_order_size_micro.as_u64() {
             // A fill can flatten the position between pricing ticks; drop any stale override.
@@ -1498,6 +1556,62 @@ impl LivePaperSimulator {
         match outcome {
             Outcome::Up => self.latest_up.as_ref().unwrap_or(&self.fallback_up),
             Outcome::Down => self.latest_dn.as_ref().unwrap_or(&self.fallback_dn),
+        }
+    }
+
+    fn update_window_max_unpaired(&mut self) {
+        let unpaired = self.ledger.filled_up.0.abs_diff(self.ledger.filled_dn.0);
+        self.window_max_abs_unpaired_micro = self.window_max_abs_unpaired_micro.max(unpaired);
+    }
+
+    /// Consumes L2 depth filled by a simulated taker flatten so subsequent 10Hz ticks do not
+    /// repeatedly fill against already-depleted book levels before the next market update.
+    fn consume_book_liquidity(
+        &mut self,
+        outcome: Outcome,
+        side: OrderSide,
+        fills: &[(MicroUsdc, u64)],
+        now_ms: u64,
+        now_ns: u64,
+    ) {
+        let book_side = match side {
+            OrderSide::Buy => OrderSide::Sell,
+            OrderSide::Sell => OrderSide::Buy,
+        };
+        let updates: Vec<(MicroUsdc, u64)> = {
+            let book = self.book_ref(outcome);
+            let levels = match book_side {
+                OrderSide::Buy => book.bids_slice(),
+                OrderSide::Sell => book.asks_slice(),
+            };
+            fills
+                .iter()
+                .map(|&(price, filled)| {
+                    let current = levels
+                        .iter()
+                        .find(|l| l.price == price)
+                        .map_or(0, |l| l.size.0);
+                    (price, current.saturating_sub(filled))
+                })
+                .collect()
+        };
+        let (maintainer, latest) = match outcome {
+            Outcome::Up => (&mut self.book_up, &mut self.latest_up),
+            Outcome::Down => (&mut self.book_dn, &mut self.latest_dn),
+        };
+        for (price, remaining) in updates {
+            let _ = maintainer.apply_delta_allow_transient_cross(
+                book_side,
+                price,
+                SharesMicro(remaining),
+                now_ns,
+                now_ms,
+            );
+        }
+        if !maintainer.is_crossed()
+            && let Ok(top) = maintainer.top_n::<10>()
+        {
+            *latest = Some(top);
         }
     }
 
@@ -1774,32 +1888,64 @@ impl LivePaperSimulator {
                         Outcome::Down => (self.ledger.filled_dn, self.ledger.filled_up),
                     };
                     let net_delta = target_shares.0.abs_diff(opposite_shares.0);
-                    let flatten_shares = size.0.min(net_delta);
-                    self.stats.flattens_executed = self.stats.flattens_executed.saturating_add(1);
-                    if flatten_shares > 0 {
-                        let side = if target_shares > opposite_shares {
-                            OrderSide::Sell
-                        } else {
-                            OrderSide::Buy
-                        };
+                    let requested_shares = size.0.min(net_delta);
+                    let side = if target_shares > opposite_shares {
+                        OrderSide::Sell
+                    } else {
+                        OrderSide::Buy
+                    };
+                    self.stats.flatten_attempts = self.stats.flatten_attempts.saturating_add(1);
+
+                    let fills = match_fak_against_book(
+                        self.book_ref(outcome),
+                        side,
+                        price,
+                        requested_shares,
+                    );
+                    let mut total_filled_micro = 0_u64;
+                    let mut total_fee_micro = 0_u64;
+                    let mut total_notional_u128 = 0_u128;
+                    for &(fill_price, fill_shares) in &fills {
+                        if fill_shares == 0 {
+                            continue;
+                        }
                         let (fee, merge_opt) = self.ledger.record_taker_flatten_with_merge(
                             outcome,
                             side,
-                            price,
-                            SharesMicro(flatten_shares),
+                            fill_price,
+                            SharesMicro(fill_shares),
                         )?;
                         if let Some(merge) = merge_opt {
                             self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
                         }
+                        total_filled_micro = total_filled_micro.saturating_add(fill_shares);
+                        total_fee_micro = total_fee_micro.saturating_add(fee.0);
+                        total_notional_u128 = total_notional_u128.saturating_add(
+                            u128::from(fill_price.0).saturating_mul(u128::from(fill_shares)),
+                        );
+                    }
+
+                    if total_filled_micro > 0 {
+                        self.consume_book_liquidity(outcome, side, &fills, now_ms, now_ns);
+                        self.stats.flattens_executed =
+                            self.stats.flattens_executed.saturating_add(1);
+                        self.stats.flatten_shares_filled_micro = self
+                            .stats
+                            .flatten_shares_filled_micro
+                            .saturating_add(total_filled_micro);
+                        self.update_window_max_unpaired();
+                        let vwap_price = MicroUsdc(
+                            (total_notional_u128 / u128::from(total_filled_micro)) as u64,
+                        );
                         print_lifecycle_flatten(
                             now_ms,
                             tau_secs,
                             r_trace.map_or(self.current_tier, |trace| trace.tier),
                             outcome,
                             side,
-                            price,
-                            SharesMicro(flatten_shares),
-                            fee,
+                            vwap_price,
+                            SharesMicro(total_filled_micro),
+                            MicroUsdc(total_fee_micro),
                             &reason,
                         );
                         record_lifecycle_flatten_jsonl(
@@ -1809,9 +1955,10 @@ impl LivePaperSimulator {
                             &self.desc.slug,
                             outcome,
                             side,
-                            price,
-                            SharesMicro(flatten_shares),
-                            fee.0,
+                            vwap_price,
+                            SharesMicro(total_filled_micro),
+                            SharesMicro(requested_shares),
+                            total_fee_micro,
                             self.ledger.realized_pnl_micro,
                             &reason,
                         )?;
@@ -2057,6 +2204,19 @@ impl LivePaperSimulator {
 
         if let Some(r_trace) = risk_ack.trace {
             self.stats.ticks_evaluated = self.stats.ticks_evaluated.saturating_add(1);
+            self.update_window_max_unpaired();
+            if matches!(r_trace.flatten_action, FlattenAction::ResidualDust { .. }) {
+                self.stats.residual_dust_ticks = self.stats.residual_dust_ticks.saturating_add(1);
+            }
+            if r_trace.phase == EpochPhase::MandatoryFlatten
+                && r_trace
+                    .cancel_all_reason
+                    .as_deref()
+                    .is_some_and(|r| r.starts_with("Mandatory flatten liquidity unavailable"))
+            {
+                self.stats.flatten_unavailable_ticks =
+                    self.stats.flatten_unavailable_ticks.saturating_add(1);
+            }
             if matches!(r_trace.action_up, OrderAction::Hold)
                 && self
                     .broker
@@ -2276,6 +2436,12 @@ impl LivePaperSimulator {
             },
             jsonl,
         )?;
+        // Snapshot pre-settlement residual leg quantities before settle_epoch zeroes them.
+        let residual_q_up_micro = self.ledger.filled_up.0;
+        let residual_q_dn_micro = self.ledger.filled_dn.0;
+        self.update_window_max_unpaired();
+        let window_max_abs_unpaired_micro = self.window_max_abs_unpaired_micro;
+
         let winning_outcome = self.resolve_winning_outcome();
         let settle_delta = self.ledger.settle_epoch(winning_outcome);
         self.stats.epochs_completed = self.stats.epochs_completed.saturating_add(1);
@@ -2312,25 +2478,55 @@ impl LivePaperSimulator {
             .stats
             .merges_count
             .saturating_sub(self.window_start_merges);
+        let window_flatten_attempts = self
+            .stats
+            .flatten_attempts
+            .saturating_sub(self.window_start_flatten_attempts);
+        let window_flattens_executed = self
+            .stats
+            .flattens_executed
+            .saturating_sub(self.window_start_flattens_executed);
+        let window_flatten_shares_filled_micro = self
+            .stats
+            .flatten_shares_filled_micro
+            .saturating_sub(self.window_start_flatten_shares_micro);
+        let window_flatten_unavailable_ticks = self
+            .stats
+            .flatten_unavailable_ticks
+            .saturating_sub(self.window_start_flatten_unavailable_ticks);
+        let window_residual_dust_ticks = self
+            .stats
+            .residual_dust_ticks
+            .saturating_sub(self.window_start_residual_dust_ticks);
         let expired_slug = self.desc.slug.clone();
         let window_index = self.epoch_num;
         record_window_end_jsonl(
             jsonl,
             now_ms,
             now_ns,
-            &expired_slug,
-            window_index,
-            true,
-            Some(winning_outcome),
-            window_net,
-            window_realized,
-            0,
-            settle_delta,
-            window_fees,
-            window_rebate,
-            window_fills,
-            window_merges,
-            window_pairs,
+            &WindowEndEvent {
+                market_slug: &expired_slug,
+                window_index,
+                complete: true,
+                winning_outcome: Some(winning_outcome),
+                net_pnl_micro: window_net,
+                realized_pnl_micro: window_realized,
+                unrealized_pnl_micro: 0,
+                settlement_pnl_delta_micro: settle_delta,
+                fees_paid_micro: window_fees,
+                estimated_rebate_micro: window_rebate,
+                fills_count: window_fills,
+                merges_count: window_merges,
+                total_pairs_merged_micro: window_pairs,
+                flatten_attempts: window_flatten_attempts,
+                flattens_executed: window_flattens_executed,
+                flatten_shares_filled_micro: window_flatten_shares_filled_micro,
+                flatten_unavailable_ticks: window_flatten_unavailable_ticks,
+                residual_dust_ticks: window_residual_dust_ticks,
+                residual_q_up_micro,
+                residual_q_dn_micro,
+                max_abs_unpaired_micro: window_max_abs_unpaired_micro,
+            },
         )?;
         self.window_start_realized_micro = self.ledger.realized_pnl_micro;
         self.window_start_fees_micro = self.ledger.fees_paid_micro;
@@ -2338,6 +2534,12 @@ impl LivePaperSimulator {
         self.window_start_pairs_micro = self.ledger.total_pairs_merged.0;
         self.window_start_fills = self.stats.fills_count;
         self.window_start_merges = self.stats.merges_count;
+        self.window_start_flatten_attempts = self.stats.flatten_attempts;
+        self.window_start_flattens_executed = self.stats.flattens_executed;
+        self.window_start_flatten_shares_micro = self.stats.flatten_shares_filled_micro;
+        self.window_start_flatten_unavailable_ticks = self.stats.flatten_unavailable_ticks;
+        self.window_start_residual_dust_ticks = self.stats.residual_dust_ticks;
+        self.window_max_abs_unpaired_micro = 0;
         self.pending_settlement = Some(PendingEpochSettlement {
             expired_slug: self.desc.slug.clone(),
             winning_outcome,
@@ -2408,6 +2610,7 @@ impl LivePaperSimulator {
         self.deficit_hedge_latch.reset();
         self.market_resolved_flag = false;
         self.epoch_settled = false;
+        self.window_max_abs_unpaired_micro = 0;
         self.stats.epoch_rollovers = self.stats.epoch_rollovers.saturating_add(1);
         self.pending_feedback.push(RiskFeedback::ResetEpoch {
             new_tick_size: next_desc.tick_size_micro,
@@ -2510,25 +2713,56 @@ impl LivePaperSimulator {
                 .stats
                 .merges_count
                 .saturating_sub(self.window_start_merges);
+            let window_flatten_attempts = self
+                .stats
+                .flatten_attempts
+                .saturating_sub(self.window_start_flatten_attempts);
+            let window_flattens_executed = self
+                .stats
+                .flattens_executed
+                .saturating_sub(self.window_start_flattens_executed);
+            let window_flatten_shares_filled_micro = self
+                .stats
+                .flatten_shares_filled_micro
+                .saturating_sub(self.window_start_flatten_shares_micro);
+            let window_flatten_unavailable_ticks = self
+                .stats
+                .flatten_unavailable_ticks
+                .saturating_sub(self.window_start_flatten_unavailable_ticks);
+            let window_residual_dust_ticks = self
+                .stats
+                .residual_dust_ticks
+                .saturating_sub(self.window_start_residual_dust_ticks);
+            self.update_window_max_unpaired();
             let slug = self.desc.slug.clone();
             let window_index = self.epoch_num;
             record_window_end_jsonl(
                 jsonl,
                 now_ms,
                 now_ns,
-                &slug,
-                window_index,
-                false,
-                None,
-                window_net,
-                window_realized,
-                unreal,
-                0,
-                window_fees,
-                window_rebate,
-                window_fills,
-                window_merges,
-                window_pairs,
+                &WindowEndEvent {
+                    market_slug: &slug,
+                    window_index,
+                    complete: false,
+                    winning_outcome: None,
+                    net_pnl_micro: window_net,
+                    realized_pnl_micro: window_realized,
+                    unrealized_pnl_micro: unreal,
+                    settlement_pnl_delta_micro: 0,
+                    fees_paid_micro: window_fees,
+                    estimated_rebate_micro: window_rebate,
+                    fills_count: window_fills,
+                    merges_count: window_merges,
+                    total_pairs_merged_micro: window_pairs,
+                    flatten_attempts: window_flatten_attempts,
+                    flattens_executed: window_flattens_executed,
+                    flatten_shares_filled_micro: window_flatten_shares_filled_micro,
+                    flatten_unavailable_ticks: window_flatten_unavailable_ticks,
+                    residual_dust_ticks: window_residual_dust_ticks,
+                    residual_q_up_micro: self.ledger.filled_up.0,
+                    residual_q_dn_micro: self.ledger.filled_dn.0,
+                    max_abs_unpaired_micro: self.window_max_abs_unpaired_micro,
+                },
             )?;
         }
 
@@ -5751,5 +5985,165 @@ mod tests {
 
         let _ = std::fs::remove_file(&in_path);
         let _ = std::fs::remove_file(&out_path);
+    }
+
+    #[test]
+    fn match_fak_against_book_handles_empty_shallow_multi_and_limit() {
+        let empty = FixedBook::<10>::empty(Outcome::Up);
+        assert!(
+            match_fak_against_book(&empty, OrderSide::Buy, MicroUsdc(950_000), 20_000_000)
+                .is_empty()
+        );
+
+        let book = FixedBook::<10>::try_from_slices(
+            Outcome::Up,
+            &[
+                BookLevel {
+                    price: MicroUsdc(100_000),
+                    size: SharesMicro(6_000_000),
+                },
+                BookLevel {
+                    price: MicroUsdc(80_000),
+                    size: SharesMicro(10_000_000),
+                },
+            ],
+            &[
+                BookLevel {
+                    price: MicroUsdc(900_000),
+                    size: SharesMicro(10_000_000),
+                },
+                BookLevel {
+                    price: MicroUsdc(920_000),
+                    size: SharesMicro(20_000_000),
+                },
+            ],
+            1_000,
+            1_000,
+        )
+        .unwrap();
+
+        // Buy capped at 90c stops before 92c and returns shallow 10sh L1 only.
+        assert_eq!(
+            match_fak_against_book(&book, OrderSide::Buy, MicroUsdc(900_000), 20_000_000),
+            vec![(MicroUsdc(900_000), 10_000_000)]
+        );
+        // Buy with higher limit walks L1 + L2.
+        assert_eq!(
+            match_fak_against_book(&book, OrderSide::Buy, MicroUsdc(920_000), 20_000_000),
+            vec![
+                (MicroUsdc(900_000), 10_000_000),
+                (MicroUsdc(920_000), 10_000_000)
+            ]
+        );
+        // Sell capped at 10c returns 6sh; limit 8c walks down to 8c.
+        assert_eq!(
+            match_fak_against_book(&book, OrderSide::Sell, MicroUsdc(100_000), 15_000_000),
+            vec![(MicroUsdc(100_000), 6_000_000)]
+        );
+        assert_eq!(
+            match_fak_against_book(&book, OrderSide::Sell, MicroUsdc(80_000), 15_000_000),
+            vec![
+                (MicroUsdc(100_000), 6_000_000),
+                (MicroUsdc(80_000), 9_000_000)
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_fill_flatten_command_does_not_increment_flattens_executed() {
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let mut ctx = setup_test_actors(
+            "zero_fill_flatten",
+            test_market("btc-5m-zero-flatten", start_ms, expiry_ms),
+            50,
+            20,
+            0,
+        );
+
+        // Empty Up ask and empty Down bid (Bk 99/-----/1).
+        let up_book = FixedBook::<10>::try_from_slices(
+            Outcome::Up,
+            &[BookLevel {
+                price: MicroUsdc(990_000),
+                size: SharesMicro(50_000_000),
+            }],
+            &[],
+            start_ms * 1_000_000,
+            start_ms,
+        )
+        .unwrap();
+        let dn_book = FixedBook::<10>::try_from_slices(
+            Outcome::Down,
+            &[],
+            &[BookLevel {
+                price: MicroUsdc(10_000),
+                size: SharesMicro(50_000_000),
+            }],
+            start_ms * 1_000_000,
+            start_ms,
+        )
+        .unwrap();
+        for (outcome, book) in [(Outcome::Up, up_book), (Outcome::Down, dn_book)] {
+            ctx.sim
+                .on_poly_event(
+                    PolyMarketEvent::BookSnapshot {
+                        outcome,
+                        book,
+                        rx_mono_ns: start_ms * 1_000_000,
+                        exch_ts_ms: start_ms,
+                        epoch: 0,
+                    },
+                    start_ms,
+                    start_ms * 1_000_000,
+                    &mut ctx.jsonl,
+                )
+                .unwrap();
+        }
+        ctx.sim
+            .process_fill(
+                &SimFill {
+                    sim_id: 1,
+                    outcome: Outcome::Down,
+                    side: OrderSide::Buy,
+                    price: MicroUsdc(450_000),
+                    filled_shares: SharesMicro(20 * ONE_SHARE_MICRO),
+                    fill_ts_ms: start_ms + 1_000,
+                    is_maker: true,
+                },
+                start_ms + 1_000,
+                (start_ms + 1_000) * 1_000_000,
+                &mut ctx.jsonl,
+            )
+            .unwrap();
+
+        ctx.sim
+            .harness
+            .priority_tx
+            .try_send(ExecutionCommand::ExecuteFlattenFak {
+                outcome: Outcome::Up,
+                price: MicroUsdc(900_000),
+                size: SharesMicro(20 * ONE_SHARE_MICRO),
+                reason: "synthetic empty-book flatten test".to_string(),
+            })
+            .unwrap();
+
+        ctx.sim
+            .execute_commands(
+                start_ms + 275_000,
+                (start_ms + 275_000) * 1_000_000,
+                25,
+                None,
+                &mut ctx.jsonl,
+            )
+            .unwrap();
+
+        assert_eq!(ctx.sim.stats.flatten_attempts, 1);
+        assert_eq!(ctx.sim.stats.flattens_executed, 0);
+        assert_eq!(ctx.sim.stats.flatten_shares_filled_micro, 0);
+        assert_eq!(ctx.sim.ledger.filled_dn, SharesMicro(20 * ONE_SHARE_MICRO));
+
+        let log_contents = ctx.shutdown_and_read_jsonl(start_ms + 276_000);
+        assert!(!log_contents.contains("\"event\":\"flatten\""));
     }
 }
