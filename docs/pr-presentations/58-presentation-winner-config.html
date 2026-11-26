@@ -489,12 +489,26 @@ negative_merge_loss_micro</div>
     t.textContent = s; n.appendChild(t); };
   var rnd = function(i, k){ return Math.abs(((i * 73856093) ^ (k * 19349663)) % 1000) / 1000; };
   var sum = function(a){ return a.reduce(function(x, y){ return x + y; }, 0); };
+  var maxOf = function(a){ return Math.max.apply(null, a); };
+  var minOf = function(a){ return Math.min.apply(null, a); };
   var usd = function(v, sign){
     var a = Math.abs(v), s = a < 0.005 ? "0.00" : a.toFixed(2);
     if (v < -0.005) return "-$" + s;
     return (sign && v > 0.005 ? "+" : "") + "$" + s;
   };
   var lt = function(t){ return '<span dir="ltr">' + t + "</span>"; };
+
+  /* ── shared chart scaffolding ───────────────────── */
+  function clear(id){ var n = document.getElementById(id); n.innerHTML = ""; return n; }
+  function axisLine(svg, x1, y1, x2, y2, stroke, w){
+    return el(svg, "line", { x1: x1, y1: y1, x2: x2, y2: y2, stroke: stroke,
+      "stroke-width": w || .9, class: "vz-fade" });
+  }
+  function foot(svg, w, h, s, delay){
+    txt(svg, { x: w / 2, y: h - 8, "font-size": 7.5, "font-weight": 600, fill: "#5d6b7a",
+      "text-anchor": "middle", "letter-spacing": ".11em", class: "vz-fade",
+      style: "animation-delay:" + (delay || ".7") + "s" }, s);
+  }
 
   /* ── per-configuration analysis (lazy, cached) ──── */
   var A = {};
@@ -521,7 +535,7 @@ negative_merge_loss_micro</div>
       wr: pos.length / active.length * 100, pf: sum(pos) / Math.abs(sum(neg)),
       median: nets.slice().sort(function(a, b){ return a - b; })[Math.floor(nets.length / 2)],
       meanActive: sum(active) / active.length, maxdd: ddMax,
-      best: Math.max.apply(null, nets), worst: Math.min.apply(null, nets),
+      best: maxOf(nets), worst: minOf(nets),
       volume: vol, roi: net / vol * 100, fills: d.fills,
       rows: d.rows.slice().sort(function(a, b){ return a[0] - b[0]; })
     };
@@ -559,7 +573,7 @@ negative_merge_loss_micro</div>
     var host = document.getElementById("vizMatrix");
     host.innerHTML = "";
     var nets = Object.keys(T).map(function(k){ return T[k].net; });
-    var hi = Math.max.apply(null, nets), lo = Math.min.apply(null, nets);
+    var hi = maxOf(nets), lo = minOf(nets);
     var best = hi || 1;
 
     var corner = document.createElement("div"); corner.className = "mx-h"; host.appendChild(corner);
@@ -604,13 +618,12 @@ negative_merge_loss_micro</div>
     });
   }
 
-  function drawEffect(id, labels, vals, highlight, caption){
-    var svg = document.getElementById(id);
-    svg.innerHTML = "";
+  function drawEffect(id, labels, vals, highlight, note){
+    var svg = clear(id);
     var W = 460, H = 210, L = 16, R = 16, T0 = 22, B = 54;
-    var maxV = Math.max.apply(null, vals) * 1.05 || 1;
+    var maxV = maxOf(vals) * 1.05 || 1;
     var span = (W - L - R) / vals.length, bw = span * .52;
-    el(svg, "line", { x1: L, y1: H - B, x2: W - R, y2: H - B, stroke: GRID, "stroke-width": .9, class: "vz-fade" });
+    axisLine(svg, L, H - B, W - R, H - B, GRID);
     vals.forEach(function(v, i){
       var cx = L + span * i + span / 2;
       var h = Math.max(2, v / maxV * (H - T0 - B));
@@ -625,31 +638,35 @@ negative_merge_loss_micro</div>
       txt(svg, { x: cx, y: H - B + 18, "font-size": 10, "font-weight": 700, fill: MUTED,
         "text-anchor": "middle", class: "vz-fade" }, labels[i]);
     });
-    txt(svg, { x: W / 2, y: H - 8, "font-size": 7.5, "font-weight": 600, fill: "#5d6b7a",
-      "text-anchor": "middle", "letter-spacing": ".11em", class: "vz-fade",
-      style: "animation-delay:.7s" }, caption);
+    foot(svg, W, H, note, ".7");
+  }
+
+  /* main effects, computed once and reused by the verdict */
+  var FX = null;
+  function effects(){
+    if (FX) return FX;
+    var cap = meanBy("cap"), exit = meanBy("exit");
+    return FX = { cap: cap, exit: exit, capSpread: maxOf(cap) - minOf(cap),
+      exitSpread: maxOf(exit) - minOf(exit) };
   }
 
   function renderEffects(){
-    var capVals = meanBy("cap"), exitVals = meanBy("exit");
-    var capBest = capVals.indexOf(Math.max.apply(null, capVals));
-    var exitBest = exitVals.indexOf(Math.max.apply(null, exitVals));
-    drawEffect("vzCapFx", CAPS.map(function(c){ return "$" + c; }), capVals, capBest,
-      "MEAN NET BY ENTRY CAP · SPREAD " + usd(Math.max.apply(null, capVals) - Math.min.apply(null, capVals)));
-    drawEffect("vzExitFx", EXITS.map(function(e){ return e + "s"; }), exitVals, exitBest,
-      "MEAN NET BY EXIT WINDOW · SPREAD " + usd(Math.max.apply(null, exitVals) - Math.min.apply(null, exitVals)));
+    var e = effects();
+    drawEffect("vzCapFx", CAPS.map(function(c){ return "$" + c; }), e.cap, e.cap.indexOf(maxOf(e.cap)),
+      "MEAN NET BY ENTRY CAP · SPREAD " + usd(e.capSpread));
+    drawEffect("vzExitFx", EXITS.map(function(x){ return x + "s"; }), e.exit, e.exit.indexOf(maxOf(e.exit)),
+      "MEAN NET BY EXIT WINDOW · SPREAD " + usd(e.exitSpread));
   }
 
   /* ── 3 · equity curve, selected + winner ghost ──── */
   function drawCmp(){
-    var svg = document.getElementById("vzCmp");
-    svg.innerHTML = "";
+    var svg = clear("vzCmp");
     var a = analyze(key()), ghost = analyze(WINNER);
     var same = a.key === ghost.key;
     var W = 900, H = 300, L = 58, R = 86, T0 = 26, B = 46;
     var t0 = a.rows[0][0], t1 = a.rows[a.rows.length - 1][0];
-    var lo = Math.min(0, Math.min.apply(null, a.eq), same ? 0 : Math.min.apply(null, ghost.eq));
-    var hi = Math.max(Math.max.apply(null, a.eq), same ? 0 : Math.max.apply(null, ghost.eq));
+    var lo = Math.min(same ? 0 : minOf(ghost.eq), minOf(a.eq), 0);
+    var hi = Math.max(maxOf(a.eq), same ? 0 : maxOf(ghost.eq));
     var pad = (hi - lo) * 0.12 || 1;
     var x = function(t){ return L + (t - t0) / (t1 - t0) * (W - L - R); };
     var y = function(v){ return H - B - (v - (lo - pad)) / ((hi + pad) - (lo - pad)) * (H - T0 - B); };
@@ -664,7 +681,7 @@ negative_merge_loss_micro</div>
         "text-anchor": "middle", "letter-spacing": ".06em", class: "vz-fade" }, dayLabel(r[0]));
     });
 
-    el(svg, "line", { x1: L - 6, y1: y(0), x2: W - R, y2: y(0), stroke: GRID, "stroke-width": .9, class: "vz-fade" });
+    axisLine(svg, L - 6, y(0), W - R, y(0), GRID);
     [lo, lo + (hi - lo) / 2, hi].forEach(function(v){
       el(svg, "line", { x1: L - 4, y1: y(v), x2: W - R, y2: y(v), stroke: "#1e2630",
         "stroke-width": .6, "stroke-dasharray": "2 5", class: "vz-fade" });
@@ -699,15 +716,12 @@ negative_merge_loss_micro</div>
         fill: BLUE, class: "vz-fade", style: "paint-order:stroke;stroke:" + PANEL + ";stroke-width:3px" }, usd(endB, true));
     }
 
-    txt(svg, { x: W / 2, y: H - 6, "font-size": 7.5, "font-weight": 600, fill: "#5d6b7a",
-      "text-anchor": "middle", "letter-spacing": ".12em", class: "vz-fade",
-      style: "animation-delay:1.7s" }, "CUMULATIVE NET P&L · 226 WINDOWS · HOLLOW = NO TRADE");
+    foot(svg, W, H, "CUMULATIVE NET P&L · 226 WINDOWS · HOLLOW = NO TRADE", "1.7");
   }
 
   /* ── 4 · histogram ──────────────────────────────── */
   function drawHist(){
-    var svg = document.getElementById("vzHist");
-    svg.innerHTML = "";
+    var svg = clear("vzHist");
     var S = analyze(key());
     var data = histMode === "all" ? S.nets : S.active;
     var lo = -10, hi = 11, NB = hi - lo;
@@ -718,7 +732,7 @@ negative_merge_loss_micro</div>
       if (b >= NB) b = NB - 1;
       bins[b]++;
     });
-    var maxC = Math.max.apply(null, bins) || 1;
+    var maxC = maxOf(bins) || 1;
     var W = 460, H = 320, X0 = 40, base = 250, PW = (W - X0 - 26) / NB, HW = PW / 2 - 2;
     var step = Math.min(3.0, 176 / maxC);
 
@@ -733,7 +747,7 @@ negative_merge_loss_micro</div>
       }
     });
 
-    el(svg, "line", { x1: X0 - 3, y1: base + 4, x2: W - 24, y2: base + 4, stroke: GRID, "stroke-width": .9, class: "vz-fade" });
+    axisLine(svg, X0 - 3, base + 4, W - 24, base + 4, GRID);
     for (var e = 0; e <= NB; e++){
       var xe = X0 + e * PW;
       el(svg, "line", { x1: xe, y1: base + 4, x2: xe, y2: base + (e % 2 === 0 ? 11 : 8),
@@ -753,19 +767,16 @@ negative_merge_loss_micro</div>
       "stroke-width": .9, "stroke-dasharray": "2 4", class: "vz-fade", style: "animation-delay:1s" });
     txt(svg, { x: zeroX + 5, y: 32, "font-size": 7.5, "font-weight": 800, fill: MUTED,
       class: "vz-fade", style: "animation-delay:1.1s" }, "ZERO");
-    txt(svg, { x: W / 2, y: H - 12, "font-size": 7.5, "font-weight": 600, fill: "#5d6b7a",
-      "text-anchor": "middle", "letter-spacing": ".12em", class: "vz-fade",
-      style: "animation-delay:1.2s" }, "ONE RUNG = ONE WINDOW · RED = LOSING WINDOW");
+    foot(svg, W, H, "ONE RUNG = ONE WINDOW · RED = LOSING WINDOW", "1.2");
   }
 
   /* ── 5 · per-capture rows ───────────────────────── */
   function drawCaps(){
-    var svg = document.getElementById("vzCaps");
-    svg.innerHTML = "";
+    var svg = clear("vzCaps");
     var caps = analyze(key()).caps;
     var W = 460, H = 320, L = 132, R = 50, T0 = 14, B = 22;
-    var maxPos = Math.max.apply(null, caps.map(function(c){ return Math.max(0, c.total); })) || 1;
-    var maxNeg = Math.max.apply(null, caps.map(function(c){ return Math.max(0, -c.total); }));
+    var maxPos = maxOf(caps.map(function(c){ return Math.max(0, c.total); })) || 1;
+    var maxNeg = maxOf(caps.map(function(c){ return Math.max(0, -c.total); }));
     var span = W - L - R;
     var x0 = L + (maxNeg / (maxPos + maxNeg)) * span;
     var scale = span / (maxPos + maxNeg);
@@ -790,7 +801,7 @@ negative_merge_loss_micro</div>
         style: "animation-delay:" + (.2 + i * .04) + "s" }, usd(c.total, true));
     });
 
-    el(svg, "line", { x1: x0, y1: T0, x2: x0, y2: H - B, stroke: "#3b4757", "stroke-width": .9, class: "vz-fade" });
+    axisLine(svg, x0, T0, x0, H - B, "#3b4757");
     txt(svg, { x: x0, y: H - 6, "font-size": 7, "font-weight": 600, fill: "#5d6b7a",
       "text-anchor": "middle", "letter-spacing": ".1em", class: "vz-fade" }, "$0");
   }
@@ -823,26 +834,20 @@ negative_merge_loss_micro</div>
 
   /* ── verdict, computed from the nine cells ──────── */
   function renderNote(){
-    var capVals = meanBy("cap"), exitVals = meanBy("exit");
-    var capSpread = Math.max.apply(null, capVals) - Math.min.apply(null, capVals);
-    var exitSpread = Math.max.apply(null, exitVals) - Math.min.apply(null, exitVals);
-    var ratio = exitSpread / capSpread;
+    var e = effects(), exitVals = e.exit, ratio = e.exitSpread / e.capSpread;
     var capRow = CAPS.map(function(c){ return T[c + "/120"].net; });
-    var rowSpread = Math.max.apply(null, capRow) - Math.min.apply(null, capRow);
-    var exitRow = EXITS.map(function(e){ return T["0.65/" + e].net; });
-    var colSpread = Math.max.apply(null, exitRow) - Math.min.apply(null, exitRow);
-    var margin = T[WINNER].net - T["0.60/120"].net;
+    var rowSpread = maxOf(capRow) - minOf(capRow);
+    var exitRow = EXITS.map(function(x){ return T["0.65/" + x].net; });
+    var colSpread = maxOf(exitRow) - minOf(exitRow);
 
     document.getElementById("vizNote").innerHTML =
       "<strong>מה מזיז את התוצאה:</strong> חלון היציאה. ממוצע הרווח עולה מ־" + lt(usd(exitVals[0], true)) +
       " ב־" + lt("90s") + " ל־" + lt(usd(exitVals[2], true)) + " ב־" + lt("120s") +
-      " — טווח של " + lt(usd(exitSpread)) + ". מחיר הכניסה זז רק " + lt(usd(capSpread)) +
+      " — טווח של " + lt(usd(e.exitSpread)) + ". מחיר הכניסה זז רק " + lt(usd(e.capSpread)) +
       " באותו חישוב, כלומר חלון היציאה משפיע פי " + lt(ratio.toFixed(1) + "×") + " יותר. " +
-      "בשורה של " + lt("120s") + " שלושת מחירי הכניסה יושבים בין " + lt(usd(Math.min.apply(null, capRow), true)) +
-      " ל־" + lt(usd(Math.max.apply(null, capRow), true)) + " (טווח " + lt(usd(rowSpread)) + "), " +
+      "בשורה של " + lt("120s") + " שלושת מחירי הכניסה יושבים בין " + lt(usd(minOf(capRow), true)) +
+      " ל־" + lt(usd(maxOf(capRow), true)) + " (טווח " + lt(usd(rowSpread)) + "), " +
       "ובעמודה של " + lt("$0.65") + " הטווח הוא " + lt(usd(colSpread)) + ". " +
-      "המרווח של " + lt(usd(margin)) + " בין הזוכה ל־" + lt("$0.60 / 120s") + " הוא אפוא וויסות עדין בתוך אותו מנוע יציאה — " +
-      "לא מה שמייצר את הרווח. " +
       "<br><br><strong>אבל הכניסה קובעת את הזנב:</strong> שלוש תצורות " + lt("$0.70") +
       " קורסות מחוץ למדגם (" + lt(usd(T["0.70/90"].oos, true)) + " / " + lt(usd(T["0.70/105"].oos, true)) + " / " +
       lt(usd(T["0.70/120"].oos, true)) + " מול " + lt(usd(T["0.65/120"].oos, true)) + " אצל הזוכה), " +
@@ -852,15 +857,13 @@ negative_merge_loss_micro</div>
   }
 
   /* ── wiring ─────────────────────────────────────── */
+  function each(sel, fn){ Array.prototype.forEach.call(document.querySelectorAll(sel), fn); }
+  function press(b, on){
+    b.classList.toggle("is-on", on); b.setAttribute("aria-pressed", on ? "true" : "false");
+  }
   function syncButtons(){
-    Array.prototype.forEach.call(document.querySelectorAll("[data-cap]"), function(b){
-      var on = b.getAttribute("data-cap") === selCap;
-      b.classList.toggle("is-on", on); b.setAttribute("aria-pressed", on ? "true" : "false");
-    });
-    Array.prototype.forEach.call(document.querySelectorAll("[data-exit]"), function(b){
-      var on = +b.getAttribute("data-exit") === selExit;
-      b.classList.toggle("is-on", on); b.setAttribute("aria-pressed", on ? "true" : "false");
-    });
+    each("[data-cap]", function(b){ press(b, b.getAttribute("data-cap") === selCap); });
+    each("[data-exit]", function(b){ press(b, +b.getAttribute("data-exit") === selExit); });
   }
 
   function renderAll(){
@@ -875,10 +878,10 @@ negative_merge_loss_micro</div>
       (key() === WINNER ? " — התצורה הזוכה" : " · קו דק = הזוכה " + lt("$0.65 / 120s") + " להשוואה");
   }
 
-  Array.prototype.forEach.call(document.querySelectorAll("[data-cap]"), function(b){
+  each("[data-cap]", function(b){
     b.addEventListener("click", function(){ selCap = b.getAttribute("data-cap"); renderAll(); });
   });
-  Array.prototype.forEach.call(document.querySelectorAll("[data-exit]"), function(b){
+  each("[data-exit]", function(b){
     b.addEventListener("click", function(){ selExit = +b.getAttribute("data-exit"); renderAll(); });
   });
   document.getElementById("vizMatrix").addEventListener("click", function(ev){
@@ -887,14 +890,10 @@ negative_merge_loss_micro</div>
     var p = c.getAttribute("data-cell").split("/");
     selCap = p[0]; selExit = +p[1]; renderAll();
   });
-  Array.prototype.forEach.call(document.querySelectorAll("[data-mode]"), function(b){
+  each("[data-mode]", function(b){
     b.addEventListener("click", function(){
       histMode = b.getAttribute("data-mode");
-      Array.prototype.forEach.call(document.querySelectorAll("[data-mode]"), function(x){
-        var on = x === b;
-        x.classList.toggle("is-on", on);
-        x.setAttribute("aria-pressed", on ? "true" : "false");
-      });
+      each("[data-mode]", function(x){ press(x, x === b); });
       document.getElementById("vzHistSub").textContent = histMode === "all"
         ? "כל 226 החלונות · כל רונג = חלון אחד · תדירות לפי דולר"
         : "רק החלונות שסחרו · השאר נסגרו ב־$0.00";
@@ -902,7 +901,7 @@ negative_merge_loss_micro</div>
     });
   });
 
-  obsReveal("vzCmp", function(){ drawCmp(); });
+  obsReveal("vzCmp", drawCmp);
 
   syncButtons();
   renderStats();
@@ -910,13 +909,6 @@ negative_merge_loss_micro</div>
   renderEffects();
   renderNote();
   setTimeout(function(){ drawHist(); drawCaps(); }, 0);
-
-  window.__viz = {
-    key: key, net: T[WINNER].net, cells: Object.keys(T).length,
-    exitSpread: (function(){ var v = meanBy("exit"); return Math.max.apply(null, v) - Math.min.apply(null, v); })(),
-    capSpread: (function(){ var v = meanBy("cap"); return Math.max.apply(null, v) - Math.min.apply(null, v); })(),
-    matrixCells: function(){ return document.querySelectorAll("#vizMatrix [data-cell]").length; }
-  };
 })();
 </script>
 
