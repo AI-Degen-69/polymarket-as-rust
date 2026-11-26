@@ -189,7 +189,33 @@ struct ParsedReplay {
 
 fn run_cli_replay_config6(input_path: &Path, output_path: &Path) -> ParsedReplay {
     let bin = env!("CARGO_BIN_EXE_poly-as");
-    let output = Command::new(bin)
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let isolated_cwd = std::env::temp_dir().join(format!(
+        "poly_as_flatten_inv_cwd_{}_{seq}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&isolated_cwd).unwrap();
+
+    let mut cmd = Command::new(bin);
+    cmd.current_dir(&isolated_cwd).env_clear();
+    for var in [
+        "PATH",
+        "SYSTEMROOT",
+        "COMSPEC",
+        "WINDIR",
+        "TEMP",
+        "TMP",
+        "HOME",
+        "USERPROFILE",
+        "PATHEXT",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+    ] {
+        if let Some(val) = std::env::var_os(var) {
+            cmd.env(var, val);
+        }
+    }
+    let output = cmd
         .args([
             "lifecycle",
             "--source",
@@ -219,6 +245,7 @@ fn run_cli_replay_config6(input_path: &Path, output_path: &Path) -> ParsedReplay
         ])
         .output()
         .unwrap();
+    let _ = std::fs::remove_dir_all(&isolated_cwd);
 
     assert!(
         output.status.success(),
@@ -335,8 +362,8 @@ struct FlattenFillResult {
     fee_micro: u64,
 }
 
-/// Direct RiskActor + PaperLedger harness simulating depth-bounded partial FAK fills
-/// (since LivePaperSimulator::execute_commands in lifecycle_cmd.rs ignores book depth).
+/// Isolated RiskActor + PaperLedger harness for deterministic risk decisions, retry
+/// feedback, and ledger accounting (end-to-end depth tests use `run_cli_replay_config6`).
 struct PartialFlattenHarness {
     harness: ActorPipelineHarness,
     priority_rx: tokio::sync::mpsc::Receiver<ExecutionCommand>,

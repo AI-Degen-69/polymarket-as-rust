@@ -1128,6 +1128,12 @@ struct LivePaperSimulator {
     book_dn: BookMaintainer,
     latest_up: Option<FixedBook<10>>,
     latest_dn: Option<FixedBook<10>>,
+    /// Unmodified market books preserved for terminal outcome resolution so simulated
+    /// depth consumption on `book_*`/`latest_*` cannot alter settlement inference.
+    market_book_up: BookMaintainer,
+    market_book_dn: BookMaintainer,
+    market_latest_up: Option<FixedBook<10>>,
+    market_latest_dn: Option<FixedBook<10>>,
     fallback_up: FixedBook<10>,
     fallback_dn: FixedBook<10>,
     latest_spot: Option<f64>,
@@ -1207,6 +1213,10 @@ impl LivePaperSimulator {
             book_dn: BookMaintainer::new(Outcome::Down),
             latest_up: None,
             latest_dn: None,
+            market_book_up: BookMaintainer::new(Outcome::Up),
+            market_book_dn: BookMaintainer::new(Outcome::Down),
+            market_latest_up: None,
+            market_latest_dn: None,
             fallback_up: FixedBook::<10>::empty(Outcome::Up),
             fallback_dn: FixedBook::<10>::empty(Outcome::Down),
             latest_spot: None,
@@ -1366,20 +1376,42 @@ impl LivePaperSimulator {
                 exch_ts_ms,
                 ..
             } => {
-                let applied = match outcome {
-                    Outcome::Up => self.book_up.apply_snapshot(
-                        book.bids_slice(),
-                        book.asks_slice(),
-                        rx_mono_ns,
-                        exch_ts_ms,
+                let (applied, applied_market) = match outcome {
+                    Outcome::Up => (
+                        self.book_up.apply_snapshot(
+                            book.bids_slice(),
+                            book.asks_slice(),
+                            rx_mono_ns,
+                            exch_ts_ms,
+                        ),
+                        self.market_book_up.apply_snapshot(
+                            book.bids_slice(),
+                            book.asks_slice(),
+                            rx_mono_ns,
+                            exch_ts_ms,
+                        ),
                     ),
-                    Outcome::Down => self.book_dn.apply_snapshot(
-                        book.bids_slice(),
-                        book.asks_slice(),
-                        rx_mono_ns,
-                        exch_ts_ms,
+                    Outcome::Down => (
+                        self.book_dn.apply_snapshot(
+                            book.bids_slice(),
+                            book.asks_slice(),
+                            rx_mono_ns,
+                            exch_ts_ms,
+                        ),
+                        self.market_book_dn.apply_snapshot(
+                            book.bids_slice(),
+                            book.asks_slice(),
+                            rx_mono_ns,
+                            exch_ts_ms,
+                        ),
                     ),
                 };
+                if let Ok(valid_market_book) = applied_market {
+                    match outcome {
+                        Outcome::Up => self.market_latest_up = Some(valid_market_book),
+                        Outcome::Down => self.market_latest_dn = Some(valid_market_book),
+                    }
+                }
                 if let Ok(valid_book) = applied {
                     match outcome {
                         Outcome::Up => self.latest_up = Some(valid_book),
@@ -1417,6 +1449,14 @@ impl LivePaperSimulator {
                         {
                             self.latest_up = Some(top);
                         }
+                        let _ = self.market_book_up.apply_delta_allow_transient_cross(
+                            side, price, size, rx_mono_ns, exch_ts_ms,
+                        );
+                        if !self.market_book_up.is_crossed()
+                            && let Ok(top) = self.market_book_up.top_n::<10>()
+                        {
+                            self.market_latest_up = Some(top);
+                        }
                     }
                     Outcome::Down => {
                         let _ = self.book_dn.apply_delta_allow_transient_cross(
@@ -1426,6 +1466,14 @@ impl LivePaperSimulator {
                             && let Ok(top) = self.book_dn.top_n::<10>()
                         {
                             self.latest_dn = Some(top);
+                        }
+                        let _ = self.market_book_dn.apply_delta_allow_transient_cross(
+                            side, price, size, rx_mono_ns, exch_ts_ms,
+                        );
+                        if !self.market_book_dn.is_crossed()
+                            && let Ok(top) = self.market_book_dn.top_n::<10>()
+                        {
+                            self.market_latest_dn = Some(top);
                         }
                     }
                 }
@@ -1934,73 +1982,11 @@ impl LivePaperSimulator {
 
                     if requested_shares > 0 {
                         self.stats.flatten_attempts = self.stats.flatten_attempts.saturating_add(1);
-                        let fills = match_fak_against_book(
-                            self.book_ref(outcome),
-                            side,
-                            price,
-                            requested_shares,
-                        );
-                        let mut total_filled_micro = 0_u64;
-                        let mut total_fee_micro = 0_u64;
-                        let mut total_notional_u128 = 0_u128;
-                        for &(fill_price, fill_shares) in &fills {
-                            if fill_shares == 0 {
-                                continue;
-                            }
-                            let (fee, merge_opt) = self.ledger.record_taker_flatten_with_merge(
-                                outcome,
-                                side,
-                                fill_price,
-                                SharesMicro(fill_shares),
-                            )?;
-                            if let Some(merge) = merge_opt {
-                                self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
-                            }
-                            total_filled_micro = total_filled_micro.saturating_add(fill_shares);
-                            total_fee_micro = total_fee_micro.saturating_add(fee.0);
-                            total_notional_u128 = total_notional_u128.saturating_add(
-                                u128::from(fill_price.0).saturating_mul(u128::from(fill_shares)),
-                            );
-                        }
-
-                        if total_filled_micro > 0 {
-                            self.consume_book_liquidity(outcome, side, &fills, now_ms, now_ns)?;
-                            self.stats.flattens_executed =
-                                self.stats.flattens_executed.saturating_add(1);
-                            self.stats.flatten_shares_filled_micro = self
-                                .stats
-                                .flatten_shares_filled_micro
-                                .saturating_add(total_filled_micro);
-                            self.update_window_max_unpaired();
-                            let vwap_price = MicroUsdc(
-                                (total_notional_u128 / u128::from(total_filled_micro)) as u64,
-                            );
-                            print_lifecycle_flatten(
-                                now_ms,
-                                tau_secs,
-                                r_trace.map_or(self.current_tier, |trace| trace.tier),
-                                outcome,
-                                side,
-                                vwap_price,
-                                SharesMicro(total_filled_micro),
-                                MicroUsdc(total_fee_micro),
-                                &reason,
-                            );
-                            record_lifecycle_flatten_jsonl(
-                                jsonl,
-                                now_ms,
-                                now_ns,
-                                &self.desc.slug,
-                                outcome,
-                                side,
-                                vwap_price,
-                                SharesMicro(total_filled_micro),
-                                SharesMicro(requested_shares),
-                                total_fee_micro,
-                                self.ledger.realized_pnl_micro,
-                                &reason,
-                            )?;
-                        } else {
+                        let book_is_crossed = match outcome {
+                            Outcome::Up => self.book_up.is_crossed(),
+                            Outcome::Down => self.book_dn.is_crossed(),
+                        };
+                        if book_is_crossed {
                             record_lifecycle_flatten_unfilled_jsonl(
                                 jsonl,
                                 now_ms,
@@ -2010,8 +1996,90 @@ impl LivePaperSimulator {
                                 side,
                                 price,
                                 SharesMicro(requested_shares),
-                                &reason,
+                                "Book crossed; deferred FAK matching",
                             )?;
+                        } else {
+                            let fills = match_fak_against_book(
+                                self.book_ref(outcome),
+                                side,
+                                price,
+                                requested_shares,
+                            );
+                            let mut total_filled_micro = 0_u64;
+                            let mut total_fee_micro = 0_u64;
+                            let mut total_notional_u128 = 0_u128;
+                            for &(fill_price, fill_shares) in &fills {
+                                if fill_shares == 0 {
+                                    continue;
+                                }
+                                let (fee, merge_opt) =
+                                    self.ledger.record_taker_flatten_with_merge(
+                                        outcome,
+                                        side,
+                                        fill_price,
+                                        SharesMicro(fill_shares),
+                                    )?;
+                                if let Some(merge) = merge_opt {
+                                    self.record_merge_event(&merge, now_ms, now_ns, jsonl)?;
+                                }
+                                total_filled_micro = total_filled_micro.saturating_add(fill_shares);
+                                total_fee_micro = total_fee_micro.saturating_add(fee.0);
+                                total_notional_u128 = total_notional_u128.saturating_add(
+                                    u128::from(fill_price.0)
+                                        .saturating_mul(u128::from(fill_shares)),
+                                );
+                            }
+
+                            if total_filled_micro > 0 {
+                                self.consume_book_liquidity(outcome, side, &fills, now_ms, now_ns)?;
+                                self.stats.flattens_executed =
+                                    self.stats.flattens_executed.saturating_add(1);
+                                self.stats.flatten_shares_filled_micro = self
+                                    .stats
+                                    .flatten_shares_filled_micro
+                                    .saturating_add(total_filled_micro);
+                                self.update_window_max_unpaired();
+                                let vwap_price = MicroUsdc(
+                                    (total_notional_u128 / u128::from(total_filled_micro)) as u64,
+                                );
+                                print_lifecycle_flatten(
+                                    now_ms,
+                                    tau_secs,
+                                    r_trace.map_or(self.current_tier, |trace| trace.tier),
+                                    outcome,
+                                    side,
+                                    vwap_price,
+                                    SharesMicro(total_filled_micro),
+                                    MicroUsdc(total_fee_micro),
+                                    &reason,
+                                );
+                                record_lifecycle_flatten_jsonl(
+                                    jsonl,
+                                    now_ms,
+                                    now_ns,
+                                    &self.desc.slug,
+                                    outcome,
+                                    side,
+                                    vwap_price,
+                                    SharesMicro(total_filled_micro),
+                                    SharesMicro(requested_shares),
+                                    total_fee_micro,
+                                    self.ledger.realized_pnl_micro,
+                                    &reason,
+                                )?;
+                            } else {
+                                record_lifecycle_flatten_unfilled_jsonl(
+                                    jsonl,
+                                    now_ms,
+                                    now_ns,
+                                    &self.desc.slug,
+                                    outcome,
+                                    side,
+                                    price,
+                                    SharesMicro(requested_shares),
+                                    &reason,
+                                )?;
+                            }
                         }
                     }
                 }
@@ -2418,8 +2486,14 @@ impl LivePaperSimulator {
         if let Some(explicit) = self.explicit_winning_outcome {
             return explicit;
         }
-        let imp_up = self.latest_up.as_ref().and_then(terminal_implied_price);
-        let imp_dn = self.latest_dn.as_ref().and_then(terminal_implied_price);
+        let imp_up = self
+            .market_latest_up
+            .as_ref()
+            .and_then(terminal_implied_price);
+        let imp_dn = self
+            .market_latest_dn
+            .as_ref()
+            .and_then(terminal_implied_price);
 
         // 1. Unambiguous terminal CLOB consensus (`>= $0.85` vs `<= $0.15`,
         //    including one-sided `$0.99 / None` or `None / $0.01` books at expiry).
@@ -2643,6 +2717,10 @@ impl LivePaperSimulator {
         self.book_dn = BookMaintainer::new(Outcome::Down);
         self.latest_up = None;
         self.latest_dn = None;
+        self.market_book_up = BookMaintainer::new(Outcome::Up);
+        self.market_book_dn = BookMaintainer::new(Outcome::Down);
+        self.market_latest_up = None;
+        self.market_latest_dn = None;
         self.latest_twap_60s = None;
         self.strike_usd = next_desc
             .strike_price_usd
@@ -5721,13 +5799,13 @@ mod tests {
         ctx.sim.strike_usd = Some(95_000.0);
         ctx.sim.latest_twap_60s = Some(94_800.0);
         ctx.sim.latest_spot = Some(95_050.0);
-        ctx.sim.latest_up = Some(test_book(Outcome::Up, 500_000, 520_000, 5, 1_000));
-        ctx.sim.latest_dn = Some(test_book(Outcome::Down, 480_000, 500_000, 5, 1_000));
+        ctx.sim.market_latest_up = Some(test_book(Outcome::Up, 500_000, 520_000, 5, 1_000));
+        ctx.sim.market_latest_dn = Some(test_book(Outcome::Down, 480_000, 500_000, 5, 1_000));
         assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Up);
 
         // 2. Unambiguous one-sided terminal CLOB ($0.99 bid, no ask) overrides spot basis drift.
         ctx.sim.latest_spot = Some(94_995.0);
-        ctx.sim.latest_up = Some(
+        ctx.sim.market_latest_up = Some(
             FixedBook::try_from_slices(
                 Outcome::Up,
                 &[BookLevel {
@@ -5740,7 +5818,7 @@ mod tests {
             )
             .unwrap(),
         );
-        ctx.sim.latest_dn = None;
+        ctx.sim.market_latest_dn = None;
         assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Up);
 
         // 3. Explicit MarketResolution override takes highest priority (even over one-sided Up book).
@@ -6280,5 +6358,219 @@ mod tests {
             )
             .is_empty()
         );
+    }
+
+    #[test]
+    fn paper_flatten_consumption_does_not_alter_settlement_winner() {
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let mut ctx = setup_test_actors(
+            "settle_isolation",
+            test_market("btc-5m-settle-iso", start_ms, expiry_ms),
+            50,
+            20,
+            0,
+        );
+        ctx.sim.strike_usd = Some(60_000.0);
+        // Spot below strike so fallback would select Down if CLOB consensus were lost.
+        ctx.sim.observe_spot(59_900.0, expiry_ms);
+
+        let up_book = FixedBook::<10>::try_from_slices(
+            Outcome::Up,
+            &[BookLevel {
+                price: MicroUsdc(830_000),
+                size: SharesMicro(50 * ONE_SHARE_MICRO),
+            }],
+            &[BookLevel {
+                price: MicroUsdc(870_000),
+                size: SharesMicro(10 * ONE_SHARE_MICRO),
+            }],
+            start_ms * 1_000_000,
+            start_ms,
+        )
+        .unwrap();
+        let dn_book = FixedBook::<10>::try_from_slices(
+            Outcome::Down,
+            &[BookLevel {
+                price: MicroUsdc(120_000),
+                size: SharesMicro(50 * ONE_SHARE_MICRO),
+            }],
+            &[BookLevel {
+                price: MicroUsdc(160_000),
+                size: SharesMicro(50 * ONE_SHARE_MICRO),
+            }],
+            start_ms * 1_000_000,
+            start_ms,
+        )
+        .unwrap();
+        for (outcome, book) in [(Outcome::Up, up_book), (Outcome::Down, dn_book)] {
+            ctx.sim
+                .on_poly_event(
+                    PolyMarketEvent::BookSnapshot {
+                        outcome,
+                        book,
+                        rx_mono_ns: start_ms * 1_000_000,
+                        exch_ts_ms: start_ms,
+                        epoch: 0,
+                    },
+                    start_ms,
+                    start_ms * 1_000_000,
+                    &mut ctx.jsonl,
+                )
+                .unwrap();
+        }
+        // Before consumption: Up mid = 85c >= HIGH_CONF (85c), Dn mid = 14c <= LOW_CONF (15c) => Up.
+        assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Up);
+
+        // Simulated fill removes the 87c ask from execution book, dropping latest_up implied price to 83c.
+        ctx.sim
+            .consume_book_liquidity(
+                Outcome::Up,
+                OrderSide::Buy,
+                &[(MicroUsdc(870_000), 10 * ONE_SHARE_MICRO)],
+                expiry_ms,
+                expiry_ms * 1_000_000,
+            )
+            .unwrap();
+
+        // Settlement must still read the unmodified market book and resolve Up.
+        assert_eq!(ctx.sim.resolve_winning_outcome(), Outcome::Up);
+    }
+
+    #[test]
+    fn crossed_book_defers_fak_matching_instead_of_filling_stale_cache() {
+        let start_ms = 1_700_000_000_000_u64;
+        let expiry_ms = start_ms + 300_000;
+        let mut ctx = setup_test_actors(
+            "crossed_defer",
+            test_market("btc-5m-crossed-defer", start_ms, expiry_ms),
+            50,
+            20,
+            0,
+        );
+
+        let initial_up = FixedBook::<10>::try_from_slices(
+            Outcome::Up,
+            &[BookLevel {
+                price: MicroUsdc(890_000),
+                size: SharesMicro(50 * ONE_SHARE_MICRO),
+            }],
+            &[
+                BookLevel {
+                    price: MicroUsdc(900_000),
+                    size: SharesMicro(10 * ONE_SHARE_MICRO),
+                },
+                BookLevel {
+                    price: MicroUsdc(920_000),
+                    size: SharesMicro(10 * ONE_SHARE_MICRO),
+                },
+            ],
+            start_ms * 1_000_000,
+            start_ms,
+        )
+        .unwrap();
+        let initial_dn = test_book(Outcome::Down, 80_000, 100_000, 50, start_ms);
+        for (outcome, book) in [(Outcome::Up, initial_up), (Outcome::Down, initial_dn)] {
+            ctx.sim
+                .on_poly_event(
+                    PolyMarketEvent::BookSnapshot {
+                        outcome,
+                        book,
+                        rx_mono_ns: start_ms * 1_000_000,
+                        exch_ts_ms: start_ms,
+                        epoch: 0,
+                    },
+                    start_ms,
+                    start_ms * 1_000_000,
+                    &mut ctx.jsonl,
+                )
+                .unwrap();
+        }
+        ctx.sim
+            .process_fill(
+                &SimFill {
+                    sim_id: 1,
+                    outcome: Outcome::Down,
+                    side: OrderSide::Buy,
+                    price: MicroUsdc(450_000),
+                    filled_shares: SharesMicro(20 * ONE_SHARE_MICRO),
+                    fill_ts_ms: start_ms + 1_000,
+                    is_maker: true,
+                },
+                start_ms + 1_000,
+                (start_ms + 1_000) * 1_000_000,
+                &mut ctx.jsonl,
+            )
+            .unwrap();
+
+        // Cross the book with a 93c bid, then delete the 90c ask so maintainer remains crossed
+        // while cached latest_up still holds the deleted 90c ask.
+        ctx.sim
+            .on_poly_event(
+                PolyMarketEvent::PriceChange {
+                    outcome: Outcome::Up,
+                    side: OrderSide::Buy,
+                    price: MicroUsdc(930_000),
+                    size: SharesMicro(10 * ONE_SHARE_MICRO),
+                    best_bid: None,
+                    best_ask: None,
+                    rx_mono_ns: (start_ms + 2_000) * 1_000_000,
+                    exch_ts_ms: start_ms + 2_000,
+                    epoch: 0,
+                },
+                start_ms + 2_000,
+                (start_ms + 2_000) * 1_000_000,
+                &mut ctx.jsonl,
+            )
+            .unwrap();
+        ctx.sim
+            .on_poly_event(
+                PolyMarketEvent::PriceChange {
+                    outcome: Outcome::Up,
+                    side: OrderSide::Sell,
+                    price: MicroUsdc(900_000),
+                    size: SharesMicro::ZERO,
+                    best_bid: None,
+                    best_ask: None,
+                    rx_mono_ns: (start_ms + 2_050) * 1_000_000,
+                    exch_ts_ms: start_ms + 2_050,
+                    epoch: 0,
+                },
+                start_ms + 2_050,
+                (start_ms + 2_050) * 1_000_000,
+                &mut ctx.jsonl,
+            )
+            .unwrap();
+        assert!(ctx.sim.book_up.is_crossed());
+
+        ctx.sim
+            .harness
+            .priority_tx
+            .try_send(ExecutionCommand::ExecuteFlattenFak {
+                outcome: Outcome::Up,
+                price: MicroUsdc(900_000),
+                size: SharesMicro(20 * ONE_SHARE_MICRO),
+                reason: "crossed-book test".to_string(),
+            })
+            .unwrap();
+        ctx.sim
+            .execute_commands(
+                start_ms + 275_000,
+                (start_ms + 275_000) * 1_000_000,
+                25,
+                None,
+                &mut ctx.jsonl,
+            )
+            .unwrap();
+
+        assert_eq!(ctx.sim.stats.flatten_attempts, 1);
+        assert_eq!(ctx.sim.stats.flattens_executed, 0);
+        assert_eq!(ctx.sim.stats.flatten_shares_filled_micro, 0);
+        assert_eq!(ctx.sim.ledger.filled_dn, SharesMicro(20 * ONE_SHARE_MICRO));
+
+        let log_contents = ctx.shutdown_and_read_jsonl(start_ms + 276_000);
+        assert!(!log_contents.contains("\"event\":\"flatten\""));
+        assert!(log_contents.contains("\"event\":\"flatten_unfilled\""));
+        assert!(log_contents.contains("Book crossed; deferred FAK matching"));
     }
 }
