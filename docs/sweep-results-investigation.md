@@ -274,3 +274,52 @@ To isolate the `5cf74b9` binary difference from `Cap #21`, both capture sets wer
 
 - **Micro-dollar determinism confirmed:** Comparing all `17` `summary` accounting/telemetry fields (`ticks_evaluated`, `fills_count`, `merges_count`, `volume_in_micro`, `positive_merge_gain_micro`, `negative_merge_loss_micro`, `settlement_pnl_micro`, `net_pnl_micro`, etc.) yielded **`0` discrepancies** between `controlled_20caps_run2` and the first `20` captures of `S2`, and **`0` discrepancies** between `controlled_21caps_run2` and `S2`.
 - **Conclusion:** On the corrected `5cf74b9` binary, the original `20`-capture dataset is reproducible at `+$45.53` (`100%` retention, `22%/46%` drag/tail, `11%` MaxDD) and **still passes G1–G5**. Adding `Cap #21` genuinely pushes the combined `21`-capture sample into **both G3 failure (`12%`) and G5 failure (`39%/63%`)**, exposed because `5cf74b9` had already removed `S1`'s `-$10.50` sub-second timing-bug profit in `Cap #20`.
+
+---
+
+## Part III — What the `21`-Capture Failure Means for the Shipped Defaults *(Analysis)*
+
+**Answer: keep the values, correct the provenance claim, gather more captures.** Re-promoting a config would re-rank a grid whose margin came partly from profit the binary fix removed, and the gate thresholds are not the problem — the sample is.
+
+### 10. The failure does not implicate any configuration value
+
+- Both runs in §9 use the identical promoted config (`max_entry_price=0.65`, `entry_cutoff_secs=120`, `tier1_hedge_trigger_price=null`, `entry_open_delay_secs=15`, `cap_tier1_reducing_to_delta=true`, `QueueDecay=conservative`, `execution_mode=Paper`). Only the binary (`5cf74b9`) and the added `Cap #21` differ, so nothing here says `$0.65` or `120s` is wrong.
+- Re-promotion would select on the pre-fix ranking. The boundary grid's `79.9` vs `77.7` margin for `#6/9` over `#3/9` was earned with `Cap #20`'s `-$10.50` timing-bug profit still in the ledger; `5cf74b9` removed it, and `Cap #20`'s share of the winner's Net P&L drops from `36.1%` of `+$58.79` to a much smaller slice of `+$45.53`. A new grid ranked on the corrected binary is a different experiment, not a re-promotion of this one.
+- The `20`-capture control on the corrected binary still passes G1–G5 (`+$45.53`, `99.88%` retention, `21.55% / 45.92%` drag/tail, `10.72%` MaxDD), but with only ~`4` pp of tail-drag headroom (`45.92%` vs the `50%` limit). That is a narrow pass, not a comfortable one.
+
+### 11. Neither `12%` nor `162%` is a measurement at `351` fills
+
+Window-level stats recomputed from `26-11_07-55-07Z_1runs_21caps-241w` (`241` windows: `168` IS / `73` OOS, `351` fills):
+
+| Statistic | IS | OOS |
+|---|---:|---:|
+| Net (`0%` floor) | `+$31.6807` | `+$1.6057` |
+| Windows | `168` | `73` |
+| Mean per window | `+$0.1886` | `+$0.0220` |
+| Standard deviation | `$1.3125` | `$1.4883` |
+| Standard error | — | `$0.1742` |
+| t-statistic vs zero | `1.86` | **`0.13`** |
+| `95%` CI on the mean | — | `[-$0.3247, +$0.3686]` |
+
+- The OOS confidence interval contains both zero and the IS mean (difference t = `0.83`). There is no evidence of decay and no evidence of persistence; there is a sample too small to separate them.
+- OOS is `5` captures: `+$1.73, -$0.40, +$1.78, +$10.75, -$12.24`. One capture is `-$12.24`, and `Cap #21`'s `-$9.00` is a mandatory flatten into a `Bk 99/-----/1` book — an event that occurred in roughly `0.4%` of windows.
+- Leave-one-capture-out retention spans `-30.7%` to `78.1%`. Dropping the single `-$9.00` window alone lifts OOS to `78%`, i.e. from `FAIL(G3)` to `PASS`. G3 needed `$6.88` of OOS net against `$1.61` actual, so the gate flipped on one tail event — the signature of an under-powered sample, not of a strategy edge.
+- The expected cost of that tail is ~`$0.036`/window at a `0.4%` event rate, against an IS edge of `$0.19`/window. The point estimate is not destroyed by the tail; the estimator is just too noisy at `351` fills.
+- Spec Filter 4 ([strategy-verification-spec.md](strategy-verification-spec.md)) already requires `>=400` fills and `>=150` windows; this sample is under the fill bar. The `20`-capture run (`336` fills) was under it too, so the `162%`/`100%` "passes" carry the same caveat.
+
+### 12. What would settle it
+
+1. **Gather more captures (primary).** At ~`16.7` fills per capture, roughly `3` more captures of similar length crosses `400`, but the real requirement is OOS spread across several days and regimes — the deciding question is whether `+$0.19`/window IS survives outside the current `5` OOS captures.
+2. **Do not loosen the thresholds.** G3 `>=50%` and G5 `<=30%/50%` were not what failed here; sample size was. Loosening them would convert noise into approval.
+3. **Do not re-promote from the boundary grid** until the grid is re-run on the corrected binary.
+4. **Make the gate say so.** A sweep below the fill bar must not print `APPROVED` or `FAIL(Gx)` (see §13).
+
+### 13. Filter 4 enforced in the sweep runner
+
+`Evaluate-SurvivalGateRow` ([sweep-params.ps1](../scripts/sweep-params.ps1)) now takes `-TotalFills`; `Update-SurvivalVerdicts` forwards each result row's `FillsNum` (added to the config aggregation from `summary.fills_count`), and any config with fewer than `$script:MinValidationFills = 400` fills gets the verdict **`UNDERPOWERED`** instead of `APPROVED` or `FAIL(Gx)`. The per-gate cells keep their measured `PASS`/`FAIL`/`N/A` state so the sample's shape stays visible, the verdict column widened to `12` characters, and the summary prints the under-powered config count plus the bar. Callers that pass no fill count keep the previous behaviour rather than being silently reclassified. Tests: `pwsh -NoProfile -File scripts/sweep-style.tests.ps1`.
+
+### 14. Scope of this conclusion
+
+- No replay was re-run for this analysis; every number above is recomputed from the existing `26-11_07-55-07Z` sweep output, which may be pruned.
+- Paper execution only (`dry_run: true`). Nothing here validates live behaviour, queue position, or fill probability.
+- Flatten and `cancel_all` paths still lack replay coverage in the riskdiff harness, so `Cap #21`'s flatten is observed in the ledger but not independently verified end-to-end.

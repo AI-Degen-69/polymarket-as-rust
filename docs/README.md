@@ -9,7 +9,7 @@ Entry point for everything under `docs/`. Start here instead of guessing at a fi
 ## Strategy research
 
 - [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md) — current baseline: the `9`-configuration boundary sweep and why Config `#6/9` (`$0.65`, `120s`) was promoted. Authoritative for the shipped defaults.
-- [sweep-results-investigation.md](sweep-results-investigation.md) — Part I: accounting telemetry validation and runtime default-resolution audit; Part II: `21`-capture G3/G5 failure investigation (`25-11_21-55-50Z` vs. `26-11_07-55-07Z`).
+- [sweep-results-investigation.md](sweep-results-investigation.md) — Part I: accounting telemetry validation and runtime default-resolution audit; Part II: `21`-capture G3/G5 failure investigation (`25-11_21-55-50Z` vs. `26-11_07-55-07Z`); Part III: what that failure means for the shipped defaults (under-powered sample, values unchanged) and the `UNDERPOWERED` gate verdict.
 
 ## Historical data (PMData)
 
