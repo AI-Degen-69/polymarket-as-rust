@@ -20,6 +20,7 @@ from typing import Any
 
 SWEEP_SUBDIR = os.path.join("logs", "sweeps", "26-11_07-55-07Z_1runs_21caps-241w")
 CAPTURES_SUBDIR = os.path.join("logs", "captures")
+HOLDOUT_MARKER = "07-40-00Z"  # Capture #22; never replayed or opened
 
 
 def _logs_path(subdir: str) -> str:
@@ -130,6 +131,9 @@ def load_replay_windows(
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
     stems: list[str] = manifest["capture_stems"]
+    holdouts = [s for s in stems if HOLDOUT_MARKER in s]
+    if holdouts:
+        raise RuntimeError(f"Holdout captures in development manifest: {holdouts}")
 
     windows: list[dict[str, Any]] = []
     totals = {
@@ -143,7 +147,14 @@ def load_replay_windows(
     }
 
     for ci, stem in enumerate(stems):
-        rep_path = sorted(glob.glob(os.path.join(sweep_dir, stem, "*.jsonl")))[0]
+        replays = sorted(
+            p
+            for p in glob.glob(os.path.join(sweep_dir, stem, "*.jsonl"))
+            if not p.endswith(".inprogress.jsonl")
+        )
+        if len(replays) != 1:
+            raise RuntimeError(f"Expected 1 replay JSONL for {stem}, found {replays}")
+        rep_path = replays[0]
         q_up = q_dn = cb_up = cb_dn = 0
         max_unpaired = 0
         init_unpaired = 0

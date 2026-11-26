@@ -14,6 +14,8 @@ Across `241` baseline windows, the strategy earned `+$65.2415` from routine Make
 
 Two distinct, disjoint mechanisms explain **100%** (`40 / 40`) of the zero-flatten settlement outcomes:
 
+**Attribution basis:** `H4` classifies a window from its residual inventory at settlement. It does not re-derive `|q|` on every `MandatoryFlatten` tick. A window can end below `5.0` shares after holding more during the phase, so the classification is a settlement-level attribution, not a per-tick decision record.
+
 1. **The Exchange Minimum-Size Dust Trap (`36 / 40` windows, `-$12.7415` or `38.0%` of settlement PnL — Hypothesis H4):**
    - Thirty-six windows ended with `0 < |q| < 5.0` unpaired shares (either from partial maker fills or partial merges leaving `< 5.0` shares).
    - Polymarket enforces `min_order_size = 5.0` shares (`5_000_000` micro-shares).
@@ -39,9 +41,9 @@ Two distinct, disjoint mechanisms explain **100%** (`40 / 40`) of the zero-flatt
 | **H1: Flatten prices too conservative** | **Refuted as primary cause** | Zero opposite asks and zero heavy bids existed at *any* price (`$0.01–$0.99`) during `15s < tau <= 30s` in all `4` eligible windows. |
 | **H2: Liquidity disappears before `tau = 30s`** | **Confirmed (Primary for `4/4` eligible)** | Last executable ask/bid vanished at `tau = 63.3s` (`win#238`), `86.1s` (`win#15`), `90.8s` (`win#86`), and `54.8s` (`win#227`). |
 | **H3: Wrong side / quantity constructed** | **Refuted** | `lifecycle.rs:326-380` correctly maps `Long Down -> BUY Up at ask / SELL Down at bid` with `size = |q_up - q_dn|`. |
-| **H4: Minimum order size blocks execution** | **Confirmed (Primary for `36/40` dust)** | `36` windows (`90%` by count, `38%` by dollars) had `0.01–4.29` residual shares (`< 5.0` min order size). |
+| **H4: Minimum order size blocks execution** | **Confirmed (Primary for `36/40` dust)** | `36` windows (`90%` by count, `38%` by dollars) ended with `0.01–4.29` residual shares (`< 5.0` min order size). Per-tick eligibility during `MandatoryFlatten` was not re-derived. |
 | **H5: Risk / lifecycle gates suppress hedges** | **Confirmed upstream** | Active-phase `max_cross_tick_loss = $0.08` + `tier1_hedge_trigger = off` + post-only `CrossesBook` + `DefensiveCancel` froze passive hedging before `tau = 60s`. |
-| **H6: Simulator / matching bug blocks fills** | **Refuted on this corpus** | `match_fak_against_book` was never invoked (`0` flatten attempts), because `best_ask_opp` and `best_bid_heavy` were both `None`. |
+| **H6: Simulator / matching bug blocks fills** | **Not established** | Zero `flatten` events do not show that `match_fak_against_book` was not called. Crossed-book attempts log `flatten_unfilled`. Other attempts call the matcher and may log no event when nothing fills. Refute H6 only with a dispatch record or matcher invocation record for the eligible windows. |
 | **H7: Entries created too late or too large** | **Refuted on timing; partial on size** | All `40` exposures began at `tau >= 180.5s` (`entry_cutoff_secs = 120s` worked). Sizing `20` shares (`$4–$9`) stayed below `Tier 3` (`75%` of `$50`), delaying aggressive skew. |
 
 ---
@@ -193,6 +195,10 @@ All policies were simulated causally across **all `241` windows** (`67` windows 
 | **Pre-Entry Floor `<$0.30`** | Skip windows with Leg 1 `<$0.30` | `19` dropped | — | `$0.000` | `$+46.5640` (`-$18.678`) | `-$24.4431` (`+$9.118`) | `+$23.7265` (`-$9.560`) | `-$9.0000` |
 | **Pre-Entry Floor `<$0.35`** | Skip windows with Leg 1 `<$0.35` | `25` dropped | — | `$0.000` | `$+39.5559` (`-$25.686`) | `-$20.8671` (`+$12.694`) | `+$20.2944` (`-$12.992`) | `-$9.0000` |
 
+**Policy D is not an independent test.** `D_partial_30s` uses the same limits, timing, and fill logic as `A_baseline_30s`, so its row duplicates the baseline. It does not isolate the effect of allowing partial fills.
+
+**Stop-cross trigger fallback.** When no opposite ask exists, the simulation also fires if `vwap + (1 - heavy_bid) >= threshold`. The rule above states only the ask-based form.
+
 ---
 
 ## F. Economic Impact & Reassessment of the 85% Loss Rate
@@ -221,8 +227,7 @@ The counterfactual table reveals a critical structural fact: **BTC 5-minute bina
 | **Max Unpaired** | `5–19.99 sh` | `10` (`0 / 10`) | **`100.0%`** | `-$8.5687` | `+$8.3739` | `-$0.1948` |
 | **Max Unpaired** | `>=20 sh` | `14` (`4 / 10`) | `71.4%` | `-$18.4510` | `+$23.4552` | `+$5.0042` |
 
-- **Diagnosis of the 85% loss rate:** The `85%` loss rate is **not** negative-EV initial entries (`83` fill-active windows across every Leg-1 price bucket `<$0.30`, `$0.30–$0.35`, `$0.35–$0.50`, and `>$0.50` are all net positive: `+$9.56`, `+$3.43`, `+$3.40`, `+$16.89`).
-- Instead, the `85%` loss rate reflects **conditional adverse selection on survivors**: positions whose opposite leg fills and merges cleanly exit the settlement sample, leaving behind **only** the `40` trajectories where the market trended monotonically away from the filled leg (and in `Down` residuals, `17 / 17` lost during this `22-11..26-11` sample).
+- **Diagnosis of the 85% loss rate (in-sample only):** The `83` fill-active windows are net positive in every Leg-1 price bucket (`+$9.56`, `+$3.43`, `+$3.40`, `+$16.89`). Merged positions exit the settlement sample, so the remaining `40` trajectories carry a selection effect. Window `#238` pulled back before settling, and six residual positions settled at a profit. Positive in-sample PnL does not rule out negative expected value. Leave that conclusion open for holdout validation.
 - **Concentration:** Just **`4` eligible windows (`1.7%` of all `241` windows)** account for **`62.0%` (`-$20.8192`)** of all settlement losses, while **`36` dust windows** contribute the remaining `-$12.7415` despite already generating `+$35.8919` in Maker Merge Gain (`+$23.1504` net positive).
 
 ---
@@ -233,7 +238,7 @@ The cheapest and earliest intervention must **unlock passive maker hedging** bef
 
 | Rank | Intervention | Loss Reduction | Merge Edge Preservation | Feasibility | Complexity | Robustness |
 | :---: | :--- | :--- | :--- | :--- | :--- | :--- |
-| **1** | **Dynamic Passive Cross-Tick Override + Post-Only Exception on Reducing Leg (`Tier1` when `|q| >= 5sh` and `tau <= 90s` or `deficit_hedge_trigger`)** | Targets the `4` eligible stranded windows (`-$20.82`) before books empty at `63–91s` | **High:** Zero premature taker exit before `tau = 90s`, and fills passively (`0%` maker fee) whenever pullbacks touch `$0.62–$0.85` instead of locking at `$1.06 - vwap` | High (books had `1,797–20,945` shares at `63–160s` in `win#238`) | Low (already wired via `tier1_hedge_trigger_price` & `allows_cross_tick_override` in `station7_risk.rs` / `lifecycle_cmd.rs`) | High across regimes (replaces rigid `$1.06` freeze with gradual passive chase) |
+| **1** | **Dynamic Passive Cross-Tick Override + Post-Only Exception on Reducing Leg (`Tier1` when `|q| >= 5sh` and `tau <= 90s` or `deficit_hedge_trigger`)** | Targets the `4` eligible stranded windows (`-$20.82`) before books empty at `63–91s` | **High:** Zero premature taker exit before `tau = 90s`. Resting bids fill passively (`0%` maker fee) when pullbacks touch `$0.62–$0.85` instead of locking at `$1.06 - vwap`. An order allowed to cross the tick takes liquidity and pays a taker fee, as the `$0.61` buy against a `$0.60` ask shows at line 150. Fill and fee outcomes for both behaviours remain unverified until the replay in Section H tests them | High (books had `1,797–20,945` shares at `63–160s` in `win#238`) | Low (already wired via `tier1_hedge_trigger_price` & `allows_cross_tick_override` in `station7_risk.rs` / `lifecycle_cmd.rs`) | High across regimes (replaces rigid `$1.06` freeze with gradual passive chase) |
 | **2** | **Time-Gated Taker Stop-Cross in `PreExpiryLockout` (`E_stop_120_tau60`, `tau <= 60s`, `vwap + opp_ask >= $1.20`)** | Saved `+$3.02` in `win#227`; net `+$0.42` overall (`+$33.71`) | **High:** Never fires above `tau = 60s`, avoiding mid-window mean-reversion false positives | Proven feasible in `2/2` triggering windows (`$0.055` fees) | Low (one phase check in `lifecycle.rs`) | Moderate (only catches positions whose book survives past `tau = 60s`) |
 | **3** | **Avoid Sub-`5`-Share Odd-Lot Residue Upstream (`min_order_size`-aware sizing / rounding)** | Targets the `-$12.74` across `36` dust windows (`-$2.12` worst dust loss) | **High:** Only adjusts residual odd lots (`<5` sh) that cannot be flattened on CLOB | High (no exchange `min_order_size` violation) | Medium (requires broker fill/quote size rounding review) | High |
 | **4** | **Do NOT deploy early taker flatten (`tau <= 90s/120s`), unconstrained stop-cross (`$1.10–$1.30`), or `<$0.35` entry floors** | Reduces settlement loss `+$9–$21`, **but** destroys `-$11–$48` of Maker Merge Gain | **Severe damage:** Cuts total strategy Net PnL by `-$1.94` to `-$33.57` | — | — | Poor (over-reacts to normal BTC 5m volatility) |

@@ -21,6 +21,7 @@ from typing import Any, Callable
 
 SWEEP_SUBDIR = os.path.join("logs", "sweeps", "26-11_07-55-07Z_1runs_21caps-241w")
 CAPTURES_SUBDIR = os.path.join("logs", "captures")
+HOLDOUT_MARKER = "07-40-00Z"  # Capture #22; never replayed or opened
 
 
 def _logs_path(subdir: str) -> str:
@@ -124,6 +125,9 @@ def load_sweep_data(
     with open(manifest_path, "r", encoding="utf-8") as f:
         manifest = json.load(f)
     stems: list[str] = manifest["capture_stems"]
+    holdouts = [s for s in stems if HOLDOUT_MARKER in s]
+    if holdouts:
+        raise RuntimeError(f"Holdout captures in development manifest: {holdouts}")
 
     all_windows: list[dict[str, Any]] = []
     all_merges: list[dict[str, Any]] = []
@@ -135,7 +139,11 @@ def load_sweep_data(
 
     for ci, stem in enumerate(stems):
         cap_dir = os.path.join(sweep_dir, stem)
-        jsonls = sorted(glob.glob(os.path.join(cap_dir, "*.jsonl")))
+        jsonls = sorted(
+            p
+            for p in glob.glob(os.path.join(cap_dir, "*.jsonl"))
+            if not p.endswith(".inprogress.jsonl")
+        )
         if len(jsonls) != 1:
             raise RuntimeError(f"Expected 1 JSONL in {cap_dir}, found {jsonls}")
         path = jsonls[0]

@@ -232,7 +232,7 @@ Fortunately, Capture `#22` (`26-11_07-40-00Z_1h15m_15w.jsonl`) has **never been 
 2. **SHA-256 manifest:** Generate `holdout-manifest.sha256` recording filename, byte size, UTC time span, and SHA-256 hash for every holdout file before any run.
 3. **Frozen code and gate commit:** Before unlocking the holdout, commit the exact engine binary git SHA, [DEFAULTS.json](../DEFAULTS.json), and frozen evaluation script to git.
 4. **Inspection ledger & one-time unlock:** Maintain `docs/holdout-inspection-ledger.md`. Each holdout unlock logs: date, git SHA, manifest SHA-256, gate thresholds, and verdict. Once evaluated, all files in that manifest move to Development/IS and a fresh holdout batch is collected for any subsequent parameter change.
-5. **Minimum informative OOS target:** Collect at least **`468` OOS windows (`~39` 1h captures, `~1.6` days across Asia/London/US sessions, `~680+` fills)** before running the one-time holdout gate. This powers the primary merge-edge gate at `80%` cluster-adjusted power (`DEFF = 1.28x`) and gives `>= 140` merge-active windows to bound `ExpiryDrag` and `TailDrag`.
+5. **Minimum informative OOS target:** Collect at least **`468` OOS windows (`~39` 1h captures, `~1.6` days across Asia/London/US sessions, `~680+` fills)** before running the one-time holdout gate. `468` is a planning estimate for detecting a positive mean against zero at `80%` cluster-adjusted power (`DEFF = 1.28x`), and gives `>= 140` merge-active windows to bound `ExpiryDrag` and `TailDrag`. It does not size Gate 1's absolute floors (`>= +$0.14/w`, `>= +$0.03/pair`). Before opening the holdout, estimate the chance of passing the full Gate 1 rule at a stated alternative using complete windows.
 
 ### 3. Recommendation
 
