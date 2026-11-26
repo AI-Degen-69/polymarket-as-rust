@@ -1024,8 +1024,6 @@ function Read-CaptureJsonlMetrics {
     $netPnl = [double]$payload.net_pnl_micro / 1e6
     $rebate = [double]$payload.estimated_rebate_micro / 1e6
     $netPlusReb = $netPnl + $rebate
-    $basePnl = [double]$payload.baseline_pnl_micro / 1e6
-    $alphaEdge = $netPnl - $basePnl
     $pairs = [double]$payload.total_pairs_merged_micro / 1e6
     $fills = [int]$payload.fills_count
     $merges = [int]$payload.merges_count
@@ -1233,8 +1231,6 @@ function Read-CaptureJsonlMetrics {
         RebateNum       = $rebate
         FeesNum         = $feesPaid
         NetPlusRebNum   = $netPlusReb
-        BasePnLNum      = $basePnl
-        AlphaEdgeNum    = $alphaEdge
         SettlementNum   = $settle
         MergeNetNum     = $mergeNet
         MergePosNum     = $mergePos
@@ -1282,8 +1278,6 @@ function Complete-ConfigRunAggregation {
     $sumNetPnl = 0.0
     $sumRebate = 0.0
     $sumFeesPaid = 0.0
-    $sumBasePnl = 0.0
-    $sumAlphaEdge = 0.0
     $sumSettlement = 0.0
     $sumMergeNet = 0.0
     $sumMergePos = 0.0
@@ -1310,8 +1304,6 @@ function Complete-ConfigRunAggregation {
         $sumNetPnl += $c.NetPnLNum
         $sumRebate += $c.RebateNum
         $sumFeesPaid += $c.FeesNum
-        $sumBasePnl += $c.BasePnLNum
-        $sumAlphaEdge += $c.AlphaEdgeNum
         $sumSettlement += $c.SettlementNum
         $sumMergeNet += $c.MergeNetNum
         $sumMergePos += $c.MergePosNum

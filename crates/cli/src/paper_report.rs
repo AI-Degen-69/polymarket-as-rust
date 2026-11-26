@@ -92,8 +92,6 @@ struct PaperSummaryJsonl<'a> {
     fill_ratio: f64,
     post_fill_markout_1s_bps: f64,
     post_fill_markout_5s_bps: f64,
-    baseline_pnl_micro: i64,
-    edge_pnl_micro: i64,
     compute_latency: LatencySummary,
 }
 
@@ -348,7 +346,6 @@ pub(crate) struct PaperSummaryDisplay<'a> {
     pub(crate) fill_ratio: f64,
     pub(crate) markout_1s_bps: f64,
     pub(crate) markout_5s_bps: f64,
-    pub(crate) baseline_pnl: i64,
     pub(crate) latency: &'a LatencySummary,
 }
 
@@ -356,7 +353,6 @@ pub(crate) fn print_summary_table(disp: &PaperSummaryDisplay<'_>) {
     let t = theme::current();
     let net_pnl = disp.realized_pnl + disp.unrealized_pnl;
     let net_pnl_3pct = net_pnl.saturating_add(disp.estimated_rebate as i64);
-    let edge_pnl = net_pnl - disp.baseline_pnl;
 
     println!();
     println!("{}", t.banner("FIFO PAPER SIMULATOR ROLLING SUMMARY", None));
@@ -404,15 +400,7 @@ pub(crate) fn print_summary_table(disp: &PaperSummaryDisplay<'_>) {
     );
     println!(
         "{}",
-        t.kv(
-            "Fees & Alpha Edge:",
-            &format!(
-                "FeesPaid=${} | BaselinePnL={} | A-S Alpha Edge={}",
-                MicroUsdc(disp.fees_paid),
-                t.fmt_pnl(disp.baseline_pnl),
-                t.fmt_pnl(edge_pnl)
-            )
-        )
+        t.kv("Fees:", &format!("FeesPaid=${}", MicroUsdc(disp.fees_paid)),)
     );
     println!(
         "{}",
@@ -510,7 +498,6 @@ pub(crate) fn record_summary_jsonl(
     clock: &MonotonicClock,
 ) -> Result<(), Box<dyn Error>> {
     let net_pnl = disp.realized_pnl + disp.unrealized_pnl;
-    let edge_pnl = net_pnl - disp.baseline_pnl;
 
     let rec = PaperSummaryJsonl {
         source,
@@ -530,8 +517,6 @@ pub(crate) fn record_summary_jsonl(
         fill_ratio: disp.fill_ratio,
         post_fill_markout_1s_bps: disp.markout_1s_bps,
         post_fill_markout_5s_bps: disp.markout_5s_bps,
-        baseline_pnl_micro: disp.baseline_pnl,
-        edge_pnl_micro: edge_pnl,
         compute_latency: *disp.latency,
     };
     jsonl.write_event(now_ms, clock.now_ns()?, "summary", &rec)?;

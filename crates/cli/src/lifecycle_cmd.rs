@@ -24,8 +24,8 @@ use math_engine::{
     CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
 };
 use paper_sim::{
-    BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, MergeEvent, NaiveQuotesInput,
-    NewOrderParams, PaperLedger, SimFill, SimOrderStatus, TrajectorySnapshot,
+    BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, MergeEvent, NewOrderParams, PaperLedger,
+    SimFill, SimOrderStatus, TrajectorySnapshot,
 };
 use risk_lifecycle::{
     ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerReason, BreakerStatus,
@@ -1123,11 +1123,8 @@ impl LivePaperSimulator {
         priority_rx: mpsc::Receiver<ExecutionCommand>,
         routine_rx: mpsc::Receiver<ExecutionCommand>,
     ) -> Result<Self, Box<dyn Error>> {
-        let base_shares_micro =
-            SharesMicro::from_raw(base_size_shares.saturating_mul(ONE_SHARE_MICRO));
         let ledger = PaperLedger::new(desc.fee_schedule);
-        let telemetry =
-            BaselineTelemetry::new(broker_config, desc.fee_schedule, base_shares_micro)?;
+        let telemetry = BaselineTelemetry::new()?;
         let strike_usd = desc.strike_price_usd.map(|f| f.get());
         let tier1_hedge_trigger_micro = tier1_hedge_trigger_price
             .map(|p| MicroUsdc(((p * ONE_DOLLAR_MICRO as f64) + 1e-9).floor() as u64));
@@ -1375,9 +1372,6 @@ impl LivePaperSimulator {
                 for fill in &fills {
                     self.process_fill(fill, now_ms, now_ns, jsonl)?;
                 }
-                self.telemetry
-                    .naive_engine
-                    .on_public_trade_with_side(outcome, side, price, size, now_ms);
             }
             PolyMarketEvent::TickSizeChange { new_tick_micro, .. } => {
                 self.desc.tick_size_micro = new_tick_micro;
@@ -2036,26 +2030,6 @@ impl LivePaperSimulator {
         if let (Some(m_up), Some(m_dn)) = (mid_up, mid_dn) {
             self.telemetry.update_markouts(now_ms, m_up, m_dn);
         }
-        let tick_prec =
-            TickPrecision::from_micro(self.desc.tick_size_micro).unwrap_or(TickPrecision::Cent);
-        let best_ask_up = snap_up.best_ask().map(|l| l.price);
-        let best_ask_dn = snap_dn.best_ask().map(|l| l.price);
-        let naive_up_px =
-            paper_sim::NaiveBaselineEngine::target_bid_price(mid_up, best_ask_up, tick_prec);
-        let naive_dn_px =
-            paper_sim::NaiveBaselineEngine::target_bid_price(mid_dn, best_ask_dn, tick_prec);
-        self.telemetry.naive_engine.update_quotes(NaiveQuotesInput {
-            mid_up,
-            mid_dn,
-            best_bid_up: snap_up.best_bid().map(|l| l.price),
-            best_ask_up,
-            best_bid_dn: snap_dn.best_bid().map(|l| l.price),
-            best_ask_dn,
-            tick: tick_prec,
-            depth_up: naive_up_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(&snap_up, px)),
-            depth_dn: naive_dn_px.map_or(SharesMicro::ZERO, |px| fixed_book_depth_at(&snap_dn, px)),
-            now_ms,
-        });
 
         let (desired_bid_up, desired_bid_dn) = match pricing_ack.quote {
             QuoteOutput::Active { bid_up, bid_dn, .. } => (bid_up, bid_dn),
@@ -2295,11 +2269,6 @@ impl LivePaperSimulator {
         )?;
         let winning_outcome = self.resolve_winning_outcome();
         let settle_delta = self.ledger.settle_epoch(winning_outcome);
-        let _ = self
-            .telemetry
-            .naive_engine
-            .ledger
-            .settle_epoch(winning_outcome);
         self.stats.epochs_completed = self.stats.epochs_completed.saturating_add(1);
         self.stats.settlement_pnl_micro =
             self.stats.settlement_pnl_micro.saturating_add(settle_delta);
@@ -2406,13 +2375,6 @@ impl LivePaperSimulator {
 
         let broker_cfg = *self.broker.config();
         self.broker = FifoPaperBroker::new(broker_cfg);
-        self.telemetry.naive_engine.broker = FifoPaperBroker::new(broker_cfg);
-        self.telemetry.naive_engine.active_up_id = None;
-        self.telemetry.naive_engine.active_dn_id = None;
-        self.telemetry
-            .naive_engine
-            .ledger
-            .set_fee_schedule(next_desc.fee_schedule);
         self.ledger.set_fee_schedule(next_desc.fee_schedule);
 
         self.book_up = BookMaintainer::new(Outcome::Up);
@@ -2577,11 +2539,6 @@ impl LivePaperSimulator {
         self.stats.fill_ratio = self.telemetry.fill_ratio();
         self.stats.markout_1s_bps = self.telemetry.avg_markout_1s_bps();
         self.stats.markout_5s_bps = self.telemetry.avg_markout_5s_bps();
-        self.stats.baseline_pnl_micro = self
-            .telemetry
-            .naive_engine
-            .ledger
-            .net_pnl_micro(mid_up, mid_dn);
         Ok(())
     }
 }
@@ -5374,7 +5331,6 @@ mod tests {
             "negative_merge_loss_micro",
             "realized_pnl_micro",
             "unrealized_pnl_micro",
-            "baseline_pnl_micro",
         ] {
             assert_eq!(sum_a[key], sum_b[key], "mismatch on {key}");
         }
