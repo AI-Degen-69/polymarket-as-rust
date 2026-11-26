@@ -63,7 +63,8 @@ Agents use `scripts/sweep-params.ps1` (driving `poly-as lifecycle --source repla
 | :--- | :--- | :--- |
 | **Risk Aversion ($\gamma$)** | `[0.02, 0.05, 0.08, 0.12, 0.15, 0.25]` (`USD^-1`) | `crates/math-engine/src/station4_6_pricer.rs` (`-Gammas`) `[Implemented]` |
 | **Spread & Pair-Cost Bounds** | `include_variance_spread` (`false`/`true`), `min_spread_ticks` (`1`, `2`), `max_combined_bid_micro` (`980000`, `990000`) | `crates/math-engine/src/station4_6_pricer.rs` `[Implemented]` |
-| **Entry Guards** | `max_entry_price` (`0.60`, `off`), `max_entry_prob` (`0.80`, `off`), `max_cross_tick_loss_micro` (`80000`) | `crates/math-engine/src/station4_6_pricer.rs` `[Implemented]` |
+| **Entry Guards** | `max_entry_price` (`0.65`, `off`), `max_entry_prob` (`0.80`, `off`), `max_cross_tick_loss_micro` (`80000`) | `crates/math-engine/src/station4_6_pricer.rs` `[Implemented]` |
+| **Entry Timing Window** | `entry_open_delay_secs` (`15`; `0` disables the opening skip), `entry_cutoff_secs` (`120`; `off` disables the cutoff) | `crates/risk-lifecycle/src/lifecycle.rs` (`LifecycleConfig`), wired from `EngineConfig` by `crates/cli/src/lifecycle_cmd.rs` `[Implemented]` |
 | **Binance Lead-Lag Cancel** | `lead_lag_cancel_threshold` (`0.015`), `lead_lag_window_ms` (`1000`), `lead_lag_cooldown_ms` (`1000`), `lead_lag_directional` (`true`) | `crates/math-engine/src/station2_twap.rs` `[Implemented]` |
 | **Hedge Skew & Tier-1 Cap** | `hedge_skew_mult` (`0.0..1.0`), `cap_tier1_reducing_to_delta` (`false`/`true`) | `crates/risk-lifecycle/src/station7_risk.rs` `[Implemented]` |
 | **Hysteresis Deadband** | `hysteresis_tick_buffer` in **ticks** (e.g. `[0.10, 0.25, 0.50]` ticks; `$0.01` = `100` bps) | `crates/risk-lifecycle/src/station8_hysteresis.rs` `[Planned for sweep CLI]` |
