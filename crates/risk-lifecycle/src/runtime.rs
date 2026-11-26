@@ -1719,6 +1719,177 @@ mod tests {
         );
     }
 
+    fn actor_for_snapshot_tests() -> RiskActor {
+        let (harness, _priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+        RiskActor::new(
+            harness,
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        )
+    }
+
+    fn slot_live(price: u64, placed: u64, remaining: u64) -> OrderSlotState {
+        OrderSlotState::Live {
+            order_id: "order".to_string(),
+            price: MicroUsdc(price),
+            original_size: SharesMicro::from_raw(placed * core_types::ONE_SHARE_MICRO),
+            remaining_size: SharesMicro::from_raw(remaining * core_types::ONE_SHARE_MICRO),
+        }
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_deducts_both_live_legs_and_releases_cash() {
+        let mut actor = actor_for_snapshot_tests();
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 20));
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Down, slot_live(460_000, 10, 10));
+
+        let snapshot = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(9_600_000),
+            open_bid_shares_dn: SharesMicro::from_raw(10 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_dn: MicroUsdc(4_600_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+
+        let eval = actor.snapshot_without_own_slots(&snapshot);
+
+        // Our own resting orders are not external exposure and not committed cash.
+        assert_eq!(eval.open_bid_shares_up, SharesMicro::ZERO);
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc::ZERO);
+        assert_eq!(eval.open_bid_shares_dn, SharesMicro::ZERO);
+        assert_eq!(eval.open_bid_notional_dn, MicroUsdc::ZERO);
+        // Released notional returns to available cash: 9.60 + 4.60.
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(114_200_000));
+        // The caller's snapshot is untouched.
+        assert_eq!(snapshot.open_bid_notional_up, MicroUsdc(9_600_000));
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_uses_remaining_size_not_original() {
+        let mut actor = actor_for_snapshot_tests();
+        // 20 placed, 6 filled: only the 14 still resting may be removed.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 14));
+
+        let snapshot = OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(6 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(2_880_000),
+            open_bid_shares_up: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(9_600_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+
+        let eval = actor.snapshot_without_own_slots(&snapshot);
+
+        assert_eq!(
+            eval.open_bid_shares_up,
+            SharesMicro::from_raw(6 * core_types::ONE_SHARE_MICRO)
+        );
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc(2_880_000));
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(106_720_000));
+        // Filled inventory is real exposure and must survive the subtraction.
+        assert_eq!(
+            eval.unhedged_up,
+            SharesMicro::from_raw(6 * core_types::ONE_SHARE_MICRO)
+        );
+        assert_eq!(eval.unhedged_cost_up_micro, MicroUsdc(2_880_000));
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_leaves_external_exposure_alone() {
+        let mut actor = actor_for_snapshot_tests();
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 20));
+
+        // 40 shares resting at the exchange, only 20 of them ours.
+        let shared = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(40 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(19_200_000),
+            available_usdc_micro: MicroUsdc(50_000_000),
+            ..Default::default()
+        };
+        let eval = actor.snapshot_without_own_slots(&shared);
+        assert_eq!(
+            eval.open_bid_shares_up,
+            SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO)
+        );
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc(9_600_000));
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(59_600_000));
+
+        // Idle slot: a cancelled order that is still listed is not ours to remove.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, OrderSlotState::Idle);
+        let eval_idle = actor.snapshot_without_own_slots(&shared);
+        assert_eq!(eval_idle.open_bid_shares_up, shared.open_bid_shares_up);
+        assert_eq!(eval_idle.open_bid_notional_up, shared.open_bid_notional_up);
+        assert_eq!(eval_idle.available_usdc_micro, shared.available_usdc_micro);
+
+        // Zero-size resting order: subtracts nothing, releases nothing.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 0));
+        let eval_zero = actor.snapshot_without_own_slots(&shared);
+        assert_eq!(eval_zero.open_bid_shares_up, shared.open_bid_shares_up);
+        assert_eq!(eval_zero.open_bid_notional_up, shared.open_bid_notional_up);
+        assert_eq!(eval_zero.available_usdc_micro, shared.available_usdc_micro);
+
+        // Residual stub (3 shares, below the market minimum) is still removed.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(480_000, 20, 3));
+        let stub = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(3 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(1_440_000),
+            available_usdc_micro: MicroUsdc(10_000_000),
+            ..Default::default()
+        };
+        let eval_stub = actor.snapshot_without_own_slots(&stub);
+        assert_eq!(eval_stub.open_bid_shares_up, SharesMicro::ZERO);
+        assert_eq!(eval_stub.open_bid_notional_up, MicroUsdc::ZERO);
+        assert_eq!(eval_stub.available_usdc_micro, MicroUsdc(11_440_000));
+    }
+
+    #[test]
+    fn test_snapshot_without_own_slots_uses_slot_price_after_replacement() {
+        let mut actor = actor_for_snapshot_tests();
+        // The slot already carries the replacement price; the snapshot still shows the
+        // old order's notional. Subtraction follows the slot, so a stale snapshot
+        // cannot strand cash.
+        actor
+            .hysteresis_mut()
+            .set_state(Outcome::Up, slot_live(490_000, 20, 20));
+        let snapshot = OrderRegistrySnapshot {
+            open_bid_shares_up: SharesMicro::from_raw(20 * core_types::ONE_SHARE_MICRO),
+            open_bid_notional_up: MicroUsdc(9_600_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        };
+
+        let eval = actor.snapshot_without_own_slots(&snapshot);
+
+        assert_eq!(eval.open_bid_shares_up, SharesMicro::ZERO);
+        // The stale snapshot notional is 9.60 at the old price; the slot releases 9.80.
+        // Saturating subtraction floors the leftover notional at zero rather than wrapping.
+        assert_eq!(eval.open_bid_notional_up, MicroUsdc::ZERO);
+        assert_eq!(eval.available_usdc_micro, MicroUsdc(109_800_000));
+    }
+
     #[test]
     fn test_epoch_rollover_emits_terminal_lockout_cancel_all() {
         // First step at/after expiry emits the one-shot rollover (clearing any flatten
