@@ -10,7 +10,6 @@ Entry point for everything under `docs/`. Start here instead of guessing at a fi
 
 - [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md) — current baseline: the `9`-configuration boundary sweep and why Config `#6/9` (`$0.65`, `120s`) was promoted. Authoritative for the shipped defaults.
 - [sweep-results-investigation.md](sweep-results-investigation.md) — accounting telemetry validation (the five `summary` fields and their reconciliation identities) plus the runtime default-resolution audit.
-- [post-run-analysis/README.md](post-run-analysis/README.md) — archived per-run statistical audits, indexed by run folder (`DD-MM_<N>w`), each with `REPORT.md`, `dashboard.html`, and `metrics.json`.
 
 ## Historical data (PMData)
 
@@ -37,5 +36,4 @@ Entry point for everything under `docs/`. Start here instead of guessing at a fi
 
 - PR presentations live in `docs/pr-presentations/<pr>-presentation-<slug>.html` as self-contained files (inline CSS/JS, no external assets).
 - Question and design explainers live in `docs/explanations/`.
-- Post-run audits live in `docs/post-run-analysis/<DD-MM>_<N>w/`.
 - Research reports state their dataset, run id, and whether a figure is Observed, Derived, or Interpretation.
