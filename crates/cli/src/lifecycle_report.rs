@@ -76,6 +76,10 @@ pub(crate) struct LifecycleReportStats {
     pub(crate) orders_replaced: usize,
     pub(crate) orders_held: usize,
     pub(crate) flattens_executed: usize,
+    pub(crate) flatten_attempts: usize,
+    pub(crate) flatten_shares_filled_micro: u64,
+    pub(crate) flatten_unavailable_ticks: usize,
+    pub(crate) residual_dust_ticks: usize,
     pub(crate) phase_transitions: usize,
     pub(crate) breaker_trips: usize,
     pub(crate) fills_count: u64,
@@ -127,6 +131,10 @@ impl Default for LifecycleReportStats {
             orders_replaced: 0,
             orders_held: 0,
             flattens_executed: 0,
+            flatten_attempts: 0,
+            flatten_shares_filled_micro: 0,
+            flatten_unavailable_ticks: 0,
+            residual_dust_ticks: 0,
             phase_transitions: 0,
             breaker_trips: 0,
             fills_count: 0,
@@ -283,8 +291,19 @@ struct LifecycleFlattenEvent<'a> {
     side: &'a str,
     price_micro: u64,
     size_micro: u64,
+    requested_size_micro: u64,
     fee_micro: u64,
     realized_pnl_micro: i64,
+    reason: &'a str,
+}
+
+#[derive(Serialize)]
+struct LifecycleFlattenUnfilledEvent<'a> {
+    market_slug: &'a str,
+    outcome: Outcome,
+    side: &'a str,
+    limit_price_micro: u64,
+    requested_size_micro: u64,
     reason: &'a str,
 }
 
@@ -301,20 +320,28 @@ struct EpochRolloverEvent<'a> {
 }
 
 #[derive(Serialize)]
-struct WindowEndEvent<'a> {
-    market_slug: &'a str,
-    window_index: usize,
-    complete: bool,
-    winning_outcome: Option<Outcome>,
-    net_pnl_micro: i64,
-    realized_pnl_micro: i64,
-    unrealized_pnl_micro: i64,
-    settlement_pnl_delta_micro: i64,
-    fees_paid_micro: u64,
-    estimated_rebate_micro: u64,
-    fills_count: u64,
-    merges_count: u64,
-    total_pairs_merged_micro: u64,
+pub(crate) struct WindowEndEvent<'a> {
+    pub(crate) market_slug: &'a str,
+    pub(crate) window_index: usize,
+    pub(crate) complete: bool,
+    pub(crate) winning_outcome: Option<Outcome>,
+    pub(crate) net_pnl_micro: i64,
+    pub(crate) realized_pnl_micro: i64,
+    pub(crate) unrealized_pnl_micro: i64,
+    pub(crate) settlement_pnl_delta_micro: i64,
+    pub(crate) fees_paid_micro: u64,
+    pub(crate) estimated_rebate_micro: u64,
+    pub(crate) fills_count: u64,
+    pub(crate) merges_count: u64,
+    pub(crate) total_pairs_merged_micro: u64,
+    pub(crate) flatten_attempts: usize,
+    pub(crate) flattens_executed: usize,
+    pub(crate) flatten_shares_filled_micro: u64,
+    pub(crate) flatten_unavailable_ticks: usize,
+    pub(crate) residual_dust_ticks: usize,
+    pub(crate) residual_q_up_micro: u64,
+    pub(crate) residual_q_dn_micro: u64,
+    pub(crate) max_abs_unpaired_micro: u64,
 }
 
 #[derive(Serialize)]
@@ -328,6 +355,10 @@ struct LifecycleSummaryEvent<'a> {
     orders_canceled: usize,
     orders_held: usize,
     flattens_executed: usize,
+    flatten_attempts: usize,
+    flatten_shares_filled_micro: u64,
+    flatten_unavailable_ticks: usize,
+    residual_dust_ticks: usize,
     breaker_trips: usize,
     fills_count: u64,
     merges_count: u64,
@@ -1820,11 +1851,27 @@ fn format_lifecycle_summary(
     } else {
         t.muted(&flattens_raw)
     };
+    let flatten_attempts = fmt_count(stats.flatten_attempts as u64);
+    let flatten_unavail = fmt_count(stats.flatten_unavailable_ticks as u64);
+    let residual_dust = fmt_count(stats.residual_dust_ticks as u64);
     push_summary_section(&mut out, t, "RISK & BREAKERS");
     push_summary_row(
         &mut out,
         t,
-        &[("Breakers", &breakers), ("Flattens", &flattens)],
+        &[
+            ("Breakers", &breakers),
+            ("Flattens", &flattens),
+            ("Flat attempts", &flatten_attempts),
+        ],
+    );
+    push_summary_row(
+        &mut out,
+        t,
+        &[
+            ("Flat unavail", &flatten_unavail),
+            ("Dust ticks", &residual_dust),
+            ("", ""),
+        ],
     );
 
     out.push_str("\n\n");
@@ -2085,6 +2132,7 @@ pub(crate) fn record_lifecycle_flatten_jsonl(
     side: OrderSide,
     price: MicroUsdc,
     size: SharesMicro,
+    requested_size: SharesMicro,
     fee_micro: u64,
     realized_pnl_micro: i64,
     reason: &str,
@@ -2099,8 +2147,37 @@ pub(crate) fn record_lifecycle_flatten_jsonl(
             side: side.as_str(),
             price_micro: price.0,
             size_micro: size.0,
+            requested_size_micro: requested_size.0,
             fee_micro,
             realized_pnl_micro,
+            reason,
+        },
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_lifecycle_flatten_unfilled_jsonl(
+    jsonl: &mut JsonlWriter,
+    now_ms: u64,
+    mono_ns: u64,
+    market_slug: &str,
+    outcome: Outcome,
+    side: OrderSide,
+    limit_price: MicroUsdc,
+    requested_size: SharesMicro,
+    reason: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    jsonl.write_event(
+        now_ms,
+        mono_ns,
+        "flatten_unfilled",
+        &LifecycleFlattenUnfilledEvent {
+            market_slug,
+            outcome,
+            side: side.as_str(),
+            limit_price_micro: limit_price.0,
+            requested_size_micro: requested_size.0,
             reason,
         },
     )?;
@@ -2139,45 +2216,13 @@ pub(crate) fn record_epoch_rollover_jsonl(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_window_end_jsonl(
     jsonl: &mut JsonlWriter,
     now_ms: u64,
     mono_ns: u64,
-    market_slug: &str,
-    window_index: usize,
-    complete: bool,
-    winning_outcome: Option<Outcome>,
-    net_pnl_micro: i64,
-    realized_pnl_micro: i64,
-    unrealized_pnl_micro: i64,
-    settlement_pnl_delta_micro: i64,
-    fees_paid_micro: u64,
-    estimated_rebate_micro: u64,
-    fills_count: u64,
-    merges_count: u64,
-    total_pairs_merged_micro: u64,
+    event: &WindowEndEvent<'_>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    jsonl.write_event(
-        now_ms,
-        mono_ns,
-        "window_end",
-        &WindowEndEvent {
-            market_slug,
-            window_index,
-            complete,
-            winning_outcome,
-            net_pnl_micro,
-            realized_pnl_micro,
-            unrealized_pnl_micro,
-            settlement_pnl_delta_micro,
-            fees_paid_micro,
-            estimated_rebate_micro,
-            fills_count,
-            merges_count,
-            total_pairs_merged_micro,
-        },
-    )?;
+    jsonl.write_event(now_ms, mono_ns, "window_end", event)?;
     Ok(())
 }
 
@@ -2210,6 +2255,10 @@ pub(crate) fn record_lifecycle_summary_jsonl(
             orders_canceled: stats.orders_canceled,
             orders_held: stats.orders_held,
             flattens_executed: stats.flattens_executed,
+            flatten_attempts: stats.flatten_attempts,
+            flatten_shares_filled_micro: stats.flatten_shares_filled_micro,
+            flatten_unavailable_ticks: stats.flatten_unavailable_ticks,
+            residual_dust_ticks: stats.residual_dust_ticks,
             breaker_trips: stats.breaker_trips,
             fills_count: stats.fills_count,
             merges_count: stats.merges_count,
