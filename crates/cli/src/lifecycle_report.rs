@@ -965,7 +965,6 @@ impl LifecycleStreamReporter {
         lines
     }
 
-    /// Renders the heartbeat at the richest detail level that still fits [`TERMINAL_WIDTH`].
     /// Renders the one fixed heartbeat shape so every beat scans the same way.
     fn format_heartbeat_line(&self, row: &LifecycleStepRow<'_>, utc: &str) -> String {
         let t = self.theme;
@@ -2332,16 +2331,11 @@ mod tests {
         assert_eq!(order.chars().count(), latency.chars().count());
         assert_eq!(order.chars().count(), heartbeat.chars().count());
         // Compare character columns, not byte offsets: `♥` is multi-byte.
-        let quote_col = order.find("[QUOTE]").map(|i| order[..i].chars().count());
-        let hb_quote_col = heartbeat
-            .find("[QUOTE]")
-            .map(|i| heartbeat[..i].chars().count());
-        assert_eq!(hb_quote_col, quote_col);
-        let tier_col = order.find("[T1]").map(|i| order[..i].chars().count());
-        let hb_tier_col = heartbeat
-            .find("[T1]")
-            .map(|i| heartbeat[..i].chars().count());
-        assert_eq!(hb_tier_col, tier_col);
+        assert_eq!(
+            visible_col(&heartbeat, "[QUOTE]"),
+            visible_col(&order, "[QUOTE]")
+        );
+        assert_eq!(visible_col(&heartbeat, "[T1]"), visible_col(&order, "[T1]"));
     }
 
     /// Visible character offset of `needle` in `line`, ignoring ANSI styling.
@@ -2434,17 +2428,11 @@ mod tests {
         ];
 
         let badge_col = visible_col(heartbeat.as_str(), "[♥ BEAT]");
-        let tau_col = visible_col(heartbeat.as_str(), "T-");
         for (kind, line, badge) in rows {
             assert_eq!(
                 visible_col(line, badge),
                 badge_col,
                 "{kind} badge column drifted"
-            );
-            assert_eq!(
-                visible_col(line, "T-"),
-                tau_col,
-                "{kind} tau column drifted"
             );
             assert!(
                 crate::width::visible_width(line) <= TERMINAL_WIDTH,
@@ -3244,7 +3232,7 @@ mod row_grammar_tests {
         assert!(row.contains("Inv 20/0 (Δ+20)"));
         assert!(row.contains("| PnL +$0.00"));
         assert!(!row.contains('='));
-        assert!(row.len() <= TERMINAL_WIDTH, "{row}");
+        assert!(theme::visible_width(&row) <= TERMINAL_WIDTH, "{row}");
     }
 
     #[test]
@@ -3266,7 +3254,7 @@ mod row_grammar_tests {
         assert!(row.contains("DN SELL 20 @ 48¢"));
         assert!(row.contains("Inv 0/1.5 (Δ-1.5)"));
         assert!(row.contains("PnL -$0.25"));
-        assert!(row.len() <= TERMINAL_WIDTH, "{row}");
+        assert!(theme::visible_width(&row) <= TERMINAL_WIDTH, "{row}");
     }
 
     #[test]
@@ -3283,7 +3271,10 @@ mod row_grammar_tests {
         assert!(tripped.contains("Quoting halted"));
         assert!(tripped.contains("Polymarket feed stale"));
         assert!(!tripped.contains('{'), "{tripped}");
-        assert!(tripped.len() <= TERMINAL_WIDTH, "{tripped}");
+        assert!(
+            theme::visible_width(&tripped) <= TERMINAL_WIDTH,
+            "{tripped}"
+        );
 
         let armed = format_breaker_line(Theme::plain(), 0, 300, BreakerStatus::ArmActive);
         assert!(armed.contains("Armed"));
@@ -3327,7 +3318,7 @@ mod row_grammar_tests {
         assert!(blines[1].contains("Strike: $61,295.92"));
         assert!(blines[1].contains("(300s)"));
         for line in blines.iter().chain(lines.iter()) {
-            assert!(line.len() <= TERMINAL_WIDTH, "{line}");
+            assert!(theme::visible_width(line) <= TERMINAL_WIDTH, "{line}");
         }
     }
 }

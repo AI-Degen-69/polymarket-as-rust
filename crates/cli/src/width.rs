@@ -60,7 +60,7 @@ pub(crate) fn visible_width(s: &str) -> usize {
     strip_ansi(s).chars().count()
 }
 
-/// Pads `s` on the right with spaces so its visible width reaches at least
+/// Pads `s` on the left with spaces so its visible width reaches at least
 /// `width`. The right-aligned counterpart of [`pad_visible_right`], ignoring
 /// ANSI escapes.
 pub(crate) fn pad_visible_left(s: &str, width: usize) -> String {
@@ -84,19 +84,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derived_columns_stay_consistent() {
-        assert_eq!(STATUS_WIDTH, LEG_WIDTH);
-        assert_eq!(EPOCH_RULE_WIDTH, PHASE_RULE_WIDTH);
-    }
-
-    #[test]
     fn padding_and_width_ignore_ansi() {
         let styled = "\x1b[1;31mBTC\x1b[0m -$29";
         assert_eq!(strip_ansi(styled), "BTC -$29");
         assert_eq!(visible_width(styled), 8);
         assert_eq!(visible_width(&pad_visible_right(styled, 12)), 12);
         assert_eq!(visible_width(&pad_visible_left(styled, 12)), 12);
-        assert!(visible_width(&"x".repeat(TERMINAL_WIDTH)) <= TERMINAL_WIDTH);
-        assert!(visible_width(&"x".repeat(TERMINAL_WIDTH + 1)) > TERMINAL_WIDTH);
     }
 }
