@@ -26,7 +26,7 @@ Before running backtests or parameter sweeps, agents must enforce baseline invar
 
 ### 1.1 Invariant Rules & Peeking Checks
 * **Discrete Monotonic Clock & Replay Determinism `[Implemented]`:** All timing (`MonotonicClock` in `crates/core-types/src/clock.rs`), math engines (`crates/math-engine`), and simulation logic (`crates/paper-sim`) must process ticks strictly in chronological order. Replay code must never inspect future event frames or post-resolution settlement outcomes.
-* **Calibration Sync Surface `[Implemented]`:** Strategy defaults and thresholds in `crates/core-types/src/config.rs` (`EngineConfig`) must stay synchronized across all five calibration files (`config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`, and `.env.example`). Post-hoc threshold shifting based on sweep outputs is prohibited.
+* **Calibration Sync Surface `[Implemented]`:** Strategy defaults and thresholds in `crates/core-types/src/config.rs` (`EngineConfig`) must stay synchronized across all six calibration files (`DEFAULTS.json`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`, and `.env.example`) — the same six listed in `AGENTS.md` §7. `DEFAULTS.json` is not optional: `config.rs` embeds it at compile time via `include_str!("../../../DEFAULTS.json")`, so it *is* the default source rather than a copy of it. Post-hoc threshold shifting based on sweep outputs is prohibited.
 
 ### 1.2 Synthetic & Adversarial Determinism `[Implemented]`
 * Execute deterministic replay and edge-case tests via `crates/paper-sim/tests/adversarial.rs` and `crates/paper-sim/tests/vectors.rs`.
@@ -210,7 +210,7 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
 
 Before opening a Pull Request that alters trading math, risk filters, or execution logic:
 
-- [ ] Code preserves lookahead-free replay determinism and updates all 5 files in the Calibration Sync Surface if defaults change (`AGENTS.md` §7).
+- [ ] Code preserves lookahead-free replay determinism and updates all six files in the Calibration Sync Surface if defaults change — `DEFAULTS.json` first, then `config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`, `.env.example` (`AGENTS.md` §7).
 - [ ] Workspace gates pass cleanly:
   * `rtk cargo fmt --all -- --check`
   * `rtk cargo clippy --workspace --all-targets -- -D warnings`
