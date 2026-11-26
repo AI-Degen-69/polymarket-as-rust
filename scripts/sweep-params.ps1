@@ -696,12 +696,20 @@ function Test-EntryPriceSwept {
     param(
         [string[]]$Prices,
         [System.Globalization.CultureInfo]$Culture = [System.Globalization.CultureInfo]::InvariantCulture,
-        [double]$DefaultEntryPrice = 0.65
+        [Nullable[double]]$DefaultEntryPrice = $null
     )
+    # No hardcoded fallback: the configured cap must come from DEFAULTS.json, so a caller that
+    # omits it fails loudly instead of comparing prices against a stale number. NaN is a real
+    # value here (DEFAULTS engine.max_entry_price is null when the cap is off), so only $null
+    # means "not supplied".
+    if ($null -eq $DefaultEntryPrice) {
+        throw "Test-EntryPriceSwept requires -DefaultEntryPrice (pass DEFAULTS.json engine.max_entry_price)"
+    }
+    $defaultPrice = [double]$DefaultEntryPrice
     if ($Prices.Count -gt 1) { return $true }
     return (@($Prices | Where-Object {
         -not $_.Equals("off", [System.StringComparison]::OrdinalIgnoreCase) -and
-        [double]::Parse($_, $Culture) -ne $DefaultEntryPrice
+        [double]::Parse($_, $Culture) -ne $defaultPrice
     }).Count -gt 0)
 }
 
