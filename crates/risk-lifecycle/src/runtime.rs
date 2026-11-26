@@ -12,7 +12,8 @@ use crate::breakers::{BreakerConfig, BreakerStatus, CircuitBreakers};
 use crate::error::RiskLifecycleError;
 use crate::lifecycle::{EpochLifecycleController, EpochPhase, LifecycleAction, LifecycleInput};
 use crate::station7_risk::{
-    DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot, RiskEvaluationInput, RiskTier,
+    DollarNotionalRiskEngine, FlattenAction, OrderRegistrySnapshot, RiskDecision,
+    RiskEvaluationInput, RiskTier,
 };
 use crate::station8_hysteresis::{
     CancelReason, HysteresisGate, HysteresisInput, OrderAction, OrderSlotState, SizedQuote,
@@ -775,149 +776,20 @@ impl RiskActor {
                     flatten_in_flight: self.flatten_in_flight,
                 };
 
-                // Deduct each slot's own Live resting order from evaluation exposure/cash so a
-                // single-slot replacement does not stack against itself and trigger false churn or Tier4.
-                let mut eval_snapshot = snapshot;
-                for outcome in [Outcome::Up, Outcome::Down] {
-                    if let OrderSlotState::Live {
-                        price,
-                        remaining_size,
-                        ..
-                    } = self.hysteresis.state(outcome)
-                    {
-                        let slot_notional = ((remaining_size.0 as u128 * price.0 as u128)
-                            / core_types::MICRO_SCALE as u128)
-                            as u64;
-                        match outcome {
-                            Outcome::Up => {
-                                eval_snapshot.open_bid_shares_up = eval_snapshot
-                                    .open_bid_shares_up
-                                    .saturating_sub(*remaining_size);
-                                eval_snapshot.open_bid_notional_up = eval_snapshot
-                                    .open_bid_notional_up
-                                    .saturating_sub(MicroUsdc(slot_notional));
-                            }
-                            Outcome::Down => {
-                                eval_snapshot.open_bid_shares_dn = eval_snapshot
-                                    .open_bid_shares_dn
-                                    .saturating_sub(*remaining_size);
-                                eval_snapshot.open_bid_notional_dn = eval_snapshot
-                                    .open_bid_notional_dn
-                                    .saturating_sub(MicroUsdc(slot_notional));
-                            }
-                        }
-                        eval_snapshot.available_usdc_micro = MicroUsdc(
-                            eval_snapshot
-                                .available_usdc_micro
-                                .0
-                                .saturating_add(slot_notional),
-                        );
-                    }
-                }
-
+                let eval_snapshot = self.snapshot_without_own_slots(&snapshot);
                 let risk_decision = self.risk_engine.evaluate(&eval_snapshot, &risk_input)?;
 
-                let mut trace_flatten = risk_decision.flatten;
-                let mut cancel_all_reason = None;
-                if let FlattenAction::FlattenFak {
-                    outcome,
-                    price,
-                    size,
-                } = risk_decision.flatten
-                {
-                    let reason = "Station 7 Tier 4 Hard Stop flatten".to_string();
-                    match self
-                        .harness
-                        .priority_tx
-                        .try_send(ExecutionCommand::ExecuteFlattenFak {
-                            outcome,
-                            price,
-                            size,
-                            reason: reason.clone(),
-                        }) {
-                        Ok(()) => {
-                            self.flatten_in_flight = true;
-                            self.flatten_in_flight_since_ns = Some(now_ns);
-                        }
-                        Err(TrySendError::Full(_)) => {
-                            self.clear_flatten_in_flight();
-                            trace_flatten = FlattenAction::None;
-                            cancel_all_reason = Some(format!(
-                                "Flatten try_send failed (priority channel full): {reason}"
-                            ));
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            self.clear_flatten_in_flight();
-                            trace_flatten = FlattenAction::None;
-                            cancel_all_reason = Some(format!(
-                                "Flatten try_send failed (priority channel closed): {reason}"
-                            ));
-                        }
-                    }
-                }
+                let (trace_flatten, cancel_all_reason) =
+                    self.send_risk_flatten(risk_decision.flatten, now_ns);
 
-                // If accumulation prohibited in PreExpiryLockout, zero out the accumulating leg
-                // and strictly cap the reducing leg to the remaining offsetting delta.
-                let min_order_micro = self
-                    .risk_engine
-                    .config()
-                    .min_order_size_shares
-                    .saturating_mul(core_types::ONE_SHARE_MICRO);
-                let (mut auth_size_up, mut auth_size_dn) = if prohibit_accumulation {
-                    if snapshot.unhedged_up > snapshot.unhedged_dn {
-                        (
-                            None,
-                            cap_size_to_offset(
-                                risk_decision.size_dn,
-                                snapshot.unhedged_up,
-                                snapshot.unhedged_dn,
-                                min_order_micro,
-                            ),
-                        )
-                    } else if snapshot.unhedged_dn > snapshot.unhedged_up {
-                        (
-                            cap_size_to_offset(
-                                risk_decision.size_up,
-                                snapshot.unhedged_dn,
-                                snapshot.unhedged_up,
-                                min_order_micro,
-                            ),
-                            None,
-                        )
-                    } else {
-                        (None, None)
-                    }
-                } else if block_new_entries {
-                    // Entry-time guard: suppress fresh Leg-1 accumulation while allowing existing
-                    // inventory (including dust < 5 sh) to hedge or reduce.
-                    if snapshot.unhedged_up > snapshot.unhedged_dn {
-                        (None, risk_decision.size_dn)
-                    } else if snapshot.unhedged_dn > snapshot.unhedged_up {
-                        (risk_decision.size_up, None)
-                    } else {
-                        (None, None)
-                    }
-                } else {
-                    (risk_decision.size_up, risk_decision.size_dn)
-                };
-
-                // Extreme-probability hedge exemption: cap reducing leg strictly to offsetting delta.
-                if proposal.hedge_only_up {
-                    auth_size_up = cap_size_to_offset(
-                        auth_size_up,
-                        snapshot.unhedged_dn,
-                        snapshot.unhedged_up,
-                        min_order_micro,
-                    );
-                }
-                if proposal.hedge_only_dn {
-                    auth_size_dn = cap_size_to_offset(
-                        auth_size_dn,
-                        snapshot.unhedged_up,
-                        snapshot.unhedged_dn,
-                        min_order_micro,
-                    );
-                }
+                let (auth_size_up, auth_size_dn) = self.apply_size_overlay(
+                    &snapshot,
+                    &risk_decision,
+                    prohibit_accumulation,
+                    block_new_entries,
+                    proposal.hedge_only_up,
+                    proposal.hedge_only_dn,
+                );
 
                 let (cancel_up, cancel_dn) =
                     if proposal.defensive_cancel_up || proposal.defensive_cancel_dn {
@@ -1096,6 +968,177 @@ impl RiskActor {
             best_ask_dn: ctx.best_ask_dn,
             risk_eval_ns: ctx.started.elapsed().as_nanos() as u64,
         }
+    }
+
+    /// Removes this actor's own live resting orders from a snapshot so a single-slot
+    /// replacement cannot count itself as external exposure or as committed cash.
+    fn snapshot_without_own_slots(
+        &self,
+        snapshot: &OrderRegistrySnapshot,
+    ) -> OrderRegistrySnapshot {
+        let mut eval_snapshot = *snapshot;
+        for outcome in [Outcome::Up, Outcome::Down] {
+            if let OrderSlotState::Live {
+                price,
+                remaining_size,
+                ..
+            } = self.hysteresis.state(outcome)
+            {
+                let slot_notional = ((remaining_size.0 as u128 * price.0 as u128)
+                    / core_types::MICRO_SCALE as u128) as u64;
+                match outcome {
+                    Outcome::Up => {
+                        eval_snapshot.open_bid_shares_up = eval_snapshot
+                            .open_bid_shares_up
+                            .saturating_sub(*remaining_size);
+                        eval_snapshot.open_bid_notional_up = eval_snapshot
+                            .open_bid_notional_up
+                            .saturating_sub(MicroUsdc(slot_notional));
+                    }
+                    Outcome::Down => {
+                        eval_snapshot.open_bid_shares_dn = eval_snapshot
+                            .open_bid_shares_dn
+                            .saturating_sub(*remaining_size);
+                        eval_snapshot.open_bid_notional_dn = eval_snapshot
+                            .open_bid_notional_dn
+                            .saturating_sub(MicroUsdc(slot_notional));
+                    }
+                }
+                eval_snapshot.available_usdc_micro = MicroUsdc(
+                    eval_snapshot
+                        .available_usdc_micro
+                        .0
+                        .saturating_add(slot_notional),
+                );
+            }
+        }
+        eval_snapshot
+    }
+
+    /// Sends a Station 7 Tier-4 flatten on the priority lane and reports how the trace
+    /// should describe it: the flatten action plus any channel-failure reason.
+    fn send_risk_flatten(
+        &mut self,
+        flatten: FlattenAction,
+        now_ns: u64,
+    ) -> (FlattenAction, Option<String>) {
+        let FlattenAction::FlattenFak {
+            outcome,
+            price,
+            size,
+        } = flatten
+        else {
+            return (flatten, None);
+        };
+        let reason = "Station 7 Tier 4 Hard Stop flatten".to_string();
+        match self
+            .harness
+            .priority_tx
+            .try_send(ExecutionCommand::ExecuteFlattenFak {
+                outcome,
+                price,
+                size,
+                reason: reason.clone(),
+            }) {
+            Ok(()) => {
+                self.flatten_in_flight = true;
+                self.flatten_in_flight_since_ns = Some(now_ns);
+                (flatten, None)
+            }
+            Err(TrySendError::Full(_)) => {
+                self.clear_flatten_in_flight();
+                (
+                    FlattenAction::None,
+                    Some(format!(
+                        "Flatten try_send failed (priority channel full): {reason}"
+                    )),
+                )
+            }
+            Err(TrySendError::Closed(_)) => {
+                self.clear_flatten_in_flight();
+                (
+                    FlattenAction::None,
+                    Some(format!(
+                        "Flatten try_send failed (priority channel closed): {reason}"
+                    )),
+                )
+            }
+        }
+    }
+
+    /// Applies the phase overlay (no accumulation near expiry, entry-time guard) and the
+    /// hedge-only caps to Station 7's authorized sizes.
+    fn apply_size_overlay(
+        &self,
+        snapshot: &OrderRegistrySnapshot,
+        decision: &RiskDecision,
+        prohibit_accumulation: bool,
+        block_new_entries: bool,
+        hedge_only_up: bool,
+        hedge_only_dn: bool,
+    ) -> (Option<SharesMicro>, Option<SharesMicro>) {
+        let min_order_micro = self
+            .risk_engine
+            .config()
+            .min_order_size_shares
+            .saturating_mul(core_types::ONE_SHARE_MICRO);
+        let (mut size_up, mut size_dn) = if prohibit_accumulation {
+            if snapshot.unhedged_up > snapshot.unhedged_dn {
+                (
+                    None,
+                    cap_size_to_offset(
+                        decision.size_dn,
+                        snapshot.unhedged_up,
+                        snapshot.unhedged_dn,
+                        min_order_micro,
+                    ),
+                )
+            } else if snapshot.unhedged_dn > snapshot.unhedged_up {
+                (
+                    cap_size_to_offset(
+                        decision.size_up,
+                        snapshot.unhedged_dn,
+                        snapshot.unhedged_up,
+                        min_order_micro,
+                    ),
+                    None,
+                )
+            } else {
+                (None, None)
+            }
+        } else if block_new_entries {
+            // Entry-time guard: suppress fresh Leg-1 accumulation while allowing existing
+            // inventory (including dust < 5 sh) to hedge or reduce.
+            if snapshot.unhedged_up > snapshot.unhedged_dn {
+                (None, decision.size_dn)
+            } else if snapshot.unhedged_dn > snapshot.unhedged_up {
+                (decision.size_up, None)
+            } else {
+                (None, None)
+            }
+        } else {
+            (decision.size_up, decision.size_dn)
+        };
+
+        // Extreme-probability hedge exemption: cap reducing leg strictly to offsetting delta.
+        if hedge_only_up {
+            size_up = cap_size_to_offset(
+                size_up,
+                snapshot.unhedged_dn,
+                snapshot.unhedged_up,
+                min_order_micro,
+            );
+        }
+        if hedge_only_dn {
+            size_dn = cap_size_to_offset(
+                size_dn,
+                snapshot.unhedged_up,
+                snapshot.unhedged_dn,
+                min_order_micro,
+            );
+        }
+
+        (size_up, size_dn)
     }
 
     /// Records receipt of a Polymarket feed message for the staleness breaker.
