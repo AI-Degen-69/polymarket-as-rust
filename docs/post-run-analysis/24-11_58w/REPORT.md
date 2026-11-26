@@ -1,6 +1,7 @@
 # Lifecycle Post-Run Statistical Analysis — `2026-11-24 03:30–08:30 UTC`
 
 - **Source telemetry:** `logs/lifecycle/24-11_03-27-55Z.jsonl` (live paper lifecycle, BTC 5-minute Up/Down markets)
+- **Engine configuration:** pre-promotion baseline at `867fd41` (merge of PR #39, *configurable maximum entry price cap*), running the `EngineConfig` defaults documented in `.env.example` at that commit — `ENGINE_GAMMA=0.12`, BinaryCara variance / TradeNormalizedDepth kappa / Causal SG, `MAX_ENTRY_PROB=0.80`, `MAX_ENTRY_PRICE=0.60`, min combined spread `$0.01` (1 tick), max combined bid `$0.98`, cross-tick loss cap `$0.08`, `20` shares/leg at `$50` notional per leg, `hedge_skew_mult 1.0`, `cap_tier1_reducing_to_delta false`. `entry_open_delay_secs`, `entry_cutoff_secs` and `tier1_hedge_trigger_price` did not exist in that build. The fills match: all `37` active epochs opened at `<= $0.60` (highest opening fill exactly `$0.60`), while later hedge fills reached `$0.98`, which the upper cap permits. This run therefore **predates the promoted Config `#6/9` baseline** (`max_entry_price 0.65`, `entry_cutoff_secs 120`, `cap_tier1_reducing_to_delta true`), so its drag and settlement figures describe the earlier parameter set, not the current default.
 - **Interactive dashboard:** [dashboard.html](dashboard.html) (Lieflat Charts R09 Porcelain · offline SVG)
 - **Machine-readable ledger:** [metrics.json](metrics.json)
 - **Reconciliation error:** `$0.00000000` across all 58 epochs (`merge_gain + settlement − fees = realized_pnl`)
