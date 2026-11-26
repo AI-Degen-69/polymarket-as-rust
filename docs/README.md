@@ -28,6 +28,7 @@ Entry point for everything under `docs/`. Start here instead of guessing at a fi
 - [explanations/phase-2-math-engine.html](explanations/phase-2-math-engine.html) — how Stations 1–6 price a quote.
 - [explanations/phase-3-paper-sim.html](explanations/phase-3-paper-sim.html) — FIFO paper simulation and accounting.
 - [explanations/verification-and-survival-gates.html](explanations/verification-and-survival-gates.html) — how strategy verification and the survival gates work.
+- [explanations/risk-lifecycle-refactor.html](explanations/risk-lifecycle-refactor.html) — what splitting `RiskActor::step` into stages changed, and what the actor-level equivalence driver proves.
 - [pr-presentations/5-presentation-risk-and-300s-lifecycle.html](pr-presentations/5-presentation-risk-and-300s-lifecycle.html) — visual showcase for the risk and 300s lifecycle work.
 - [pr-presentations/16-presentation-offline-replay-and-sweep.html](pr-presentations/16-presentation-offline-replay-and-sweep.html) — visual showcase for offline replay and sweeping.
 - [pr-presentations/58-presentation-winner-config.html](pr-presentations/58-presentation-winner-config.html) — interactive explainer of the promoted `$0.65` / `120s` configuration.
