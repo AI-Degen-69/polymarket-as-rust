@@ -11,6 +11,10 @@ use risk_lifecycle::{
 use serde::Serialize;
 
 use crate::theme::{self, Badge, Theme};
+use crate::width::{
+    EPOCH_LABEL_WIDTH, EVENT_BADGE_WIDTH, LATENCY_VALUE_WIDTH, LEG_WIDTH, PHASE_BADGE_WIDTH,
+    STATUS_WIDTH, SUMMARY_LABEL_WIDTH, SUMMARY_VALUE_WIDTH, TERMINAL_WIDTH, TIER_BADGE_WIDTH,
+};
 use crate::window_gate::format_utc_hms;
 
 pub(crate) const PRICING_BUDGET_US: u64 = 25;
@@ -19,24 +23,10 @@ pub(crate) const TOTAL_BUDGET_US: u64 = 100;
 pub(crate) const HEARTBEAT_NORMAL_MS: u64 = 5_000;
 pub(crate) const HEARTBEAT_FAST_MS: u64 = 1_000;
 
-/// Fixed column widths for stream rows: event badge, phase badge, tier badge.
-const EVENT_BADGE_WIDTH: usize = 9;
-const PHASE_BADGE_WIDTH: usize = 10;
-const TIER_BADGE_WIDTH: usize = 4;
-/// Fixed leg column so `UP` / `DN` actions line up even when one side holds or cancels.
-const LEG_WIDTH: usize = 21;
-/// Fixed status column for suppression/resume notices; matches `LEG_WIDTH` so columns align with `[ORDER]` rows.
-const STATUS_WIDTH: usize = LEG_WIDTH;
-/// Fixed value width keeps `Pricing` / `Risk` / `Total` labels aligned across latency rows.
-const LATENCY_VALUE_WIDTH: usize = 10;
 /// Nominal latency rows are reported as a health check at most this often.
 const LATENCY_PERIOD_MS: u64 = 10_000;
 /// Minor latency breaches (`<= 2x` budget) share a cooldown so Windows timer jitter does not spam.
 const LATENCY_MINOR_BREACH_COOLDOWN_MS: u64 = 5_000;
-/// Width budget for phase and order rows; longer trailing text is ellipsized.
-const ROW_WIDTH_BUDGET: usize = 130;
-/// Label column for the framed epoch block (`★ EPOCH ROLLOVER`, `◆ EPOCH #2`).
-const EPOCH_LABEL_WIDTH: usize = 19;
 
 /// Content of the middle badge column: epoch phase, or any other badge such as `[MAKER]`.
 #[derive(Debug, Clone, Copy)]
@@ -877,7 +867,7 @@ impl LifecycleStreamReporter {
                     } else {
                         0
                     };
-                let room = ROW_WIDTH_BUDGET.saturating_sub(reserved).max(8);
+                let room = TERMINAL_WIDTH.saturating_sub(reserved).max(8);
                 notes.push(t.gray(&truncate_to_width(t, &detail, room)));
             }
             if !notes.is_empty() {
@@ -975,7 +965,6 @@ impl LifecycleStreamReporter {
         lines
     }
 
-    /// Renders the heartbeat at the richest detail level that still fits [`ROW_WIDTH_BUDGET`].
     /// Renders the one fixed heartbeat shape so every beat scans the same way.
     fn format_heartbeat_line(&self, row: &LifecycleStepRow<'_>, utc: &str) -> String {
         let t = self.theme;
@@ -1348,7 +1337,7 @@ pub(crate) fn print_phase_transition(
         t.bar(),
     );
     let used = theme::visible_width(&head);
-    let budget = ROW_WIDTH_BUDGET.saturating_sub(used + 3);
+    let budget = TERMINAL_WIDTH.saturating_sub(used + 3);
     let reason_text = truncate_to_width(t, reason, budget.saturating_sub(20).max(12));
     let meaning_max = budget.saturating_sub(theme::visible_width(&reason_text));
     let meaning_text = truncate_to_width(t, meaning, meaning_max);
@@ -1634,10 +1623,6 @@ pub(crate) fn print_lifecycle_summary(
         format_lifecycle_summary(theme::current(), stats, pricing_lat, risk_lat, total_lat)
     );
 }
-
-/// Label column and right-aligned value column for the summary blocks.
-const SUMMARY_LABEL_WIDTH: usize = 16;
-const SUMMARY_VALUE_WIDTH: usize = 12;
 
 /// Groups a digit string in threes (`6295` -> `6,295`).
 fn group_thousands(raw: &str) -> String {
@@ -2346,16 +2331,136 @@ mod tests {
         assert_eq!(order.chars().count(), latency.chars().count());
         assert_eq!(order.chars().count(), heartbeat.chars().count());
         // Compare character columns, not byte offsets: `♥` is multi-byte.
-        let quote_col = order.find("[QUOTE]").map(|i| order[..i].chars().count());
-        let hb_quote_col = heartbeat
-            .find("[QUOTE]")
-            .map(|i| heartbeat[..i].chars().count());
-        assert_eq!(hb_quote_col, quote_col);
-        let tier_col = order.find("[T1]").map(|i| order[..i].chars().count());
-        let hb_tier_col = heartbeat
-            .find("[T1]")
-            .map(|i| heartbeat[..i].chars().count());
-        assert_eq!(hb_tier_col, tier_col);
+        assert_eq!(
+            visible_col(&heartbeat, "[QUOTE]"),
+            visible_col(&order, "[QUOTE]")
+        );
+        assert_eq!(visible_col(&heartbeat, "[T1]"), visible_col(&order, "[T1]"));
+    }
+
+    /// Visible character offset of `needle` in `line`, ignoring ANSI styling.
+    fn visible_col(line: &str, needle: &str) -> usize {
+        let plain = crate::width::strip_ansi(line);
+        let byte = plain.find(needle).expect("column marker present");
+        plain[..byte].chars().count()
+    }
+
+    /// Picks the row carrying `badge` out of a reporter tick.
+    fn row_with(lines: Vec<String>, badge: &str) -> String {
+        lines
+            .into_iter()
+            .find(|line| crate::width::strip_ansi(line).contains(badge))
+            .expect("row kind emitted")
+    }
+
+    /// Rendered column positions of the body separators (`|` / `│`), ANSI-free.
+    fn bar_cols(line: &str) -> Vec<usize> {
+        crate::width::strip_ansi(line)
+            .chars()
+            .enumerate()
+            .filter_map(|(idx, ch)| matches!(ch, '|' | '│').then_some(idx))
+            .collect()
+    }
+
+    #[test]
+    fn every_stream_row_kind_shares_one_column_contract() {
+        let hold = OrderAction::Hold;
+        let base_ms = 1_795_345_200_000_u64;
+        let submit_up = OrderAction::SubmitNew {
+            outcome: Outcome::Up,
+            price: MicroUsdc(200_000),
+            size: SharesMicro::from_raw(20 * 1_000_000),
+        };
+
+        let mut rep = LifecycleStreamReporter::new(LifecycleDisplayMode::Stream, Theme::plain());
+        let heartbeat = row_with(
+            rep.format_step(&sample_row(base_ms, 300, &hold, &hold)),
+            "[♥ BEAT]",
+        );
+        let order = row_with(
+            rep.format_step(&sample_row(base_ms + 100, 299, &submit_up, &hold)),
+            "[ORDER]",
+        );
+
+        let mut breach = sample_row(base_ms + 200, 298, &hold, &hold);
+        breach.risk_ns = RISK_BUDGET_US * 1_000 + 1;
+        let latency = row_with(rep.format_step(&breach), "[LATENCY]");
+
+        let mut paused = sample_row(base_ms + 300, 297, &hold, &hold);
+        paused.quote = QuoteOutput::Suppressed(SuppressionReason::WarmingUp);
+        let suppression = row_with(rep.format_step(&paused), "[SUPPR]");
+        let resume = row_with(
+            rep.format_step(&sample_row(base_ms + 400, 296, &hold, &hold)),
+            "[RESUME]",
+        );
+
+        let fill = SimFill {
+            sim_id: 12,
+            outcome: Outcome::Up,
+            side: OrderSide::Buy,
+            price: MicroUsdc(480_000),
+            filled_shares: SharesMicro::from_raw(20_000_000),
+            fill_ts_ms: base_ms,
+            is_maker: true,
+        };
+        let fill_row = format_fill_line(
+            Theme::plain(),
+            base_ms,
+            300,
+            RiskTier::Tier1Normal,
+            FillImpact {
+                fill: &fill,
+                q_up: SharesMicro::from_raw(20_000_000),
+                q_dn: SharesMicro::ZERO,
+                realized_pnl_micro: 0,
+            },
+        );
+        let breaker = format_breaker_line(Theme::plain(), base_ms, 300, BreakerStatus::ArmActive);
+
+        let rows = [
+            ("heartbeat", heartbeat.as_str(), "[♥ BEAT]"),
+            ("order", order.as_str(), "[ORDER]"),
+            ("latency", latency.as_str(), "[LATENCY]"),
+            ("suppression", suppression.as_str(), "[SUPPR]"),
+            ("resume", resume.as_str(), "[RESUME]"),
+            ("fill", fill_row.as_str(), "[FILL]"),
+            ("breaker", breaker.as_str(), "[BREAKER]"),
+        ];
+
+        let badge_col = visible_col(heartbeat.as_str(), "[♥ BEAT]");
+        for (kind, line, badge) in rows {
+            assert_eq!(
+                visible_col(line, badge),
+                badge_col,
+                "{kind} badge column drifted"
+            );
+            assert!(
+                crate::width::visible_width(line) <= TERMINAL_WIDTH,
+                "{kind} row exceeds {TERMINAL_WIDTH} visible chars"
+            );
+        }
+
+        // Tier cells sit in one column wherever a tier is rendered.
+        let tier_col = visible_col(heartbeat.as_str(), "[T1]");
+        assert_eq!(visible_col(order.as_str(), "[T1]"), tier_col);
+        assert_eq!(visible_col(fill_row.as_str(), "[T1]"), tier_col);
+
+        // Body rows that use the leg column start their first separator at the same column.
+        let order_bars = bar_cols(order.as_str());
+        assert!(
+            !order_bars.is_empty(),
+            "order row lost its separator: {order}"
+        );
+        for (kind, line) in [
+            ("suppression", suppression.as_str()),
+            ("breaker", breaker.as_str()),
+        ] {
+            assert_eq!(
+                bar_cols(line)[0],
+                order_bars[0],
+                "{kind} leg column drifted"
+            );
+        }
     }
 
     #[test]
@@ -2375,7 +2480,7 @@ mod tests {
         assert!(l0[0].contains("Inv 20/0 (Δ+20)"));
         assert!(l0[0].contains("PnL +$0.20"));
         assert!(
-            l0[0].chars().count() <= 140,
+            l0[0].chars().count() <= TERMINAL_WIDTH,
             "heartbeat must not wrap: {} -> {}",
             l0[0].chars().count(),
             l0[0]
@@ -2755,7 +2860,7 @@ mod tests {
         row5.net_pnl_micro = 0;
 
         let pipe_cols = |line: &str| -> Vec<usize> {
-            theme::strip_ansi(line)
+            crate::width::strip_ansi(line)
                 .chars()
                 .enumerate()
                 .filter_map(|(idx, ch)| matches!(ch, '|' | '│').then_some(idx))
@@ -2778,20 +2883,20 @@ mod tests {
                 })
                 .collect();
 
-            let stripped_r2 = theme::strip_ansi(&lines[1]);
+            let stripped_r2 = crate::width::strip_ansi(&lines[1]);
             assert!(stripped_r2.contains("Inv 0/1.5"));
             assert!(stripped_r2.contains("Bk --/1"));
             assert!(stripped_r2.contains("99/--"));
             assert!(stripped_r2.contains("Q --/78"));
 
-            let stripped_r3 = theme::strip_ansi(&lines[2]);
+            let stripped_r3 = crate::width::strip_ansi(&lines[2]);
             assert!(stripped_r3.contains("Inv 20.25/10.5"));
 
-            let stripped_r4 = theme::strip_ansi(&lines[3]);
+            let stripped_r4 = crate::width::strip_ansi(&lines[3]);
             assert!(stripped_r4.contains("Inv 0/0"));
             assert!(stripped_r4.contains("Q 50/50"));
 
-            let stripped_r5 = theme::strip_ansi(&lines[4]);
+            let stripped_r5 = crate::width::strip_ansi(&lines[4]);
             assert!(stripped_r5.contains("Bk 47/50"));
             assert!(stripped_r5.contains("47/50"));
             assert!(stripped_r5.contains("Q 50/47"));
@@ -2801,14 +2906,14 @@ mod tests {
                 .find("[♥ BEAT]")
                 .map(|i| lines[0][..i].chars().count());
             for (idx, line) in lines.iter().enumerate() {
-                let plain = theme::strip_ansi(line);
+                let plain = crate::width::strip_ansi(line);
                 assert_eq!(
                     plain.matches(['|', '│']).count(),
                     expected_pipes.len(),
                     "row {idx} separator count drifted: {plain}"
                 );
                 assert!(
-                    plain.chars().count() <= 140,
+                    plain.chars().count() <= TERMINAL_WIDTH,
                     "row {idx} wraps ({} chars): {plain}",
                     plain.chars().count()
                 );
@@ -2887,8 +2992,8 @@ mod tests {
                 .enumerate()
             {
                 assert!(
-                    theme::visible_width(line) <= 140,
-                    "styled line {idx} exceeds 140 visible chars: {}",
+                    theme::visible_width(line) <= TERMINAL_WIDTH,
+                    "styled line {idx} exceeds {TERMINAL_WIDTH} visible chars: {}",
                     theme::visible_width(line)
                 );
             }
@@ -2900,12 +3005,15 @@ mod tests {
             };
             for line in &suppr_lines {
                 assert!(
-                    theme::visible_width(line) <= 140,
+                    theme::visible_width(line) <= TERMINAL_WIDTH,
                     "suppression wraps: {line}"
                 );
             }
-            assert!(theme::strip_ansi(&suppr_lines[0]).contains("Quoting paused"));
-            assert_eq!(theme::visible_width(&theme.phase_rule()), 124);
+            assert!(crate::width::strip_ansi(&suppr_lines[0]).contains("Quoting paused"));
+            assert_eq!(
+                theme::visible_width(&theme.phase_rule()),
+                crate::width::PHASE_RULE_WIDTH
+            );
         }
     }
 
@@ -2990,7 +3098,7 @@ mod tests {
             s.quote = QuoteOutput::Suppressed(SuppressionReason::BothLegsSuppressed);
             s.suppression_ctx = Some(ctx);
             for line in r.format_step(&s) {
-                assert!(theme::visible_width(&line) <= 140, "{line}");
+                assert!(theme::visible_width(&line) <= TERMINAL_WIDTH, "{line}");
             }
         }
 
@@ -3124,7 +3232,7 @@ mod row_grammar_tests {
         assert!(row.contains("Inv 20/0 (Δ+20)"));
         assert!(row.contains("| PnL +$0.00"));
         assert!(!row.contains('='));
-        assert!(row.len() <= 140, "{row}");
+        assert!(theme::visible_width(&row) <= TERMINAL_WIDTH, "{row}");
     }
 
     #[test]
@@ -3146,7 +3254,7 @@ mod row_grammar_tests {
         assert!(row.contains("DN SELL 20 @ 48¢"));
         assert!(row.contains("Inv 0/1.5 (Δ-1.5)"));
         assert!(row.contains("PnL -$0.25"));
-        assert!(row.len() <= 140, "{row}");
+        assert!(theme::visible_width(&row) <= TERMINAL_WIDTH, "{row}");
     }
 
     #[test]
@@ -3163,7 +3271,10 @@ mod row_grammar_tests {
         assert!(tripped.contains("Quoting halted"));
         assert!(tripped.contains("Polymarket feed stale"));
         assert!(!tripped.contains('{'), "{tripped}");
-        assert!(tripped.len() <= 140, "{tripped}");
+        assert!(
+            theme::visible_width(&tripped) <= TERMINAL_WIDTH,
+            "{tripped}"
+        );
 
         let armed = format_breaker_line(Theme::plain(), 0, 300, BreakerStatus::ArmActive);
         assert!(armed.contains("Armed"));
@@ -3207,7 +3318,7 @@ mod row_grammar_tests {
         assert!(blines[1].contains("Strike: $61,295.92"));
         assert!(blines[1].contains("(300s)"));
         for line in blines.iter().chain(lines.iter()) {
-            assert!(line.len() <= 140, "{line}");
+            assert!(theme::visible_width(line) <= TERMINAL_WIDTH, "{line}");
         }
     }
 }
@@ -3278,7 +3389,7 @@ mod summary_tests {
         assert!(!block.contains("key="));
         assert!(!block.contains("Orders (Sub/Rep/Cxl):"));
         for line in block.lines() {
-            assert!(line.chars().count() <= 140, "{line}");
+            assert!(line.chars().count() <= TERMINAL_WIDTH, "{line}");
         }
     }
 

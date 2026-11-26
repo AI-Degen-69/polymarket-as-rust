@@ -26,6 +26,7 @@ mod sandbox_report;
 mod theme;
 mod trace_cmd;
 mod trace_report;
+mod width;
 mod window_gate;
 
 use std::path::PathBuf;
