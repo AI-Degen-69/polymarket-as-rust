@@ -1,10 +1,11 @@
 //! Differential driver for `RiskActor::step`.
 //!
-//! `riskdiff.ps1` compares the replay's telemetry traces. Traces only describe what the
-//! actor *decided*; they do not show the commands it actually put on the priority and
-//! routine lanes, in order, with their payloads, nor the slot state it left behind.
-//! This driver records exactly that, for one scripted scenario per exit path, so the same
-//! file can be compiled against two commits and the two dumps diffed line for line.
+//! The comparison is manual: build this example at two commits, run both, and diff the two
+//! dumps line for line. No comparison script is committed (there is no `riskdiff.ps1` in this
+//! repository). Telemetry traces alone only describe what the actor *decided*; they do not
+//! show the commands it actually put on the priority and routine lanes, in order, with their
+//! payloads, nor the slot state it left behind. This driver records exactly that, for one
+//! scripted scenario per exit path, so the two dumps are directly comparable.
 //!
 //! Usage: `cargo run -q -p risk-lifecycle --example actor_equivalence -- <out.jsonl>`
 //!
