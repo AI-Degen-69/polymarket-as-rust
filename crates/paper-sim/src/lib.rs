@@ -3,7 +3,7 @@
 //!
 //! Provides top-of-book and L2 FIFO matching engine simulation, wire and cancel
 //! flight latency modeling, cash/inventory/fee accounting with VWAP pair merges,
-//! and baseline comparative telemetry.
+//! and paper-trading telemetry collection.
 
 #![forbid(unsafe_code)]
 #![cfg_attr(
@@ -31,4 +31,4 @@ pub use fifo_book::{
     FifoBrokerConfig, FifoPaperBroker, NewOrderParams, QueueDecayPolicy, SimFill, SimOrder,
     SimOrderStatus,
 };
-pub use telemetry::{BaselineTelemetry, FillMarkoutProbe, TrajectorySnapshot};
+pub use telemetry::{FillMarkoutProbe, SimTelemetry, TrajectorySnapshot};

@@ -24,8 +24,8 @@ use math_engine::{
     CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput, SuppressionReason,
 };
 use paper_sim::{
-    BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, MergeEvent, NewOrderParams, PaperLedger,
-    SimFill, SimOrderStatus, TrajectorySnapshot,
+    FifoBrokerConfig, FifoPaperBroker, MergeEvent, NewOrderParams, PaperLedger, SimFill,
+    SimOrderStatus, SimTelemetry, TrajectorySnapshot,
 };
 use risk_lifecycle::{
     ActorPipelineHarness, ActorSupervisor, BreakerConfig, BreakerReason, BreakerStatus,
@@ -1076,7 +1076,7 @@ struct LivePaperSimulator {
     pending_tick_sync_ack: bool,
     broker: FifoPaperBroker,
     ledger: PaperLedger,
-    telemetry: BaselineTelemetry,
+    telemetry: SimTelemetry,
     harness: ActorPipelineHarness,
     priority_rx: mpsc::Receiver<ExecutionCommand>,
     routine_rx: mpsc::Receiver<ExecutionCommand>,
@@ -1125,7 +1125,7 @@ impl LivePaperSimulator {
         routine_rx: mpsc::Receiver<ExecutionCommand>,
     ) -> Result<Self, Box<dyn Error>> {
         let ledger = PaperLedger::new(desc.fee_schedule);
-        let telemetry = BaselineTelemetry::new()?;
+        let telemetry = SimTelemetry::new()?;
         let strike_usd = desc.strike_price_usd.map(|f| f.get());
         let tier1_hedge_trigger_micro = tier1_hedge_trigger_price
             .map(|p| MicroUsdc(((p * ONE_DOLLAR_MICRO as f64) + 1e-9).floor() as u64));

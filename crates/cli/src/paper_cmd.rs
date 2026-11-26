@@ -19,7 +19,7 @@ use historical_data::{
 };
 use math_engine::{CostContext, MathPipeline, MathPipelineConfig, PipelineInput, QuoteOutput};
 use paper_sim::{
-    BaselineTelemetry, FifoBrokerConfig, FifoPaperBroker, NewOrderParams, PaperLedger,
+    FifoBrokerConfig, FifoPaperBroker, NewOrderParams, PaperLedger, SimTelemetry,
     TrajectorySnapshot,
 };
 use rtrb::RingBuffer;
@@ -86,7 +86,7 @@ struct PaperState {
 type SimTuple<'a> = (
     &'a mut FifoPaperBroker,
     &'a mut PaperLedger,
-    &'a mut BaselineTelemetry,
+    &'a mut SimTelemetry,
 );
 
 impl PaperState {
@@ -190,7 +190,7 @@ impl PaperState {
         now_ms: u64,
         broker: &mut FifoPaperBroker,
         ledger: &mut PaperLedger,
-        telemetry: &mut BaselineTelemetry,
+        telemetry: &mut SimTelemetry,
         pipe: &mut MathPipeline,
     ) -> Option<PendingEpochSettlement> {
         let (expired_slug, expiry_ts_ms) = {
@@ -236,7 +236,7 @@ impl PaperState {
         next_epoch: u64,
         broker: &mut FifoPaperBroker,
         ledger: &mut PaperLedger,
-        telemetry: &mut BaselineTelemetry,
+        telemetry: &mut SimTelemetry,
         pipe: &mut MathPipeline,
     ) {
         let broker_cfg = *broker.config();
@@ -358,7 +358,7 @@ fn run_replay(
     };
     let mut broker = FifoPaperBroker::new(broker_config);
     let mut ledger = PaperLedger::new(core_types::FeeSchedule::btc_5m_default());
-    let mut telemetry = BaselineTelemetry::new()?;
+    let mut telemetry = SimTelemetry::new()?;
 
     let reader = BufReader::new(File::open(input_path)?);
     for line_res in reader.lines() {
@@ -462,7 +462,7 @@ fn run_canonical_replay(
     };
     let mut broker = FifoPaperBroker::new(broker_config);
     let mut ledger = PaperLedger::new(core_types::FeeSchedule::btc_5m_default());
-    let mut telemetry = BaselineTelemetry::new()?;
+    let mut telemetry = SimTelemetry::new()?;
 
     let mut pending_resolutions: std::collections::HashMap<String, Outcome> =
         std::collections::HashMap::new();
@@ -922,7 +922,7 @@ fn handle_replay_trade_print(
 fn finalize_paper_output(
     state: &PaperState,
     ledger: &PaperLedger,
-    telemetry: &mut BaselineTelemetry,
+    telemetry: &mut SimTelemetry,
     args: &PaperArgs,
     tracker: &LatencyTracker,
     mut jsonl: JsonlWriter,
@@ -1562,7 +1562,7 @@ async fn run_live(args: &PaperArgs, cfg: &EngineConfig) -> Result<(), Box<dyn Er
     };
     let mut broker = FifoPaperBroker::new(broker_config);
     let mut ledger = PaperLedger::new(desc.fee_schedule);
-    let mut telemetry = BaselineTelemetry::new()?;
+    let mut telemetry = SimTelemetry::new()?;
 
     let (poly_prod, mut poly_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
     let (bin_prod, mut binance_cons) = RingBuffer::new(DEFAULT_RING_CAPACITY);
@@ -2123,7 +2123,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry = BaselineTelemetry::new().unwrap();
+        let mut telemetry = SimTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2265,7 +2265,7 @@ mod tests {
         let broker_config = FifoBrokerConfig::default();
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry = BaselineTelemetry::new().unwrap();
+        let mut telemetry = SimTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2382,7 +2382,7 @@ mod tests {
         let broker_config = FifoBrokerConfig::default();
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market.fee_schedule);
-        let mut telemetry = BaselineTelemetry::new().unwrap();
+        let mut telemetry = SimTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2427,7 +2427,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market.fee_schedule);
-        let mut telemetry = BaselineTelemetry::new().unwrap();
+        let mut telemetry = SimTelemetry::new().unwrap();
 
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
@@ -2490,7 +2490,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry = BaselineTelemetry::new().unwrap();
+        let mut telemetry = SimTelemetry::new().unwrap();
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
         let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
@@ -2551,7 +2551,7 @@ mod tests {
         let broker_config = FifoBrokerConfig::default();
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry = BaselineTelemetry::new().unwrap();
+        let mut telemetry = SimTelemetry::new().unwrap();
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
         let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();
@@ -2632,7 +2632,7 @@ mod tests {
         let base_size = SharesMicro(20 * ONE_SHARE_MICRO);
         let mut broker = FifoPaperBroker::new(broker_config);
         let mut ledger = PaperLedger::new(market1.fee_schedule);
-        let mut telemetry = BaselineTelemetry::new().unwrap();
+        let mut telemetry = SimTelemetry::new().unwrap();
         let cfg = EngineConfig::default();
         let pipe_cfg = MathPipelineConfig::from_engine_config(&cfg).unwrap();
         let mut pipe = MathPipeline::new(pipe_cfg, clock).unwrap();

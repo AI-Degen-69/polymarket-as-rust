@@ -400,7 +400,7 @@ pub(crate) fn print_summary_table(disp: &PaperSummaryDisplay<'_>) {
     );
     println!(
         "{}",
-        t.kv("Fees:", &format!("FeesPaid=${}", MicroUsdc(disp.fees_paid)),)
+        t.kv("Fees paid:", &format!("${}", MicroUsdc(disp.fees_paid)),)
     );
     println!(
         "{}",

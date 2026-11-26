@@ -42,7 +42,7 @@ pub struct FillMarkoutProbe {
 
 /// Telemetry tracker collecting RPM, trajectories, paired latency, fill ratios,
 /// and post-fill markouts.
-pub struct BaselineTelemetry {
+pub struct SimTelemetry {
     cancel_replace_timestamps_ms: VecDeque<u64>,
     trajectories: Vec<TrajectorySnapshot>,
     unpaired_start_ts_ms: Option<u64>,
@@ -56,8 +56,8 @@ pub struct BaselineTelemetry {
     markout_5s_count: u64,
 }
 
-impl BaselineTelemetry {
-    /// Constructs a new baseline telemetry engine.
+impl SimTelemetry {
+    /// Constructs a new simulator telemetry collector.
     pub fn new() -> Result<Self, core_types::TelemetryError> {
         let pair_latency_tracker = LatencyTracker::new()?;
         Ok(Self {

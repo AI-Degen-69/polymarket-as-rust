@@ -176,6 +176,7 @@ Flags:
 | `--inject-fault <none\|stale\|tier4\|tick-change\|disconnect>` | Adversarial fault injection (default `none`; alias `--fault`) |
 | `--v-max USD` | Max position capital (default `$50`) |
 | `--base-size shares` | Base order size (default `20`) |
+| `--latency-ms` | Simulated wire place/cancel latency, applied to both placement and cancel (default `40ms`) |
 | `--queue-decay conservative\|optimistic` | FIFO queue decay policy (default `conservative`) |
 | `--pin-pricing-core N` | Pin Pricing actor OS thread to CPU core N |
 | `--pin-risk-core N` | Pin Risk actor OS thread to CPU core N |
