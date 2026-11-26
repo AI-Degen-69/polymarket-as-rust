@@ -1324,8 +1324,27 @@ mod tests {
             }
         );
 
+        // Characterization: the breaker exits before exposure is measured, so the trace
+        // carries placeholder risk values and emits no per-leg order actions.
+        assert_eq!(trace.phase, EpochPhase::ActiveQuoting);
+        assert_eq!(trace.tier, RiskTier::Tier4HardStop);
+        assert_eq!(trace.utilization_u_e6, 0);
+        assert_eq!(trace.action_up, OrderAction::Hold);
+        assert_eq!(trace.action_dn, OrderAction::Hold);
+        assert_eq!(trace.flatten_action, FlattenAction::None);
+        assert!(!trace.flatten_in_flight);
+        assert_eq!(
+            trace.cancel_all_reason.as_deref(),
+            Some("Circuit breaker tripped: PolymarketFeedStale")
+        );
+
         let cmd = priority_rx.try_recv().unwrap();
-        assert!(matches!(cmd, ExecutionCommand::CancelAll { .. }));
+        assert_eq!(
+            cmd,
+            ExecutionCommand::CancelAll {
+                reason: "Circuit breaker tripped: PolymarketFeedStale".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -1563,6 +1582,14 @@ mod tests {
                 size: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
             }
         );
+        // Characterization: the flatten exit reports placeholder risk values, holds both
+        // legs, and carries no cancel-all reason once the FAK is accepted.
+        assert_eq!(trace_recovered.phase, EpochPhase::MandatoryFlatten);
+        assert_eq!(trace_recovered.tier, RiskTier::Tier4HardStop);
+        assert_eq!(trace_recovered.utilization_u_e6, 0);
+        assert_eq!(trace_recovered.action_up, OrderAction::Hold);
+        assert_eq!(trace_recovered.action_dn, OrderAction::Hold);
+        assert!(trace_recovered.cancel_all_reason.is_none());
 
         let cmd = priority_rx.try_recv().unwrap();
         assert_eq!(
@@ -1572,6 +1599,158 @@ mod tests {
                 price: MicroUsdc(520_000),
                 size: SharesMicro::from_raw(19 * core_types::ONE_SHARE_MICRO),
                 reason: "Mandatory flatten BUY UP at ask".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_mandatory_flatten_residual_dust_is_unflattenable() {
+        // 3 unhedged UP shares sit below the 5-share market minimum: the flatten window
+        // cannot trade out of it, so the actor cancels everything and reports the dust.
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(3 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(1_500_000), // $1.50 acquisition cost
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+
+        let expiry_ms = 300_000;
+        harness.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: expiry_ms - 20_000, // T-20s -> MandatoryFlatten
+            expiry_ms,
+            tick_size_micro: MicroUsdc(10_000),
+            best_bid_up: Some(MicroUsdc(490_000)),
+            best_ask_up: Some(MicroUsdc(510_000)),
+            best_bid_dn: Some(MicroUsdc(460_000)),
+            best_ask_dn: Some(MicroUsdc(480_000)),
+            ..Default::default()
+        });
+
+        let trace = risk_actor.step(1_000_000, 0).unwrap().unwrap();
+
+        assert_eq!(trace.phase, EpochPhase::MandatoryFlatten);
+        assert_eq!(
+            trace.flatten_action,
+            FlattenAction::ResidualDust {
+                unhedged_shares: SharesMicro::from_raw(3 * core_types::ONE_SHARE_MICRO),
+                min_order_size: SharesMicro::from_raw(5 * core_types::ONE_SHARE_MICRO),
+            }
+        );
+        assert_eq!(
+            trace.cancel_all_reason.as_deref(),
+            Some("Residual dust below min order size")
+        );
+        assert!(!trace.flatten_in_flight);
+        assert_eq!(trace.action_up, OrderAction::Hold);
+        assert_eq!(trace.action_dn, OrderAction::Hold);
+        assert_eq!(trace.tier, RiskTier::Tier4HardStop);
+        assert_eq!(trace.utilization_u_e6, 0);
+
+        assert_eq!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAll {
+                reason: "Residual dust below min order size".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_epoch_rollover_emits_terminal_lockout_cancel_all() {
+        // First step at/after expiry emits the one-shot rollover (clearing any flatten
+        // guard); the following step in the same epoch falls back to a plain cancel-all.
+        let (harness, mut priority_rx, _routine_rx) = ActorPipelineHarness::new(16, 16);
+
+        let engine = DollarNotionalRiskEngine::new(RiskConfig::default()).unwrap();
+        let hysteresis = HysteresisGate::new(HysteresisConfig::default()).unwrap();
+        let lifecycle = EpochLifecycleController::new(LifecycleConfig::default()).unwrap();
+        let breakers = CircuitBreakers::new(BreakerConfig::default(), MicroUsdc(10_000), 0);
+
+        let mut risk_actor = RiskActor::new(
+            harness.clone(),
+            engine,
+            hysteresis,
+            lifecycle,
+            breakers,
+            FaultInjection::None,
+        );
+
+        harness.publish_registry_snapshot(OrderRegistrySnapshot {
+            unhedged_up: SharesMicro::from_raw(10 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_up_micro: MicroUsdc(5_000_000),
+            unhedged_dn: SharesMicro::from_raw(4 * core_types::ONE_SHARE_MICRO),
+            unhedged_cost_dn_micro: MicroUsdc(1_880_000),
+            available_usdc_micro: MicroUsdc(100_000_000),
+            ..Default::default()
+        });
+
+        let expiry_ms = 300_000;
+        harness.publish_quote(QuoteProposal {
+            seq: 1,
+            now_ms: expiry_ms, // tau = 0
+            expiry_ms,
+            tick_size_micro: MicroUsdc(10_000),
+            ..Default::default()
+        });
+
+        let rollover = risk_actor.step(1_000_000, 0).unwrap().unwrap();
+
+        assert_eq!(rollover.phase, EpochPhase::TerminalLockout);
+        assert_eq!(rollover.tau_secs, 0);
+        assert!(!rollover.flatten_in_flight);
+        assert_eq!(rollover.flatten_action, FlattenAction::None);
+        assert_eq!(rollover.action_up, OrderAction::Hold);
+        assert_eq!(rollover.action_dn, OrderAction::Hold);
+        assert_eq!(rollover.tier, RiskTier::Tier1Normal);
+        assert_eq!(rollover.utilization_u_e6, 0);
+        let rollover_reason = rollover
+            .cancel_all_reason
+            .clone()
+            .expect("rollover must carry a cancel-all reason");
+        assert!(rollover_reason.starts_with("Epoch rollover for expiry 300000"));
+        assert!(rollover_reason.contains("paired"));
+
+        assert_eq!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAll {
+                reason: rollover_reason,
+            }
+        );
+
+        // Second step in the expired epoch: no second rollover, plain terminal cancel-all.
+        harness.publish_quote(QuoteProposal {
+            seq: 2,
+            now_ms: expiry_ms,
+            expiry_ms,
+            tick_size_micro: MicroUsdc(10_000),
+            ..Default::default()
+        });
+        let terminal = risk_actor.step(2_000_000, 0).unwrap().unwrap();
+        assert_eq!(terminal.phase, EpochPhase::TerminalLockout);
+        assert_eq!(
+            terminal.cancel_all_reason.as_deref(),
+            Some("Market expired (tau = 0s)")
+        );
+        assert_eq!(
+            priority_rx.try_recv().unwrap(),
+            ExecutionCommand::CancelAll {
+                reason: "Market expired (tau = 0s)".to_string(),
             }
         );
     }
@@ -1724,6 +1903,10 @@ mod tests {
 
         let trace = risk_actor.step(1_000_000, 0).unwrap().unwrap();
         assert_eq!(trace.tier, RiskTier::Tier1Normal);
+        // Characterization: the normal-path trace reports the measured tier and utilization.
+        assert_eq!(trace.phase, EpochPhase::ActiveQuoting);
+        assert_eq!(trace.utilization_u_e6, 10_000); // $0.50 / $50.00 = 1%
+        assert_eq!(trace.flatten_action, FlattenAction::None);
         assert_eq!(
             trace.action_dn,
             OrderAction::SubmitNew {
