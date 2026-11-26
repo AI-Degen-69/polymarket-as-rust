@@ -7,7 +7,7 @@
 > removed; the current ranking, winner justification and promoted defaults live in
 > [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md).
 
-- **Dataset:** `logs/sweeps/25-11_16-21-55Z_18runs_20caps-226w` (`18` configurations × `20` captures = `360` JSONL files, `226` 5-minute windows, `QueueDecay=conservative`)
+- **Dataset (raw output since pruned):** `logs/sweeps/25-11_16-21-55Z_18runs_20caps-226w` (`18` configurations × `20` captures = `360` JSONL files, `226` 5-minute windows, `QueueDecay=conservative`); the findings below are the retained record of that audit.
 - **Verification Standard:** [strategy-verification-spec.md](strategy-verification-spec.md)
 
 ---
@@ -32,9 +32,9 @@ Five new accounting fields (`#[serde(default)]`) were added to `PaperLedger` ([a
 
 ### 1.2 Why No Sweep Rerun Was Needed
 
-Event-level reconstruction across all `360` original JSONL files succeeded with **`0` reconciliation mismatches**:
+Event-level reconstruction across all `360` dataset JSONL files (since pruned) succeeded with **`0` reconciliation mismatches**:
 - Every file already emits full `"event":"fill"` (`filled_shares_micro`, `price_micro`, `side`), `"event":"flatten"` (`size_micro`, `price_micro`, `side`, `fee_micro`), `"event":"merge"` (`realized_gain_micro`), `"event":"window_end"`, and `"event":"summary"` rows.
-- Exact identities hold in all `360` files:
+- Exact identities hold in all `360` files of that dataset:
   - `count(fill) == summary.fills_count` and `count(merge) == summary.merges_count`
   - `sum(merge.realized_gain_micro) + summary.settlement_pnl_micro - summary.fees_paid_micro == summary.realized_pnl_micro`
   - `sum(flatten.fee_micro) == summary.fees_paid_micro`
@@ -54,11 +54,11 @@ In `Read-CaptureJsonlMetrics` ([sweep-params.ps1](../scripts/sweep-params.ps1)),
 ### 2.1 Runtime Loading Path Verified
 
 Root [DEFAULTS.json](../DEFAULTS.json) is promoted to **Config #6/9** (`max_entry_price: 0.65`, `tier1_hedge_trigger_price: null`, `entry_cutoff_secs: 120`, `cap_tier1_reducing_to_delta: true`, `entry_open_delay_secs: 15`) alongside all six calibration sync files (`AGENTS.md` §7). The earlier Config #13 (`$0.60`) baseline is superseded by the boundary sweep described in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md):
-- [DEFAULTS.json](../DEFAULTS.json#L23-L32)
+- [DEFAULTS.json](../DEFAULTS.json#L13-L44)
 - [.env.example](../.env.example#L86-L104)
-- `EngineConfig::default()` / `EngineConfig::hardcoded_fallback()` ([config.rs](../crates/core-types/src/config.rs#L509-L554)) embeds `DEFAULTS.json` at compile time via `include_str!("../../../DEFAULTS.json")`.
+- `EngineConfig::default()` / `EngineConfig::hardcoded_fallback()` ([config.rs](../crates/core-types/src/config.rs#L521-L592)) embeds `DEFAULTS.json` at compile time via `include_str!("../../../DEFAULTS.json")`.
 - Live and replay CLI entrypoints (`lifecycle_cmd.rs`, `paper_cmd.rs`, `trace_cmd.rs`, `feeds_cmd.rs`, `doctor.rs`, `main.rs`) load `EngineConfig::from_env()?`, which starts from `EngineConfig::default()` (`DEFAULTS.json`). `lifecycle_cmd.rs` explicitly passes `cfg.cap_tier1_reducing_to_delta`, `cfg.entry_open_delay_secs`, `cfg.entry_cutoff_secs`, and `MathPipelineConfig::from_engine_config(cfg)`. `exec_cmd.rs` dry-run loads `MathPipelineConfig::try_default()?`, which calls `MathPipelineConfig::from_engine_config(&EngineConfig::default())`.
-- Verified by `embedded_defaults_json_parses_validates_and_matches_default` ([config.rs](../crates/core-types/src/config.rs#L1344)), `config_locked_defaults_validate` ([lib.rs](../crates/core-types/src/lib.rs#L227)), and `cli_lifecycle_and_pipeline_defaults_resolve_promoted_defaults` ([main.rs](../crates/cli/src/main.rs)).
+- Verified by `embedded_defaults_json_parses_validates_and_matches_default` ([config.rs](../crates/core-types/src/config.rs#L1382)), `config_locked_defaults_validate` ([lib.rs](../crates/core-types/src/lib.rs#L227)), and `cli_lifecycle_and_pipeline_defaults_resolve_promoted_defaults` ([main.rs](../crates/cli/src/main.rs)).
 
 ### 2.2 Conflicting Library Struct Defaults (Non-Runtime)
 
