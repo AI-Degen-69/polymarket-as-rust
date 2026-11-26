@@ -105,7 +105,7 @@ polymarket-as-rust/
     ├── core-types/                    # Phase 0: Fixed-point types, config, errors, clock, HDR, JSONL
     ├── feeds/                         # Phase 1: Gamma v1/v2 discovery, Binance/CLOB/PolyBolt WSS, rtrb
     ├── math-engine/                   # Phase 2: Zero-alloc Stations 1-6 + lead-lag + PipelineTrace
-    ├── paper-sim/                     # Phase 3: FIFO queue-aware simulator, VWAP merge, BaselineTelemetry
+    ├── paper-sim/                     # Phase 3: FIFO queue-aware simulator, VWAP merge, SimTelemetry
     ├── risk-lifecycle/                # Phase 4: Stations 7-8, Tiers 1-4, 300s FSM, actor wiring
     ├── execution/                     # Phase 5: EIP-712 V2/V3, L2 HMAC, REST/Heartbeats, /ws/user, Merge
     └── cli/                           # Unified binary `poly-as` with phase subcommands
@@ -360,25 +360,25 @@ polymarket-as-rust/
     - Tracks `filled_up`, `filled_dn`, `cost_basis_up_micro`, `cost_basis_dn_micro`, `realized_pnl_micro`, `fees_paid_micro`, `maker_weighted_volume_micro` (`sum shares * p * (1-p)`), `estimated_rebate_micro`, `total_pairs_merged`.
     - **Zero Maker Fee + Exact Taker Fee:** Passive fills pay `0` USDC; aggressive simulated `FAK` flattens pay exact `FeeSchedule::compute_taker_fee_micro`!
     - **VWAP Atomic Pair Merge (`min(filled_up, filled_dn)`):** Computes exact integer/rational VWAP per leg, credits `pairable * ($1.00 - avg_up - avg_dn)` to `realized_pnl_micro`, deducts merged shares & cost basis proportionally, and computes mark-to-market unrealized PnL on residual `Delta_q` plus terminal binary settlement PnL (`$1.00` winner / `$0.00` loser at `t = 300s`).
-  - `src/telemetry.rs` (`BaselineTelemetry`):
+  - `src/telemetry.rs` (`SimTelemetry`):
     - Records exact metrics from Legacy `05-runbook.md:385-440` + `binary-spread-capture.md:78`:
       1. `CancelAndReplace` **RPM** (rolling 60s window).
       2. `(T - t)` skew & spread trajectory snapshots.
       3. **Paired-Fill Latency** ($\Delta t_{\text{pair}}$ between Leg A fill and Leg B completion).
       4. **Fill Ratio** (filled shares / posted shares) and **Adverse Selection Post-Fill Markout** (mid-price move `1s` and `5s` after fill!).
       5. **Null Baseline Comparison:** Tracks naive static-spread (`mid ± 1 tick`) benchmark PnL alongside adaptive A-S PnL (`binary-spread-capture.md:78`).
-- **CLI Subcommand (`crates/cli/`):** `poly-as paper --source live|replay [--input <file.jsonl>] --duration 300s --v-max 50 --base-size 20 --latency-ms 40 --jsonl logs/phase3-paper.jsonl`
+- **CLI Subcommand (`crates/cli/`):** `poly-as lifecycle --source live|replay [--input <file.jsonl>] --duration 300s --v-max 50 --base-size 20 --latency-ms 40 --jsonl logs/phase3-paper.jsonl`
 
 #### [3.2 VERIFY]
 - **Live Terminal Calculation Trace:**
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- paper --source live --duration 60s --v-max 50 --base-size 20 --latency-ms 40 --jsonl logs/phase3-paper.jsonl
+  rtk cargo run -p cli --bin poly-as -- lifecycle --source live --duration 60s --v-max 50 --base-size 20 --latency-ms 40 --jsonl logs/phase3-paper.jsonl
   ```
   Must print:
   - `(a)` Live market & feed status + simulated order latency (`40ms`).
   - `(b)` Every order placement (`sim_id`, `outcome`, `price`, `size`, `volume_ahead`) and every public trade tick evaluated against resting queue.
   - `(c)` Exact queue depletion (`vol_ahead: 150 -> 50 -> 0`, `reachable: 10`), partial fill math, VWAP pair cost, and simulated merge PnL (`1.00 - avg_up - avg_dn`).
-  - `(d)` Rolling summary table: `q_up`, `q_dn`, `Delta_q`, `pairs_merged`, `realized_pnl`, `unrealized_pnl`, `fees_paid`, `RPM`, `fill_ratio`, `post_fill_markout_1s`, `baseline_pnl`.
+  - `(d)` Rolling summary table: `q_up`, `q_dn`, `Delta_q`, `pairs_merged`, `realized_pnl`, `unrealized_pnl`, `fees_paid`, `RPM`, `fill_ratio`, `post_fill_markout_1s`.
   - `(e)` Per-tick math + sim compute latency HDR `P50 / P99` in `us`.
 - **Numeric Unit-Test Vectors:**
   ```powershell
@@ -399,7 +399,7 @@ polymarket-as-rust/
 - Adversarial re-runs (`rtk cargo test -p paper-sim adversarial`):
   1. **Cancel in-flight adverse fill race:** Emit `Cancel` at `t=100ms` (`latency=40ms`), trade hits at `t=120ms` -> order MUST still fill (realistic adverse selection during cancel RTT!).
   2. **Same-millisecond multi-order placement:** Place 10 orders at identical `ts_ms` -> 10 distinct monotonic `sim_id`s, zero HashMap collisions.
-  3. **Replay determinism:** Running `poly-as paper --source replay --input <fixture.jsonl>` twice produces byte-for-byte identical final PnL, fill count, and merged pairs.
+  3. **Replay determinism:** Running `poly-as lifecycle --source replay --input <fixture.jsonl>` twice produces byte-for-byte identical final PnL, fill count, and merged pairs.
   4. **Regression:** `rtk cargo test --workspace` passes (Phases 0–3).
 - **PASS/FAIL Criteria:** PASS iff FIFO partial fills, cancel-race adverse fills, VWAP merges, and fee deductions match exact test vectors, live 60s paper session runs cleanly with valid JSONL, and all prior tests remain green.
 
@@ -407,7 +407,7 @@ polymarket-as-rust/
 - [x] `rtk cargo fmt --all -- --check` exits 0
 - [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
 - [x] `rtk cargo test --workspace` exits 0
-- [x] Live 60s `poly-as paper` + deterministic replay run verified with JSONL audit
+- [x] Live 60s `poly-as lifecycle --source live` + deterministic replay run verified with JSONL audit
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
 - [x] Git delivery gate passed (`AGENTS.md`): phase branch, atomic conventional commits, PR + green CI merged to `main`, local `main` synced, and `phase-3-complete` tag pushed
@@ -633,7 +633,7 @@ The greenfield Rust project is **DONE** when:
 1. Phases 0–5 have each individually passed `[X.1 DO]`, `[X.2 VERIFY]`, `[X.3 VERIFY-AGAIN]`, and mandatory `rust-reviewer` + `silent-failure-hunter` gates.
 2. `rtk cargo build --release`, `rtk cargo test --workspace`, `rtk cargo clippy --workspace --all-targets -- -D warnings`, and `rtk cargo fmt --all -- --check` all exit `0`.
 3. `poly-as` executes cleanly on Windows 11 with zero UI dependencies, sub-25 $\mu\text{s}$ P99 math compute latency, sub-80 $\mu\text{s}$ P99 EIP-712 signing latency, structured JSONL telemetry on disk, and zero leaked secrets.
-4. At least 30 minutes of live paper trading (`poly-as paper --source live`) and 1 full 5-minute epoch of `poly-as exec --mode dry-run` complete with zero panics, zero inventory drift, clean epoch rollover, and verified PnL/fee/markout telemetry.
+4. At least 30 minutes of live paper trading (`poly-as lifecycle --source live`) and 1 full 5-minute epoch of `poly-as exec --mode dry-run` complete with zero panics, zero inventory drift, clean epoch rollover, and verified PnL/fee/markout telemetry.
 
 ### 5.2 Locked Operator Decisions (Confirmed Before Phase 0)
 
