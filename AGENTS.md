@@ -64,6 +64,16 @@ git tag -a phase-<N>-complete -m "Phase <N> verified and merged"
 rtk git push origin phase-<N>-complete
 ```
 
+### Docs-Only Fast Path
+
+A pull request whose entire diff against `main` is documentation (`*.md`, or anything under `docs/`) is not a phase deliverable and skips the full gate:
+
+- Confirm it really is docs-only first: `git diff --name-only origin/main...HEAD` must list nothing outside `*.md` and `docs/`.
+- Pre-commit gate (§4): run only `rtk cargo fmt --all -- --check`; clippy and the test suite cannot observe a Markdown diff.
+- Pull request (§5): skip the Phase Verification Scorecard, the OCR delegation review, the `rust-reviewer` and `silent-failure-hunter` sign-offs, and the CodeRabbit request. State in the PR body which phase-gate items were intentionally skipped and why.
+- Merge as soon as checks report (`gh pr merge --merge --delete-branch`), without waiting for a review round.
+- CI skips the Rust job for these PRs through the `paths-ignore` filter in [.github/workflows/ci.yml](.github/workflows/ci.yml). If `main` ever becomes protected with `Format, Clippy & Test (Windows)` as a required check, a skipped workflow leaves the PR stuck at *Expected*; keep a same-named always-run job that exits 0 when the diff is docs-only instead of widening the filter.
+
 ## 6. Hard Prohibitions
 
 - Never force-push `main` or rewrite pushed history.
