@@ -206,6 +206,40 @@
     *{transition:none!important;animation:none!important}
     .cell:hover{transform:none}
   }
+
+  /* ---- analytics (Mono structure, page palette) ---- */
+  .viz{margin-top:56px}
+  .viz-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin:18px 0 22px}
+  .viz-stat{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+  .viz-stat-v{font-size:19px;font-weight:800;font-variant-numeric:tabular-nums;color:var(--amber);direction:ltr;text-align:right}
+  .viz-stat-l{font-size:12.5px;color:var(--text);margin-top:2px}
+  .viz-stat-n{font-size:11px;color:var(--muted);margin-top:2px}
+  .viz-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:18px 18px 14px}
+  .viz-card h3{margin:0 0 4px;font-size:15.5px;font-weight:700}
+  .viz-sub{font-size:12px;color:var(--muted);margin-bottom:10px}
+  .viz-wide{margin-bottom:18px}
+  .viz-grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media (max-width:780px){.viz-grid2{grid-template-columns:1fr}}
+  .viz-canvas{direction:ltr}
+  .viz-canvas svg{width:100%;height:auto;display:block;overflow:visible}
+  .viz-canvas text{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  .viz-src{font-size:9.5px;letter-spacing:.08em;color:#5d6b7a;margin-top:8px;direction:ltr;text-align:left;font-weight:500}
+  .viz-toggle{display:flex;gap:6px;margin:0 0 8px}
+  .viz-btn{font:inherit;font-size:11.5px;padding:5px 10px;border-radius:999px;cursor:pointer;
+    background:var(--panel-2);color:var(--muted);border:1px solid var(--line)}
+  .viz-btn.is-on{color:#1a1206;background:var(--amber);border-color:var(--amber);font-weight:700}
+  .viz-note{margin-top:18px;border:1px solid #52401c;background:#1a1610;border-radius:14px;
+    padding:16px 18px;font-size:13.5px;color:#d8cfbe;line-height:1.7}
+  .viz-note strong{color:var(--amber)}
+  @keyframes vzDraw{from{stroke-dasharray:1;stroke-dashoffset:1}to{stroke-dasharray:1;stroke-dashoffset:0}}
+  @keyframes vzFade{from{opacity:0}to{opacity:1}}
+  @keyframes vzPop{0%{opacity:0;transform:scale(.4)}70%{opacity:1;transform:scale(1.06)}100%{opacity:1;transform:scale(1)}}
+  .vz-draw{stroke-dasharray:1;stroke-dashoffset:1;animation:vzDraw 1.4s cubic-bezier(.25,.8,.3,1) forwards}
+  .vz-fade{opacity:0;animation:vzFade .5s ease forwards}
+  .vz-pop{opacity:0;transform-box:fill-box;transform-origin:center;animation:vzPop .45s cubic-bezier(.25,.8,.3,1) forwards}
+  @media (prefers-reduced-motion:reduce){
+    .vz-draw,.vz-fade,.vz-pop{animation:none!important;opacity:1!important;stroke-dashoffset:0!important;transform:none!important}
+  }
 </style>
 </head>
 <body>
@@ -339,6 +373,323 @@ negative_merge_loss_micro</div>
       </li>
     </ol>
   </section>
+
+<section class="viz" id="analytics">
+  <h2>כל 226 החלונות, אחד־אחד</h2>
+  <p class="sub">
+    כל נקודה היא חלון של 5 דקות מהקלטה אמיתית. הרווח המצטבר לאורך שלושת הימים, ההתפלגות של כל חלון,
+    ואיפה הכסף באמת נוצר — מהחלון הבודד ועד ההקלטה הבודדת.
+  </p>
+
+  <div class="viz-stats" id="vizStats"></div>
+
+  <div class="viz-card viz-wide">
+    <h3>הרווח המצטבר על פני הזמן</h3>
+    <div class="viz-sub">226 חלונות · 20 הקלטות · 22–25 בנובמבר · נקודה מלאה = חלון שסחר, נקודה חלולה = חלון בלי עסקה</div>
+    <div class="viz-canvas"><svg id="vzEquity" viewBox="0 0 900 300" role="img" aria-label="עקומת רווח מצטבר לאורך 226 חלונות"></svg></div>
+    <div class="viz-src">HAIRLINE LINE · 1 DOT = 1 WINDOW · SOURCE: 20 × epx-0p65_ec-120 REPLAY</div>
+  </div>
+
+  <div class="viz-grid2">
+    <div class="viz-card">
+      <h3>התפלגות הרווח לחלון</h3>
+      <div class="viz-sub" id="vzHistSub">כל 226 החלונות · כל רונג = חלון אחד · תדירות לפי דולר</div>
+      <div class="viz-toggle" role="group" aria-label="בחירת מדגם">
+        <button type="button" class="viz-btn is-on" data-mode="all" aria-pressed="true">כל החלונות (226)</button>
+        <button type="button" class="viz-btn" data-mode="active" aria-pressed="false">חלונות שסחרו (74)</button>
+      </div>
+      <div class="viz-canvas"><svg id="vzHist" viewBox="0 0 460 320" role="img" aria-label="היסטוגרמה של רווח לחלון"></svg></div>
+      <div class="viz-src">RUNG HISTOGRAM · 1 RUNG = 1 WINDOW · $1 BINS</div>
+    </div>
+
+    <div class="viz-card">
+      <h3>מי הרוויח, מי שילם</h3>
+      <div class="viz-sub">רווח נקי לכל הקלטה (20 הקלטות, 5–15 חלונות כל אחת)</div>
+      <div class="viz-canvas"><svg id="vzCaps" viewBox="0 0 460 320" role="img" aria-label="רווח לפי הקלטה"></svg></div>
+      <div class="viz-src">TICK ROWS · BAR = CAPTURE NET · SORTED BEST → WORST</div>
+    </div>
+  </div>
+
+  <div class="viz-note">
+    <strong>מה שהגרפים אומרים:</strong>
+    מתוך 226 חלונות רק 74 סחרו בכלל — 152 חלונות נסגרו ב־$0.00 כי לא נכנסה עסקה.
+    מכאן החציון הוא $0.00 והממוצע לחלון פעיל הוא $0.79.
+    החלון הגרוע ביותר (<span dir="ltr">−$9.60</span>) לבדו כמעט שווה לכל השקיעה המקסימלית
+    (<span dir="ltr">$9.71</span>), וההקלטה הטובה ביותר לבדה תרמה <span dir="ltr">$21.24</span> —
+    <span dir="ltr">36%</span> מכלל הרווח.
+  </div>
+</section>
+
+<script>
+(function(){
+  "use strict";
+
+  /* one row = [windowStartEpochSec, captureIndex, netMicroUsdc] */
+  var ROWS = [[1795342200,0,0],[1795342500,0,0],[1795342800,0,-1484300],[1795343100,0,-2300],[1795343400,0,0],[1795343700,0,3500],[1795357500,1,-2200],[1795357800,1,0],[1795358100,1,-655400],[1795358400,1,-15400],[1795358700,1,1595800],[1795361700,2,0],[1795362000,2,0],[1795362300,2,0],[1795362600,2,0],[1795362900,2,0],[1795365600,3,-4100],[1795365900,3,0],[1795366200,3,0],[1795366500,3,0],[1795366800,3,0],[1795367100,3,0],[1795376700,4,2462100],[1795377000,4,2300],[1795377300,4,-534200],[1795377600,4,600000],[1795377900,4,0],[1795378200,4,0],[1795389300,5,4750900],[1795389600,5,4598100],[1795389900,5,753900],[1795390200,5,0],[1795390500,5,0],[1795390800,5,1475300],[1795395300,6,-102600],[1795395600,6,0],[1795395900,6,0],[1795396200,6,-883500],[1795396500,6,-710000],[1795396800,6,0],[1795398000,7,-400000],[1795398300,7,0],[1795398600,7,-799700],[1795398900,7,0],[1795399200,7,2207500],[1795399500,7,0],[1795399800,7,6015200],[1795400100,7,3315500],[1795400400,7,0],[1795400700,7,-600000],[1795412700,8,-100000],[1795413000,8,0],[1795413300,8,0],[1795413600,8,0],[1795413900,8,0],[1795414200,8,0],[1795414500,8,0],[1795414800,8,0],[1795415100,8,0],[1795415400,8,-601200],[1795415700,8,0],[1795416000,8,0],[1795416300,8,202000],[1795416600,8,0],[1795416900,8,0],[1795449000,9,-1220000],[1795449300,9,5234000],[1795449600,9,0],[1795449900,9,0],[1795450200,9,0],[1795450500,9,0],[1795451100,9,0],[1795451400,9,0],[1795451700,9,0],[1795452000,9,0],[1795452300,9,0],[1795452600,9,0],[1795452900,9,0],[1795453200,9,0],[1795453500,9,0],[1795515300,10,0],[1795515600,10,4100000],[1795515900,10,0],[1795516200,10,0],[1795516500,10,453200],[1795516800,10,100000],[1795517100,10,4310000],[1795517400,10,0],[1795517700,10,-9600000],[1795518000,10,0],[1795518300,10,-110000],[1795518600,10,0],[1795520400,11,4400000],[1795520700,11,0],[1795521000,11,0],[1795521300,11,0],[1795521600,11,0],[1795521900,11,0],[1795522200,11,0],[1795522500,11,-220800],[1795522800,11,0],[1795523100,11,-1044900],[1795523400,11,0],[1795523700,11,2142800],[1795524000,11,0],[1795524300,11,150000],[1795527600,12,0],[1795527900,12,0],[1795528200,12,0],[1795528500,12,0],[1795528800,12,0],[1795529100,12,200000],[1795529400,12,0],[1795529700,12,0],[1795530000,12,-1200000],[1795530300,12,757500],[1795530600,12,400000],[1795530900,12,0],[1795531200,12,0],[1795531500,12,0],[1795531800,12,0],[1795534200,13,0],[1795534500,13,0],[1795534800,13,-5211200],[1795535100,13,0],[1795535400,13,0],[1795535700,13,1100000],[1795536000,13,0],[1795536300,13,0],[1795536600,13,0],[1795536900,13,0],[1795537200,13,0],[1795537500,13,0],[1795537800,13,0],[1795538100,13,0],[1795538400,13,0],[1795539300,14,0],[1795539600,14,200000],[1795539900,14,0],[1795540200,14,0],[1795540500,14,50000],[1795540800,14,0],[1795541100,14,0],[1795541400,14,0],[1795541700,14,0],[1795542000,14,0],[1795542300,14,117600],[1795542600,14,0],[1795542900,14,0],[1795543200,14,0],[1795543500,14,4627500],[1795549500,15,-851100],[1795549800,15,558300],[1795550100,15,0],[1795550400,15,0],[1795550700,15,3870000],[1795551000,15,0],[1795551300,15,200000],[1795551600,15,0],[1795551900,15,0],[1795552200,15,837700],[1795552500,15,-1000000],[1795552800,15,0],[1795553100,15,0],[1795553400,15,0],[1795553700,15,0],[1795556100,16,0],[1795556400,16,0],[1795556700,16,-1546600],[1795557000,16,0],[1795557300,16,0],[1795557600,16,0],[1795557900,16,1100000],[1795558200,16,0],[1795558500,16,0],[1795558800,16,0],[1795559100,16,2173400],[1795559400,16,0],[1795559700,16,0],[1795560000,16,0],[1795560300,16,0],[1795561500,17,0],[1795561800,17,0],[1795562100,17,-400000],[1795562400,17,0],[1795562700,17,0],[1795563000,17,0],[1795563300,17,0],[1795563600,17,0],[1795563900,17,0],[1795564200,17,0],[1795564500,17,0],[1795564800,17,0],[1795565100,17,0],[1795565400,17,0],[1795565700,17,0],[1795602900,18,-877800],[1795603200,18,0],[1795603500,18,400000],[1795603800,18,0],[1795604100,18,0],[1795604400,18,2000000],[1795604700,18,0],[1795605000,18,0],[1795605300,18,-210800],[1795605600,18,0],[1795605900,18,0],[1795606200,18,0],[1795606500,18,0],[1795606800,18,466200],[1795607100,18,0],[1795611000,19,5779900],[1795611300,19,0],[1795611600,19,0],[1795611900,19,200000],[1795612200,19,0],[1795612500,19,50000],[1795612800,19,-803300],[1795613100,19,10948720],[1795613400,19,0],[1795613700,19,0],[1795614000,19,-100000],[1795614300,19,4344000],[1795614600,19,0],[1795614900,19,825000],[1795615200,19,0]];
+  var CAPS = ["22.11 10:10", "22.11 14:25", "22.11 15:35", "22.11 16:40", "22.11 19:45", "22.11 23:15", "23.11 00:55", "23.11 01:40", "23.11 05:45", "23.11 15:50", "24.11 10:15", "24.11 11:40", "24.11 13:40", "24.11 15:30", "24.11 16:55", "24.11 19:45", "24.11 21:35", "24.11 23:05", "25.11 10:35", "25.11 12:50"];
+
+  var INK = "#e8edf3", MUTED = "#93a1b1", GRID = "#2a333f",
+      AMBER = "#f5b544", RED = "#ff6b6b", PANEL = "#10151b";
+  var NS = "http://www.w3.org/2000/svg";
+  var el = function(p, t, a){ var n = document.createElementNS(NS, t);
+    for (var k in a) n.setAttribute(k, a[k]); p.appendChild(n); return n; };
+  var txt = function(p, a, s){ var n = el(p, "text", a); n.textContent = s; return n; };
+  var tip = function(n, s){ var t = document.createElementNS(NS, "title");
+    t.textContent = s; n.appendChild(t); };
+  var rnd = function(i, k){ return Math.abs(((i * 73856093) ^ (k * 19349663)) % 1000) / 1000; };
+  var usd = function(v, sign){
+    var s = Math.abs(v) < 0.005 ? "0.00" : Math.abs(v).toFixed(2);
+    if (v < -0.005) return "-$" + s;
+    return (sign && v > 0.005 ? "+" : "") + "$" + s;
+  };
+
+  var rows = ROWS.slice().sort(function(a, b){ return a[0] - b[0]; });
+  var nets = rows.map(function(r){ return r[2] / 1e6; });
+
+  /* ── derived series ─────────────────────────────── */
+  var cum = 0, peak = 0, eq = [], dd = [];
+  rows.forEach(function(r, i){
+    cum += nets[i]; peak = Math.max(peak, cum);
+    eq.push(cum); dd.push(peak - cum);
+  });
+  var activeNets = nets.filter(function(n){ return Math.abs(n) > 0.0005; });
+  var capsTotals = CAPS.map(function(name, ci){
+    var t = 0, w = 0;
+    rows.forEach(function(r){ if (r[1] === ci) { t += r[2] / 1e6; w++; } });
+    return { name: name, total: t, windows: w };
+  }).sort(function(a, b){ return b.total - a.total; });
+
+  var pos = activeNets.filter(function(n){ return n > 0; });
+  var neg = activeNets.filter(function(n){ return n < 0; });
+  var grossPos = pos.reduce(function(a, b){ return a + b; }, 0);
+  var grossNeg = neg.reduce(function(a, b){ return a + b; }, 0);
+
+  /* ── stat strip ─────────────────────────────────── */
+  var s = document.getElementById("vizStats");
+  var lt = function(t){ return '<span dir="ltr">' + t + "</span>"; };
+  [
+    ["רווח נטו", usd(cum, true), lt("226") + " חלונות"],
+    ["חלונות פעילים", String(activeNets.length), "מתוך " + lt("226")],
+    ["אחוז הצלחה", (pos.length / activeNets.length * 100).toFixed(1) + "%",
+      lt(pos.length + "W / " + neg.length + "L")],
+    ["מכפיל רווח", (grossPos / Math.abs(grossNeg)).toFixed(2) + "×",
+      lt(usd(grossPos, true) + " מול " + usd(grossNeg, true))],
+    ["חציון לחלון", usd(0),
+      "הממוצע הפעיל " + lt(usd(activeNets.reduce(function(a, b){ return a + b; }, 0) / activeNets.length))],
+    ["שקיעה מקסימלית", usd(Math.max.apply(null, dd)), "משיא לשיא"],
+    ["החלון הטוב", usd(Math.max.apply(null, nets), true), "הגרוע " + lt(usd(Math.min.apply(null, nets)))]
+  ].forEach(function(row){
+    var d = document.createElement("div");
+    d.className = "viz-stat";
+    var v = document.createElement("div"); v.className = "viz-stat-v"; v.textContent = row[1];
+    var l = document.createElement("div"); l.className = "viz-stat-l"; l.textContent = row[0];
+    var n = document.createElement("div"); n.className = "viz-stat-n"; n.innerHTML = row[2];
+    d.appendChild(v); d.appendChild(l); d.appendChild(n);
+    s.appendChild(d);
+  });
+
+  /* ── reveal (Mono obsReveal, timers cleared on replay) ── */
+  var timers = {}, drawn = {};
+  function obsReveal(id, fn){
+    var n = document.getElementById(id);
+    var go = function(){
+      (timers[id] || []).forEach(clearInterval); timers[id] = [];
+      if (n.tagName.toLowerCase() === "svg") n.innerHTML = "";
+      drawn[id] = true;
+      fn(n);
+    };
+    var io = new IntersectionObserver(function(es){
+      if (es[0].isIntersecting){ go(); io.disconnect(); }
+    }, { threshold: .1 });
+    io.observe(n);
+    n.style.cursor = "pointer";
+    n.addEventListener("click", go);
+    /* audit fallback: a hidden or below-fold chart must still exist */
+    setTimeout(function(){ if (!drawn[id]) go(); }, 1500);
+  }
+
+  var DAY = 86400;
+  function dayLabel(sec){
+    var d = new Date(sec * 1000);
+    return String(d.getUTCDate()).padStart(2, "0") + "." + String(d.getUTCMonth() + 1).padStart(2, "0");
+  }
+
+  /* ── 1 · equity, hairline line ──────────────────── */
+  obsReveal("vzEquity", function(svg){
+    var W = 900, H = 300, L = 58, R = 24, T = 26, B = 46;
+    var t0 = rows[0][0], t1 = rows[rows.length - 1][0];
+    var lo = Math.min(0, Math.min.apply(null, eq)), hi = Math.max.apply(null, eq);
+    var pad = (hi - lo) * 0.12 || 1;
+    var x = function(t){ return L + (t - t0) / (t1 - t0) * (W - L - R); };
+    var y = function(v){ return H - B - (v - (lo - pad)) / ((hi + pad) - (lo - pad)) * (H - T - B); };
+
+    /* calendar floor: one hairline per capture start */
+    var seen = {};
+    rows.forEach(function(r){
+      var d = Math.floor(r[0] / DAY);
+      if (seen[d]) return; seen[d] = 1;
+      el(svg, "line", { x1: x(r[0]), y1: H - B, x2: x(r[0]), y2: H - B + 6,
+        stroke: "#3b4757", "stroke-width": .7, class: "vz-fade" });
+      txt(svg, { x: x(r[0]), y: H - B + 20, "font-size": 8, "font-weight": 600, fill: MUTED,
+        "text-anchor": "middle", "letter-spacing": ".06em", class: "vz-fade" }, dayLabel(r[0]));
+    });
+
+    /* zero baseline */
+    el(svg, "line", { x1: L - 6, y1: y(0), x2: W - R, y2: y(0), stroke: GRID, "stroke-width": .9, class: "vz-fade" });
+
+    /* y guides */
+    [lo, lo + (hi - lo) / 2, hi].forEach(function(v){
+      el(svg, "line", { x1: L - 4, y1: y(v), x2: W - R, y2: y(v), stroke: "#1e2630",
+        "stroke-width": .6, "stroke-dasharray": "2 5", class: "vz-fade" });
+      txt(svg, { x: L - 10, y: y(v) + 3, "font-size": 8.5, "font-weight": 600, fill: MUTED,
+        "text-anchor": "end" }, usd(v, true));
+    });
+
+    /* hairline path drawn left → right */
+    var d = "M" + rows.map(function(r, i){ return x(r[0]) + " " + y(eq[i]); }).join(" L ");
+    el(svg, "path", { d: d, fill: "none", stroke: AMBER, "stroke-width": 1.25,
+      pathLength: 1, class: "vz-draw", style: "animation-duration:1.6s" });
+
+    /* one dot per window: hollow = no trade */
+    rows.forEach(function(r, i){
+      var flat = Math.abs(nets[i]) < 0.0005;
+      var big = i === eq.indexOf(hi) || i === eq.indexOf(lo);
+      var c = el(svg, "circle", { cx: x(r[0]), cy: y(eq[i]), r: big ? 4 : (flat ? 1.7 : 2.1),
+        fill: big ? (eq[i] === hi ? AMBER : RED) : (flat ? PANEL : AMBER),
+        stroke: flat ? "#5f7183" : (big ? "none" : AMBER), "stroke-width": flat ? .9 : 0,
+        class: "vz-pop", style: "animation-delay:" + (0.25 + i * 0.004) + "s" });
+      tip(c, dayLabel(r[0]) + " · window " + (i + 1) + " · " + usd(nets[i], true) +
+             " → " + usd(eq[i], true));
+    });
+
+    /* peak + trough callouts */
+    var hiIdx = eq.indexOf(hi), loIdx = eq.indexOf(Math.min.apply(null, eq));
+    txt(svg, { x: x(rows[hiIdx][0]), y: y(hi) - 12, "font-size": 11, "font-weight": 800,
+      fill: AMBER, "text-anchor": "middle", class: "vz-fade",
+      style: "paint-order:stroke;stroke:" + PANEL + ";stroke-width:3px" }, usd(hi, true));
+    if (loIdx !== hiIdx) {
+      txt(svg, { x: x(rows[loIdx][0]), y: y(eq[loIdx]) + 18, "font-size": 10, "font-weight": 700,
+        fill: RED, "text-anchor": "middle", class: "vz-fade",
+        style: "paint-order:stroke;stroke:" + PANEL + ";stroke-width:3px" }, usd(eq[loIdx], true));
+    }
+
+    txt(svg, { x: W / 2, y: H - 6, "font-size": 7.5, "font-weight": 600, fill: "#5d6b7a",
+      "text-anchor": "middle", "letter-spacing": ".12em", class: "vz-fade",
+      style: "animation-delay:1.7s" }, "CUMULATIVE NET P&L · 226 WINDOWS · HOLLOW = NO TRADE");
+  });
+
+  /* ── 2 · histogram, rung histogram ──────────────── */
+  var histMode = "all";
+  function drawHist(){
+    var svg = document.getElementById("vzHist");
+    svg.innerHTML = "";
+    var data = histMode === "all" ? nets : activeNets;
+    var lo = -10, hi = 11, NB = hi - lo;
+    var bins = new Array(NB).fill(0);
+    data.forEach(function(v){
+      var b = Math.floor(v - lo);
+      if (b < 0) b = 0;
+      if (b >= NB) b = NB - 1;
+      bins[b]++;
+    });
+    var maxC = Math.max.apply(null, bins);
+    var W = 460, H = 320, X0 = 40, base = 250, PW = (W - X0 - 26) / NB, HW = PW / 2 - 2;
+    var step = Math.min(3.0, 176 / maxC);
+
+    bins.forEach(function(v, i){
+      var cx = X0 + i * PW + PW / 2;
+      for (var k = 0; k < v; k++){
+        var yy = base - k * step, w = Math.max(2.2, HW - 1 + rnd(k + 1, i + 2) * 2.2);
+        el(svg, "line", { x1: cx - w, y1: yy, x2: cx + w, y2: yy,
+          stroke: i < 10 ? RED : AMBER, "stroke-width": 1,
+          opacity: .5 + rnd(k + 2, i + 4) * .5, class: "vz-fade",
+          style: "animation-delay:" + (i * .04 + k * .004) + "s" });
+      }
+    });
+
+    /* bin edges — the histogram's identity */
+    el(svg, "line", { x1: X0 - 3, y1: base + 4, x2: W - 24, y2: base + 4, stroke: GRID, "stroke-width": .9, class: "vz-fade" });
+    for (var e = 0; e <= NB; e++){
+      var xe = X0 + e * PW;
+      el(svg, "line", { x1: xe, y1: base + 4, x2: xe, y2: base + (e % 2 === 0 ? 11 : 8),
+        stroke: "#3b4757", "stroke-width": .7, class: "vz-fade" });
+      if (e % 2 === 0) txt(svg, { x: xe, y: base + 22, "font-size": 7.5, "font-weight": 600,
+        fill: MUTED, "text-anchor": "middle" }, (lo + e) === 0 ? "0" : usd(lo + e, true));
+    }
+
+    /* peak label + zero marker */
+    var pk = bins.indexOf(maxC);
+    var px = X0 + pk * PW + PW / 2, py = base - maxC * step - 10;
+    var num = txt(svg, { x: px, y: Math.max(20, py), "font-size": 11, "font-weight": 800,
+      fill: INK, "text-anchor": "middle", class: "vz-fade", style: "animation-delay:.9s" }, maxC);
+    num.setAttribute("aria-label", maxC + " windows landed in " + usd(lo + pk, true) + " to " + usd(lo + pk + 1, true));
+    var zeroX = X0 + (0 - lo) * PW;
+    el(svg, "line", { x1: zeroX, y1: base + 4, x2: zeroX, y2: 34, stroke: "#5f7183",
+      "stroke-width": .9, "stroke-dasharray": "2 4", class: "vz-fade", style: "animation-delay:1s" });
+    txt(svg, { x: zeroX + 5, y: 32, "font-size": 7.5, "font-weight": 800, fill: MUTED,
+      class: "vz-fade", style: "animation-delay:1.1s" }, "ZERO");
+
+    txt(svg, { x: W / 2, y: H - 12, "font-size": 7.5, "font-weight": 600, fill: "#5d6b7a",
+      "text-anchor": "middle", "letter-spacing": ".12em", class: "vz-fade",
+      style: "animation-delay:1.2s" }, "ONE RUNG = ONE WINDOW · RED = LOSING WINDOW");
+  }
+
+  obsReveal("vzHist", drawHist);
+
+  Array.prototype.forEach.call(document.querySelectorAll(".viz-btn"), function(b){
+    b.addEventListener("click", function(){
+      histMode = b.getAttribute("data-mode");
+      Array.prototype.forEach.call(document.querySelectorAll(".viz-btn"), function(x){
+        var on = x === b;
+        x.classList.toggle("is-on", on);
+        x.setAttribute("aria-pressed", on ? "true" : "false");
+      });
+      document.getElementById("vzHistSub").textContent = histMode === "all"
+        ? "כל 226 החלונות · כל רונג = חלון אחד · תדירות לפי דולר"
+        : "74 החלונות שסחרו · 152 חלונות בלי עסקה הוסרו";
+      drawHist();
+    });
+  });
+
+  /* ── 3 · per-capture tick rows ──────────────────── */
+  obsReveal("vzCaps", function(svg){
+    var W = 460, H = 320, L = 132, R = 46, T = 14, B = 22;
+    var maxAbs = Math.max.apply(null, capsTotals.map(function(c){ return Math.abs(c.total); }));
+    var zeroX = L + (W - L - R) * (Math.max.apply(null, capsTotals.map(function(c){ return -c.total; })) / (2 * maxAbs));
+    var scale = (W - L - R) / (2 * maxAbs);
+    var xOf = function(v){ return zeroX + v * scale; };
+    var rowH = (H - T - B) / capsTotals.length;
+
+    capsTotals.forEach(function(c, i){
+      var y = T + i * rowH + rowH / 2;
+      if (c.total < -0.005) y = y;
+      var name = c.name;
+      txt(svg, { x: L - 8, y: y + 2.5, "font-size": 7, "font-weight": 600, fill: MUTED,
+        "text-anchor": "end", class: "vz-fade", style: "animation-delay:" + i * .03 + "s" }, name);
+      el(svg, "line", { x1: L - 4, y1: y, x2: W - R, y2: y, stroke: "#1b222b",
+        "stroke-width": .6, class: "vz-fade" });
+      var w = Math.abs(c.total) * scale;
+      var bar = el(svg, "rect", {
+        x: c.total >= 0 ? zeroX : zeroX - w, y: y - rowH * .3,
+        width: Math.max(1, w), height: rowH * .6, rx: Math.min(4, rowH * .3),
+        fill: c.total >= 0 ? AMBER : "none",
+        stroke: c.total >= 0 ? "none" : RED, "stroke-width": 1,
+        "stroke-dasharray": c.total >= 0 ? "0" : "2 2",
+        class: "vz-pop", style: "animation-delay:" + (.15 + i * .04) + "s" });
+      tip(bar, c.name + " — " + usd(c.total, true) + " across " + c.windows + " windows");
+      txt(svg, { x: c.total >= 0 ? W - R + 4 : W - R + 4, y: y + 2.5,
+        "font-size": 7.5, "font-weight": 800, fill: c.total >= 0 ? AMBER : RED,
+        "text-anchor": "start", class: "vz-fade", style: "animation-delay:" + (.2 + i * .04) + "s" },
+        usd(c.total, true));
+    });
+
+    el(svg, "line", { x1: zeroX, y1: T, x2: zeroX, y2: H - B, stroke: "#3b4757",
+      "stroke-width": .9, class: "vz-fade" });
+    txt(svg, { x: zeroX, y: H - 6, "font-size": 7, "font-weight": 600, fill: "#5d6b7a",
+      "text-anchor": "middle", "letter-spacing": ".1em", class: "vz-fade" }, "$0");
+  });
+})();
+</script>
 
   <footer>
     מבוסס על סקירת הגבולות <span class="ltr">boundary-9runs_20caps-226w</span> · 20 הקלטות, 226 חלונות, 3 מחירים × 3 זמני עצירה ·
