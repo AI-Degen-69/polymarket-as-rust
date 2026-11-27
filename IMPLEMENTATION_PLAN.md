@@ -600,7 +600,7 @@ polymarket-as-rust/
   4. **Merge Before Confirmation Guard:** Attempt settlement when fill is `MATCHED` (not `CONFIRMED`) -> verify `SettlementWorker` defers merge until `CONFIRMED`!
   5. **Canary Safety Latch:** Running `poly-as exec --mode canary-live` WITHOUT `--confirm-live-capital` OR with `DRY_RUN=true` MUST refuse to start (non-zero exit).
   6. **Full Regression:** `cargo test --workspace` + `cargo build --release` passes cleanly.
-- **Optional Live Canary (ONLY after explicit operator sign-off on Phase 5 dry-run + Open Question #1 wallet verification):** Run `poly-as exec --mode canary-live --confirm-live-capital --canary-max-usd 10` for 1 single 5-minute epoch with live operator supervision, verifying `GET /data/orders` empty on shutdown.
+- **Optional Live Canary *(Superseded / Not Executable in Current Build)*:** Originally planned as a single 5-minute epoch via `poly-as exec --mode canary-live --confirm-live-capital --canary-max-usd 10` after Phase 5 dry-run sign-off. **Do not attempt `canary-live`:** `crates/cli/src/exec_cmd.rs` hard-gates `canary-live` off, `RelayerClient::submit_merge` is preview-only, and that hard gate remains authoritative.
 - **PASS/FAIL Criteria:** PASS iff all signing, HMAC, heartbeat recovery, maker-fill accounting, mock CLOB error handling, secret-redaction, release build, and workspace regression checks pass with `tau_3 < 80 us` and zero CRITICAL/HIGH reviewer findings.
 
 #### Phase 5 GATE CHECKLIST
