@@ -3,7 +3,7 @@
 **Date:** 2026-11-26  
 **Corpus:** 21 Development/In-Sample captures (`241` windows, `351` fills, `0` flattens) in `logs/sweeps/26-11_07-55-07Z_1runs_21caps-241w/sweep-manifest.json`  
 **Baseline Config:** `Config #6/9` in [DEFAULTS.json](../DEFAULTS.json) (`gamma=0.12`, `max_entry_price=$0.65`, `entry_cutoff_secs=120s`, `tier1_hedge_trigger_price=null`, `QueueDecay=conservative`)  
-**Reproducibility Script:** [analyze_mandatory_flatten_root_cause.py](../scripts/analyze_mandatory_flatten_root_cause.py) (`rtk python scripts/analyze_mandatory_flatten_root_cause.py`)  
+**Reproducibility Script:** [analyze_mandatory_flatten_root_cause.py](../scripts/analyze_mandatory_flatten_root_cause.py) (`python scripts/analyze_mandatory_flatten_root_cause.py`)  
 **Guardrail Note:** Capture `#22` (`26-11_07-40-00Z_1h15m_15w.jsonl`) and `.inprogress.jsonl` were not inspected, opened, or replayed.
 
 ---
@@ -23,7 +23,7 @@ Two distinct, disjoint mechanisms explain **100%** (`40 / 40`) of the zero-flatt
 2. **Pre-Flatten Book Collapse + Active-Phase Cross-Tick Cap Stranding (`4 / 40` windows, `-$20.8192` or `62.0%` of settlement PnL — Hypotheses H2 & H5):**
    - Only `4` of `40` windows reached settlement with flattenable inventory (`|q| >= 5.0`): `win#238` (`-$9.0000`), `win#15` (`-$4.7952`), `win#86` (`-$4.0000`), and `win#227` (`-$3.0240`).
    - In **all four**, the Polymarket L2 book had already collapsed to an empty one-sided `$0.99 / $0.01` terminal state **24.8s to 60.8s before `MandatoryFlatten` started at `tau = 30s`** (`0` book snapshots with opposite asks or heavy-leg bids during `15s < tau <= 30s`).
-   - Upstream of `tau = 30s`, `station4_6_pricer.rs` ([station4_6_pricer.rs#L442-L468](../crates/math-engine/src/station4_6_pricer.rs#L442-L468)) capped passive hedge bids at `$1.06 - vwap` (`max_combined_bid $0.98 + max_cross_tick_loss $0.08`) because `tier1_hedge_trigger_price` is `off` and `allow_cross_tick_override` ([lifecycle_cmd.rs#L2231-L2247](../crates/cli/src/lifecycle_cmd.rs#L2231-L2247)) only activates in `PreExpiryLockout` (`tau <= 60s`) or `Tier3OneSided` (`u > 75%` of `$50` `V_max`).
+   - Upstream of `tau = 30s`, `station4_6_pricer.rs` ([station4_6_pricer.rs#L442-L468](../crates/math-engine/src/station4_6_pricer.rs#L442-L468)) capped passive hedge bids at `$1.06 - vwap` (`max_combined_bid $0.98 + max_cross_tick_loss $0.08`) because `tier1_hedge_trigger_price` is `off` and `allow_cross_tick_override` ([lifecycle_cmd.rs#L2231-L2247](../crates/cli/src/lifecycle_cmd.rs#L2231-L2247)) only activates in `PreExpiryLockout` (`tau <= 60s`) or `Tier3OneSided` (`u > 60%` of `$50` `V_max`, i.e., `> $30`; corrected from an earlier `75%` note).
 
 ### Execution Pipeline Stage Audit & Hypothesis Verdict
 
@@ -44,7 +44,7 @@ Two distinct, disjoint mechanisms explain **100%** (`40 / 40`) of the zero-flatt
 | **H4: Minimum order size blocks execution** | **Confirmed (Primary for `36/40` dust)** | `36` windows (`90%` by count, `38%` by dollars) ended with `0.01–4.29` residual shares (`< 5.0` min order size). Per-tick eligibility during `MandatoryFlatten` was not re-derived. |
 | **H5: Risk / lifecycle gates suppress hedges** | **Confirmed upstream** | Active-phase `max_cross_tick_loss = $0.08` + `tier1_hedge_trigger = off` + post-only `CrossesBook` + `DefensiveCancel` froze passive hedging before `tau = 60s`. |
 | **H6: Simulator / matching bug blocks fills** | **Not established** | Zero `flatten` events do not show that `match_fak_against_book` was not called. Crossed-book attempts log `flatten_unfilled`. Other attempts call the matcher and may log no event when nothing fills. Refute H6 only with a dispatch record or matcher invocation record for the eligible windows. |
-| **H7: Entries created too late or too large** | **Refuted on timing; partial on size** | All `40` exposures began at `tau >= 180.5s` (`entry_cutoff_secs = 120s` worked). Sizing `20` shares (`$4–$9`) stayed below `Tier 3` (`75%` of `$50`), delaying aggressive skew. |
+| **H7: Entries created too late or too large** | **Refuted on timing; partial on size** | All `40` exposures began at `tau >= 180.5s` (`entry_cutoff_secs = 120s` worked). Sizing `20` shares (`$4–$9`) stayed below `Tier 3` (`60%` of `$50`, i.e., `$30`; corrected from an earlier `75%` note — the `$4–$9` sizing conclusion is unchanged), delaying aggressive skew. |
 
 ---
 
@@ -251,4 +251,4 @@ The cheapest and earliest intervention must **unlock passive maker hedging** bef
 2. **Zero live taker-flatten empirical friction:** Because `0` flattens fired in the `21`-capture baseline, actual Polymarket `40ms` wire latency and L2 book slippage under `MandatoryFlatten` remain untested in live or replay data.
 3. **Dust (`< 5` shares) creation mechanics:** `36` windows ended with sub-minimum dust (`0.01–4.29` shares) largely from partial passive fills on the reducing or accumulating leg; whether `cap_tier1_reducing_to_delta` rounding or `max_combined_bid` adjustment can safely absorb `0.01–4.99` share remnants without creating opposite-side overshoot requires targeted simulation.
 4. **Script `[cause]` column is a summary label, not a per-window verdict:** `analyze_mandatory_flatten_root_cause.py` stamps every non-dust window `H2:EmptyBook@30s+H5:CrossTickCap` from the residual quantity alone. The attribution in Section D rests on the computed `Last Opp Ask` `tau` and `MandatoryFlatten` `opp_ask` columns. Treat the label as a summary, not as independent evidence.
-4. **Regime generalization beyond 21 IS captures:** `win#238` (`-$9.00`) occurred in `Cap #21` (`26-11`), and `17 / 17` `Down` residuals lost in this `5`-day window. Out-of-sample validation on the sealed Holdout Vault (starting with Capture `#22`) is still required after any Rank 1–3 code change.
+5. **Regime generalization beyond 21 IS captures:** `win#238` (`-$9.00`) occurred in `Cap #21` (`26-11`), and `17 / 17` `Down` residuals lost in this `5`-day window. Out-of-sample validation on the sealed Holdout Vault (starting with Capture `#22`) is still required after any Rank 1–3 code change.

@@ -19,7 +19,7 @@ NEX_WS_URL=wss://nex-ws.preprod.defi.euw2.polymarket.sh
 GAMMA_PREPROD_URL=https://gamma-api-preprod.polymarket.dev
 NEX_CHAIN_ID=80002
 NEX_INGRESS_IP=51.24.102.79
-NEX_ALLOWLISTED_EGRESS_IP=31.168.108.54
+NEX_ALLOWLISTED_EGRESS_IP=<ALLOWLISTED_EGRESS_IP>
 NEX_EXCHANGE_ADDRESS=0xe3333700cA9d93003F00f0F71f8515005F6c00Aa
 NEX_TRADING_ADDRESS=<amoy-eoa-or-deposit-wallet>
 NEX_WALLET_MODE=eoa            # or: deposit-wallet (Safe/Proxy unsupported)
@@ -38,9 +38,9 @@ sandbox hosts, on chain IDs other than 80002, and on the three known production 
 addresses. It checks only addresses and key presence, not key ownership, so keep production
 keys out of sandbox settings yourself.
 
-## 1. Allowlist `31.168.108.54/32`
+## 1. Allowlist `<ALLOWLISTED_EGRESS_IP>/32`
 
-1. NEX registry must list operator egress as `31.168.108.54/32` (verified by live `sandbox health` on 2026-11-20; re-check if NAT changes).
+1. NEX registry must list operator egress as `<ALLOWLISTED_EGRESS_IP>/32` (re-check if NAT changes).
 2. Map both NEX hostnames locally to the pinned ingress:
    `nex.preprod.defi.euw2.polymarket.sh -> 51.24.102.79`
    `nex-ws.preprod.defi.euw2.polymarket.sh -> 51.24.102.79`
@@ -54,21 +54,21 @@ cargo run -p cli --bin poly-as -- sandbox health --require-allowlisted-egress
 Expected:
 
 ```text
-Egress public IPv4:      31.168.108.54
-Registered allowlist:   31.168.108.54
+Egress public IPv4:      <ALLOWLISTED_EGRESS_IP>
+Registered allowlist:   <ALLOWLISTED_EGRESS_IP>
 Allowlist match:        YES
 Pinned ingress IPv4:    51.24.102.79
 Host nex.preprod... -> ["51.24.102.79"] (pinned=true)
 Host nex-ws.preprod... -> ["51.24.102.79"] (pinned=true)
 Outbound TCP/443:       true
 GET /health:            Some(200) (ok=true)
-GATE: PASS  /health=200 from egress 31.168.108.54
+GATE: PASS  /health=200 from egress <ALLOWLISTED_EGRESS_IP>
 ```
 
 If egress differs, stop and re-allowlist. Gate fails closed on unpinned DNS, TCP failure,
 or non-200 `/health`.
 
-Note: egress is NAT-dependent. Earlier runs saw `79.181.159.149`; live check on 2026-11-20 shows `31.168.108.54`. If `Allowlist match: NO`, update the NEX registry and `NEX_ALLOWLISTED_EGRESS_IP` before trading.
+Note: egress is NAT-dependent (for example, changing from `<PREVIOUS_EGRESS_IP>` to `<ALLOWLISTED_EGRESS_IP>`). If `Allowlist match: NO`, update the NEX registry and `NEX_ALLOWLISTED_EGRESS_IP` before trading.
 
 ## 2. Credentials
 
@@ -195,8 +195,8 @@ The steps below assume `NEX_WALLET_MODE=eoa`.
 2. Create L2 creds. Start with `--nonce 0`; retry with `--derive` on a nonce conflict:
 
    ```powershell
-   python3 scripts/nex_create_l2_key.py --nonce 0
-   python3 scripts/nex_create_l2_key.py --nonce 0 --derive
+   python scripts/nex_create_l2_key.py --nonce 0
+   python scripts/nex_create_l2_key.py --nonce 0 --derive
    ```
 
 3. Check the route and discovery. Pick a clean `PolyV2` asset with `neg_risk=false`:
