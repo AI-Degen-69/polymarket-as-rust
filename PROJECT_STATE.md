@@ -19,7 +19,7 @@ Key operating rules (governed in full by [AGENTS.md](AGENTS.md), [CONSTRAINTS.md
 - **Strict dataset separation:** Keep Development (In-Sample), Candidate Selection, Holdout, Forward Testing, and Live Trading strictly separate. Never reuse inspected data as an untouched Out-of-Sample gate.
 - **Frozen experimental discipline:** Freeze engine code, defaults, and candidate flags before forward or holdout evaluation. Never alter a frozen experiment mid-run or relax failure thresholds (`Filter 4` requires `>= 400` fills under conservative queue decay).
 - **Capture and worktree protection:** Never terminate an active `poly-as.exe` process, modify its logs or manifests, or run `cargo build`/`cargo clean` inside a worktree and build profile whose binary is active.
-- **Live capital boundary:** Mainnet live trading (`poly-as exec --mode canary-live`) is hard-gated off in code and requires explicit user authorization.
+- **Live capital boundary:** Mainnet `canary-live` (`poly-as exec --mode canary-live`) is hard-gated off in the current build ([crates/cli/src/exec_cmd.rs](crates/cli/src/exec_cmd.rs)). User authorization does not bypass that implementation hard gate, and historical Phase 5 documentation in [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) is not authorization to attempt live execution.
 
 ---
 
@@ -58,9 +58,15 @@ Key operating rules (governed in full by [AGENTS.md](AGENTS.md), [CONSTRAINTS.md
 
 ### Frozen Candidate: `cand_b_admit_cancel`
 
-**[Verified Fact — branch commit `3870cbb`]** Candidate `cand_b_admit_cancel` tests **[Hypothesis]** that gating flat initial entries and canceling resting flat-entry orders during wide-spread toxic flow reduces single-leg adverse selection without destroying pair-merge edge.
+**[Verified Fact — branch commit `3870cbb`]** `cand_b_admit_cancel` is the exact frozen candidate rule under forward-testing evaluation, not a general description of toxic-flow gating. It tests **[Hypothesis]** that suppressing flat first-leg quotes when its frozen predicate fires reduces single-leg adverse selection without destroying pair-merge edge.
 
-- **Exact delta vs. Baseline Config #6:** Identical to Config #6 on every parameter, plus three explicit CLI flags:
+- **Frozen predicate and action (all conditions locked):**
+  - **Spread threshold:** Spread `>= 30,000` micro-USDC (`$0.03`).
+  - **Flow window:** `5,000ms` rolling window.
+  - **Order-flow sign:** Signed Polymarket `Sell - Buy` shares `> 0` over the `5,000ms` window.
+  - **Flat inventory only:** `q_up == 0 && q_dn == 0` (applies only when flat).
+  - **Frozen action (`admit-cancel`):** Block new first-leg quotes and cancel existing resting first-leg quotes while the predicate holds.
+- **Exact CLI delta vs. Baseline Config #6:** Identical to Config #6 on every parameter, plus three explicit CLI flags:
   - `--exp-entry-toxic-spread-micro 30000` (`$0.03` / 3 ticks)
   - `--exp-entry-toxic-flow-window-ms 5000` (`5000ms`)
   - `--exp-entry-toxic-mode admit-cancel`
@@ -81,8 +87,8 @@ Key operating rules (governed in full by [AGENTS.md](AGENTS.md), [CONSTRAINTS.md
 | **Development (IS)** | Exploratory diagnostics, bug fixes, feature design | Inspect freely, test root causes | `21` captures (`241w`) frozen as IS (burned for OOS) |
 | **Candidate Selection** | Rank parameter grids or candidate rules before freezing | Structured sweeps on non-Holdout splits | `cand_b_admit_cancel` frozen for forward replay |
 | **Holdout** | Single-shot confirmatory OOS gate under locked SHA & manifest | Sealed storage until pre-registered unlock | Seed `#22` + `#24`–`#26` sealed (manifest pending) |
-| **Forward Testing** | Prospective raw feed collection + offline paired replay | Record fresh windows, run frozen paired replay | Campaign `fwd-20261127-cand_b_v1` in collection |
-| **Live Trading** | Real-capital CLOB execution & Relayer settlement | **Prohibited** without explicit user authorization | Hard-gated off in `crates/cli/src/exec_cmd.rs` |
+| **Forward Testing** | Prospective raw feed collection + offline paired replay | Record fresh windows, run frozen paired replay | **[Audit Snapshot — 2026-11-27]** `fwd-20261127-cand_b_v1` recorded as in collection at audit time (not a live state claim — see §4) |
+| **Live Trading** | Real-capital CLOB execution & Relayer settlement | **Unavailable in current build** (user authorization does not bypass the code hard gate, and historical Phase 5 docs are not authorization to attempt live execution) | Mainnet `canary-live` hard-gated off in [crates/cli/src/exec_cmd.rs](crates/cli/src/exec_cmd.rs) |
 
 > **Profitability Status [Verified Fact]:** **No forward-testing profitability conclusion has been established** for either Baseline Config #6 or `cand_b_admit_cancel`.
 
