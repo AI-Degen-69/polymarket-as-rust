@@ -1,23 +1,28 @@
-# Polymarket 5-Minute BTC Avellaneda-Stoikov HFT Bot (Greenfield Rust) — Master Implementation Plan
+# Polymarket 5-Minute BTC Avellaneda-Stoikov HFT Bot — Technical Specification & Historical Phase 0–5 Record
 
-> **For agentic workers:** Implement strictly one phase at a time following Section 4 (Strict Gating Rule). Use `skills/verification-before-completion/SKILL.md` on every gate and `skills/doubt-driven-development/SKILL.md` before locking any non-trivial invariant. Mandatory phase reviewers: `C:\Users\Tiger\.agents\agents\rust-reviewer.md`, `C:\Users\Tiger\.agents\agents\silent-failure-hunter.md`, and `C:\Users\Tiger\.agents\agents\rust-build-resolver.md` (on build failures).
+> **Document Status:** **Phases 0–5 are completed and tagged (`phase-0-complete` through `phase-5-complete`).** This document is **not** an active greenfield phased build prompt. Treat **Architecture**, **Global Constraints**, **Section 1**, and **Section 2** as the active technical specification (with strategy defaults owned by [`DEFAULTS.json`](DEFAULTS.json)); treat **Sections 3–5** as the archived historical build record (`AGENTS.md` §3).
 
-**Goal:** Build a pure-Rust, terminal-first, zero-UI, zero-allocation-hot-path Avellaneda-Stoikov dual-bid market maker for Polymarket's 5-minute Bitcoin UP/DOWN binary prediction series, progressing cleanly from typed foundations through live feeds, 8-station math, FIFO paper simulation, risk/lifecycle actors, and live Polymarket CLOB execution with on-chain collateral recycling.
+**Goal:** Pure-Rust, terminal-first, zero-UI, zero-allocation-hot-path Avellaneda-Stoikov dual-bid market maker for Polymarket's 5-minute Bitcoin UP/DOWN binary prediction series (with `5m`/`15m`/`1h` historical canonical replay support), progressing from typed foundations through live feeds, quantitative math stations, FIFO paper simulation, risk/lifecycle actors, and Polymarket CLOB execution/settlement building blocks.
 
-**Architecture:** Modular 7-crate Cargo workspace (`core-types`, `feeds`, `math-engine`, `paper-sim`, `risk-lifecycle`, `execution`, `cli`) running a hybrid Tokio I/O + pinned OS-thread actor pipeline. Per-feed `rtrb` SPSC ringbuffers feed a pinned Pricing thread; Pricing publishes latest-wins conflated quotes (`ArcSwap` / triple-buffer) to a pinned Risk thread; Risk sends non-blocking intents over bounded `tokio::sync::mpsc` to the Execution Tokio actor; Execution publishes lock-free `OrderRegistrySnapshot` updates back via `ArcSwap` to eliminate cyclic deadlocks. Every phase ships a runnable `poly-as` CLI subcommand printing live human-readable traces to stdout and structured JSONL telemetry to `logs/`.
+**Architecture:** Modular 8-crate Cargo workspace (`core-types`, `feeds`, `historical-data`, `math-engine`, `paper-sim`, `risk-lifecycle`, `execution`, `cli`) running a hybrid Tokio I/O + pinned OS-thread actor pipeline. Per-feed `rtrb` SPSC ringbuffers feed a pinned Pricing thread; Pricing publishes latest-wins conflated quotes (`ArcSwap`) to a pinned Risk thread; Risk sends non-blocking intents over bounded `tokio::sync::mpsc` to the Execution/Paper Tokio actor; Execution publishes lock-free `OrderRegistrySnapshot` updates back via `ArcSwap` to eliminate cyclic deadlocks. `historical-data` adds PMData catalog/quota-guarded downloads and `CanonicalEvent` normalization (`5m`/`15m`/`1h`), and `execution::nex` adds live NEX Amoy sandbox support. The `poly-as` CLI prints human-readable telemetry to stdout and structured JSONL logs to `logs/`.
 
-**Tech Stack:** Rust `1.99.1` (`edition = "2024"`, target `x86_64-pc-windows-msvc`), `tokio`, `tokio-tungstenite` (`TCP_NODELAY`), `reqwest` (rustls), `rtrb`, `arc-swap`, `alloy` (`sol!`, `eip712_domain!`, `PrivateKeySigner`), `hmac`/`sha2`/`base64` (`URL_SAFE`), `hdrhistogram`, `secrecy`, `thiserror`, `clap`, `serde`/`serde_json`, `windows-sys` (`timeBeginPeriod`/`CreateWaitableTimerExW`).
+**Tech Stack:** Rust MSRV `1.89+` (`edition = "2024"`, target `x86_64-pc-windows-msvc`), `tokio`, `tokio-tungstenite` (`TCP_NODELAY`), `reqwest` (rustls), `rtrb`, `arc-swap`, `alloy` (`sol!`, `eip712_domain!`, `PrivateKeySigner`), `hmac`/`sha2`/`base64` (`URL_SAFE`), `hdrhistogram` (`7.5`), `arrow-array`/`arrow-schema`/`parquet`/`zip` (`historical-data`), `secrecy`, `thiserror`, `clap`, `serde`/`serde_json`, `windows-sys` (`timeBeginPeriod`/`CreateWaitableTimerExW`), `wiremock`.
 
 ## Global Constraints
 
-1. **Zero UI / Pure Rust / Terminal-First:** No Python runtime, no web server, no React/Vite frontend. Every phase produces a runnable `poly-as <subcommand>` printing stdout telemetry and writing JSONL logs to disk.
+1. **Pure-Rust Trading Runtime / Terminal-First:** The trading, replay, and simulation runtime (`poly-as`) is pure Rust with zero web UI or Python runtime dependency. Offline research analysis and sandbox key-generation helpers under `scripts/` may use PowerShell or Python.
 2. **Zero Hardcoded Secrets:** Never commit or embed private keys, API keys, secrets, passphrases, or relayer keys in source code or `Default` impls. Load strictly from `.env` / environment variables wrapped in `secrecy::SecretString`, and never print secrets to stdout or JSONL.
-3. **Zero Silent Failures & Zero Hot-Path Panics:** Workspace Cargo lints enforce `#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic)]` in library/production code (`cfg_attr(test, allow(...))`). All fallbacks emit explicit typed flags and telemetry counters.
+3. **Zero Silent Failures & Zero Hot-Path Panics:** Workspace Cargo lints enforce `deny` on `clippy::unwrap_used`, `clippy::expect_used`, `clippy::panic`, `clippy::todo`, `clippy::unimplemented`, `clippy::indexing_slicing`, and `rust::unsafe_op_in_unsafe_fn` in non-test targets (`cfg_attr(test, allow(...))`). All fallbacks emit explicit typed flags and telemetry counters.
 4. **Fixed-Point Monetary Exactness:** All wire prices, order sizes, ticks, fees, and hysteresis thresholds use integer fixed-point newtypes (`MicroUsdc(u64)`, `SharesMicro(u64)`, `PriceTicks(u32)`). Floating-point (`f64`) is confined strictly to analytical math (Stations 1–5) and explicitly finite-checked before integer quantization.
 5. **Zero-Allocation Hot Path:** Intern 77-digit token IDs to `#[repr(u8)] enum Outcome { Up = 0, Down = 1 }` at ingress. Parse price/size decimal slices directly into integer micro-units without allocating `String`/`Vec` inside `rtrb` slots.
-6. **Official Docs Grounding:** Verified against `C:\Users\Tiger\Agents\Projects\AI Trading\Library\`, read-only legacy docs `C:\Users\Tiger\Agents\Projects\AI Trading\dangerously-skip-permissions-bot\docs\avellaneda-stoikov\`, live Polymarket official docs (`polymarket-docs` MCP, Nov 2026), and Context7 (`rtrb`, `tokio-tungstenite`, `hdrhistogram`, `alloy`).
-7. **Windows 11 Platform Discipline:** Commands use Windows PowerShell (`pwsh`) syntax; use `rtk cargo ...` / `rtk git ...` in agent tool calls. Mitigate Windows 15.625ms timer granularity and `w32time` clock drift explicitly in `core-types`.
-8. **Git Workflow & Delivery Discipline:** Follow [AGENTS.md](AGENTS.md) for all Phase 2–5 work: branch from synced `main` (`feat/phase-<N>-<slug>`), make atomic conventional commits per verified slice (separating prior-phase polish from new phase features), push to `origin`, open a PR with the Verification Scorecard, wait for green CI, merge cleanly (`--merge --delete-branch`), fast-forward local `main`, and push annotated tag `phase-<N>-complete`. Never commit feature work directly to `main`.
+6. **Official Docs Grounding:** Verified against upstream Polymarket official docs (`polymarket-docs`), crate documentation (`rtrb`, `tokio-tungstenite`, `hdrhistogram`, `alloy`), and historical microstructure/legacy research reports.
+7. **Windows 11 Platform Discipline:** Operator commands use Windows PowerShell (`pwsh`) syntax. Mitigate Windows 15.625ms timer granularity and `w32time` clock drift explicitly in `core-types` and `cli::preflight`.
+8. **Governance & Delivery Discipline:** Follow [AGENTS.md](AGENTS.md) for Git, PR, capture-safety, and configuration rules, and [CONSTRAINTS.md](CONSTRAINTS.md) for mandatory Rust and PowerShell quality bars.
+
+> **Current Implementation & Live-Execution Boundary:**
+> - **Strategy defaults:** Calibrated non-secret defaults live in [`DEFAULTS.json`](DEFAULTS.json) (embedded into `EngineConfig::default()`), superseding early Phase 0–5 placeholders (such as the initial `2`-tick spread floor).
+> - **Removed baseline twin:** `NaiveBaselineEngine` (null baseline comparison originally specified in Phase 3) was later removed from `paper-sim` (see [docs/strategy-verification-spec.md](docs/strategy-verification-spec.md) §3.1).
+> - **Mainnet execution boundary:** `poly-as exec --mode canary-live` is hard-gated off in `crates/cli/src/exec_cmd.rs`. `exec` dry-run runs against synthetic books with ephemeral keys, and `RelayerClient::submit_merge` (`crates/execution/src/settlement.rs`) currently posts a `"calldataPreview"` JSON payload rather than ABI-encoded signed relayer transactions. Live exchange connectivity testing currently targets the NEX Amoy sandbox (`crates/execution/src/nex.rs`).
 
 ---
 
@@ -90,25 +95,31 @@
 
 ---
 
-## 3. Phased Build Plan
+## 3. Historical Build Record (Phases 0–5 — Completed & Tagged)
 
-### Workspace Directory Map (Locked Upfront)
+> **Historical Record Note:** Phases 0–5 below are completed and tagged (`phase-0-complete` .. `phase-5-complete`). The `[N.1 DO]`, `[N.2 VERIFY]`, `[N.3 VERIFY-AGAIN]`, and Section 4 sequential phase gates governed the original greenfield build and do not block post-Phase-5 research or engineering (`AGENTS.md` §3).
+
+### Workspace Directory Map (Current 8-Crate Layout)
 
 ```text
 polymarket-as-rust/
 ├── .gitignore
 ├── .env.example
-├── Cargo.toml                         # Workspace root + strict clippy lints
-├── IMPLEMENTATION_PLAN.md             # This master specification
+├── Cargo.toml                         # 8-crate workspace root + strict deny lints
+├── DEFAULTS.json                      # Canonical non-secret engine & simulation defaults
+├── IMPLEMENTATION_PLAN.md             # Technical specification + archived Phase 0-5 record
 ├── logs/                              # Gitignored JSONL telemetry output
+├── data/                              # Gitignored PMData cache & canonical datasets
+├── scripts/                           # PowerShell sweep/style checks & Python research/key helpers
 └── crates/
-    ├── core-types/                    # Phase 0: Fixed-point types, config, errors, clock, HDR, JSONL
+    ├── core-types/                    # Phase 0: Fixed-point types, config, errors, clock, HDR, JSONL, sandbox profile
     ├── feeds/                         # Phase 1: Gamma v1/v2 discovery, Binance/CLOB/PolyBolt WSS, rtrb
+    ├── historical-data/               # Post-Phase-5: PMData catalog/downloader, CanonicalEvent normalizer, reconcile
     ├── math-engine/                   # Phase 2: Zero-alloc Stations 1-6 + lead-lag + PipelineTrace
     ├── paper-sim/                     # Phase 3: FIFO queue-aware simulator, VWAP merge, SimTelemetry
     ├── risk-lifecycle/                # Phase 4: Stations 7-8, Tiers 1-4, 300s FSM, actor wiring
-    ├── execution/                     # Phase 5: EIP-712 V2/V3, L2 HMAC, REST/Heartbeats, /ws/user, Merge
-    └── cli/                           # Unified binary `poly-as` with phase subcommands
+    ├── execution/                     # Phase 5 + Post-Phase-5: EIP-712 V2/V3, L2 HMAC, REST/Heartbeats, /ws/user, Merge preview, NEX sandbox
+    └── cli/                           # Unified binary `poly-as` (`doctor`, `feeds`, `trace`, `lifecycle`, `pmdata`, `sandbox`, `exec`)
 ```
 
 ---
@@ -118,7 +129,7 @@ polymarket-as-rust/
 #### [0.1 DO]
 - **Initialize Git & Workspace:**
   - `git init`, create `.gitignore` (ignore `/target`, `.env`, `logs/*.jsonl`, `*.log`), create `.env.example` (placeholder values ONLY — never real keys!).
-  - Create root `Cargo.toml` with `resolver = "2"`, `edition = "2024"`, `rust-version = "1.88"` (matching `hdrhistogram 7.6.0`), workspace members `["crates/core-types", "crates/cli"]` (expanding workspace members sequentially in each phase), and `[workspace.lints.clippy]` denying `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`.
+  - Create root `Cargo.toml` with `resolver = "2"`, `edition = "2024"`, `rust-version = "1.88"` (matching `hdrhistogram 7.6.0`), workspace members `["crates/core-types", "crates/cli"]` (expanding workspace members sequentially in each phase), and `[workspace.lints.clippy]` denying `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`. *(Historical note: shipped on `main` as `rust-version = "1.89"`, `hdrhistogram = "7.5"`, plus `clippy::indexing_slicing = "deny"` and `rust::unsafe_op_in_unsafe_fn = "deny"`.)*
 - **Crate `crates/core-types/`:**
   - `src/money.rs`:
     - `MicroUsdc(u64)` (`$1.00 = 1_000_000`, `ONE_DOLLAR = 1_000_000`, `ONE_CENT = 10_000`), `SharesMicro(u64)` (`1 share = 1_000_000`), `SignedSharesMicro(i64)`, `FinitePosF64(f64)`.
@@ -145,7 +156,7 @@ polymarket-as-rust/
 #### [0.2 VERIFY]
 - **Live Terminal Calculation Trace:**
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- doctor --jsonl logs/phase0-doctor.jsonl
+  cargo run -p cli --bin poly-as -- doctor --jsonl logs/phase0-doctor.jsonl
   ```
   Must print:
   - `(a)` Source: config env validation + Windows `timeBeginPeriod(1)` active + QPC resolution in ns.
@@ -155,7 +166,7 @@ polymarket-as-rust/
   - `(e)` Compute latency: per-op and 1,000-op HDR `P50 / P99` in `ns/us`.
 - **Numeric Unit-Test Vectors:**
   ```powershell
-  rtk cargo test -p core-types -- --nocapture
+  cargo test -p core-types -- --nocapture
   ```
   Required exact unit test assertions:
   - `parse_decimal_micro(b"0.52") == Ok(520_000)` and `parse_decimal_micro(b"0.29") == Ok(290_000)`
@@ -173,7 +184,7 @@ polymarket-as-rust/
   Must parse cleanly with zero errors and contain zero secret substrings.
 
 #### [0.3 VERIFY-AGAIN]
-- Adversarial unit tests (`rtk cargo test -p core-types adversarial`):
+- Adversarial unit tests (`cargo test -p core-types adversarial`):
   1. `parse_decimal_micro` rejects negative, `NaN`, `"1.1234567"` (>6 decimals), empty bytes, overflow `u64::MAX`.
   2. `floor_to_tick(f64::NAN, 10_000)`, `floor_to_tick(f64::INFINITY, 10_000)`, `floor_to_tick(-0.01, 10_000)` all return `Err`, never panic.
   3. `EngineConfig` debug-formatting with dummy secret `"SECRET_SENTINEL_123"` MUST NOT contain `"SECRET_SENTINEL_123"`.
@@ -181,10 +192,10 @@ polymarket-as-rust/
 - **PASS/FAIL Criteria:** PASS iff 0 warnings under `clippy -D warnings`, all unit + adversarial tests green, `doctor` prints exact vectors & sub-microsecond math P99, and JSONL parses cleanly.
 
 #### Phase 0 GATE CHECKLIST
-- [x] `rtk cargo fmt --all -- --check` exits 0
-- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [x] `rtk cargo test --workspace` exits 0 (all numeric + adversarial vectors pass)
-- [x] `rtk cargo run -p cli --bin poly-as -- doctor --jsonl logs/phase0-doctor.jsonl` verified
+- [x] `cargo fmt --all -- --check` exits 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `cargo test --workspace` exits 0 (all numeric + adversarial vectors pass)
+- [x] `cargo run -p cli --bin poly-as -- doctor --jsonl logs/phase0-doctor.jsonl` verified
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 
 ---
@@ -220,7 +231,7 @@ polymarket-as-rust/
 #### [1.2 VERIFY]
 - **Live Terminal Calculation Trace:**
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- feeds --discover --duration 20s --jsonl logs/phase1-feeds.jsonl
+  cargo run -p cli --bin poly-as -- feeds --discover --duration 20s --jsonl logs/phase1-feeds.jsonl
   ```
   Must print:
   - `(a)` Discovered live 5m BTC market (`slug`, `condition_id`, `version: v1|v2`, `up/dn` asset IDs, `tick_size`, `min_order_size`, `feeRate`, `takerDelayMs`, `expiry_ts`, `clock_offset_ms`).
@@ -230,7 +241,7 @@ polymarket-as-rust/
   - `(e)` Ingress parse latency HDR `P50 / P99` in `us` (target `< 50 us` on Windows).
 - **Unit-Test Vectors:**
   ```powershell
-  rtk cargo test -p feeds -- --nocapture
+  cargo test -p feeds -- --nocapture
   ```
   - Parse recorded real-shape Polymarket `book`, `price_change` (multi-item `price_changes[]`), `last_trade_price`, `tick_size_change` frames + Gamma V1 (`clobTokenIds` string) AND V2 (`positionIds` array) payloads + Binance `@bookTicker`/`@aggTrade` payloads.
   - Verify `BookMaintainer` sorts bids descending, asks ascending, deletes `size == "0"` levels, and detects crossed book (`best_bid >= best_ask`).
@@ -241,18 +252,18 @@ polymarket-as-rust/
   Must contain both `binance_tick` and `poly_book` / `poly_price_change` records with monotonic `mono_ns`.
 
 #### [1.3 VERIFY-AGAIN]
-- Adversarial tests (`rtk cargo test -p feeds adversarial`):
+- Adversarial tests (`cargo test -p feeds adversarial`):
   1. **Stale feed watchdog:** Mock WS stops sending for `3,100ms` -> `StaleTimeout` event fires within `3,500ms`.
   2. **Reconnect + REST resync gate:** Mock WS drops connection -> actor emits `Disconnected`, then `ResyncingRest`, blocks `Ready` until mock HTTP `/book` returns snapshot.
   3. **Malformed / unknown JSON & `price_change` with unknown `asset_id`:** Logged as explicit parse warning counter; never panics or corrupts book state.
   4. **Ringbuffer full pressure:** Fill `rtrb` to capacity -> emits `RingOverflow` telemetry counter without blocking WS ping/pong loop!
-  5. **Regression:** `rtk cargo test --workspace` passes (Phase 0 + Phase 1).
+  5. **Regression:** `cargo test --workspace` passes (Phase 0 + Phase 1).
 - **PASS/FAIL Criteria:** PASS iff live discovery succeeds on real Polymarket Gamma/CLOB APIs, live Binance + Polymarket ticks stream for 20s with `0` panics and `0` dropped pings, parse latency `P99 < 100 us`, and all adversarial + regression tests pass.
 
 #### Phase 1 GATE CHECKLIST
-- [x] `rtk cargo fmt --all -- --check` exits 0
-- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [x] `rtk cargo test --workspace` exits 0
+- [x] `cargo fmt --all -- --check` exits 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `cargo test --workspace` exits 0
 - [x] Live `poly-as feeds --discover --duration 20s` captures real Binance + Polymarket ticks & writes valid JSONL
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 
@@ -296,7 +307,7 @@ polymarket-as-rust/
 #### [2.2 VERIFY]
 - **Live Terminal Calculation Trace:**
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- trace --source live --sg-mode causal --ticks 20 --jsonl logs/phase2-trace.jsonl
+  cargo run -p cli --bin poly-as -- trace --source live --sg-mode causal --ticks 20 --jsonl logs/phase2-trace.jsonl
   ```
   Must print for every evaluated tick:
   - `(a)` Data source (`live` or `replay`) + raw UP/DOWN BBO & Binance BTC spot tick.
@@ -306,7 +317,7 @@ polymarket-as-rust/
   - `(e)` Compute latency: per-station (`s1_ns..s6_ns`) and total `us` + HDR `P50 / P99` (target total compute `P99 < 25 us` per `latency-profiling-and-clock-sync.md:57`!).
 - **Numeric Unit-Test Vectors:**
   ```powershell
-  rtk cargo test -p math-engine -- --nocapture
+  cargo test -p math-engine -- --nocapture
   ```
   Exact verified assertions:
   1. **Station 1:** Window `[0.49, 0.50, 0.52, 0.51, 0.50]` -> Symmetric `0.514000`, Causal `0.500000` (tol `1e-9`). Overshoot `[0.99, 0.50, 0.50, 0.90, 0.99]` -> unclamped `1.078857`, clamped `<= 0.99`.
@@ -323,19 +334,19 @@ polymarket-as-rust/
   ```
 
 #### [2.3 VERIFY-AGAIN]
-- Adversarial re-runs (`rtk cargo test -p math-engine adversarial` + CLI replay stress):
+- Adversarial re-runs (`cargo test -p math-engine adversarial` + CLI replay stress):
   1. **Nonzero heavy inventory (`q = +100` and `q = -100`):** Verify `r_i` shifts strictly downward for `q > 0` and upward for `q < 0`, quotes stay in `[tick, 1 - tick]` or cleanly `None`, never negative or `NaN`.
   2. **Empty / 1-level / zero-volume / spoofed L2 book:** Verify `kappa_fallback = true`, zero `NaN`, wide protective spread.
   3. **Near-expiry & clock overshoot (`tau = 1s`, `tau = 0s`, `now_ms > expiry_ms`):** Verify `tau_secs == 0.0`, zero negative-tau sign flip, zero division by zero in `d_2`.
   4. **Causal SG step-jump (`0.50 -> 0.60`):** Verify tick-2 unclamped `0.6143` is clamped to `<= best_ask` so bid NEVER crosses the spread.
   5. **Dynamic `tick_size_change` (`0.01 -> 0.001`) at tail (`p = 0.02`):** Verify zero panic, valid 3-decimal ticks, `bid_up + bid_dn <= max_combined_bid`.
-  6. **Zero-allocation check & regression:** Benchmark 100,000 `evaluate()` iterations (`P99 < 25 us`) and run `rtk cargo test --workspace`.
+  6. **Zero-allocation check & regression:** Benchmark 100,000 `evaluate()` iterations (`P99 < 25 us`) and run `cargo test --workspace`.
 - **PASS/FAIL Criteria:** PASS iff all exact vectors match to `1e-6`, `P99` compute `< 25 us`, all 5 adversarial cases pass without panic/`NaN`/crossed quotes, and Phase 0–1 tests stay green.
 
 #### Phase 2 GATE CHECKLIST
-- [x] `rtk cargo fmt --all -- --check` exits 0
-- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [x] `rtk cargo test --workspace` exits 0
+- [x] `cargo fmt --all -- --check` exits 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `cargo test --workspace` exits 0
 - [x] Live/replay `poly-as trace` outputs complete 6-station trace + `P99 < 25 us` + valid JSONL
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
@@ -366,13 +377,13 @@ polymarket-as-rust/
       2. `(T - t)` skew & spread trajectory snapshots.
       3. **Paired-Fill Latency** ($\Delta t_{\text{pair}}$ between Leg A fill and Leg B completion).
       4. **Fill Ratio** (filled shares / posted shares) and **Adverse Selection Post-Fill Markout** (mid-price move `1s` and `5s` after fill!).
-      5. **Null Baseline Comparison:** Tracks naive static-spread (`mid ± 1 tick`) benchmark PnL alongside adaptive A-S PnL (`binary-spread-capture.md:78`).
+      5. **Null Baseline Comparison:** Tracks naive static-spread (`mid ± 1 tick`) benchmark PnL alongside adaptive A-S PnL (`binary-spread-capture.md:78`). *(Historical note: `NaiveBaselineEngine` was later removed — see [docs/strategy-verification-spec.md](docs/strategy-verification-spec.md) §3.1.)*
 - **CLI Subcommand (`crates/cli/`):** `poly-as lifecycle --source live|replay [--input <file.jsonl>] --duration 300s --v-max 50 --base-size 20 --latency-ms 40 --jsonl logs/phase3-paper.jsonl`
 
 #### [3.2 VERIFY]
 - **Live Terminal Calculation Trace:**
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- lifecycle --source live --duration 60s --v-max 50 --base-size 20 --latency-ms 40 --jsonl logs/phase3-paper.jsonl
+  cargo run -p cli --bin poly-as -- lifecycle --source live --duration 60s --v-max 50 --base-size 20 --latency-ms 40 --jsonl logs/phase3-paper.jsonl
   ```
   Must print:
   - `(a)` Live market & feed status + simulated order latency (`40ms`).
@@ -382,7 +393,7 @@ polymarket-as-rust/
   - `(e)` Per-tick math + sim compute latency HDR `P50 / P99` in `us`.
 - **Numeric Unit-Test Vectors:**
   ```powershell
-  rtk cargo test -p paper-sim -- --nocapture
+  cargo test -p paper-sim -- --nocapture
   ```
   Exact verified assertions:
   1. **FIFO Partial Fill:** Order `size=20` @ `$0.48` with `volume_ahead=100`. Trade #1 `size=80` @ `$0.48` -> `0` filled (`volume_ahead=20`). Trade #2 `size=25` @ `$0.48` -> **`5` shares filled** (`remaining=15`, `volume_ahead=0`), NOT full 20!
@@ -396,17 +407,17 @@ polymarket-as-rust/
   ```
 
 #### [3.3 VERIFY-AGAIN]
-- Adversarial re-runs (`rtk cargo test -p paper-sim adversarial`):
+- Adversarial re-runs (`cargo test -p paper-sim adversarial`):
   1. **Cancel in-flight adverse fill race:** Emit `Cancel` at `t=100ms` (`latency=40ms`), trade hits at `t=120ms` -> order MUST still fill (realistic adverse selection during cancel RTT!).
   2. **Same-millisecond multi-order placement:** Place 10 orders at identical `ts_ms` -> 10 distinct monotonic `sim_id`s, zero HashMap collisions.
   3. **Replay determinism:** Running `poly-as lifecycle --source replay --input <fixture.jsonl>` twice produces byte-for-byte identical final PnL, fill count, and merged pairs.
-  4. **Regression:** `rtk cargo test --workspace` passes (Phases 0–3).
+  4. **Regression:** `cargo test --workspace` passes (Phases 0–3).
 - **PASS/FAIL Criteria:** PASS iff FIFO partial fills, cancel-race adverse fills, VWAP merges, and fee deductions match exact test vectors, live 60s paper session runs cleanly with valid JSONL, and all prior tests remain green.
 
 #### Phase 3 GATE CHECKLIST
-- [x] `rtk cargo fmt --all -- --check` exits 0
-- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [x] `rtk cargo test --workspace` exits 0
+- [x] `cargo fmt --all -- --check` exits 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `cargo test --workspace` exits 0
 - [x] Live 60s `poly-as lifecycle --source live` + deterministic replay run verified with JSONL audit
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
@@ -458,11 +469,11 @@ polymarket-as-rust/
 #### [4.2 VERIFY]
 - **Live Terminal Calculation Trace:**
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- lifecycle --source sim-epoch --fast-forward --jsonl logs/phase4-lifecycle.jsonl
+  cargo run -p cli --bin poly-as -- lifecycle --source sim-epoch --fast-forward --jsonl logs/phase4-lifecycle.jsonl
   ```
   And live 5-minute epoch trace against real feeds (paper execution backend):
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- lifecycle --source live --duration 90s --jsonl logs/phase4-live.jsonl
+  cargo run -p cli --bin poly-as -- lifecycle --source live --duration 90s --jsonl logs/phase4-live.jsonl
   ```
   Must print:
   - `(a)` Actor thread startup (core pinning status, `rtrb` capacities, `ArcSwap` slots, high-res timer active).
@@ -472,7 +483,7 @@ polymarket-as-rust/
   - `(e)` Wire-to-intent latency HDR `P50 / P99` (`Pricing < 25 us`, `Risk < 10 us`, end-to-end internal `< 100 us`).
 - **Numeric Unit-Test Vectors:**
   ```powershell
-  rtk cargo test -p risk-lifecycle -- --nocapture
+  cargo test -p risk-lifecycle -- --nocapture
   ```
   1. **First-Order Cap Vector:** `V_max=$50, base=100, p=$0.60, unhedged=0` -> `Q_max=83`, output `size=83` (`$49.80 <= $50.00`, NOT 100!).
   2. **Martingale Crash Vector:** Bought 100 UP @ `$0.50` (`cost=$50`), price crashes to `$0.10` -> `u = 50/50 = 1.00` (`Tier4HardStop`, NOT Tier 1!).
@@ -485,19 +496,19 @@ polymarket-as-rust/
   ```
 
 #### [4.3 VERIFY-AGAIN]
-- Adversarial fault-injection runs (`rtk cargo test -p risk-lifecycle adversarial` + CLI fault flags):
+- Adversarial fault-injection runs (`cargo test -p risk-lifecycle adversarial` + CLI fault flags):
   1. `--inject-fault stale`: Simulates 3.5s Polymarket WS silence -> `StaleTimeout` fires `CancelAll` within `< 3.5s`, halts quoting, resumes only after `Ready`.
   2. `--inject-fault tier4`: Forces `u = 0.95` -> instant `CancelAll` + single-flight `FlattenFak` (verifies zero duplicate FAKs during 50ms taker delay!).
   3. `--inject-fault tick-change`: Emits `tick_size_change 0.01 -> 0.001` -> freezes stale-tick intents until next Pricing snapshot with `tick = 0.001`.
   4. **Slow Execution Backpressure Test:** Block Execution consumer for 500ms while Pricing emits 500 quotes -> Risk & Pricing NEVER block/deadlock; when Execution resumes, it immediately sees the **latest** quote (zero 500-item stale backlog!).
   5. **Lead-Lag `<15ms` Defensive Cancel Test:** Inject sudden Binance `+$150` BTC jump -> `LeadLagDefensiveCancel` bypasses 100ms SG grid and dispatches `Cancel` in `< 1ms` internal latency.
-  6. **Regression:** `rtk cargo test --workspace` passes (Phases 0–4).
+  6. **Regression:** `cargo test --workspace` passes (Phases 0–4).
 - **PASS/FAIL Criteria:** PASS iff all 4 lifecycle phases, 4 risk tiers, continuous hysteresis, fault-injection breakers, backpressure conflation, and all Phase 0–3 regressions pass with zero deadlocks/panics.
 
 #### Phase 4 GATE CHECKLIST
-- [x] `rtk cargo fmt --all -- --check` exits 0
-- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [x] `rtk cargo test --workspace` exits 0
+- [x] `cargo fmt --all -- --check` exits 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `cargo test --workspace` exits 0
 - [x] `poly-as lifecycle --source sim-epoch --fast-forward` and `--inject-fault` tests verified
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
@@ -506,6 +517,8 @@ polymarket-as-rust/
 ---
 
 ### Phase 5: Live Polymarket CLOB Execution, Signing, Heartbeats & Settlement (`execution`, `cli exec`)
+
+> **Phase 5 Boundary Note:** Phase 5 delivered unit- and mock-tested `execution` crate modules plus `poly-as exec --mode dry-run` signing/settlement previews. Mainnet `canary-live` dispatch remains hard-gated off in `crates/cli/src/exec_cmd.rs`, `exec` dry-run uses synthetic books and ephemeral keys, and `RelayerClient::submit_merge` posts a `"calldataPreview"` JSON payload rather than ABI-encoded signed relayer transactions. Live venue integration currently runs through the NEX Amoy sandbox (`crates/execution/src/nex.rs`).
 
 #### [5.1 DO]
 - Add `crates/execution/` to workspace:
@@ -550,13 +563,13 @@ polymarket-as-rust/
     - Primary path: Polymarket Gasless Relayer v2 (`POST https://relayer-v2.polymarket.com/submit` with `RELAYER_API_KEY` + `RELAYER_API_KEY_ADDRESS`, wallet nonce fetch `/v1/account/transactions/params`, wallet-specific EIP-712 batch signing, polling until `STATE_CONFIRMED`).
     - Fallback direct Polygon RPC path (opt-in): enforces dynamic gas-batching floor $N_{\min} = \lceil 10 \cdot \text{TxCost}_{\text{gas}} / s^* \rceil$ and calls wallet execute (never raw EOA CTF call!).
     - Pre-flight startup approval verifier checking ERC-20 `pUSD` allowance + ERC-1155 `isApprovedForAll` before enabling live quoting!
-    - Automatic read-only on-chain/profile wallet-type verification (`eth_getCode` / Polymarket profile check confirming `0xeE3B...` matches configured `POLY_SIG_TYPE` `3` vs `2` before Phase 5 live canary starts, refusing live start on mismatch).
+    - Automatic read-only on-chain/profile wallet-type verification (`eth_getCode` / Polymarket profile check confirming the configured operator wallet matches `POLY_SIG_TYPE` `3` vs `2` before live canary starts, refusing live start on mismatch).
 - **CLI Subcommand (`crates/cli/`):** `poly-as exec --mode dry-run|canary-live [--confirm-live-capital] [--canary-max-usd 10] --jsonl logs/phase5-exec.jsonl`
 
 #### [5.2 VERIFY]
 - **Live Terminal Calculation Trace (Dry-Run Mode — Zero Capital At Risk):**
   ```powershell
-  rtk cargo run -p cli --bin poly-as -- exec --mode dry-run --duration 60s --jsonl logs/phase5-exec-dry.jsonl
+  cargo run -p cli --bin poly-as -- exec --mode dry-run --duration 60s --jsonl logs/phase5-exec-dry.jsonl
   ```
   Must print:
   - `(a)` Discovered live 5m BTC market (`version`, `domain_version`, `verifying_contract`, `wallet_mode`, `feeRate`, `takerDelayMs`).
@@ -565,7 +578,7 @@ polymarket-as-rust/
   - `(d)` Wire-to-wire checkpoint latencies (`tau_1` ingress, `tau_2` compute, `tau_3` signing `< 80 us`, `tau_4` mock/HTTP egress) + HDR `P50 / P99`.
 - **Unit & Mock-Exchange Integration Tests:**
   ```powershell
-  rtk cargo test -p execution -- --nocapture
+  cargo test -p execution -- --nocapture
   ```
   1. **L2 HMAC Test Vector:** Verify `URL_SAFE` base64 secret containing `_` decodes and signs `ts + "POST" + "/order" + body` and strips query string on `GET /data/orders?market=0x123` (signing `/data/orders`).
   2. **EIP-712 Signature Recovery Test:** Sign V2 CTF order (`sig_type=2` Safe) AND V3 PolyV2 DepositWallet order (`sig_type=3` ERC-7739 wrapped); recover exact signer address via `alloy` and verify ERC-7739 trailer byte layout (`len == 65 + 32 + 32 + ORDER_TYPE.len() + 2`).
@@ -580,21 +593,21 @@ polymarket-as-rust/
   ```
 
 #### [5.3 VERIFY-AGAIN]
-- Adversarial re-runs (`rtk cargo test -p execution adversarial`):
+- Adversarial re-runs (`cargo test -p execution adversarial`):
   1. **Secret Redaction Audit:** Scan `logs/phase5-exec-dry.jsonl` and stdout capture for private key, L2 secret, passphrase, relayer key -> MUST return 0 matches.
   2. **`order_not_found` Race Test:** Mock `DELETE /order` returns `order_not_found` -> verify FSM enters `PendingReconcile` and does NOT submit replacement until mock `GET /data/orders` confirms filled vs canceled!
   3. **User WS Drop & Reconcile Lock:** Drop mock `/ws/user` socket while an unseen fill occurs -> verify quoting halts until REST reconcile detects fill and updates `Delta_q`.
   4. **Merge Before Confirmation Guard:** Attempt settlement when fill is `MATCHED` (not `CONFIRMED`) -> verify `SettlementWorker` defers merge until `CONFIRMED`!
   5. **Canary Safety Latch:** Running `poly-as exec --mode canary-live` WITHOUT `--confirm-live-capital` OR with `DRY_RUN=true` MUST refuse to start (non-zero exit).
-  6. **Full Regression:** `rtk cargo test --workspace` + `rtk cargo build --release` passes cleanly.
+  6. **Full Regression:** `cargo test --workspace` + `cargo build --release` passes cleanly.
 - **Optional Live Canary (ONLY after explicit operator sign-off on Phase 5 dry-run + Open Question #1 wallet verification):** Run `poly-as exec --mode canary-live --confirm-live-capital --canary-max-usd 10` for 1 single 5-minute epoch with live operator supervision, verifying `GET /data/orders` empty on shutdown.
 - **PASS/FAIL Criteria:** PASS iff all signing, HMAC, heartbeat recovery, maker-fill accounting, mock CLOB error handling, secret-redaction, release build, and workspace regression checks pass with `tau_3 < 80 us` and zero CRITICAL/HIGH reviewer findings.
 
 #### Phase 5 GATE CHECKLIST
-- [x] `rtk cargo fmt --all -- --check` exits 0
-- [x] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [x] `rtk cargo test --workspace` exits 0
-- [x] `rtk cargo build --release` exits 0
+- [x] `cargo fmt --all -- --check` exits 0
+- [x] `cargo clippy --workspace --all-targets -- -D warnings` exits 0
+- [x] `cargo test --workspace` exits 0
+- [x] `cargo build --release` exits 0
 - [x] `poly-as exec --mode dry-run --duration 60s` verified (`tau_3 < 80 us`, 0 leaked secrets, valid JSONL)
 - [x] Mandatory reviewers completed with 0 CRITICAL/HIGH findings: `rust-reviewer`, `silent-failure-hunter`
 - [x] Human-Readable Verification Scorecard (plain-English metric translation + 0–100 rubric score + PASS/FAIL verdict) presented alongside raw terminal output
@@ -602,10 +615,10 @@ polymarket-as-rust/
 
 ---
 
-## 4. Strict Gating Rule (Non-Negotiable Execution Law)
+## 4. Strict Gating Rule (Historical Greenfield Gate — Phases 0–5 Complete)
 
-> **STRICT SEQUENTIAL PHASE GATE:**
-> Work may advance from **Phase $N$** to **Phase $N+1$** **ONLY** when ALL SIX conditions are satisfied with fresh terminal evidence:
+> **STRICT SEQUENTIAL PHASE GATE (HISTORICAL):**
+> During the Phase 0–5 build, work advanced from **Phase $N$** to **Phase $N+1$** **ONLY** when ALL SIX conditions were satisfied with fresh terminal evidence:
 > 1. **[N.1 DO]** All crates, modules, structs, and CLI subcommands for Phase $N$ are implemented cleanly with zero placeholders.
 > 2. **[N.2 VERIFY]** The live terminal calculation trace (`cargo run ...`), all exact numeric unit-test vectors (`cargo test ...`), and structured JSONL log validation have been executed fresh and confirmed passing.
 > 3. **[N.3 VERIFY-AGAIN]** All adversarial edge-case re-runs and full workspace regression tests (`cargo test --workspace`) have been executed fresh and confirmed passing.
@@ -626,22 +639,22 @@ polymarket-as-rust/
 
 ---
 
-## 5. Definition of DONE & Locked Operator Decisions
+## 5. Historical Definition of DONE & Initial Locked Decisions
 
-### 5.1 Project Definition of DONE
-The greenfield Rust project is **DONE** when:
-1. Phases 0–5 have each individually passed `[X.1 DO]`, `[X.2 VERIFY]`, `[X.3 VERIFY-AGAIN]`, and mandatory `rust-reviewer` + `silent-failure-hunter` gates.
-2. `rtk cargo build --release`, `rtk cargo test --workspace`, `rtk cargo clippy --workspace --all-targets -- -D warnings`, and `rtk cargo fmt --all -- --check` all exit `0`.
-3. `poly-as` executes cleanly on Windows 11 with zero UI dependencies, sub-25 $\mu\text{s}$ P99 math compute latency, sub-80 $\mu\text{s}$ P99 EIP-712 signing latency, structured JSONL telemetry on disk, and zero leaked secrets.
-4. At least 30 minutes of live paper trading (`poly-as lifecycle --source live`) and 1 full 5-minute epoch of `poly-as exec --mode dry-run` complete with zero panics, zero inventory drift, clean epoch rollover, and verified PnL/fee/markout telemetry.
+### 5.1 Project Definition of DONE (Phases 0–5 Milestone)
+The greenfield Rust project milestone was **DONE** when:
+1. Phases 0–5 each individually passed `[X.1 DO]`, `[X.2 VERIFY]`, `[X.3 VERIFY-AGAIN]`, and mandatory Phase 0–5 review gates.
+2. `cargo build --release`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, and `cargo fmt --all -- --check` all exited `0`.
+3. `poly-as` executed cleanly on Windows 11 with zero UI dependencies, sub-25 $\mu\text{s}$ P99 math compute latency, sub-80 $\mu\text{s}$ P99 EIP-712 signing latency, structured JSONL telemetry on disk, and zero leaked secrets.
+4. At least 30 minutes of live paper trading (`poly-as lifecycle --source live`) and 1 full 5-minute epoch of `poly-as exec --mode dry-run` completed with zero panics, zero inventory drift, clean epoch rollover, and verified PnL/fee/markout telemetry.
 
-### 5.2 Locked Operator Decisions (Confirmed Before Phase 0)
+### 5.2 Initial Locked Operator Decisions (Confirmed Before Phase 0)
 
-1. **Wallet Type (`0xeE3B778A783510BC833384919F709e3d2fee1624`):** Default to `POLY_SIG_TYPE=3` (`WalletMode::DepositWallet1271`), keep `signatureType=2` (`WalletMode::GnosisSafe`) supported in code, and enforce an automatic read-only on-chain/profile wallet-type verification check before Phase 5 live canary starts.
+1. **Wallet Type (`<operator wallet address configured via .env>`):** Default to `POLY_SIG_TYPE=3` (`WalletMode::DepositWallet1271`), keep `signatureType=2` (`WalletMode::GnosisSafe`) supported in code, and enforce an automatic read-only on-chain/profile wallet-type verification check before Phase 5 live canary starts.
 2. **Math Defaults:** Use the audit-fixed defaults (`BinaryCara` variance + full A-S spread + `TradeNormalizedDepth` $\kappa$), keeping the literal Library formulas behind CLI flags (`--variance-mode library-strict`, `--kappa-mode log-slope`, `--sg-mode symmetric`) for paper A/B comparison.
-3. **Risk Defaults:** `V_max = $50.00`, `BASE_ORDER_SIZE_SHARES = 20`, and `>= 2 cents` minimum combined spread floor (`max_combined_bid = $0.98`).
+3. **Risk Defaults (superseded by [`DEFAULTS.json`](DEFAULTS.json)):** Initial Phase 0 lock used `V_max = $50.00`, `BASE_ORDER_SIZE_SHARES = 20`, and `>= 2 cents` minimum combined spread floor (`max_combined_bid = $0.98`). Current calibrated non-secret defaults—including `min_spread_ticks = 1`, `min_combined_spread_micro = 10_000`, `max_entry_price = 0.65`, and `entry_cutoff_secs = 120`—are governed by [`DEFAULTS.json`](DEFAULTS.json).
 4. **Chainlink PolyBolt:** No Chainlink API key — default to Binance Spot WSS + local 60s rolling TWAP, with PolyBolt opt-in (`POLYBOLT_ENABLED=false`).
 5. **Execution Client:** Direct Native Rust (`reqwest` + `alloy` + `hmac`).
-6. **Cross-Model Review (`doubt-driven-development`):** Skipped by operator; proceeding with single-model adversarial findings only.
-7. **Operator Verification Scorecard:** Starting from Phase 2 onward, every phase verification report MUST include a Human-Readable Verification Scorecard (plain-English metric translation, target vs. measured values, transparent 0–100 rubric score, and PASS/FAIL verdict) alongside the raw terminal output.
-8. **Git Workflow & Repository Conventions:** Repository lives at `AI-Degen-69/polymarket-as-rust` (private). Starting from Phase 2 onward, all changes follow `AGENTS.md` (short-lived feature branches, atomic conventional commits, PR + green CI before merging to `main`, and `phase-<N>-complete` tags).
+6. **Cross-Model Review (`doubt-driven-development`):** Skipped by operator; proceeded with single-model adversarial findings only.
+7. **Operator Verification Scorecard (Historical Phase 2–5 Rule):** Phases 2–5 included a Human-Readable Verification Scorecard alongside raw terminal output. Current PR and verification requirements are governed by [`AGENTS.md`](AGENTS.md) and [`CONSTRAINTS.md`](CONSTRAINTS.md).
+8. **Git Workflow & Repository Conventions (Historical Note):** Repository lives at `AI-Degen-69/polymarket-as-rust` (private). Current branching, PR, merge (`--merge --delete-branch`), and operational safety rules are governed by [`AGENTS.md`](AGENTS.md).
