@@ -3,7 +3,7 @@
 **Date:** 2026-11-26  
 **Baseline Config:** `Config #6/9` (`gamma=0.12`, `max_entry_price=$0.65`, `entry_cutoff_secs=120s`, `tier1_hedge_trigger_price=off`, `QueueDecay=conservative`) in [DEFAULTS.json](../DEFAULTS.json)  
 **Primary Corpus:** 21 replayed captures (`241` windows) from `logs/sweeps/26-11_07-55-07Z_1runs_21caps-241w/sweep-manifest.json`  
-**Reproducibility Script:** [analyze_merge_edge_feasibility.py](../scripts/analyze_merge_edge_feasibility.py) (`rtk python scripts/analyze_merge_edge_feasibility.py`)
+**Reproducibility Script:** [analyze_merge_edge_feasibility.py](../scripts/analyze_merge_edge_feasibility.py) (`python scripts/analyze_merge_edge_feasibility.py`)
 
 ---
 

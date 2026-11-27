@@ -1,43 +1,26 @@
 ## Summary
 
-- Phase / Scope:
+- Scope:
 - Why this change exists:
-- Issue: Closes #<id>
+- Issue (if applicable):
 
-## Atomic Commits / Key Changes
+## Key Changes
 
 -
 
-## Verification (Station IV Step 0 proof gate — proved or honestly unverified, never silent)
+## Verification
 
-- [ ] Targeted suites for touched modules pass (paste command + result below)
-- [ ] Browser gate (UI changes only): endpoint smoke 200, DOM checks, zero console errors, zero failed requests, screenshot last
-- [ ] Items that could not be verified (name each + tooling reason):
+Paste the commands run and their outputs. Name any checks not run and why (for example, Rust and PowerShell checks skipped on a docs-only PR).
 
-```
+```text
 <paste verification output>
 ```
 
-## Gate Checklist
+## Checklist
 
-- [ ] `rtk cargo fmt --all -- --check` exits 0
-- [ ] `rtk cargo clippy --workspace --all-targets -- -D warnings` exits 0
-- [ ] `rtk cargo test --workspace` exits 0
-- [ ] Live/replay `poly-as` trace and JSONL telemetry verified (if applicable)
-- [ ] OCR delegation review completed (file list + rule groups + findings, or skip reason)
-- [ ] Spec axis: diff matches linked issue/plan (Missing / Added-not-asked / Implemented-wrong)
-- [ ] `rust-reviewer` and `silent-failure-hunter` report 0 CRITICAL / 0 HIGH findings
-- [ ] Zero `.env` files, secrets, private keys, or `logs/` artifacts in diff
-
-## Human-Readable Verification Scorecard
-
-- Score: `/100`
-- Verdict: `PASS` / `PASS WITH NOTES` / `FAIL`
-- Key Metrics:
-
-## CodeRabbit (Station IV Step 5 → Station V)
-
-- Trigger: `@coderabbitai review` posted (paste comment link)
-- Ack status (exactly one): *review started* / *rate limited (N min)* / *summary-only — no findings expected here; verification rests on the local gates* / *other (quoted)* / *no acknowledgement*
-
-@coderabbitai summary
+- [ ] `cargo fmt --all -- --check` passes
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings` passes (if Rust code changed)
+- [ ] `cargo test --workspace` passes with zero skipped tests (if Rust code changed)
+- [ ] PowerShell AST syntax check and `pwsh -NoProfile -File scripts/sweep-style.tests.ps1` pass (if `scripts/*.ps1` changed)
+- [ ] Zero `.env`, `.env.*` (except `.env.example`), secrets, private keys, `logs/`, `data/`, or `*.jsonl` artifacts in diff
+- [ ] Relevant documentation updated, and if defaults or calibration changed, `DEFAULTS.json` and all consumers are synchronized (`AGENTS.md` §10)

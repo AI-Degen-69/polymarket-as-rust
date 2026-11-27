@@ -289,6 +289,8 @@ Per §8, no dust modifications were implemented. Below is the exact baseline dia
 
 ### Reproducible Offline Command
 
+> **Archived script note:** As noted in §2, `scripts/run_passive_override_replay.py` and the experimental replay-only CLI flags are archived on the unmerged `validate_strategy_edge_metric` branch and are not present on `main`.
+
 ```powershell
-rtk python scripts/run_passive_override_replay.py --workers 6
+python scripts/run_passive_override_replay.py --workers 6
 ```

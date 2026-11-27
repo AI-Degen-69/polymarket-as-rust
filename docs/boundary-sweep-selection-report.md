@@ -170,7 +170,7 @@ The `+2.2`-point weighted margin (`79.9` vs `77.7`) over `#3/9` rests on a **226
 
 ## 5. Promoted Defaults & Reproducibility
 
-Promoted cleanly to [DEFAULTS.json](../DEFAULTS.json) (with strict JSON `"provenance"` object validated by `DefaultsProvenance` in `crates/core-types/src/config.rs`) — a provisional promotion: the values are unchanged and remain unvalidated at the `400`-fill bar (§4.3), and synchronized across all six calibration files (`DEFAULTS.json`, `.env.example`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1` + `AGENTS.md` §7):
+Promoted cleanly to [DEFAULTS.json](../DEFAULTS.json) (with strict JSON `"provenance"` object validated by `DefaultsProvenance` in `crates/core-types/src/config.rs`) — a provisional promotion: the values are unchanged and remain unvalidated at the `400`-fill bar (§4.3), and synchronized across all six calibration files in the surface at selection time (`DEFAULTS.json`, `.env.example`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`; see `AGENTS.md` §10):
 - `max_entry_price = 0.65` (`MAX_ENTRY_PRICE=0.65`)
 - `entry_cutoff_secs = 120` (`ENTRY_CUTOFF_SECS=120`)
 - `entry_open_delay_secs = 15` (`ENTRY_OPEN_DELAY_SECS=15`)
@@ -183,7 +183,7 @@ Promoted cleanly to [DEFAULTS.json](../DEFAULTS.json) (with strict JSON `"proven
 
 ### A. Historical Dataset Expansion via PMData (Respecting Fidelity Boundaries)
 
-Per the Phase 0 historical verification audit (`audit_pmdata_historical_pipeline/docs/pmdata-phase0-historical-report.md` and `docs/pmdata/reconcile.md`):
+Per the Phase 0 historical verification audit ([pmdata-phase0-historical-report.md](pmdata-phase0-historical-report.md) and [pmdata/reconcile.md](pmdata/reconcile.md)):
 - **Hard fidelity limits (cannot skip):**
   1. **21-day free-tier cutoff:** Trailing `21` days return `HTTP 403`; live captures from `2026-11-22..25` cannot be reconciled against PMData until **`>= 2026-12-13..16`**.
   2. **Missing live-latency semantics:** PMData rows carry `mono_ns = null`, `clock_sync = null`, `EstimatedReplayClock`, and **`MissingBinanceSpot`**. Never use PMData to tune lead-lag latency (`lead_lag_window_ms`) or sub-100ms queue priority.

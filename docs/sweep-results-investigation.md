@@ -52,11 +52,11 @@ In `Read-CaptureJsonlMetrics` ([sweep-params.ps1](../scripts/sweep-params.ps1)),
 
 ### 2.1 Runtime Loading Path Verified
 
-Root [DEFAULTS.json](../DEFAULTS.json) is promoted to **Config #6/9** (`max_entry_price: 0.65`, `tier1_hedge_trigger_price: null`, `entry_cutoff_secs: 120`, `cap_tier1_reducing_to_delta: true`, `entry_open_delay_secs: 15`) alongside all six calibration sync files (`AGENTS.md` §7). The earlier Config #13 (`$0.60`) baseline is superseded by the boundary sweep described in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md):
+Root [DEFAULTS.json](../DEFAULTS.json) is promoted to **Config #6/9** (`max_entry_price: 0.65`, `tier1_hedge_trigger_price: null`, `entry_cutoff_secs: 120`, `cap_tier1_reducing_to_delta: true`, `entry_open_delay_secs: 15`) alongside the calibration sync files (`AGENTS.md` §10). The earlier Config #13 (`$0.60`) baseline is superseded by the boundary sweep described in [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md):
 - [DEFAULTS.json](../DEFAULTS.json#L13-L44)
 - [.env.example](../.env.example#L86-L104)
 - `EngineConfig::default()` / `EngineConfig::hardcoded_fallback()` ([config.rs](../crates/core-types/src/config.rs#L521-L592)) embeds `DEFAULTS.json` at compile time via `include_str!("../../../DEFAULTS.json")`.
-- Live and replay CLI entrypoints (`lifecycle_cmd.rs`, `paper_cmd.rs`, `trace_cmd.rs`, `feeds_cmd.rs`, `doctor.rs`, `main.rs`) load `EngineConfig::from_env()?`, which starts from `EngineConfig::default()` (`DEFAULTS.json`). `lifecycle_cmd.rs` explicitly passes `cfg.cap_tier1_reducing_to_delta`, `cfg.entry_open_delay_secs`, `cfg.entry_cutoff_secs`, and `MathPipelineConfig::from_engine_config(cfg)`. `exec_cmd.rs` dry-run loads `MathPipelineConfig::try_default()?`, which calls `MathPipelineConfig::from_engine_config(&EngineConfig::default())`.
+- Live and replay CLI entrypoints (`lifecycle_cmd.rs`, `paper_cmd.rs` *(since removed; `lifecycle` is now the sole replay entrypoint)*, `trace_cmd.rs`, `feeds_cmd.rs`, `doctor.rs`, `main.rs`) load `EngineConfig::from_env()?`, which starts from `EngineConfig::default()` (`DEFAULTS.json`). `lifecycle_cmd.rs` explicitly passes `cfg.cap_tier1_reducing_to_delta`, `cfg.entry_open_delay_secs`, `cfg.entry_cutoff_secs`, and `MathPipelineConfig::from_engine_config(cfg)`. `exec_cmd.rs` dry-run loads `MathPipelineConfig::try_default()?`, which calls `MathPipelineConfig::from_engine_config(&EngineConfig::default())`.
 - Verified by `embedded_defaults_json_parses_validates_and_matches_default` ([config.rs](../crates/core-types/src/config.rs#L1382)), `config_locked_defaults_validate` ([lib.rs](../crates/core-types/src/lib.rs#L227)), and `cli_lifecycle_and_pipeline_defaults_resolve_promoted_defaults` ([main.rs](../crates/cli/src/main.rs)).
 
 ### 2.2 Conflicting Library Struct Defaults (Non-Runtime)
@@ -128,7 +128,7 @@ Inspection of `git diff 90419cd..84bf56b` across all Rust crates confirms two ru
 #### 5.3 Effective Configuration Parity
 Comparing the `Active Config's Parameters` table printed in S1 (`22-11_10-10-00Z/...ec-120.log`) and S2 (`22-11_10-10-00Z/...ep-0p8.log`) confirms **all `24` lines are identical**:
 - `Gamma = 0.12`, `Include Variance Spread = true`, `Min Combined Spread = $0.01 (1 tick)`, `Max Combined Bid = $0.98`, `Cross Tick Loss Cap = 80000 micro-USDC`, `Max Entry Prob = 0.8`, `Max Entry Price = 0.65`, `Lead/Lag = 0.015 / 1000 ms / 1000 ms / true`, `Hedge Skew Multiplier = 1`, `Cap Tier-1 Reducing = true`, `Tier-1 Hedge Trigger = off`, `Entry Open Delay = 15 s`, `Entry Cutoff = 120 s`, `V_max = $50.00`, `Base Order Size = 20 shares`, `QueueDecay = conservative`.
-- *CLI help-text note:* `crates/cli/src/main.rs` (`#L321`, `#L339`) still displays `(0.60 default)` and `(false default)` in `--help` docstrings, which is cosmetic only; runtime defaults come from `DEFAULTS.json` (`0.65` and `true`).
+- *CLI help-text note:* `crates/cli/src/main.rs` (`#L321`, `#L339`) at the time of that run still displayed `(0.60 default)` and `(false default)` in `--help` docstrings, which was cosmetic only; runtime defaults came from `DEFAULTS.json` (`0.65` and `true`). *(Resolved on current `main`: `crates/cli/src/main.rs` now displays `0.65` and `true`.)*
 
 ---
 

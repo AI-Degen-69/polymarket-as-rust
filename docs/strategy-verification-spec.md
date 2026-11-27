@@ -26,7 +26,7 @@ Before running backtests or parameter sweeps, agents must enforce baseline invar
 
 ### 1.1 Invariant Rules & Peeking Checks
 * **Discrete Monotonic Clock & Replay Determinism `[Implemented]`:** All timing (`MonotonicClock` in `crates/core-types/src/clock.rs`), math engines (`crates/math-engine`), and simulation logic (`crates/paper-sim`) must process ticks strictly in chronological order. Replay code must never inspect future event frames or post-resolution settlement outcomes.
-* **Calibration Sync Surface `[Implemented]`:** Strategy defaults and thresholds in `crates/core-types/src/config.rs` (`EngineConfig`) must stay synchronized across all six calibration files (`DEFAULTS.json`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`, and `.env.example`) — the same six listed in `AGENTS.md` §7. `DEFAULTS.json` is not optional: `config.rs` embeds it at compile time via `include_str!("../../../DEFAULTS.json")`, so it *is* the default source rather than a copy of it. Post-hoc threshold shifting based on sweep outputs is prohibited.
+* **Calibration Sync Surface `[Implemented]`:** Strategy defaults and thresholds in `crates/core-types/src/config.rs` (`EngineConfig`) must stay synchronized across all calibration consumers (`DEFAULTS.json`, `crates/core-types/src/config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`, and `.env.example`, with the live dependency surface checked per `AGENTS.md` §10). `DEFAULTS.json` is not optional: `config.rs` embeds it at compile time via `include_str!("../../../DEFAULTS.json")`, so it *is* the default source rather than a copy of it. Post-hoc threshold shifting based on sweep outputs is prohibited.
 
 ### 1.2 Synthetic & Adversarial Determinism `[Implemented]`
 * Execute deterministic replay and edge-case tests via `crates/paper-sim/tests/adversarial.rs` and `crates/paper-sim/tests/vectors.rs`.
@@ -178,18 +178,18 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
   * *Microstructure Toxicity / Spot Jumps:* `station2_twap.rs` triggers fast-path directional defensive cancels (`lead_lag_cancel_threshold`) to pull endangered resting bids before informed takers sweep them.
   * *Expiry Convergence:* `crates/risk-lifecycle/src/lifecycle.rs` transitions through `ActiveQuoting` (`>60s`), `PreExpiryLockout` (`30–60s`), `MandatoryFlatten` (`15–30s`), and `TerminalLockout` (`<=15s`) to cap unhedged settlement exposure.
 
-### 5.2 3-Tier Production Promotion Workflow `[Implemented]`
+### 5.2 3-Tier Production Promotion Workflow `[Tiers 1–2 Implemented; Tier 3 Gated]`
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────┐
-│ TIER 1: Offline Replay & Parameter Sweep                               │
+│ TIER 1: Offline Replay & Parameter Sweep [Implemented]                 │
 │ - Run `poly-as lifecycle --source replay` via `scripts/sweep-params.ps1`│
 │ - Require `-QueueDecay conservative` and Six Filtering Checks          │
 └──────────────────────────────────┬─────────────────────────────────────┘
                                    │
                                    ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│ TIER 2: NEX Sandbox Live Validation                                    │
+│ TIER 2: NEX Sandbox Live Validation [Implemented]                      │
 │ - Run `poly-as sandbox health|markets|book|validate|feeds`             │
 │   (`crates/execution/src/nex.rs` & `crates/cli/src/sandbox_cmd.rs`)    │
 │ - Verify EIP-712 signing, L2 HMAC, heartbeat timers, and order FSM     │
@@ -197,10 +197,10 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
                                    │
                                    ▼
 ┌────────────────────────────────────────────────────────────────────────┐
-│ TIER 3: Live Canary Deployment                                         │
-│ - Run `poly-as exec --mode canary-live --confirm-live-capital`         │
-│   with `--canary-max-usd <= 25`                                        │
-│ - Compare real MO1s / MO5s and unhedged expiry drag vs paper-sim       │
+│ TIER 3: Live Canary Deployment [Gated / Not Wired]                     │
+│ - `poly-as exec --mode canary-live` is hard-gated off in               │
+│   `crates/cli/src/exec_cmd.rs`; not yet wired for live capital         │
+│ - Target checks: real MO1s / MO5s and expiry drag vs paper-sim         │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -210,13 +210,13 @@ Candidate configurations generated from `scripts/sweep-params.ps1` must pass all
 
 Before opening a Pull Request that alters trading math, risk filters, or execution logic:
 
-- [ ] Code preserves lookahead-free replay determinism and updates all six files in the Calibration Sync Surface if defaults change — `DEFAULTS.json` first, then `config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`, `.env.example` (`AGENTS.md` §7).
+- [ ] Code preserves lookahead-free replay determinism and updates `DEFAULTS.json` plus all calibration consumers if defaults change (`AGENTS.md` §10: `DEFAULTS.json`, `config.rs`, `crates/core-types/src/lib.rs`, `crates/cli/src/main.rs`, `scripts/sweep-params.ps1`, `.env.example`).
 - [ ] Workspace gates pass cleanly:
-  * `rtk cargo fmt --all -- --check`
-  * `rtk cargo clippy --workspace --all-targets -- -D warnings`
-  * `rtk cargo test --workspace` (including `crates/paper-sim/tests/adversarial.rs`, `vectors.rs`, and `crates/math-engine/tests/zero_alloc.rs`).
+  * `cargo fmt --all -- --check`
+  * `cargo clippy --workspace --all-targets -- -D warnings`
+  * `cargo test --workspace` (including `crates/paper-sim/tests/adversarial.rs`, `vectors.rs`, and `crates/math-engine/tests/zero_alloc.rs`).
 - [ ] Offline sweep verified with `scripts/sweep-params.ps1 -QueueDecay conservative` (and 70/30 OOS split once enabled).
 - [ ] Candidate strategy outperforms Twin 1 once reinstated (`AlphaEdge > 0`; see §3.1) and passes the **Six Filtering Checks** (Zero-Edge + Conservative Queue, Drawdown/WinCap/Expiry Drag, OOS Retention, Sample Size, Plateau Stability, `MO1s > 0`). Report Filter 3 honestly as `[Planned]` and do not describe a sample under `400` fills as `APPROVED` — the runner will call it `UNDERPOWERED`.
 - [ ] For execution or lifecycle changes, validated order lifecycle against NEX Sandbox:
-  * `rtk cargo run -p cli --bin poly-as -- sandbox health`
-  * `rtk cargo run -p cli --bin poly-as -- sandbox validate --asset-id <id> --confirm-sandbox-trade`
+  * `cargo run -p cli --bin poly-as -- sandbox health`
+  * `cargo run -p cli --bin poly-as -- sandbox validate --asset-id <id> --confirm-sandbox-trade`
