@@ -8,8 +8,11 @@ Entry point for everything under `docs/`. Start here instead of guessing at a fi
 
 ## Strategy research
 
-- [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md) — current baseline: the `9`-configuration boundary sweep and why Config `#6/9` (`$0.65`, `120s`) was promoted. Authoritative for the shipped defaults.
+- [boundary-sweep-selection-report.md](boundary-sweep-selection-report.md) — current baseline: the `9`-configuration boundary sweep and why Config `#6/9` (`$0.65`, `120s`) was promoted as a provisional research baseline. Authoritative for the shipped defaults.
 - [sweep-results-investigation.md](sweep-results-investigation.md) — Part I: accounting telemetry validation and runtime default-resolution audit; Part II: `21`-capture G3/G5 failure investigation (`25-11_21-55-50Z` vs. `26-11_07-55-07Z`); Part III: what that failure means for the shipped defaults (under-powered sample, values unchanged) and the `UNDERPOWERED` gate verdict.
+- [merge-edge-retention-feasibility.md](merge-edge-retention-feasibility.md) — `21`-capture (`241`-window) accounting audit and statistical power study separating repeatable maker pair-merge edge (`+$65.24`) from adverse-selection settlement drag (`-$33.56`, `85%` loss rate, `0` flattens); recommends a complementary 3-gate framework and a sealed Holdout Vault.
+- [mandatory-flatten-root-cause-investigation.md](mandatory-flatten-root-cause-investigation.md) — root-cause audit of why `0` mandatory flattens executed across `40` settlement-exposed windows (`36/40` sub-`5sh` dust, `4/40` books collapsing empty before `tau = 30s`) and counterfactuals showing early taker flattens hurt Net PnL.
+- [passive-reducing-hedge-override-replay.md](passive-reducing-hedge-override-replay.md) — **NO-GO** exact L2 replay evaluation of dynamic passive reducing-leg cross-tick overrides: rescued the `4` large settlement windows (`+$9.52`) but destroyed `24%–75%` of Net PnL on mean-reverting windows; defaults left unchanged.
 
 ## Historical data (PMData)
 
