@@ -461,6 +461,15 @@ Use debug-only verification when release artifacts may be in use (and vice versa
 
 Never sacrifice data integrity or an active experiment for engineering convenience.
 
+### Long-Running Replay and Test Output
+
+Default to live terminal output for long-running paired replays and similar lengthy test commands whenever the command supports it.
+
+* For `forward_test_pipeline.py paired-replay`, explicitly pass `--stream-output`.
+* Do not disable streaming (for example, `stream_output=False`) on long-running replay jobs unless a specific technical reason requires it.
+* If output volume becomes excessive, choose a less-verbose display mode instead of suppressing output entirely.
+* Continue showing stage start and completion messages alongside final verification results.
+
 ## 10. Configuration and Calibration Integrity
 
 Treat configuration as a system-wide contract.
